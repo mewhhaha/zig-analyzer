@@ -154,11 +154,31 @@ fn allocationFromCall(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) ?A
     const method = tree.tokenSlice(method_token);
     const release = allocationRelease(method) orelse return null;
     if (expressionReferencesField(tree, receiver, "arena")) return null;
+    if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(tree, receiver)) return null;
     return .{
         .method = method,
         .release = release,
         .receiver = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null,
         .allocator_source = allocatorSourceName(tree, receiver),
+    };
+}
+
+fn expressionLooksLikeAllocator(tree: *const std.zig.Ast, expression: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodeTag(expression)) {
+        .identifier => true,
+        .field_access => field: {
+            const field_token = tree.nodeData(expression).node_and_token[1];
+            const field_name = tree.tokenSlice(field_token);
+            break :field std.mem.eql(u8, field_name, "allocator") or std.mem.eql(u8, field_name, "gpa");
+        },
+        .call, .call_comma, .call_one, .call_one_comma => call: {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const full_call = tree.fullCall(&buffer, expression) orelse break :call false;
+            if (tree.nodeTag(full_call.ast.fn_expr) != .field_access) break :call false;
+            const field_token = tree.nodeData(full_call.ast.fn_expr).node_and_token[1];
+            break :call std.mem.eql(u8, tree.tokenSlice(field_token), "allocator");
+        },
+        else => false,
     };
 }
 
@@ -1032,6 +1052,17 @@ test "allocation release must match method and allocator" {
     defer freeWarnings(std.testing.allocator, allocator_findings);
     try std.testing.expectEqual(@as(usize, 1), allocator_findings.len);
     try std.testing.expectEqual(types.Rule.mismatched_allocation_release, allocator_findings[0].rule);
+}
+
+test "non-allocator dupe methods may pair with destroy" {
+    const source =
+        "fn run(parsed: anytype) void {" ++
+        "const edited_tree = parsed.tree.dupe();" ++
+        "defer edited_tree.destroy();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "double release and use after release are reported in straight line code" {

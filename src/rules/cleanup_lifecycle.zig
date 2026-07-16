@@ -31,8 +31,11 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
         for (context.tokens[defer_end + 1 .. scope_end], defer_end + 1..) |candidate, index| {
             if (candidate.tag != .identifier or !context.tokenIs(index, cleanup_binding) or index + 1 >= scope_end or
                 context.tokens[index + 1].tag != .equal or context.enclosingOpeningBrace(index) != scope_opening) continue;
+            if (index > 0 and (context.tokens[index - 1].tag == .keyword_const or
+                context.tokens[index - 1].tag == .keyword_var)) continue;
             const assignment_end = context.statementEnd(index) orelse continue;
             if (replacementConsumesOriginal(context, cleanup_binding, index + 2, assignment_end) or
+                replacementRelinquishesOwnership(context, cleanup_binding, defer_end + 1, index, index + 2, assignment_end) or
                 releasedBeforeReplacement(context, cleanup_binding, defer_end + 1, index)) continue;
             try context.emit(.{
                 .rule = .defer_uses_reassigned_binding,
@@ -47,6 +50,32 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn replacementRelinquishesOwnership(
+    context: RuleRun,
+    name: []const u8,
+    search_start: usize,
+    assignment_index: usize,
+    replacement_start: usize,
+    replacement_end: usize,
+) bool {
+    if (replacement_start + 1 >= replacement_end or context.tokens[replacement_start].tag != .period or
+        context.tokens[replacement_start + 1].tag != .identifier or !context.tokenIs(replacement_start + 1, "empty")) return false;
+    for (context.tokens[search_start..assignment_index], search_start..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+        if (index > search_start and context.tokens[index - 1].tag == .equal) return true;
+        var opening = index;
+        while (opening > search_start and index - opening < 16) {
+            opening -= 1;
+            if (context.tokens[opening].tag == .l_paren) break;
+            if (context.tokens[opening].tag == .semicolon or context.tokens[opening].tag == .l_brace) break;
+        }
+        if (context.tokens[opening].tag != .l_paren or opening == 0 or
+            context.tokens[opening - 1].tag != .identifier) continue;
+        if (std.mem.indexOf(u8, context.tokenText(opening - 1), "Owned") != null) return true;
+    }
+    return false;
 }
 
 fn replacementConsumesOriginal(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
@@ -357,6 +386,36 @@ test "realloc transfers the original allocation into the replacement" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "cleanup reassignment ignores ownership moves and shadow declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn transfer(a: anytype, supplied: ?[]u8) void {" ++
+        "var ranges = acquire(); defer ranges.deinit(a);" ++
+        "const result = takeOwned(ranges); ranges = .empty; _ = result;" ++
+        "const owned_path = supplied; defer if (owned_path) |path| a.free(path);" ++
+        "const path = supplied orelse return; _ = path;" ++
+        "}";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
+}
+
+test "clearing a deferred binding without transferring it still warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn leak(a: anytype) void { var ranges = acquire(); defer ranges.deinit(a); ranges = .empty; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqual(types.Rule.defer_uses_reassigned_binding, findings.items[0].rule);
 }
 
 test "constant allocation products are not runtime overflow risks" {

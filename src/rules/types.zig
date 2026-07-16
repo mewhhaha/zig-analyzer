@@ -202,7 +202,6 @@ pub const Rule = enum {
             .returning_arena_allocation,
             .invalidated_element_pointer,
             .defer_uses_reassigned_binding,
-            .error_collapsed_to_absence,
             .allocation_size_overflow,
             .resource_cleanup_on_error_only,
             .iterator_invalidated_during_loop,
@@ -222,7 +221,6 @@ pub const Rule = enum {
     pub fn profile(rule: Rule) ?LintProfile {
         return switch (rule) {
             .non_idiomatic_name,
-            .vague_type_name,
             .redundant_qualified_name,
             .underscore_private_name,
             .non_idiomatic_file_name,
@@ -237,8 +235,6 @@ pub const Rule = enum {
             .needless_else_after_terminator,
             .needless_empty_else,
             .mixed_bitwise_arithmetic,
-            .unsafe_catch_unreachable,
-            .lost_error_context,
             .unknown_comptime_member,
             .constant_comptime_condition,
             .prefer_optional_capture,
@@ -254,7 +250,6 @@ pub const Rule = enum {
             .redundant_import_path,
             .redundant_type_qualification,
             .prefer_anonymous_initializer,
-            .unsafe_orelse_unreachable,
             .redundant_optional_unwrap,
             .prefer_testing_expect_equal_strings,
             .prefer_testing_expect_equal_slices,
@@ -271,7 +266,13 @@ pub const Rule = enum {
             .negated_comptime_expression,
             .unbraced_multiline_if,
             => .idiomatic,
-            .public_declaration_docs => .strict,
+            .vague_type_name,
+            .unsafe_catch_unreachable,
+            .lost_error_context,
+            .unsafe_orelse_unreachable,
+            .error_collapsed_to_absence,
+            .public_declaration_docs,
+            => .strict,
             else => null,
         };
     }
@@ -288,6 +289,7 @@ pub const Configuration = struct {
     levels: [std.meta.fields(Rule).len]Level,
     lint_profile: LintProfile = .none,
     banned: []const BannedIdentifier = &.{},
+    check_excludes: []const []const u8 = &.{},
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {

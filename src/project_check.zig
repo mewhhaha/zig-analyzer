@@ -76,7 +76,7 @@ fn runWithWriter(
         summary.findings += 1;
     }
 
-    const relative_paths = collectZigPaths(io, arena, root) catch |err| {
+    const relative_paths = collectZigPaths(io, arena, root, configuration) catch |err| {
         try writer.print("zig-analyzer check: could not scan '{s}': {t}\n", .{ options.path, err });
         return 2;
     };
@@ -190,7 +190,12 @@ fn loadConfiguration(
     }
 }
 
-fn collectZigPaths(io: std.Io, allocator: std.mem.Allocator, root: ScanRoot) ![]const []const u8 {
+fn collectZigPaths(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    configuration: analysis.Configuration,
+) ![]const []const u8 {
     if (root.single_file) |file_name| {
         const paths = try allocator.alloc([]const u8, 1);
         paths[0] = try allocator.dupe(u8, file_name);
@@ -202,10 +207,13 @@ fn collectZigPaths(io: std.Io, allocator: std.mem.Allocator, root: ScanRoot) ![]
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory) {
-            if (!skipDirectory(entry.basename)) try walker.enter(io, entry);
+            if (!skipDirectory(entry.basename) and !pathIsExcluded(entry.path, configuration.check_excludes)) {
+                try walker.enter(io, entry);
+            }
             continue;
         }
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        if (pathIsExcluded(entry.path, configuration.check_excludes)) continue;
         try paths.append(allocator, try allocator.dupe(u8, entry.path));
     }
     std.mem.sort([]const u8, paths.items, {}, struct {
@@ -216,8 +224,38 @@ fn collectZigPaths(io: std.Io, allocator: std.mem.Allocator, root: ScanRoot) ![]
     return try paths.toOwnedSlice(allocator);
 }
 
+fn pathIsExcluded(path: []const u8, exclusions: []const []const u8) bool {
+    for (exclusions) |exclusion| {
+        if (!pathHasPrefix(path, exclusion)) continue;
+        if (path.len == exclusion.len or isPathSeparator(path[exclusion.len])) return true;
+    }
+    return false;
+}
+
+fn pathHasPrefix(path: []const u8, prefix: []const u8) bool {
+    if (path.len < prefix.len) return false;
+    for (path[0..prefix.len], prefix) |path_character, prefix_character| {
+        if (path_character == prefix_character) continue;
+        if (!isPathSeparator(path_character) or !isPathSeparator(prefix_character)) return false;
+    }
+    return true;
+}
+
+fn isPathSeparator(character: u8) bool {
+    return character == '/' or character == '\\';
+}
+
 fn skipDirectory(name: []const u8) bool {
-    const skipped = [_][]const u8{ ".git", ".zig-analyzer", ".zig-cache", "node_modules", "zig-out", "zig-pkg" };
+    const skipped = [_][]const u8{
+        ".git",
+        ".zig-analyzer",
+        ".zig-cache",
+        ".zig-global-cache",
+        "node_modules",
+        "vendor",
+        "zig-out",
+        "zig-pkg",
+    };
     for (skipped) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
     }
@@ -406,9 +444,12 @@ test "check fixes safe findings recursively and skips dependency directories" {
     defer temporary.cleanup();
     try temporary.dir.createDirPath(io, "src");
     try temporary.dir.createDirPath(io, "node_modules/package");
+    try temporary.dir.createDirPath(io, ".zig-global-cache/generated");
+    try temporary.dir.createDirPath(io, "vendor/package");
+    try temporary.dir.createDirPath(io, "tests/syntax");
     try temporary.dir.writeFile(io, .{
         .sub_path = "zig-analyzer.json",
-        .data = "{\"lints\":{\"rules\":{\"redundant-boolean-if\":\"warning\"}}}\n",
+        .data = "{\"check\":{\"exclude\":[\"tests/syntax\"]},\"lints\":{\"rules\":{\"redundant-boolean-if\":\"warning\"}}}\n",
     });
     try temporary.dir.writeFile(io, .{
         .sub_path = "src/main.zig",
@@ -418,6 +459,9 @@ test "check fixes safe findings recursively and skips dependency directories" {
         .sub_path = "node_modules/package/ignored.zig",
         .data = "fn ignored() void { var dependency = 1; _ = dependency; }\n",
     });
+    try temporary.dir.writeFile(io, .{ .sub_path = ".zig-global-cache/generated/ignored.zig", .data = "fn generated() void { missing(); }\n" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "vendor/package/ignored.zig", .data = "fn vendored() void { missing(); }\n" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "tests/syntax/fixture.zig", .data = "fn fixture() void { fixtureCall(); }\n" });
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
@@ -433,7 +477,16 @@ test "check fixes safe findings recursively and skips dependency directories" {
     defer std.testing.allocator.free(ignored);
     try std.testing.expect(std.mem.indexOf(u8, ignored, "var dependency") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "unresolved-call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "fixtureCall") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "checked 1 Zig files") != null);
+}
+
+test "check exclusions reject parent paths" {
+    const configuration = try analysis.parseConfiguration(std.testing.allocator,
+        \\{"check":{"exclude":["../fixtures"]}}
+    );
+    defer std.testing.allocator.free(configuration.warning.?);
+    try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, "../fixtures") != null);
 }
 
 test "check reports UTF-8 source locations without modifying explicit fixes" {

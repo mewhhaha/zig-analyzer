@@ -23,6 +23,45 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
     };
     const removed_format = root.get("format") != null;
 
+    if (root.get("check")) |check_value| {
+        const check = switch (check_value) {
+            .object => |object| object,
+            else => {
+                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'check' must contain an object");
+                return configuration;
+            },
+        };
+        if (check.get("exclude")) |exclude_value| {
+            const excludes = switch (exclude_value) {
+                .array => |array| array,
+                else => {
+                    configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'check.exclude' must contain an array of relative paths");
+                    return configuration;
+                },
+            };
+            var paths: std.ArrayList([]const u8) = .empty;
+            for (excludes.items) |value| {
+                const path = switch (value) {
+                    .string => |string| string,
+                    else => {
+                        configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'check.exclude' must contain only relative path strings");
+                        return configuration;
+                    },
+                };
+                if (path.len == 0 or std.fs.path.isAbsolute(path) or containsParentPathComponent(path)) {
+                    configuration.warning = try std.fmt.allocPrint(
+                        allocator,
+                        "zig-analyzer.json check exclusion '{s}' must be a non-empty relative path without '..' components",
+                        .{path},
+                    );
+                    return configuration;
+                }
+                try paths.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, path, "/")));
+            }
+            configuration.check_excludes = try paths.toOwnedSlice(allocator);
+        }
+    }
+
     const lints_value = root.get("lints") orelse {
         if (removed_format) configuration.warning = try removedFormatWarning(allocator);
         return configuration;
@@ -165,6 +204,14 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
     }
     if (removed_format) configuration.warning = try removedFormatWarning(allocator);
     return configuration;
+}
+
+fn containsParentPathComponent(path: []const u8) bool {
+    var components = std.mem.splitAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return true;
+    }
+    return false;
 }
 
 fn removedFormatWarning(allocator: std.mem.Allocator) ![]const u8 {
