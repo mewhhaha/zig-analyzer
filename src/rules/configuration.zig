@@ -21,43 +21,12 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             return configuration;
         },
     };
-    if (root.get("format")) |format_value| {
-        const format = switch (format_value) {
-            .object => |object| object,
-            else => {
-                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'format' must contain an object");
-                return configuration;
-            },
-        };
-        if (format.get("profile")) |profile_value| {
-            const profile_name = switch (profile_value) {
-                .string => |string| string,
-                else => {
-                    configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'format.profile' must be zig or analyzer");
-                    return configuration;
-                },
-            };
-            configuration.format_profile = if (std.mem.eql(u8, profile_name, "zig"))
-                .zig
-            else if (std.mem.eql(u8, profile_name, "analyzer"))
-                .analyzer
-            else {
-                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'format.profile' must be zig or analyzer");
-                return configuration;
-            };
-        }
-        if (format.get("organizeImports")) |organize_value| {
-            configuration.format_organize_imports = switch (organize_value) {
-                .bool => |enabled| enabled,
-                else => {
-                    configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'format.organizeImports' must be a boolean");
-                    return configuration;
-                },
-            };
-        }
-    }
+    const removed_format = root.get("format") != null;
 
-    const lints_value = root.get("lints") orelse return configuration;
+    const lints_value = root.get("lints") orelse {
+        if (removed_format) configuration.warning = try removedFormatWarning(allocator);
+        return configuration;
+    };
     const lints = switch (lints_value) {
         .object => |object| object,
         else => {
@@ -132,7 +101,15 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             configuration.levels[@intFromEnum(rule)] = level;
         }
     }
+    if (removed_format) configuration.warning = try removedFormatWarning(allocator);
     return configuration;
+}
+
+fn removedFormatWarning(allocator: std.mem.Allocator) ![]const u8 {
+    return try allocator.dupe(
+        u8,
+        "zig-analyzer.json key 'format' is no longer supported; formatting always delegates to zig fmt",
+    );
 }
 
 pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]const u8 {

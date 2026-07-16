@@ -51,7 +51,8 @@ inspected and applied independently. The same fixture covers exact
 expectation, errors collapsed to absence, an optional capture used only as a
 presence test, and a manually appended zero terminator. It also shows quick
 fixes for boolean-valued `if` expressions, one-statement `defer` blocks, and
-empty `else` branches; all three are safe fix-all and analyzer-format rewrites.
+empty `else` branches; all three are safe fix-all rewrites. Formatting itself
+remains the exact output of `zig fmt`.
 
 Open `diagnostics/memory_management.zig` to exercise memory ownership warnings.
 `forgottenRelease` warns because its allocation has no cleanup. `errorPathOnly`

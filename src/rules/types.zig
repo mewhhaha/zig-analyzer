@@ -257,8 +257,6 @@ pub const Tier = enum { semantic, correctness, style };
 pub const Configuration = struct {
     levels: [std.meta.fields(Rule).len]Level,
     lint_profile: LintProfile = .none,
-    format_profile: FormatProfile = .zig,
-    format_organize_imports: bool = false,
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {
@@ -278,7 +276,6 @@ pub const Configuration = struct {
     }
 };
 
-pub const FormatProfile = enum { zig, analyzer };
 pub const LintProfile = enum { none, official, idiomatic, strict };
 
 pub const Edit = struct {
