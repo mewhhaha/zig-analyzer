@@ -88,6 +88,7 @@ pub fn findingsWithShapes(
         });
     }
     var found: std.ArrayList(Finding) = .empty;
+    const suppression_directives_present = configuration_parser.hasSuppressionDirectives(source);
 
     try findUnresolvedCalls(allocator, source, tokens, configuration, &found);
     try findNeverMutatedVariables(allocator, source, tokens, configuration, &found);
@@ -134,7 +135,18 @@ pub fn findingsWithShapes(
         .tokens = tokens,
         .configuration = configuration,
         .findings = &found,
+        .suppression_directives_present = suppression_directives_present,
     });
+
+    if (suppression_directives_present) {
+        var kept: usize = 0;
+        for (found.items) |finding| {
+            if (configuration_parser.isSuppressed(source, finding.rule, finding.span.start)) continue;
+            found.items[kept] = finding;
+            kept += 1;
+        }
+        found.shrinkRetainingCapacity(kept);
+    }
 
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
@@ -206,7 +218,10 @@ fn addFinding(
     found: *std.ArrayList(Finding),
     finding: Finding,
 ) !void {
-    if (finding.level == .off or configuration_parser.isSuppressed(source, finding.rule, finding.span.start)) return;
+    _ = source;
+    // Suppression directives are applied once over the collected findings in
+    // findingsWithShapes; checking here would rescan the file per finding.
+    if (finding.level == .off) return;
     try found.append(allocator, finding);
 }
 
@@ -368,6 +383,9 @@ fn bindingIsMutated(
         if (usedByMutableOptionalCapture(tokens, index)) return true;
         if (usedByMutableSwitchCapture(tokens, index)) return true;
         if (index + 1 >= tokens.len) continue;
+        // '@field(binding, ...)' can be an lvalue, just like 'binding.name'.
+        if (index >= 2 and tokens[index - 1].tag == .l_paren and
+            tokenIs(source, tokens[index - 2], "@field")) return true;
         if (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket) return true;
         if (isAssignment(tokens[index + 1].tag)) return true;
         if (identifierIsDestructuredAssignmentTarget(tokens, index)) return true;
@@ -535,6 +553,8 @@ fn findCatchDiagnostics(
         }
         if (context_level == .off) continue;
         const remapped_error = remappedErrorToken(source, tokens, body_start) orelse continue;
+        // A body that stores or logs the captured error keeps its identity.
+        if (catchCaptureIsUsed(source, tokens, catch_index, body_start)) continue;
         try addFinding(allocator, source, configuration, found, .{
             .rule = .lost_error_context,
             .level = context_level,
@@ -546,6 +566,29 @@ fn findCatchDiagnostics(
             ),
         });
     }
+}
+
+fn catchCaptureIsUsed(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    catch_index: usize,
+    body_start: usize,
+) bool {
+    if (catch_index + 2 >= tokens.len or tokens[catch_index + 1].tag != .pipe or
+        tokens[catch_index + 2].tag != .identifier) return false;
+    const capture_name = tokenText(source, tokens[catch_index + 2]);
+    if (std.mem.eql(u8, capture_name, "_")) return false;
+    var limit = @min(tokens.len, body_start + 16);
+    if (tokens[body_start].tag == .l_brace) {
+        limit = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return false;
+    }
+    for (tokens[body_start..limit], body_start..) |token, index| {
+        if (token.tag == .semicolon and tokens[body_start].tag != .l_brace) break;
+        if (token.tag != .identifier or !tokenIs(source, token, capture_name)) continue;
+        if (index > 0 and tokens[index - 1].tag == .period) continue;
+        return true;
+    }
+    return false;
 }
 
 fn catchBodyStart(tokens: []const std.zig.Token, catch_index: usize) ?usize {
@@ -1139,7 +1182,7 @@ fn findUnusedPrivateDeclarations(
             const keyword_index: usize = declaration.ast.mut_token;
             if (keyword_index >= tokens.len or tokens[keyword_index].tag != .keyword_const or
                 keyword_index + 1 >= tokens.len or tokens[keyword_index + 1].tag != .identifier or
-                insideFunctionOrTestBody(tokens, keyword_index) or !declarationIsPrivate(tokens, keyword_index)) continue;
+                !declarationIsPrivate(tokens, keyword_index) or insideFunctionOrTestBody(tokens, keyword_index)) continue;
             try declarations.append(allocator, .{ .name_index = keyword_index + 1, .kind = .constant });
             continue;
         }
@@ -1151,12 +1194,22 @@ fn findUnusedPrivateDeclarations(
             !declarationIsPrivate(tokens, keyword_index)) continue;
         try declarations.append(allocator, .{ .name_index = keyword_index + 1, .kind = .function });
     }
+    if (declarations.items.len == 0) return;
+    var occurrence_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer occurrence_counts.deinit(allocator);
+    for (tokens) |token| {
+        const entry = try occurrence_counts.getOrPutValue(allocator, tokenText(source, token), 0);
+        entry.value_ptr.* += 1;
+    }
+    var reflected_names = try collectReflectedNames(allocator, source, tokens);
+    defer reflected_names.names.deinit(allocator);
+    if (reflected_names.wildcard) return;
     for (declarations.items) |declaration| {
         const name_token = tokens[declaration.name_index];
         const name = tokenText(source, name_token);
         if (std.mem.eql(u8, name, "_") or std.mem.startsWith(u8, name, "@\"") or
-            isImplicitDeclarationName(name) or identifierOccurrenceCount(source, tokens, name) != 1 or
-            reflectionMayReferenceName(source, tokens, name)) continue;
+            isImplicitDeclarationName(name) or (occurrence_counts.get(name) orelse 0) != 1 or
+            reflected_names.names.contains(name)) continue;
         try addFinding(allocator, source, configuration, found, .{
             .rule = .unused_private_declaration,
             .level = level,
@@ -1233,21 +1286,31 @@ fn isImplicitDeclarationName(name: []const u8) bool {
         std.mem.eql(u8, name, "test_runner");
 }
 
-fn identifierOccurrenceCount(source: []const u8, tokens: []const std.zig.Token, name: []const u8) usize {
-    var count: usize = 0;
-    for (tokens) |token| if (tokenIs(source, token, name)) {
-        count += 1;
-    };
-    return count;
-}
+const ReflectedNames = struct {
+    /// A reflection call whose name argument is not a plain string literal may
+    /// reference any declaration.
+    wildcard: bool,
+    names: std.StringHashMapUnmanaged(void),
+};
 
-fn reflectionMayReferenceName(source: []const u8, tokens: []const std.zig.Token, name: []const u8) bool {
+fn collectReflectedNames(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+) !ReflectedNames {
+    var collected: ReflectedNames = .{ .wildcard = false, .names = .empty };
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or
             (!tokenIs(source, token, "@field") and !tokenIs(source, token, "@hasDecl") and
                 !tokenIs(source, token, "@hasField"))) continue;
-        if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) return true;
-        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse return true;
+        if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) {
+            collected.wildcard = true;
+            return collected;
+        }
+        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse {
+            collected.wildcard = true;
+            return collected;
+        };
         var comma: ?usize = null;
         var depth: usize = 0;
         for (tokens[index + 2 .. closing], index + 2..) |argument_token, argument_index| {
@@ -1261,12 +1324,18 @@ fn reflectionMayReferenceName(source: []const u8, tokens: []const std.zig.Token,
                 else => {},
             }
         }
-        const name_index = (comma orelse return true) + 1;
-        if (name_index >= closing or tokens[name_index].tag != .string_literal) return true;
+        const name_index = (comma orelse {
+            collected.wildcard = true;
+            return collected;
+        }) + 1;
+        if (name_index >= closing or tokens[name_index].tag != .string_literal) {
+            collected.wildcard = true;
+            return collected;
+        }
         const literal = tokenText(source, tokens[name_index]);
-        if (literal.len >= 2 and std.mem.eql(u8, literal[1 .. literal.len - 1], name)) return true;
+        if (literal.len >= 2) try collected.names.put(allocator, literal[1 .. literal.len - 1], {});
     }
-    return false;
+    return collected;
 }
 
 fn bindingHasType(
@@ -1500,6 +1569,17 @@ fn findSwitches(
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
+    if (configuration.level(.missing_switch_prong) == .off and
+        configuration.level(.non_exhaustive_switch_else) == .off and
+        configuration.level(.non_exhaustive_error_switch) == .off) return;
+    var declaration_sites = try collectBindingDeclarationSites(allocator, source, tokens);
+    defer {
+        var site_lists = declaration_sites.valueIterator();
+        while (site_lists.next()) |list| list.deinit(allocator);
+        declaration_sites.deinit(allocator);
+    }
+    var return_types = try collectFunctionReturnTypes(allocator, source, tokens);
+    defer return_types.deinit(allocator);
     for (tokens, 0..) |token, switch_index| {
         if (token.tag != .keyword_switch or switch_index + 4 >= tokens.len or tokens[switch_index + 1].tag != .l_paren) continue;
         const operand_end = matchingToken(tokens, switch_index + 1, .l_paren, .r_paren) orelse continue;
@@ -1509,10 +1589,10 @@ fn findSwitches(
         const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
         const operand_name = tokenText(source, tokens[switch_index + 2]);
         const type_name = if (operand_end == switch_index + 3)
-            bindingTypeName(source, tokens, operand_name, switch_index) orelse continue
+            bindingTypeName(source, tokens, &declaration_sites, &return_types, operand_name, switch_index) orelse continue
         else if (operand_end == switch_index + 5 and tokens[switch_index + 3].tag == .l_paren and
             tokens[switch_index + 4].tag == .r_paren)
-            functionReturnTypeName(source, tokens, operand_name) orelse continue
+            return_types.get(operand_name) orelse continue
         else
             continue;
         const container = containerNamed(source, tokens, containers, type_name, switch_index) orelse continue;
@@ -1618,20 +1698,80 @@ fn findSwitches(
     }
 }
 
-fn bindingTypeName(
+const BindingDeclarationSites = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize));
+const FunctionReturnTypes = std.StringHashMapUnmanaged([]const u8);
+
+/// Indexes every 'name:' and 'const/var name' site so switch analysis can find
+/// a binding's declaration without rescanning the file per switch.
+fn collectBindingDeclarationSites(
+    allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
-    binding_name: []const u8,
-    before: usize,
-) ?[]const u8 {
-    var index = before;
-    while (index > 0) {
-        index -= 1;
-        if (!tokenIs(source, tokens[index], binding_name)) continue;
+) !BindingDeclarationSites {
+    var sites: BindingDeclarationSites = .empty;
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier) continue;
         const is_typed_declaration = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
         const is_local_declaration = index > 0 and
             (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var);
         if (!is_typed_declaration and !is_local_declaration) continue;
+        const entry = try sites.getOrPutValue(allocator, tokenText(source, token), .empty);
+        try entry.value_ptr.append(allocator, index);
+    }
+    return sites;
+}
+
+fn collectFunctionReturnTypes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+) !FunctionReturnTypes {
+    var return_types: FunctionReturnTypes = .empty;
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .keyword_fn or index + 3 >= tokens.len or tokens[index + 1].tag != .identifier or
+            tokens[index + 2].tag != .l_paren) continue;
+        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
+        // A switch on the call's result sees the error union's payload type.
+        var return_start = parameters_end + 1;
+        if (return_start < tokens.len and tokens[return_start].tag == .bang) return_start += 1;
+        if (return_start >= tokens.len or tokens[return_start].tag != .identifier) continue;
+        var type_index = return_start;
+        while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
+            tokens[type_index + 2].tag == .identifier)
+        {
+            type_index += 2;
+        }
+        if (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .bang and
+            tokens[type_index + 2].tag == .identifier)
+        {
+            type_index += 2;
+            while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
+                tokens[type_index + 2].tag == .identifier)
+            {
+                type_index += 2;
+            }
+        }
+        const entry = try return_types.getOrPut(allocator, tokenText(source, tokens[index + 1]));
+        if (!entry.found_existing) entry.value_ptr.* = tokenText(source, tokens[type_index]);
+    }
+    return return_types;
+}
+
+fn bindingTypeName(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    declaration_sites: *const BindingDeclarationSites,
+    return_types: *const FunctionReturnTypes,
+    binding_name: []const u8,
+    before: usize,
+) ?[]const u8 {
+    const site_list = declaration_sites.get(binding_name) orelse return null;
+    var remaining = site_list.items.len;
+    while (remaining > 0) {
+        remaining -= 1;
+        const index = site_list.items[remaining];
+        if (index >= before) continue;
+        const is_typed_declaration = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
         if (!bindingDeclarationContainsUse(tokens, index, before)) continue;
         if (is_typed_declaration) {
             if (index + 2 >= tokens.len or tokens[index + 2].tag != .identifier) return null;
@@ -1646,7 +1786,7 @@ fn bindingTypeName(
         if (index + 3 < tokens.len and tokens[index + 1].tag == .equal and tokens[index + 2].tag == .identifier and
             tokens[index + 3].tag == .l_paren and matchingToken(tokens, index + 3, .l_paren, .r_paren) != null)
         {
-            return functionReturnTypeName(source, tokens, tokenText(source, tokens[index + 2]));
+            return return_types.get(tokenText(source, tokens[index + 2]));
         }
         return null;
     }
@@ -1682,30 +1822,6 @@ fn enclosingOpeningParenthesis(tokens: []const std.zig.Token, index: usize) ?usi
             .l_brace, .semicolon => return null,
             else => {},
         }
-    }
-    return null;
-}
-
-fn functionReturnTypeName(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    function_name: []const u8,
-) ?[]const u8 {
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_fn or index + 3 >= tokens.len or !tokenIs(source, tokens[index + 1], function_name) or
-            tokens[index + 2].tag != .l_paren)
-        {
-            continue;
-        }
-        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
-        if (parameters_end + 1 >= tokens.len or tokens[parameters_end + 1].tag != .identifier) continue;
-        var type_index = parameters_end + 1;
-        while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
-            tokens[type_index + 2].tag == .identifier)
-        {
-            type_index += 2;
-        }
-        return tokenText(source, tokens[type_index]);
     }
     return null;
 }
@@ -2158,28 +2274,44 @@ fn findNonIdiomaticNames(
 ) !void {
     const level = configuration.level(.non_idiomatic_name);
     if (level == .off) return;
+    // Aliases like 'const Alias = Target;' inherit Target's convention, so one
+    // pass collects every name declared as a type or type-returning function.
+    var type_declaring_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer type_declaring_names.deinit(allocator);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or index == 0) continue;
+        const declares_type = switch (tokens[index - 1].tag) {
+            .keyword_const => declarationInitializesType(tokens, index),
+            .keyword_fn => functionDeclarationReturnsType(source, tokens, index),
+            else => false,
+        };
+        if (declares_type) try type_declaring_names.put(allocator, tokenText(source, token), {});
+    }
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or index == 0) continue;
         const declaration_tag = tokens[index - 1].tag;
         if (declaration_tag != .keyword_fn and declaration_tag != .keyword_const and declaration_tag != .keyword_var) continue;
         if (!identifierIsDeclaration(tokens, index)) continue;
         if (index >= 2 and (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export)) continue;
+        // 'extern "lib" fn name(...)' binds an ABI symbol whose name is fixed.
+        if (index >= 3 and tokens[index - 2].tag == .string_literal and tokens[index - 3].tag == .keyword_extern) continue;
+        if (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index)) continue;
         const name = tokenText(source, token);
         if (std.mem.startsWith(u8, name, "@\"")) continue;
         const is_namespace = declaration_tag == .keyword_const and declarationIsNamespace(tokens, index);
-        const is_type = declaration_tag == .keyword_const and declarationNamesType(source, tokens, index);
-        const function_alias = declaration_tag == .keyword_const and declarationAliasesFunction(source, tokens, index);
+        const is_type = declaration_tag == .keyword_const and
+            declarationNamesType(source, tokens, index, &type_declaring_names);
         const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index);
         const idiomatic = if (type_function or is_type and !is_namespace)
             isTitleCase(name)
-        else if (declaration_tag == .keyword_fn or function_alias)
+        else if (declaration_tag == .keyword_fn)
             isCamelCase(name)
         else
             isSnakeCase(name);
         if (idiomatic) continue;
         const convention = if (type_function or is_type and !is_namespace)
             "TitleCase"
-        else if (declaration_tag == .keyword_fn or function_alias)
+        else if (declaration_tag == .keyword_fn)
             "camelCase"
         else
             "snake_case";
@@ -2201,12 +2333,20 @@ fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: u
         identifier_index + 2;
     return switch (tokens[initializer_index].tag) {
         .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => true,
+        // 'error{...}' declares an error-set type; 'error.Name' is a value.
+        .keyword_error => initializer_index + 1 < tokens.len and tokens[initializer_index + 1].tag == .l_brace,
         else => false,
     };
 }
 
-fn declarationNamesType(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
+fn declarationNamesType(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    identifier_index: usize,
+    type_declaring_names: *const std.StringHashMapUnmanaged(void),
+) bool {
     if (declarationInitializesType(tokens, identifier_index)) return true;
+    if (initializerMergesErrorSets(tokens, identifier_index)) return true;
     if (identifier_index + 3 < tokens.len and tokens[identifier_index + 1].tag == .equal and
         tokens[identifier_index + 2].tag == .builtin and tokens[identifier_index + 3].tag == .l_paren)
     {
@@ -2258,25 +2398,36 @@ fn declarationNamesType(source: []const u8, tokens: []const std.zig.Token, ident
         },
         else => return false,
     }
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .identifier or !tokenIs(source, token, target) or index == 0) continue;
-        if (tokens[index - 1].tag == .keyword_const and declarationInitializesType(tokens, index)) return true;
-        if (tokens[index - 1].tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index)) return true;
+    return type_declaring_names.contains(target);
+}
+
+/// '||' only merges error sets, so an initializer containing one at top level
+/// declares an error-set type.
+fn initializerMergesErrorSets(tokens: []const std.zig.Token, identifier_index: usize) bool {
+    if (identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
+    const end = statementEnd(tokens, identifier_index + 2) orelse return false;
+    var depth: usize = 0;
+    for (tokens[identifier_index + 2 .. end]) |token| {
+        switch (token.tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -|= 1,
+            .pipe_pipe => if (depth == 0) return true,
+            else => {},
+        }
     }
     return false;
 }
 
-fn declarationAliasesFunction(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
+/// 'pub const _foreign_name = lib._foreign_name;' re-exports a declaration
+/// under its original name, which this file does not get to choose.
+fn declarationIsSameNameAlias(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
     if (identifier_index + 3 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
     var end = identifier_index + 2;
     while (end < tokens.len and tokens[end].tag != .semicolon) : (end += 1) {}
     if (end >= tokens.len or end < identifier_index + 4 or tokens[end - 1].tag != .identifier or
         tokens[end - 2].tag != .period) return false;
     const name = tokenText(source, tokens[identifier_index]);
-    const target = tokenText(source, tokens[end - 1]);
-    if (!std.mem.eql(u8, name, target) or !isCamelCase(name)) return false;
-    for (name) |character| if (std.ascii.isUpper(character)) return true;
-    return false;
+    return std.mem.eql(u8, name, tokenText(source, tokens[end - 1]));
 }
 
 fn identifierIsDeclaration(tokens: []const std.zig.Token, identifier_index: usize) bool {
@@ -2372,8 +2523,10 @@ fn findOfficialStyleIssues(
         if (declaration_tag != .keyword_fn and declaration_tag != .keyword_const and declaration_tag != .keyword_var) continue;
         if (!identifierIsDeclaration(tokens, index)) continue;
         const name = tokenText(source, token);
-        const externally_named = index >= 2 and
-            (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export);
+        const externally_named = (index >= 2 and
+            (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export)) or
+            (index >= 3 and tokens[index - 2].tag == .string_literal and tokens[index - 3].tag == .keyword_extern) or
+            (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index));
         if (underscore_level != .off and name.len > 1 and name[0] == '_' and !externally_named) {
             try addFinding(allocator, source, configuration, found, .{
                 .rule = .underscore_private_name,
@@ -2713,6 +2866,16 @@ fn findPointerParameterIdioms(
 ) !void {
     const level = configuration.level(.mutable_pointer_parameter);
     if (level == .off) return;
+    // A function passed around as a value (comparator, callback) has its
+    // signature dictated by the receiving API, not by its body. One pass over
+    // the file collects every identifier that appears without a call's '('.
+    var value_referenced_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer value_referenced_names.deinit(allocator);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier) continue;
+        if (index + 1 < tokens.len and tokens[index + 1].tag == .l_paren) continue;
+        try value_referenced_names.put(allocator, tokenText(source, token), {});
+    }
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 3 >= tokens.len or tokens[fn_index + 2].tag != .l_paren) continue;
         const parameters_end = matchingToken(tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
@@ -2723,9 +2886,8 @@ fn findPointerParameterIdioms(
         // deinit takes '*T' by convention: it invalidates the value even when its
         // body happens to only read through the pointer.
         if (tokens[fn_index + 1].tag == .identifier and tokenIs(source, tokens[fn_index + 1], "deinit")) continue;
-        // A function passed around as a value (comparator, callback) has its
-        // signature dictated by the receiving API, not by its body.
-        if (functionIsReferencedAsValue(source, tokens, fn_index)) continue;
+        if (tokens[fn_index + 1].tag == .identifier and
+            value_referenced_names.contains(tokenText(source, tokens[fn_index + 1]))) continue;
         var parameter_index = fn_index + 3;
         while (parameter_index + 3 < parameters_end) : (parameter_index += 1) {
             if (tokens[parameter_index].tag != .identifier or tokens[parameter_index + 1].tag != .colon or
@@ -2794,17 +2956,6 @@ fn pointerParameterReadOnly(
         if (cursor < body_close and (isAssignment(tokens[cursor].tag) or tokens[cursor].tag == .l_paren)) return false;
     }
     return uses != 0;
-}
-
-fn functionIsReferencedAsValue(source: []const u8, tokens: []const std.zig.Token, fn_index: usize) bool {
-    if (tokens[fn_index + 1].tag != .identifier) return false;
-    const name = tokenText(source, tokens[fn_index + 1]);
-    for (tokens, 0..) |token, index| {
-        if (index == fn_index + 1 or token.tag != .identifier or !tokenIs(source, token, name)) continue;
-        if (index + 1 < tokens.len and tokens[index + 1].tag == .l_paren) continue;
-        return true;
-    }
-    return false;
 }
 
 fn switchHasPointerCapture(tokens: []const std.zig.Token, condition_open: usize, limit: usize) bool {
@@ -3823,6 +3974,93 @@ test "error switches and import rules provide conservative actions" {
     try std.testing.expect(duplicate);
     try std.testing.expectEqual(@as(usize, 2), unused_count);
     try std.testing.expectEqual(@as(usize, 2), normalized_count);
+}
+
+test "mutation through @field keeps a var mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn withStackAlign(cc: Convention, alignment: u64) Convention {\n" ++
+        "    var result = cc;\n" ++
+        "    @field(result, @tagName(cc)).incoming_stack_alignment = alignment;\n" ++
+        "    return result;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
+}
+
+test "a switch on a fallible call's result sees the error union payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Result = union(enum) { success, failure: u32 };\n" ++
+        "const Error = error{ BadToken, Eof };\n" ++
+        "fn parseWrite() Error!Result { return .success; }\n" ++
+        "fn parse() !void {\n" ++
+        "    const result = parseWrite() catch return;\n" ++
+        "    switch (result) {\n" ++
+        "        .success => {},\n" ++
+        "        .failure => {},\n" ++
+        "    }\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .missing_switch_prong);
+}
+
+test "error-set types foreign symbols and re-exports keep their names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub const VerifyError = WeakError || IdentityError;\n" ++
+        "const WeakError = error{Weak};\n" ++
+        "const IdentityError = error{Identity};\n" ++
+        "extern \"c\" fn dispatch_get_context(object: usize) ?*anyopaque;\n" ++
+        "pub extern \"root\" fn _errnop() *i32;\n" ++
+        "pub const _dyld_image_count = darwin._dyld_image_count;\n" ++
+        "const darwin = @import(\"darwin.zig\");\n" ++
+        "const BadValue = error.Oops;\n" ++
+        "pub fn use() void { _ = dispatch_get_context(0); _ = VerifyError; _ = BadValue; }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@intFromEnum(Rule.underscore_private_name)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var naming_count: usize = 0;
+    var underscore_count: usize = 0;
+    for (found) |finding| switch (finding.rule) {
+        .non_idiomatic_name => {
+            naming_count += 1;
+            // 'error.Oops' is a value, not an error-set type, so the TitleCase
+            // binding is still reported.
+            try std.testing.expect(std.mem.indexOf(u8, finding.message, "'BadValue'") != null);
+        },
+        .underscore_private_name => underscore_count += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+    try std.testing.expectEqual(@as(usize, 0), underscore_count);
+}
+
+test "a catch body that records the captured error keeps its context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn check(cache: *Cache) !void {\n" ++
+        "    cache.file.lock() catch |err| {\n" ++
+        "        cache.diagnostic = err;\n" ++
+        "        return error.CacheCheckFailed;\n" ++
+        "    };\n" ++
+        "}\n" ++
+        "fn remap(cache: *Cache) !void {\n" ++
+        "    cache.file.lock() catch return error.CacheCheckFailed;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.lost_error_context)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var context_loss_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .lost_error_context) context_loss_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), context_loss_count);
 }
 
 test "file naming follows the implicit file struct shape" {
