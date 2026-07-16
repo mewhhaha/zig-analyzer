@@ -87,6 +87,10 @@ pub fn warnings(
             allocation.release,
         );
         if (cleanup == .released or mismatched_release) continue;
+        // 'defer pool.deinit(...)' reclaims everything the pool handed out.
+        if (allocation.receiver) |receiver_name| {
+            if (deferDeinitializesReceiver(source, tokens, receiver_name, declaration_index, scope_end)) continue;
+        }
 
         const message = switch (cleanup) {
             .released => unreachable,
@@ -709,6 +713,35 @@ fn statementStartsWithErrdefer(tokens: []const std.zig.Token, index: usize) bool
     return false;
 }
 
+fn deferDeinitializesReceiver(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    receiver_name: []const u8,
+    declaration_index: usize,
+    scope_end: usize,
+) bool {
+    const scope = enclosingScope(tokens, declaration_index) orelse return false;
+    var index = scope.opening + 1;
+    while (index + 3 < scope_end) : (index += 1) {
+        // Only 'defer' releases on the success path; 'errdefer' alone still
+        // leaks when the function succeeds.
+        if (tokens[index].tag != .keyword_defer) continue;
+        const body_end = if (tokens[index + 1].tag == .l_brace)
+            matchingToken(tokens, index + 1, .l_brace, .r_brace) orelse scope_end
+        else
+            findStatementEnd(tokens, index + 1) orelse scope_end;
+        var body_index = index + 1;
+        while (body_index + 2 < @min(body_end, scope_end)) : (body_index += 1) {
+            if (tokens[body_index].tag == .identifier and
+                tokenIsIdentifier(source, tokens[body_index], receiver_name) and
+                tokens[body_index + 1].tag == .period and
+                tokenIsIdentifier(source, tokens[body_index + 2], "deinit")) return true;
+        }
+        index = @min(body_end, scope_end - 1);
+    }
+    return false;
+}
+
 fn tokenIsIdentifier(source: []const u8, token: std.zig.Token, name: []const u8) bool {
     return token.tag == .identifier and std.mem.eql(u8, source[token.loc.start..token.loc.end], name);
 }
@@ -818,6 +851,31 @@ test "accepts deferred and explicit releases" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a deferred pool deinit reclaims the pool's allocations" {
+    const source =
+        "fn run(a: std.mem.Allocator) !void {" ++
+        "var pool: MemoryPool = .empty;" ++
+        "defer pool.deinit(a);" ++
+        "const first = try pool.create(a);" ++
+        "const second = try pool.create(a);" ++
+        "_ = first; _ = second; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "an errdefer pool deinit alone still warns about the success path" {
+    const source =
+        "fn run(a: std.mem.Allocator) !void {" ++
+        "var pool: MemoryPool = .empty;" ++
+        "errdefer pool.deinit(a);" ++
+        "const first = try pool.create(a);" ++
+        "_ = first; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
 }
 
 test "errdefer alone still warns about the success path" {

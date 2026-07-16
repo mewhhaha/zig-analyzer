@@ -327,7 +327,7 @@ fn payloadRewrittenBody(
         // A by-value capture is immutable and a fresh copy: assigning into it does
         // not compile, and taking its address would divert writes from the union.
         if (assignsThroughPostfixChain(context, index + 3, end)) return null;
-        if (context.tokens[index - 1].tag == .ampersand) return null;
+        if (addressedThroughParens(context, index)) return null;
         try writer.writer.writeAll(context.source[cursor..context.tokens[index].loc.start]);
         try writer.writer.writeAll(capture);
         cursor = context.tokens[index + 2].loc.end;
@@ -344,8 +344,12 @@ fn assignsThroughPostfixChain(context: ActionRun, start: usize, end: usize) bool
     while (index < end) {
         switch (context.tokens[index].tag) {
             .period => {
-                if (index + 1 >= end or context.tokens[index + 1].tag != .identifier) return false;
-                index += 2;
+                if (index + 1 >= end) return false;
+                switch (context.tokens[index + 1].tag) {
+                    // '.field' and the '.?' unwrap both continue the assignable chain.
+                    .identifier, .question_mark => index += 2,
+                    else => return false,
+                }
             },
             .period_asterisk => index += 1,
             .l_bracket => index = (context.matchingToken(index, .l_bracket, .r_bracket) orelse return false) + 1,
@@ -353,6 +357,12 @@ fn assignsThroughPostfixChain(context: ActionRun, start: usize, end: usize) bool
         }
     }
     return false;
+}
+
+fn addressedThroughParens(context: ActionRun, value_index: usize) bool {
+    var index = value_index;
+    while (index > 0 and context.tokens[index - 1].tag == .l_paren) index -= 1;
+    return index > 0 and context.tokens[index - 1].tag == .ampersand;
 }
 
 fn bindingType(context: ActionRun, name: []const u8, before: usize) ?[]const u8 {
@@ -797,6 +807,26 @@ test "tagged union bodies that mutate or address the payload keep the if" {
     const address_start = std.mem.indexOf(u8, address_source, "if") orelse unreachable;
     const address = try registry.actions(arena.allocator(), address_source, .{ .start = address_start, .end = address_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), address.len);
+}
+
+test "tagged union bodies that assign through unwraps or take parenthesized addresses keep the if" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_][]const u8{ "number", "text" };
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
+
+    const unwrap_source: [:0]const u8 =
+        "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { value.number.? = 2; } }";
+    const unwrap_start = std.mem.indexOf(u8, unwrap_source, "if") orelse unreachable;
+    const unwrap = try registry.actions(arena.allocator(), unwrap_source, .{ .start = unwrap_start, .end = unwrap_start + 2 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), unwrap.len);
+
+    const parenthesized_source: [:0]const u8 =
+        "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { mutate(&(value.number)); } }";
+    const parenthesized_start = std.mem.indexOf(u8, parenthesized_source, "if") orelse unreachable;
+    const parenthesized = try registry.actions(arena.allocator(), parenthesized_source, .{ .start = parenthesized_start, .end = parenthesized_start + 2 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), parenthesized.len);
 }
 
 test "tagged union payload captures avoid names already used in the body" {

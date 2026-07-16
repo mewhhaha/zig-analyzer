@@ -7,6 +7,7 @@ pub fn run(context: ActionRun) !void {
     try addErrorAndOptionalActions(context);
     try addPointerCastAction(context);
     try addSplitCompoundAssertion(context);
+    try addOrelseUnreachableUnwrap(context);
 }
 
 const ReturnKind = struct {
@@ -306,8 +307,10 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
         if (!context.selected(statement_span)) continue;
         const conditions = try topLevelAndOperands(context, name_index + 2, closing) orelse continue;
         if (conditions.len < 2) continue;
-        // A line comment inside an operand would comment out the inserted ');'.
-        if (anyContainsComment(conditions)) continue;
+        // A line comment inside an operand would comment out the inserted ');',
+        // and one next to an 'and' or a parenthesis would be dropped silently.
+        const argument_text = context.source[context.tokens[name_index + 1].loc.end..context.tokens[closing].loc.start];
+        if (std.mem.indexOf(u8, argument_text, "//") != null) continue;
         const callee = context.source[context.tokens[callee_start].loc.start..context.tokens[name_index].loc.end];
         const indentation = context.lineIndentation(statement_span.start);
         var writer: std.Io.Writer.Allocating = .init(context.allocator);
@@ -324,11 +327,6 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
             false,
         );
     }
-}
-
-fn anyContainsComment(operands: []const []const u8) bool {
-    for (operands) |operand| if (std.mem.indexOf(u8, operand, "//") != null) return true;
-    return false;
 }
 
 fn topLevelAndOperands(context: ActionRun, start: usize, end: usize) !?[]const []const u8 {
@@ -353,6 +351,131 @@ fn topLevelAndOperands(context: ActionRun, start: usize, end: usize) !?[]const [
         context.source[context.tokens[operand_start].loc.start..context.tokens[end - 1].loc.end],
     );
     return try operands.toOwnedSlice(context.allocator);
+}
+
+/// 'value.?' is Zig's spelling of 'value orelse unreachable', so the rewrite
+/// preserves behavior exactly. The match is limited to a postfix chain that
+/// starts its own expression so no lower-precedence operand is captured.
+fn addOrelseUnreachableUnwrap(context: ActionRun) !void {
+    for (context.tokens, 0..) |token, orelse_index| {
+        if (token.tag != .keyword_orelse or orelse_index == 0 or orelse_index + 1 >= context.tokens.len or
+            context.tokens[orelse_index + 1].tag != .keyword_unreachable) continue;
+        if (orelse_index + 2 < context.tokens.len and switch (context.tokens[orelse_index + 2].tag) {
+            .semicolon, .comma, .r_paren, .r_bracket, .r_brace => false,
+            else => true,
+        }) continue;
+        const start_index = unwrappedChainStart(context, orelse_index - 1) orelse continue;
+        if (start_index > 0 and !startsOwnExpression(context.tokens[start_index - 1].tag)) continue;
+        const span = std.zig.Token.Loc{
+            .start = context.tokens[start_index].loc.start,
+            .end = context.tokens[orelse_index + 1].loc.end,
+        };
+        if (!context.selected(span)) continue;
+        if (commentBetweenTokens(context, start_index, orelse_index + 1)) continue;
+        try context.oneEdit(
+            "Unwrap with '.?' instead of orelse unreachable",
+            .refactor_rewrite,
+            span,
+            try std.fmt.allocPrint(context.allocator, "{s}.?", .{
+                context.source[span.start..context.tokens[orelse_index - 1].loc.end],
+            }),
+            false,
+        );
+    }
+}
+
+fn unwrappedChainStart(context: ActionRun, last: usize) ?usize {
+    var index = last;
+    while (true) {
+        switch (context.tokens[index].tag) {
+            .identifier => {
+                if (index >= 2 and context.tokens[index - 1].tag == .period) {
+                    switch (context.tokens[index - 2].tag) {
+                        .identifier, .r_paren, .r_bracket, .question_mark => {
+                            index -= 2;
+                            continue;
+                        },
+                        else => return null,
+                    }
+                }
+                // '.name' with nothing to chain from is an enum or error literal.
+                if (index >= 1 and context.tokens[index - 1].tag == .period) return null;
+                return index;
+            },
+            .question_mark => {
+                if (index >= 2 and context.tokens[index - 1].tag == .period) {
+                    index -= 2;
+                    continue;
+                }
+                return null;
+            },
+            .period_asterisk => {
+                if (index == 0) return null;
+                index -= 1;
+            },
+            .r_paren => {
+                const opening = reverseMatchingToken(context, index, .r_paren, .l_paren) orelse return null;
+                if (opening == 0) return opening;
+                switch (context.tokens[opening - 1].tag) {
+                    .identifier, .r_paren, .r_bracket, .question_mark => index = opening - 1,
+                    .builtin => return opening - 1,
+                    // Not a call: the parenthesized group is its own primary.
+                    else => return opening,
+                }
+            },
+            .r_bracket => {
+                const opening = reverseMatchingToken(context, index, .r_bracket, .l_bracket) orelse return null;
+                if (opening == 0) return null;
+                switch (context.tokens[opening - 1].tag) {
+                    .identifier, .r_paren, .r_bracket => index = opening - 1,
+                    else => return null,
+                }
+            },
+            else => return null,
+        }
+    }
+}
+
+fn startsOwnExpression(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .equal,
+        .l_paren,
+        .l_brace,
+        .l_bracket,
+        .comma,
+        .semicolon,
+        .keyword_return,
+        .equal_angle_bracket_right,
+        => true,
+        else => false,
+    };
+}
+
+fn reverseMatchingToken(
+    context: ActionRun,
+    closing: usize,
+    closing_tag: std.zig.Token.Tag,
+    opening_tag: std.zig.Token.Tag,
+) ?usize {
+    var depth: usize = 0;
+    var index = closing + 1;
+    while (index > 0) {
+        index -= 1;
+        const tag = context.tokens[index].tag;
+        if (tag == closing_tag) depth += 1;
+        if (tag != opening_tag) continue;
+        depth -= 1;
+        if (depth == 0) return index;
+    }
+    return null;
+}
+
+fn commentBetweenTokens(context: ActionRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        const gap = context.source[token.loc.end..context.tokens[index + 1].loc.start];
+        if (std.mem.indexOf(u8, gap, "//") != null) return true;
+    }
+    return false;
 }
 
 fn declaredType(context: ActionRun, name: []const u8, before: usize) ?[]const u8 {
@@ -489,6 +612,17 @@ test "assertions with a comment inside an operand are not split" {
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
 
+test "assertions with a comment between and and an operand are not split" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(a: bool, b: bool) void {\n    assert(a and // invariant\n    b);\n}";
+    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
+}
+
 test "assertions mixing or at the top level stay together" {
     const registry = @import("registry.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -497,4 +631,39 @@ test "assertions mixing or at the top level stay together" {
     const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
+}
+
+test "orelse unreachable becomes a .? unwrap" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const call_source: [:0]const u8 = "fn get(map: Map, key: u32) u8 { return map.get(key) orelse unreachable; }";
+    const call_start = std.mem.indexOf(u8, call_source, "unreachable") orelse unreachable;
+    const call = try registry.actions(arena.allocator(), call_source, .{ .start = call_start, .end = call_start + 11 }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), call.len);
+    try std.testing.expectEqualStrings("map.get(key).?", call[0].edits[0].replacement);
+    try std.testing.expectEqual(std.mem.indexOf(u8, call_source, "map.get").?, call[0].edits[0].span.start);
+
+    const binding_source: [:0]const u8 = "fn run(maybe: ?u8) u8 { const value = maybe orelse unreachable; return value; }";
+    const binding_start = std.mem.indexOf(u8, binding_source, "unreachable") orelse unreachable;
+    const binding = try registry.actions(arena.allocator(), binding_source, .{ .start = binding_start, .end = binding_start + 11 }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), binding.len);
+    try std.testing.expectEqualStrings("maybe.?", binding[0].edits[0].replacement);
+}
+
+test "orelse unreachable with a comment or a larger operand is not rewritten" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comment_source: [:0]const u8 =
+        "fn run(maybe: ?u8) u8 { return maybe orelse // proven non-null\n    unreachable; }";
+    const comment_start = std.mem.indexOf(u8, comment_source, "unreachable") orelse unreachable;
+    const commented = try registry.actions(arena.allocator(), comment_source, .{ .start = comment_start, .end = comment_start + 11 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), commented.len);
+
+    const operand_source: [:0]const u8 =
+        "fn run(flag: bool, maybe: ?bool) bool { return flag == maybe orelse unreachable; }";
+    const operand_start = std.mem.indexOf(u8, operand_source, "unreachable") orelse unreachable;
+    const operand = try registry.actions(arena.allocator(), operand_source, .{ .start = operand_start, .end = operand_start + 11 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), operand.len);
 }

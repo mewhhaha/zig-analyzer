@@ -21,6 +21,9 @@ pub fn run(context: RuleRun) !void {
         if (std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
         if (declarationLooksArenaBacked(context, context.tokenText(acquisition.receiver_start))) continue;
         if (scopeReleasesBinding(context, scope_opening, scope_end, binding_name)) continue;
+        // 'defer pool.deinit(...)' reclaims everything the pool handed out,
+        // error path included.
+        if (scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.receiver_end))) continue;
         const fallible_index = fallibleBeforeBindingUse(context, declaration_end + 1, scope_end, binding_name) orelse continue;
 
         const release: []const u8 = if (std.mem.eql(u8, method, "create")) "destroy" else "free";
@@ -160,6 +163,27 @@ fn scopeReleasesBinding(context: RuleRun, scope_opening: usize, scope_end: usize
     return false;
 }
 
+fn scopeDeinitializesReceiver(context: RuleRun, scope_opening: usize, scope_end: usize, receiver_segment: []const u8) bool {
+    var index = scope_opening + 1;
+    while (index + 3 < scope_end) : (index += 1) {
+        const tag = context.tokens[index].tag;
+        if (tag != .keyword_defer and tag != .keyword_errdefer) continue;
+        const body_end = if (context.tokens[index + 1].tag == .l_brace)
+            context.matchingToken(index + 1, .l_brace, .r_brace) orelse scope_end
+        else
+            context.statementEnd(index + 1) orelse scope_end;
+        var body_index = index + 1;
+        while (body_index + 2 < @min(body_end, scope_end)) : (body_index += 1) {
+            if (context.tokens[body_index].tag == .identifier and
+                context.tokenIs(body_index, receiver_segment) and
+                context.tokens[body_index + 1].tag == .period and
+                context.tokenIs(body_index + 2, "deinit")) return true;
+        }
+        index = @min(body_end, scope_end - 1);
+    }
+    return false;
+}
+
 fn fallibleBeforeBindingUse(context: RuleRun, start: usize, scope_end: usize, binding: []const u8) ?usize {
     var cursor = start;
     while (cursor < scope_end) {
@@ -250,6 +274,22 @@ test "released transferred arena-backed and final allocations stay clean" {
         "        allocator.free(pair);\n" ++
         "    }\n" ++
         "    try flush(pair, pair);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "allocations reclaimed by a deferred pool deinit stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(a: std.mem.Allocator) !void {\n" ++
+        "    var pool: MemoryPool = .empty;\n" ++
+        "    defer pool.deinit(a);\n" ++
+        "    const first = try pool.create(a);\n" ++
+        "    const second = try pool.create(a);\n" ++
+        "    use(first, second);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 

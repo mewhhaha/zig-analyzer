@@ -8,13 +8,19 @@ pub const RuleRun = struct {
     tokens: []const std.zig.Token,
     configuration: types.Configuration,
     findings: *std.ArrayList(types.Finding),
+    /// Whether the source contains any "// zig-analyzer:" directive, when the
+    /// caller has already scanned for one; null means emit checks itself.
+    suppression_directives_present: ?bool = null,
 
     pub fn level(context: RuleRun, rule: types.Rule) types.Level {
         return context.configuration.level(rule);
     }
 
     pub fn emit(context: RuleRun, finding: types.Finding) !void {
-        if (finding.level == .off or configuration.isSuppressed(context.source, finding.rule, finding.span.start)) return;
+        if (finding.level == .off) return;
+        const directives_present = context.suppression_directives_present orelse
+            configuration.hasSuppressionDirectives(context.source);
+        if (directives_present and configuration.isSuppressed(context.source, finding.rule, finding.span.start)) return;
         try context.findings.append(context.allocator, finding);
     }
 

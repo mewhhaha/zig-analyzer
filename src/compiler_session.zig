@@ -7,9 +7,15 @@ const DrainResult = @typeInfo(@TypeOf(drainCompilerStdout)).@"fn".return_type.?;
 
 pub const Session = struct {
     io: std.Io,
+    allocator: std.mem.Allocator,
     child: std.process.Child,
     stdout_future: std.Io.Future(DrainResult),
+    /// Set by the stdout drain task when the backend releases its stdout,
+    /// which the backend only does when it exits. Lets deinit wait for a
+    /// graceful exit with a deadline instead of blocking forever.
+    stdout_closed: *std.Io.Event,
     client: compiler_client.Client,
+    exit_deadline_ms: i64 = compiler_client.default_response_deadline_ms,
 
     pub fn start(
         io: std.Io,
@@ -52,7 +58,10 @@ pub const Session = struct {
         });
         errdefer child.kill(io);
 
-        var stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.? });
+        const stdout_closed = try allocator.create(std.Io.Event);
+        errdefer allocator.destroy(stdout_closed);
+        stdout_closed.* = .unset;
+        var stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed });
         errdefer stdout_future.cancel(io) catch |err| std.log.warn("failed to cancel compiler output reader: {t}", .{err});
 
         var stdin_writer = child.stdin.?.writer(io, &.{});
@@ -109,8 +118,10 @@ pub const Session = struct {
 
         return .{
             .io = io,
+            .allocator = allocator,
             .child = child,
             .stdout_future = stdout_future,
+            .stdout_closed = stdout_closed,
             .client = client,
         };
     }
@@ -138,12 +149,35 @@ pub const Session = struct {
         } else {
             graceful_shutdown = false;
         }
-        if (!graceful_shutdown) session.child.kill(session.io);
+        var backend_exited = false;
+        if (graceful_shutdown) {
+            const exit_timeout: std.Io.Timeout = .{ .duration = .{
+                .raw = .fromMilliseconds(session.exit_deadline_ms),
+                .clock = .awake,
+            } };
+            backend_exited = if (session.stdout_closed.waitTimeout(session.io, exit_timeout)) |_| true else |err| switch (err) {
+                error.Timeout, error.Canceled => false,
+            };
+            if (!backend_exited) {
+                std.log.warn("compiler backend did not exit within {d} ms; killing it", .{session.exit_deadline_ms});
+            }
+        }
 
-        _ = session.stdout_future.await(session.io) catch |err| switch (err) {
-            error.Canceled => {},
-            else => std.log.warn("compiler output reader failed during shutdown: {t}", .{err}),
-        };
+        if (backend_exited) {
+            _ = session.stdout_future.await(session.io) catch |err| switch (err) {
+                error.Canceled => {},
+                else => std.log.warn("compiler output reader failed during shutdown: {t}", .{err}),
+            };
+        } else {
+            // Cancel the reader before kill: kill closes the stdout handle
+            // while the reader would still be blocked on it.
+            _ = session.stdout_future.cancel(session.io) catch |err| switch (err) {
+                error.Canceled => {},
+                else => std.log.warn("compiler output reader failed during shutdown: {t}", .{err}),
+            };
+            session.child.kill(session.io);
+        }
+        session.allocator.destroy(session.stdout_closed);
         if (session.child.id != null) {
             const term = session.child.wait(session.io) catch |err| {
                 std.log.warn("failed to wait for compiler shutdown: {t}", .{err});
@@ -214,7 +248,8 @@ fn connectCompilerClient(io: std.Io, allocator: std.mem.Allocator, port: u16) !c
     return error.CompilerProtocolUnavailable;
 }
 
-fn drainCompilerStdout(io: std.Io, file: std.Io.File) !void {
+fn drainCompilerStdout(io: std.Io, file: std.Io.File, stdout_closed: *std.Io.Event) !void {
+    defer stdout_closed.set(io);
     var reader = file.readerStreaming(io, &.{});
     while (true) {
         const header = reader.interface.takeStruct(std.zig.Server.Message.Header, .little) catch |err| switch (err) {
@@ -223,4 +258,45 @@ fn drainCompilerStdout(io: std.Io, file: std.Io.File) !void {
         };
         try reader.interface.discardAll(header.bytes_len);
     }
+}
+
+test "deinit kills a backend that never exits instead of blocking forever" {
+    // The kill-after-deadline warn is expected here; silence it so the
+    // accumulated stderr is not attributed to whichever test fails later.
+    std.testing.log_level = .err;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // A listener that never replies stands in for the backend's socket side.
+    const address: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    var client = try compiler_client.Client.connect(io, allocator, server.socket.address.getPort());
+    errdefer client.deinit();
+    client.response_deadline_ms = 100;
+
+    // sleep ignores the exit message and never closes its stdout, exactly
+    // like a hung compiler process.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "sleep", "300" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    errdefer child.kill(io);
+    const stdout_closed = try allocator.create(std.Io.Event);
+    errdefer allocator.destroy(stdout_closed);
+    stdout_closed.* = .unset;
+    const stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed });
+
+    var session: Session = .{
+        .io = io,
+        .allocator = allocator,
+        .child = child,
+        .stdout_future = stdout_future,
+        .stdout_closed = stdout_closed,
+        .client = client,
+        .exit_deadline_ms = 100,
+    };
+    session.deinit();
 }
