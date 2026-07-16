@@ -10,6 +10,7 @@ pub fn run(context: RuleRun) !void {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or
             declaration_index + 4 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
+        if (!startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const acquisition = allocatingAcquisition(context, declaration_index, declaration_end) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
@@ -62,6 +63,16 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+// `const` also appears inside pointer and slice types ("[]const u8"), where the
+// following identifier is the pointee type, not a binding.
+fn startsStatement(context: RuleRun, index: usize) bool {
+    if (index == 0) return true;
+    return switch (context.tokens[index - 1].tag) {
+        .semicolon, .l_brace, .r_brace, .keyword_pub, .keyword_comptime, .keyword_export => true,
+        else => false,
+    };
 }
 
 const Acquisition = struct {
@@ -158,6 +169,9 @@ fn fallibleBeforeBindingUse(context: RuleRun, start: usize, scope_end: usize, bi
         for (context.tokens[cursor .. end + 1], cursor..) |chunk_token, chunk_index| {
             switch (chunk_token.tag) {
                 .keyword_return => return null,
+                // A nested function declaration's body does not execute here, so a
+                // 'try' inside it is not a fallible operation on this path.
+                .keyword_fn => return null,
                 .keyword_try => if (fallible_index == null) {
                     fallible_index = chunk_index;
                 },
@@ -229,6 +243,47 @@ test "released transferred arena-backed and final allocations stay clean" {
         "fn last(allocator: std.mem.Allocator) ![]u8 {\n" ++
         "    const buffer = try allocator.alloc(u8, 4);\n" ++
         "    return buffer;\n" ++
+        "}\n" ++
+        "fn block(allocator: std.mem.Allocator) !void {\n" ++
+        "    const pair = try allocator.alloc(u8, 2);\n" ++
+        "    defer {\n" ++
+        "        allocator.free(pair);\n" ++
+        "    }\n" ++
+        "    try flush(pair, pair);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "a try inside a nested function declaration is not a fallible operation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(allocator: std.mem.Allocator) !void {\n" ++
+        "    const buffer = try allocator.alloc(u8, 4);\n" ++
+        "    const Helper = struct {\n" ++
+        "        fn fill() !void { try refill(); }\n" ++
+        "    };\n" ++
+        "    Helper.fill() catch {};\n" ++
+        "    allocator.free(buffer);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "a multiline typed acquisition with errdefer on the next line stays clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(gpa: std.mem.Allocator, options: Options) !void {\n" ++
+        "    const exe_path: []const u8 = try gpa.dupe(\n" ++
+        "        u8,\n" ++
+        "        options.prebuilt orelse fallback.?,\n" ++
+        "    );\n" ++
+        "    errdefer gpa.free(exe_path);\n" ++
+        "    try shell.exec(exe_path);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 

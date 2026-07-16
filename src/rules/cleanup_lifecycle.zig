@@ -296,8 +296,13 @@ fn identifierIsRuntimeBound(context: RuleRun, identifier_index: usize, use_index
     while (cursor > 0 and context.tokens[cursor].tag != .keyword_fn) : (cursor -= 1) {}
     if (context.tokens[cursor].tag != .keyword_fn) return false;
     for (context.tokens[cursor..body_start], cursor..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, name) and index + 1 < body_start and
-            context.tokens[index + 1].tag == .colon) return true;
+        if (token.tag != .identifier or !context.tokenIs(index, name) or index + 2 >= body_start or
+            context.tokens[index + 1].tag != .colon) continue;
+        // A comptime parameter (explicit keyword or a 'type' parameter) is
+        // resolved before runtime and cannot overflow a size computation.
+        if (index > 0 and context.tokens[index - 1].tag == .keyword_comptime) continue;
+        if (context.tokenIs(index + 2, "type")) continue;
+        return true;
     }
     return false;
 }
@@ -397,6 +402,18 @@ test "locally declared literal factors are not runtime overflow risks" {
     const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn run(a: anytype) !void { const w = 640; const h = 480; const bytes = try a.alloc(u8, w * h); defer a.free(bytes); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "comptime parameters do not make allocation sizes runtime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn decode(a: anytype, comptime Word: type) !void { const bytes = try a.alloc(Word, 4 * maxInt(Word)); defer a.free(bytes); }";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });

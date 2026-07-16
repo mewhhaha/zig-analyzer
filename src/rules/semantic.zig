@@ -683,6 +683,12 @@ fn findMissingResourceCleanup(
         var pair: ?ResourcePair = null;
         var acquisition_index: usize = declaration_index + 3;
         while (acquisition_index < statement_end) : (acquisition_index += 1) {
+            switch (tokens[acquisition_index].tag) {
+                // A type definition initializer: any init/openFile inside it is a
+                // method declaration or nested body, not an acquisition by this binding.
+                .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque, .keyword_fn => break,
+                else => {},
+            }
             if (tokens[acquisition_index].tag != .identifier or acquisition_index + 1 >= statement_end or
                 tokens[acquisition_index + 1].tag != .l_paren) continue;
             const name = tokenText(source, tokens[acquisition_index]);
@@ -700,10 +706,30 @@ fn findMissingResourceCleanup(
         const binding_name = tokenText(source, tokens[declaration_index + 1]);
         if (bindingHasRelease(source, tokens, binding_name, statement_end + 1, scope_end, resource.release, resource.alternative_release) or
             bindingObviouslyEscapes(source, tokens, binding_name, statement_end + 1, scope_end)) continue;
+        const line_start = lineStart(source, tokens[declaration_index].loc.start);
+        var indentation_end = line_start;
+        while (indentation_end < source.len and (source[indentation_end] == ' ' or source[indentation_end] == '\t')) indentation_end += 1;
+        const edits = try allocator.alloc(Edit, 1);
+        edits[0] = .{
+            .span = .{ .start = tokens[statement_end].loc.end, .end = tokens[statement_end].loc.end },
+            .replacement = try std.fmt.allocPrint(
+                allocator,
+                "\n{s}defer {s}.{s}();",
+                .{ source[line_start..indentation_end], binding_name, resource.release },
+            ),
+        };
+        const fixes = try allocator.alloc(Fix, 1);
+        fixes[0] = .{
+            .title = try std.fmt.allocPrint(allocator, "Insert 'defer {s}.{s}()'", .{ binding_name, resource.release }),
+            .kind = .quickfix,
+            .edits = edits,
+            .preferred = true,
+        };
         try addFinding(allocator, source, configuration, found, .{
             .rule = .missing_resource_cleanup,
             .level = level,
             .span = tokens[declaration_index + 1].loc,
+            .fixes = fixes,
             .message = try std.fmt.allocPrint(
                 allocator,
                 "resource '{s}' from {s} has no visible {s}{s} or ownership transfer",
@@ -1493,6 +1519,11 @@ fn findSwitches(
             if (tokens[cursor].tag == .keyword_else) else_index = cursor;
         }
         if (missing.items.len == 0) continue;
+        // 'inline else' expands into every remaining case at comptime; the switch
+        // is exhaustive by construction and the expansion is deliberate.
+        if (else_index) |index| {
+            if (index > opening and tokens[index - 1].tag == .keyword_inline) continue;
+        }
         if (container.kind == .error_set) {
             const level = configuration.level(.non_exhaustive_error_switch);
             if (level == .off) continue;
@@ -2043,6 +2074,8 @@ fn findNeedlessElse(
         if (token.tag != .keyword_else or else_index == 0 or else_index + 1 >= tokens.len or tokens[else_index + 1].tag != .l_brace) continue;
         if (tokens[else_index - 1].tag != .r_brace) continue;
         const preceding_open = matchingOpeningToken(tokens, else_index - 1, .l_brace, .r_brace) orelse continue;
+        // A loop's else runs when the loop exits without break, so it is never removable.
+        if (!precedingBlockIsIfBranch(tokens, preceding_open)) continue;
         if (!blockAlwaysTerminates(tokens, preceding_open, else_index - 1)) continue;
         const else_close = matchingToken(tokens, else_index + 1, .l_brace, .r_brace) orelse continue;
         const edits = try allocator.alloc(Edit, 2);
@@ -2060,20 +2093,49 @@ fn findNeedlessElse(
     }
 }
 
+fn precedingBlockIsIfBranch(tokens: []const std.zig.Token, opening: usize) bool {
+    var cursor = opening;
+    if (cursor > 0 and tokens[cursor - 1].tag == .pipe) {
+        cursor -= 1;
+        while (cursor > 0 and tokens[cursor - 1].tag != .pipe) cursor -= 1;
+        if (cursor == 0) return false;
+        cursor -= 1;
+    }
+    if (cursor == 0 or tokens[cursor - 1].tag != .r_paren) return false;
+    const condition_open = matchingOpeningToken(tokens, cursor - 1, .l_paren, .r_paren) orelse return false;
+    return condition_open > 0 and tokens[condition_open - 1].tag == .keyword_if;
+}
+
 fn blockAlwaysTerminates(tokens: []const std.zig.Token, opening: usize, closing: usize) bool {
-    var cursor = closing;
-    var found_terminator = false;
+    // Only the last statement decides: a terminator earlier in the block (for
+    // example 'orelse unreachable' in its first line) does not end the branch.
+    if (closing <= opening + 1) return false;
+    if (tokens[closing - 1].tag != .semicolon) return false;
+    var depth: usize = 0;
+    var cursor = closing - 1;
+    var statement_start = opening + 1;
     while (cursor > opening + 1) {
         cursor -= 1;
         switch (tokens[cursor].tag) {
-            .keyword_return, .keyword_break, .keyword_continue, .keyword_unreachable => found_terminator = true,
-            .semicolon => if (found_terminator) return true,
-            .l_brace, .r_brace => return false,
-            .keyword_if, .keyword_for, .keyword_while, .keyword_switch => return false,
+            .r_brace, .r_paren, .r_bracket => depth += 1,
+            .l_brace, .l_paren, .l_bracket => {
+                if (depth == 0) {
+                    statement_start = cursor + 1;
+                    break;
+                }
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) {
+                statement_start = cursor + 1;
+                break;
+            },
             else => {},
         }
     }
-    return found_terminator;
+    return switch (tokens[statement_start].tag) {
+        .keyword_return, .keyword_break, .keyword_continue, .keyword_unreachable => true,
+        else => false,
+    };
 }
 
 fn findNonIdiomaticNames(
@@ -2399,8 +2461,14 @@ fn findOfficialStyleIssues(
 }
 
 fn vagueTypeWord(name: []const u8) ?[]const u8 {
-    const words = [_][]const u8{ "Value", "Data", "Context", "Manager", "State", "Utils", "Misc" };
-    for (words) |word| {
+    // Value/Context/State as a suffix names a role precisely (LookupContext,
+    // CheckpointState); only the bare word says nothing about the domain.
+    const exact_words = [_][]const u8{ "Value", "Context", "State" };
+    for (exact_words) |word| {
+        if (std.mem.eql(u8, name, word)) return word;
+    }
+    const suffix_words = [_][]const u8{ "Data", "Manager", "Utils", "Misc" };
+    for (suffix_words) |word| {
         if (std.mem.eql(u8, name, word) or std.mem.endsWith(u8, name, word)) return word;
     }
     return null;
@@ -2641,6 +2709,12 @@ fn findPointerParameterIdioms(
         while (body_open < tokens.len and tokens[body_open].tag != .l_brace and tokens[body_open].tag != .semicolon) : (body_open += 1) {}
         if (body_open >= tokens.len or tokens[body_open].tag != .l_brace) continue;
         const body_close = matchingToken(tokens, body_open, .l_brace, .r_brace) orelse continue;
+        // deinit takes '*T' by convention: it invalidates the value even when its
+        // body happens to only read through the pointer.
+        if (tokens[fn_index + 1].tag == .identifier and tokenIs(source, tokens[fn_index + 1], "deinit")) continue;
+        // A function passed around as a value (comparator, callback) has its
+        // signature dictated by the receiving API, not by its body.
+        if (functionIsReferencedAsValue(source, tokens, fn_index)) continue;
         var parameter_index = fn_index + 3;
         while (parameter_index + 3 < parameters_end) : (parameter_index += 1) {
             if (tokens[parameter_index].tag != .identifier or tokens[parameter_index + 1].tag != .colon or
@@ -2677,6 +2751,14 @@ fn pointerParameterReadOnly(
     for (tokens[body_open + 1 .. body_close], body_open + 1..) |token, index| {
         if (token.tag != .identifier or !tokenIs(source, token, parameter_name)) continue;
         uses += 1;
+        // '&param.field' escapes as a mutable pointer, which '*const' would forbid.
+        if (index > 0 and tokens[index - 1].tag == .ampersand) return false;
+        // Likewise '&@field(param, ...)'.
+        if (index >= 3 and tokens[index - 1].tag == .l_paren and tokens[index - 2].tag == .builtin and
+            tokens[index - 3].tag == .ampersand) return false;
+        // 'switch (param.field)' with a '|*capture|' prong mutates through the operand.
+        if (index >= 2 and tokens[index - 1].tag == .l_paren and tokens[index - 2].tag == .keyword_switch and
+            switchHasPointerCapture(tokens, index - 1, body_close)) return false;
         var cursor = index + 1;
         while (cursor < body_close) {
             switch (tokens[cursor].tag) {
@@ -2688,6 +2770,10 @@ fn pointerParameterReadOnly(
                 .l_bracket => {
                     const subscript_close = matchingToken(tokens, cursor, .l_bracket, .r_bracket) orelse return false;
                     if (subscript_close >= body_close) return false;
+                    // A range subscript produces a mutable slice of the pointee.
+                    for (tokens[cursor + 1 .. subscript_close]) |subscript_token| {
+                        if (subscript_token.tag == .ellipsis2) return false;
+                    }
                     cursor = subscript_close + 1;
                 },
                 else => break,
@@ -2697,6 +2783,27 @@ fn pointerParameterReadOnly(
         if (cursor < body_close and (isAssignment(tokens[cursor].tag) or tokens[cursor].tag == .l_paren)) return false;
     }
     return uses != 0;
+}
+
+fn functionIsReferencedAsValue(source: []const u8, tokens: []const std.zig.Token, fn_index: usize) bool {
+    if (tokens[fn_index + 1].tag != .identifier) return false;
+    const name = tokenText(source, tokens[fn_index + 1]);
+    for (tokens, 0..) |token, index| {
+        if (index == fn_index + 1 or token.tag != .identifier or !tokenIs(source, token, name)) continue;
+        if (index + 1 < tokens.len and tokens[index + 1].tag == .l_paren) continue;
+        return true;
+    }
+    return false;
+}
+
+fn switchHasPointerCapture(tokens: []const std.zig.Token, condition_open: usize, limit: usize) bool {
+    const condition_close = matchingToken(tokens, condition_open, .l_paren, .r_paren) orelse return false;
+    if (condition_close + 1 >= limit or tokens[condition_close + 1].tag != .l_brace) return false;
+    const body_close = matchingToken(tokens, condition_close + 1, .l_brace, .r_brace) orelse return false;
+    for (tokens[condition_close + 2 .. @min(body_close, limit)], condition_close + 2..) |token, index| {
+        if (token.tag == .pipe and index + 1 < limit and tokens[index + 1].tag == .asterisk) return true;
+    }
+    return false;
 }
 
 fn findComptimeIdioms(
@@ -4188,4 +4295,155 @@ test "unused private declarations offer whole declaration removal" {
         } else return error.TestUnexpectedResult;
     };
     try std.testing.expectEqual(@as(usize, 3), declaration_count);
+}
+
+test "type definitions inside test bodies are not resource acquisitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "test \"merge\" {\n" ++
+        "    const T = struct {\n" ++
+        "        output_buf: std.ArrayList(u8),\n" ++
+        "        fn init(gpa: std.mem.Allocator) !@This() {\n" ++
+        "            return .{ .output_buf = std.ArrayList(u8).init(gpa) };\n" ++
+        "        }\n" ++
+        "    };\n" ++
+        "    _ = T;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .missing_resource_cleanup);
+}
+
+test "missing resource cleanup offers inserting a defer after the acquisition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load(directory: anytype) !void {\n" ++
+        "    const file = try directory.openFile(\"state\", .{});\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        cleanup_count += 1;
+        try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+        try std.testing.expect(!finding.fixes[0].fix_all);
+        const edit = finding.fixes[0].edits[0];
+        try std.testing.expectEqual(edit.span.start, edit.span.end);
+        try std.testing.expectEqual(std.mem.indexOfScalar(u8, source, ';').? + 1, edit.span.start);
+        try std.testing.expectEqualStrings("\n    defer file.close();", edit.replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "else stays when the branch terminator is not the last statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(stack: anytype, model: anytype, c: bool) !void {\n" ++
+        "    if (c) {\n" ++
+        "        const top = stack.peek() orelse unreachable;\n" ++
+        "        try model.append(top);\n" ++
+        "    } else {\n" ++
+        "        model.clear();\n" ++
+        "    }\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
+}
+
+test "a loop else runs on normal exit and is never needless" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(values: []const u8) void {\n" ++
+        "    for (values) |value| {\n" ++
+        "        _ = value;\n" ++
+        "        break;\n" ++
+        "    } else {\n" ++
+        "        mark();\n" ++
+        "    }\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
+}
+
+test "inline else is exhaustive by construction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { fast, safe, slow };\n" ++
+        "fn run(mode: Mode) usize {\n" ++
+        "    return switch (mode) {\n" ++
+        "        .fast => 0,\n" ++
+        "        inline else => |m| @intFromEnum(m),\n" ++
+        "    };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
+}
+
+test "pointer parameters that escape mutably stay mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Ring = struct { items: [4]u8, index: usize };\n" ++
+        "fn itemPtr(ring: *Ring, index: usize) *u8 {\n" ++
+        "    return &ring.items[index];\n" ++
+        "}\n" ++
+        "fn head(ring: *Ring) []u8 {\n" ++
+        "    return ring.items[0..ring.index];\n" ++
+        "}\n" ++
+        "fn advance(ring: *Ring) void {\n" ++
+        "    switch (ring.index) { else => |*value| value.* = 0 }\n" ++
+        "}\n" ++
+        "fn deinit(ring: *Ring) void {\n" ++
+        "    _ = ring.items[0];\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .mutable_pointer_parameter);
+}
+
+test "constrained signatures and field address escapes keep mutable pointers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Read = struct { ready_at: u64 };\n" ++
+        "fn lessThan(_: void, a: *Read, b: *Read) bool {\n" ++
+        "    return a.ready_at < b.ready_at;\n" ++
+        "}\n" ++
+        "const Queue = std.PriorityQueue(*Read, void, lessThan);\n" ++
+        "const Forest = struct { grooves: u32 };\n" ++
+        "fn groovePtr(forest: *Forest) *u32 {\n" ++
+        "    return &@field(forest, \"grooves\");\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .mutable_pointer_parameter);
+}
+
+test "compound Context and State names describe their role" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const LookupContext = struct { key: u32 };\n" ++
+        "const CheckpointState = struct { op: u64 };\n" ++
+        "const Context = struct { key: u32 };\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.vague_type_name)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var vague_count: usize = 0;
+    for (found) |finding| if (finding.rule == .vague_type_name) {
+        vague_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Context'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), vague_count);
 }
