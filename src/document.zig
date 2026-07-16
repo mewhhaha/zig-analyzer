@@ -129,12 +129,18 @@ pub const Document = struct {
     }
 
     pub fn identifierAt(document: *const Document, byte_offset: usize) ?std.zig.Token.Loc {
+        const token = document.tokenAt(byte_offset) orelse return null;
+        return if (token.tag == .identifier) token.loc else null;
+    }
+
+    pub fn tokenAt(document: *const Document, byte_offset: usize) ?std.zig.Token {
         var tokenizer = std.zig.Tokenizer.init(document.source);
+        var token_ending_at_offset: ?std.zig.Token = null;
         while (true) {
             const token = tokenizer.next();
-            if (token.tag == .eof) return null;
-            if (token.tag != .identifier) continue;
-            if (token.loc.start <= byte_offset and byte_offset <= token.loc.end) return token.loc;
+            if (token.tag == .eof or token.loc.start > byte_offset) return token_ending_at_offset;
+            if (token.loc.start <= byte_offset and byte_offset < token.loc.end) return token;
+            if (token.loc.end == byte_offset) token_ending_at_offset = token;
         }
     }
 
@@ -587,6 +593,15 @@ test "identifier lookup finds declarations and every reference" {
     const reference_spans = try document.identifierSpans(std.testing.allocator, name);
     defer std.testing.allocator.free(reference_spans);
     try std.testing.expectEqual(@as(usize, 2), reference_spans.len);
+}
+
+test "token lookup prefers punctuation beginning at an identifier boundary" {
+    var document = try Document.open(std.testing.allocator, "file:///fixture.zig", 1, "value+1;\n");
+    defer document.deinit();
+
+    try std.testing.expectEqual(std.zig.Token.Tag.plus, document.tokenAt(5).?.tag);
+    try std.testing.expectEqual(std.zig.Token.Tag.semicolon, document.tokenAt(7).?.tag);
+    try std.testing.expect(document.identifierAt(5) == null);
 }
 
 test "scoped identifier lookup excludes an unrelated parameter" {

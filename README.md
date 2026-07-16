@@ -309,7 +309,9 @@ help, definition, references, reflection-aware rename, call hierarchy, document
 and workspace symbols, semantic tokens, inlay hints, code lenses, and
 formatting. It completes local `@import` paths and format placeholders, shows
 implicit enum values, and exposes compiler-resolved comptime types through
-hover and a `zig-analyzer.peekResolvedType` code-lens command. It remains
+hover and a `zig-analyzer.peekResolvedType` code-lens command. Hover also
+describes Zig keywords, builtins, primitive types and values, literals,
+operators, and punctuation with links to the language reference. It remains
 experimental and pins an exact Zig compiler revision.
 
 See [DEVELOPING.md](DEVELOPING.md) for backend bootstrapping, the full

@@ -29,14 +29,14 @@ fn Traced(comptime Inner: type) type {
 }
 
 fn Pipeline(comptime stages: []const Stage) type {
-    comptime var Current = Source;
+    comptime var current = Source;
     inline for (stages) |stage| {
-        Current = switch (stage) {
-            .buffered => Buffered(Current),
-            .traced => Traced(Current),
+        current = switch (stage) {
+            .buffered => Buffered(current),
+            .traced => Traced(current),
         };
     }
-    return Current;
+    return current;
 }
 
 const ActivePipeline = Pipeline(&.{ .buffered, .traced });
