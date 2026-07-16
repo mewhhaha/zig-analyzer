@@ -68,6 +68,68 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
         };
         setTier(&configuration, .style, level);
     }
+    if (lints.get("banned")) |banned_value| {
+        const entries = switch (banned_value) {
+            .array => |array| array.items,
+            else => {
+                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.banned' must contain an array of objects");
+                return configuration;
+            },
+        };
+        const banned = try allocator.alloc(rule_types.BannedIdentifier, entries.len);
+        for (entries, banned) |entry_value, *banned_entry| {
+            const entry = switch (entry_value) {
+                .object => |object| object,
+                else => {
+                    configuration.warning = try allocator.dupe(u8, "zig-analyzer.json entries in 'lints.banned' must be objects with a 'path' and optional 'hint'");
+                    return configuration;
+                },
+            };
+            var keys = entry.iterator();
+            while (keys.next()) |pair| {
+                if (std.mem.eql(u8, pair.key_ptr.*, "path") or std.mem.eql(u8, pair.key_ptr.*, "hint")) continue;
+                configuration.warning = try std.fmt.allocPrint(
+                    allocator,
+                    "zig-analyzer.json key 'lints.banned' contains unknown key '{s}'",
+                    .{pair.key_ptr.*},
+                );
+                return configuration;
+            }
+            const path_value = entry.get("path") orelse {
+                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json entries in 'lints.banned' must contain a 'path' string");
+                return configuration;
+            };
+            const path = switch (path_value) {
+                .string => |string| string,
+                else => {
+                    configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.banned' paths must be strings");
+                    return configuration;
+                },
+            };
+            if (!validBannedPath(path)) {
+                configuration.warning = try std.fmt.allocPrint(
+                    allocator,
+                    "zig-analyzer.json banned path '{s}' must be identifiers separated by single dots",
+                    .{path},
+                );
+                return configuration;
+            }
+            const hint: ?[]const u8 = if (entry.get("hint")) |hint_value| switch (hint_value) {
+                .string => |string| try allocator.dupe(u8, string),
+                else => {
+                    configuration.warning = try std.fmt.allocPrint(
+                        allocator,
+                        "zig-analyzer.json key 'lints.banned' hint for '{s}' must be a string",
+                        .{path},
+                    );
+                    return configuration;
+                },
+            } else null;
+            banned_entry.* = .{ .path = try allocator.dupe(u8, path), .hint = hint };
+        }
+        configuration.banned = banned;
+        if (banned.len != 0) configuration.levels[@intFromEnum(Rule.banned_identifier)] = .warning;
+    }
     if (lints.get("rules")) |rules_value| {
         const rules = switch (rules_value) {
             .object => |object| object,
@@ -366,6 +428,14 @@ fn applyLintProfile(configuration: *Configuration, profile: LintProfile) void {
     }
 }
 
+fn validBannedPath(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '.');
+    while (segments.next()) |segment| {
+        if (!std.zig.isValidId(segment)) return false;
+    }
+    return true;
+}
+
 fn ruleNamed(name: []const u8) ?Rule {
     for (std.enums.values(Rule)) |rule| {
         if (std.mem.eql(u8, name, rule.code())) return rule;
@@ -382,6 +452,73 @@ test "configuration reports an unknown rule" {
         "zig-analyzer.json contains unknown lint rule 'not-a-rule'",
         configuration.warning.?,
     );
+}
+
+test "configuration parses banned identifiers and activates the rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"banned":[
+        \\  {"path":"std.BoundedArray","hint":"use stdx.BoundedArrayType"},
+        \\  {"path":"sleep"}
+        \\]}}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    try std.testing.expectEqual(@as(usize, 2), configuration.banned.len);
+    try std.testing.expectEqualStrings("std.BoundedArray", configuration.banned[0].path);
+    try std.testing.expectEqualStrings("use stdx.BoundedArrayType", configuration.banned[0].hint.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.banned[1].hint);
+    try std.testing.expectEqual(Level.warning, configuration.level(.banned_identifier));
+}
+
+test "an explicit rule level overrides the banned default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"banned":[{"path":"sleep"}],"rules":{"banned-identifier":"error"}}}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    try std.testing.expectEqual(Level.@"error", configuration.level(.banned_identifier));
+}
+
+test "malformed banned configuration reports the offending key or value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, warning: []const u8 }{
+        .{
+            .source = "{\"lints\":{\"banned\":{}}}",
+            .warning = "zig-analyzer.json key 'lints.banned' must contain an array of objects",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[\"std.BoundedArray\"]}}",
+            .warning = "zig-analyzer.json entries in 'lints.banned' must be objects with a 'path' and optional 'hint'",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[{\"path\":\"sleep\",\"replacement\":\"nap\"}]}}",
+            .warning = "zig-analyzer.json key 'lints.banned' contains unknown key 'replacement'",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[{\"hint\":\"use stdx\"}]}}",
+            .warning = "zig-analyzer.json entries in 'lints.banned' must contain a 'path' string",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[{\"path\":42}]}}",
+            .warning = "zig-analyzer.json key 'lints.banned' paths must be strings",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[{\"path\":\"std..BoundedArray\"}]}}",
+            .warning = "zig-analyzer.json banned path 'std..BoundedArray' must be identifiers separated by single dots",
+        },
+        .{
+            .source = "{\"lints\":{\"banned\":[{\"path\":\"sleep\",\"hint\":7}]}}",
+            .warning = "zig-analyzer.json key 'lints.banned' hint for 'sleep' must be a string",
+        },
+    };
+    for (cases) |case| {
+        const configuration = try parse(arena.allocator(), case.source);
+        try std.testing.expectEqualStrings(case.warning, configuration.warning.?);
+        try std.testing.expectEqual(Level.off, configuration.level(.banned_identifier));
+    }
 }
 
 test "suppression reports its source line" {

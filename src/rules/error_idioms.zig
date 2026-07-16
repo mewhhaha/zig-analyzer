@@ -24,6 +24,7 @@ fn findCollapsedErrors(context: RuleRun) !void {
             (std.mem.eql(u8, fallback, "null") or std.mem.eql(u8, fallback, "false")) or
             context.tokens[fallback_index].tag == .number_literal and std.mem.eql(u8, fallback, "0");
         if (!collapses) continue;
+        if (absenceImmediatelyTested(context, fallback_index)) continue;
         try context.emit(.{
             .rule = .error_collapsed_to_absence,
             .level = level,
@@ -35,6 +36,21 @@ fn findCollapsedErrors(context: RuleRun) !void {
             ),
         });
     }
+}
+
+// 'x catch null == null' and 'if (x catch null) |value|' handle the absence on
+// the spot, so the collapse is the point rather than a lost failure.
+fn absenceImmediatelyTested(context: RuleRun, fallback_index: usize) bool {
+    var after = fallback_index + 1;
+    while (after < context.tokens.len and context.tokens[after].tag == .r_paren) : (after += 1) {}
+    if (after >= context.tokens.len) return false;
+    return switch (context.tokens[after].tag) {
+        .equal_equal, .bang_equal => true,
+        // Only a capture directly after a closed condition, to avoid reading a
+        // bitwise-or fallback expression as a capture.
+        .pipe => after > fallback_index + 1,
+        else => false,
+    };
 }
 
 fn findRedundantCaptures(context: RuleRun) !void {
@@ -84,6 +100,27 @@ fn findRedundantCaptures(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+test "immediately tested catch null is deliberate absence handling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn check() void {\n" ++
+        "    if ((load() catch null) == null) mark();\n" ++
+        "    if (parse() catch null) |value| use(value);\n" ++
+        "    const leaked = load() catch null;\n" ++
+        "    _ = leaked;\n" ++
+        "}\n";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var collapsed_count: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .error_collapsed_to_absence) {
+        collapsed_count += 1;
+        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "leaked").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), collapsed_count);
 }
 
 test "collapsed errors and unused captures are distinguished" {

@@ -75,6 +75,9 @@ pub const Document = struct {
                 .text_document_content_change_partial => |partial| partial,
             };
 
+            if (lsp.offsets.orderPosition(replacement.range.start, replacement.range.end) == .gt) {
+                return error.InvalidRange;
+            }
             const changed_span = lsp.offsets.rangeToLoc(next_source, replacement.range, .@"utf-16");
             const replaced_length = changed_span.start + replacement.text.len + next_source.len - changed_span.end;
             const replaced_source = try document.allocator.allocSentinel(u8, replaced_length, 0);
@@ -110,7 +113,10 @@ pub const Document = struct {
     }
 
     pub fn range(document: *const Document, span: std.zig.Token.Loc) lsp.types.Range {
-        return lsp.offsets.locToRange(document.source, span, .@"utf-16");
+        // Spans can come from compiler replies computed against different
+        // text; locToRange asserts in-bounds codepoint-aligned offsets, so
+        // clamp here instead of trusting the producer.
+        return lsp.offsets.locToRange(document.source, clampSpan(document.source, span), .@"utf-16");
     }
 
     pub fn declarationAt(document: *const Document, byte_offset: usize) ?Declaration {
@@ -319,6 +325,18 @@ fn collectDeclarations(allocator: std.mem.Allocator, source: [:0]const u8) ![]De
     return try declarations.toOwnedSlice(allocator);
 }
 
+fn clampSpan(source: []const u8, span: std.zig.Token.Loc) std.zig.Token.Loc {
+    var start = @min(span.start, source.len);
+    var end = @min(@max(span.end, start), source.len);
+    while (start > 0 and start < source.len and isUtf8Continuation(source[start])) start -= 1;
+    while (end > start and end < source.len and isUtf8Continuation(source[end])) end -= 1;
+    return .{ .start = start, .end = end };
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0b1100_0000 == 0b1000_0000;
+}
+
 fn copySource(allocator: std.mem.Allocator, source: []const u8) ![:0]u8 {
     const owned = try allocator.allocSentinel(u8, source.len, 0);
     @memcpy(owned, source);
@@ -497,6 +515,39 @@ test "incremental changes use UTF-16 positions" {
     }};
     try document.applyChanges(2, &changes);
     try std.testing.expectEqualStrings("const 🦎value = 1;\n", document.source);
+}
+
+test "document rejects a reversed change range without changing source" {
+    var document = try Document.open(std.testing.allocator, "file:///fixture.zig", 1, "const stable = 1;\n");
+    defer document.deinit();
+
+    const changes = [_]lsp.types.TextDocument.ContentChangeEvent{.{
+        .text_document_content_change_partial = .{
+            .range = .{
+                .start = .{ .line = 0, .character = 10 },
+                .end = .{ .line = 0, .character = 4 },
+            },
+            .text = "renamed",
+        },
+    }};
+    try std.testing.expectError(error.InvalidRange, document.applyChanges(2, &changes));
+    try std.testing.expectEqualStrings("const stable = 1;\n", document.source);
+}
+
+test "range clamps spans that outlive the source and snaps mid-codepoint offsets" {
+    var document = try Document.open(std.testing.allocator, "file:///fixture.zig", 1, "\"😀\" ok");
+    defer document.deinit();
+
+    const past_end = document.range(.{ .start = 3, .end = 100 });
+    try std.testing.expectEqual(@as(u32, 1), past_end.start.character);
+    try std.testing.expectEqual(@as(u32, 7), past_end.end.character);
+
+    const inside_codepoint = document.range(.{ .start = 2, .end = 3 });
+    try std.testing.expectEqual(@as(u32, 1), inside_codepoint.start.character);
+    try std.testing.expectEqual(@as(u32, 1), inside_codepoint.end.character);
+
+    const reversed = document.range(.{ .start = 6, .end = 1 });
+    try std.testing.expectEqual(reversed.start, reversed.end);
 }
 
 test "document rejects stale versions without changing source" {

@@ -37,7 +37,7 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn bodyCanExit(context: RuleRun, start: usize, end: usize) bool {
-    for (context.tokens[start..end]) |token| {
+    for (context.tokens[start..end], start..) |token, index| {
         switch (token.tag) {
             .keyword_break,
             .keyword_return,
@@ -47,6 +47,8 @@ fn bodyCanExit(context: RuleRun, start: usize, end: usize) bool {
             .builtin,
             .l_paren,
             => return true,
+            // 'continue :label' targets an enclosing loop, leaving this one.
+            .keyword_continue => if (index + 1 < end and context.tokens[index + 1].tag == .colon) return true,
             else => {},
         }
     }
@@ -76,6 +78,23 @@ test "loops with calls breaks returns or fallible bodies stay clean" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "a labeled continue to an enclosing loop counts as an exit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn drain(items: *Queue) void {\n" ++
+        "    outer: while (items.refill()) {\n" ++
+        "        while (true) {\n" ++
+        "            continue :outer;\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "fn stuck() void { while (true) { continue; } }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 test "busy loop diagnostics honor suppression" {

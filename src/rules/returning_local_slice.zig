@@ -9,6 +9,9 @@ pub fn run(context: RuleRun) !void {
         if (token.tag != .keyword_var or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
             !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+        // A 'comptime var' array is interned into the binary; slices of it are
+        // valid after the function returns.
+        if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
         const declaration_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
@@ -121,6 +124,23 @@ test "dereferencing the slice returns the array by value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn digest() [4]u8 { var buf = [_]u8{ 1, 2, 3, 4 }; return buf[0..4].*; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = @import("types.zig").Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "comptime var arrays are interned and outlive the function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn snake(comptime input: []const u8) []const u8 { comptime var output: [input.len * 2]u8 = undefined; return output[0..1]; }";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
     try run(.{

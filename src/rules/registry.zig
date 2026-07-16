@@ -1,6 +1,7 @@
 const RuleRun = @import("context.zig").RuleRun;
 
 const aliased_memcpy = @import("aliased_memcpy.zig");
+const banned_identifier = @import("banned_identifier.zig");
 const cleanup_after_fallible_operation = @import("cleanup_after_fallible_operation.zig");
 const cleanup_lifecycle = @import("cleanup_lifecycle.zig");
 const container_invalidation = @import("container_invalidation.zig");
@@ -27,6 +28,7 @@ const usize_in_packed_struct = @import("usize_in_packed_struct.zig");
 
 pub fn run(context: RuleRun) !void {
     try aliased_memcpy.run(context);
+    try banned_identifier.run(context);
     try cleanup_after_fallible_operation.run(context);
     try cleanup_lifecycle.run(context);
     try container_invalidation.run(context);
@@ -54,6 +56,7 @@ pub fn run(context: RuleRun) !void {
 
 test {
     _ = aliased_memcpy;
+    _ = banned_identifier;
     _ = cleanup_after_fallible_operation;
     _ = cleanup_lifecycle;
     _ = container_invalidation;

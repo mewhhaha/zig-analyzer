@@ -9,7 +9,10 @@ pub fn run(context: RuleRun) !void {
     for (context.tokens, 0..) |token, if_index| {
         if (token.tag != .keyword_if or if_index + 3 >= context.tokens.len) continue;
         if (if_index > 0) switch (context.tokens[if_index - 1].tag) {
-            .semicolon, .l_brace, .r_brace => {},
+            // 'else' admits the trailing if of an else-if chain; expression-position
+            // chains are excluded below because their body contains 'else' or ends
+            // without a top-level semicolon.
+            .semicolon, .l_brace, .r_brace, .keyword_else => {},
             else => continue,
         };
         if (context.tokens[if_index + 1].tag != .l_paren) continue;
@@ -114,6 +117,24 @@ test "a comment inside the guarded statement keeps the diagnostic but declines t
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(@as(usize, 0), findings[0].fixes.len);
+}
+
+test "the trailing if of an else-if chain warns when its body drops to another line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn pick(flag: bool, other: bool) void {\n" ++
+        "    if (flag) {\n" ++
+        "        one();\n" ++
+        "    } else if (other)\n" ++
+        "        two();\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'two'") != null);
+    try std.testing.expectEqualStrings(" {", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("\n    }", findings[0].fixes[0].edits[1].replacement);
 }
 
 test "braced same-line expression and else-chained ifs stay clean" {
