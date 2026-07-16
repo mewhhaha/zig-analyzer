@@ -105,10 +105,11 @@ point is not that ZLS has no semantic features; it is that syntax-derived
 possibilities and compiler-resolved facts are different answers for heavily
 comptime-driven code.
 
-The [side-by-side comparison gallery](docs/index.html) walks through the exact
-code, request location, and captured response for completion, hover, warnings,
-and compiler errors. Every result names the compared versions and links back to
-its checked-in fixture.
+The [side-by-side comparison gallery](https://mewhhaha.github.io/zig-analyzer/)
+walks through the exact code, request location, and captured response for
+completion, hover, warnings, and compiler errors. Every result names the
+compared versions and links back to its checked-in fixture. Its source is in
+[`docs/index.html`](docs/index.html); run `just docs` to view it locally.
 
 ## Useful diagnostics, not just completion
 
