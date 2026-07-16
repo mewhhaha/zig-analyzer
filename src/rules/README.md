@@ -1,14 +1,16 @@
 # Rule architecture
 
 `analysis.zig` is the stable public facade. Rule implementation lives in this
-directory and receives a tokenized document through `RuleRun`; rules never
-read files, publish LSP messages, or apply edits themselves.
+directory and receives a tokenized document through `RuleRun`; rules never read
+files, publish LSP messages, or apply edits themselves.
 
-Add an independent rule in four places:
+Add an independent rule in these places:
 
-1. Add its stable identifier, code, tier, and minimum profile to `types.zig`.
+1. Add its `snake_case` identifier to `types.zig`; the stable kebab-case code is
+   derived from that name. Add a tier or minimum profile only when the default
+   opt-in style policy is not appropriate.
 2. Add `<rule-code>.zig` with a `pub fn run(run: RuleRun) !void` entry point.
-3. Register that module in `registry.zig` in deterministic diagnostic order.
+3. Add the module once to `registry.zig`'s ordered `rule_modules` tuple.
 4. Keep positive, negative, suppression, and fix tests beside the rule.
 
 `RuleRun.emit` applies severity and source suppression uniformly. A rule owns
@@ -33,3 +35,8 @@ same proof.
 files. It receives normalized relative paths and complete source text from the
 CLI scanner. File-local runners must not infer build reachability or compare
 compile configurations from a single document.
+
+Each stable rule code has a neighboring `<rule-code>.md` page, linked from
+`RULES.md`. A unit test requires one document, index link, and why/when section
+per `Rule` member, so adding a rule is incomplete until its user-facing
+rationale is documented.

@@ -96,90 +96,7 @@ pub const Rule = enum {
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
-            .unresolved_call => "unresolved-call",
-            .missing_switch_prong => "missing-switch-prong",
-            .missing_struct_field => "missing-struct-field",
-            .never_mutated_var => "never-mutated-var",
-            .unreleased_allocation => "unreleased-allocation",
-            .defer_cleanup_in_loop => "defer-cleanup-in-loop",
-            .error_value_comparison => "error-value-comparison",
-            .discarded_error => "discarded-error",
-            .redundant_bool_comparison => "redundant-bool-comparison",
-            .redundant_boolean_if => "redundant-boolean-if",
-            .non_exhaustive_switch_else => "non-exhaustive-switch-else",
-            .non_idiomatic_name => "non-idiomatic-name",
-            .unsorted_imports => "unsorted-imports",
-            .needless_cast => "needless-cast",
-            .needless_else_after_terminator => "needless-else-after-terminator",
-            .needless_empty_else => "needless-empty-else",
-            .mixed_bitwise_arithmetic => "mixed-bitwise-arithmetic",
-            .unused_private_declaration => "unused-private-declaration",
-            .cleanup_after_fallible_operation => "cleanup-after-fallible-operation",
-            .mismatched_allocation_release => "mismatched-allocation-release",
-            .double_release => "double-release",
-            .use_after_release => "use-after-release",
-            .overwritten_owning_value => "overwritten-owning-value",
-            .unsafe_catch_unreachable => "unsafe-catch-unreachable",
-            .lost_error_context => "lost-error-context",
-            .missing_resource_cleanup => "missing-resource-cleanup",
-            .undefined_value_escape => "undefined-value-escape",
-            .unknown_comptime_member => "unknown-comptime-member",
-            .constant_comptime_condition => "constant-comptime-condition",
-            .vague_type_name => "vague-type-name",
-            .redundant_qualified_name => "redundant-qualified-name",
-            .underscore_private_name => "underscore-private-name",
-            .non_idiomatic_file_name => "non-idiomatic-file-name",
-            .doc_comment_style => "doc-comment-style",
-            .public_declaration_docs => "public-declaration-docs",
-            .prefer_optional_capture => "prefer-optional-capture",
-            .prefer_try => "prefer-try",
-            .prefer_testing_expect_equal => "prefer-testing-expect-equal",
-            .mutable_pointer_parameter => "mutable-pointer-parameter",
-            .redundant_comptime => "redundant-comptime",
-            .redundant_inline => "redundant-inline",
-            .needless_defer_block => "needless-defer-block",
-            .non_exhaustive_error_switch => "non-exhaustive-error-switch",
-            .duplicate_import => "duplicate-import",
-            .unused_import => "unused-import",
-            .redundant_import_path => "redundant-import-path",
-            .redundant_type_qualification => "redundant-type-qualification",
-            .prefer_anonymous_initializer => "prefer-anonymous-initializer",
-            .returning_local_slice => "returning-local-slice",
-            .unsafe_orelse_unreachable => "unsafe-orelse-unreachable",
-            .redundant_optional_unwrap => "redundant-optional-unwrap",
-            .prefer_testing_expect_equal_strings => "prefer-testing-expect-equal-strings",
-            .invalidated_container_view => "invalidated-container-view",
-            .returning_deinitialized_view => "returning-deinitialized-view",
-            .returning_arena_allocation => "returning-arena-allocation",
-            .invalidated_element_pointer => "invalidated-element-pointer",
-            .defer_uses_reassigned_binding => "defer-uses-reassigned-binding",
-            .error_collapsed_to_absence => "error-collapsed-to-absence",
-            .allocation_size_overflow => "allocation-size-overflow",
-            .resource_cleanup_on_error_only => "resource-cleanup-on-error-only",
-            .iterator_invalidated_during_loop => "iterator-invalidated-during-loop",
-            .prefer_testing_expect_equal_slices => "prefer-testing-expect-equal-slices",
-            .prefer_testing_expect_error => "prefer-testing-expect-error",
-            .prefer_testing_expect_approx => "prefer-testing-expect-approx",
-            .prefer_optional_presence_test => "prefer-optional-presence-test",
-            .redundant_error_capture => "redundant-error-capture",
-            .needless_switch_else_capture => "needless-switch-else-capture",
-            .prefer_sentinel_termination => "prefer-sentinel-termination",
-            .duplicate_c_import => "duplicate-c-import",
-            .unreferenced_test_file => "unreferenced-test-file",
-            .conflicting_build_options => "conflicting-build-options",
-            .duplicate_module_import => "duplicate-module-import",
-            .returning_released_value => "returning-released-value",
-            .inclusive_index_bound => "inclusive-index-bound",
-            .unsigned_reverse_loop => "unsigned-reverse-loop",
-            .missing_errdefer => "missing-errdefer",
-            .aliased_memcpy => "aliased-memcpy",
-            .negated_comptime_expression => "negated-comptime-expression",
-            .usize_in_packed_struct => "usize-in-packed-struct",
-            .unbraced_multiline_if => "unbraced-multiline-if",
-            .unconditional_busy_loop => "unconditional-busy-loop",
-            .banned_identifier => "banned-identifier",
-            .truncating_intcast => "truncating-intcast",
-            .padded_byte_compare => "padded-byte-compare",
+            inline else => |known_rule| derivedRuleCode(@tagName(known_rule)),
         };
     }
 
@@ -345,3 +262,60 @@ pub const RelatedSpan = struct {
     span: std.zig.Token.Loc,
     message: []const u8,
 };
+
+fn derivedRuleCode(comptime enum_name: []const u8) []const u8 {
+    const code = comptime code: {
+        var code_bytes: [enum_name.len]u8 = undefined;
+        for (enum_name, 0..) |byte, index| {
+            code_bytes[index] = if (byte == '_') '-' else byte;
+        }
+        break :code code_bytes;
+    };
+    return &code;
+}
+
+test "rule codes follow enum names" {
+    try std.testing.expectEqualStrings("missing-switch-prong", Rule.missing_switch_prong.code());
+    try std.testing.expectEqualStrings("padded-byte-compare", Rule.padded_byte_compare.code());
+}
+
+test "rule reference documents every rule" {
+    @setEvalBranchQuota(10_000);
+    const reference = @embedFile("RULES.md");
+    try std.testing.expectEqual(
+        std.meta.fields(Rule).len,
+        std.mem.count(u8, reference, "\n- [`"),
+    );
+
+    for (std.enums.values(Rule)) |rule| {
+        var heading_bytes: [128]u8 = undefined;
+        const link = try std.fmt.bufPrint(&heading_bytes, "]({s}.md)", .{rule.code()});
+        if (std.mem.count(u8, reference, link) != 1) {
+            std.debug.print("rule reference needs exactly one '{s}' link\n", .{link});
+            return error.IncompleteRuleReference;
+        }
+    }
+
+    inline for (std.meta.fields(Rule)) |enum_field| {
+        const document = @embedFile(comptime derivedRuleDocumentPath(enum_field.name));
+        if (std.mem.indexOf(u8, document, "**Why it matters.**") == null or
+            std.mem.indexOf(u8, document, "**When it matters.**") == null)
+        {
+            std.debug.print("rule document '{s}' needs why and when explanations\n", .{enum_field.name});
+            return error.IncompleteRuleReference;
+        }
+    }
+}
+
+fn derivedRuleDocumentPath(comptime enum_name: []const u8) []const u8 {
+    const extension = ".md";
+    const path = comptime path: {
+        var path_bytes: [enum_name.len + extension.len]u8 = undefined;
+        for (enum_name, 0..) |byte, index| {
+            path_bytes[index] = if (byte == '_') '-' else byte;
+        }
+        for (extension, 0..) |byte, index| path_bytes[enum_name.len + index] = byte;
+        break :path path_bytes;
+    };
+    return &path;
+}

@@ -6,6 +6,7 @@ const backend_bootstrap = @import("backend_bootstrap.zig");
 const compiler_session = @import("compiler_session.zig");
 const document_module = @import("document.zig");
 const language_hover = @import("language_hover.zig");
+const hover = @import("hover.zig");
 const syntax_types = @import("syntax_types.zig");
 const action_lsp = @import("actions/lsp_adapter.zig");
 const project_actions = @import("actions/project.zig");
@@ -316,16 +317,23 @@ pub const Server = struct {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
         const token = document.tokenAt(document.byteOffset(params.position)) orelse return null;
         const spelling = document.source[token.loc.start..token.loc.end];
-        const description = if (try language_hover.describe(arena, spelling, token.tag)) |language| HoverDescription{
+        const description = if (try language_hover.describe(arena, spelling, token.tag)) |language| hover.Content{
             .declaration = language.syntax,
             .type_summary = language.category,
-            .documentation = try language.renderDocumentation(arena),
+            .documentation = language.summary,
+            .reference = .{
+                .label = "Zig language reference",
+                .url = language.reference,
+            },
         } else if (token.tag == .identifier)
             try server.hoverDescription(arena, document, token.loc) orelse return null
         else
             return null;
         return .{
-            .contents = .{ .markup_content = .{ .kind = .markdown, .value = try description.render(arena) } },
+            .contents = .{ .markup_content = .{
+                .kind = .markdown,
+                .value = try hover.default_markdown_renderer.render(arena, description),
+            } },
             .range = document.range(token.loc),
         };
     }
@@ -974,7 +982,7 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         document: *const Document,
         identifier_span: std.zig.Token.Loc,
-    ) !?HoverDescription {
+    ) !?hover.Content {
         const name = document.source[identifier_span.start..identifier_span.end];
         if (try server.resolvedShapeForName(allocator, document, name)) |shape| {
             return .{
@@ -1051,7 +1059,7 @@ pub const Server = struct {
         document: *const Document,
         member_span: std.zig.Token.Loc,
         member_name: []const u8,
-    ) !?HoverDescription {
+    ) !?hover.Content {
         const receiver_span = receiverIdentifierSpan(document.source, member_span.start) orelse return null;
         const receiver_bindings = try document.scopedIdentifierSpans(allocator, receiver_span.start) orelse return null;
         if (receiver_bindings.len == 0) return null;
@@ -1088,7 +1096,7 @@ pub const Server = struct {
         document: *const Document,
         identifier_start: usize,
         name: []const u8,
-    ) !?HoverDescription {
+    ) !?hover.Content {
         const import_prefix = "@import(\"std\").";
         const prefix_start = std.mem.lastIndexOf(u8, document.source[0..identifier_start], import_prefix) orelse return null;
         const module_expression = document.source[prefix_start + import_prefix.len .. identifier_start];
@@ -1410,35 +1418,6 @@ const ModuleView = struct {
     members: []const SyntaxMember,
 };
 
-const HoverDescription = struct {
-    declaration: []const u8,
-    type_summary: ?[]const u8 = null,
-    documentation: ?[]const u8 = null,
-
-    fn render(description: HoverDescription, allocator: std.mem.Allocator) ![]const u8 {
-        if (description.type_summary) |type_summary| {
-            if (description.documentation) |documentation| {
-                return try std.fmt.allocPrint(allocator, "```zig\n{s}\n```\n```zig\n({s})\n```\n\n{s}", .{
-                    description.declaration,
-                    type_summary,
-                    documentation,
-                });
-            }
-            return try std.fmt.allocPrint(allocator, "```zig\n{s}\n```\n```zig\n({s})\n```", .{
-                description.declaration,
-                type_summary,
-            });
-        }
-        if (description.documentation) |documentation| {
-            return try std.fmt.allocPrint(allocator, "```zig\n{s}\n```\n\n{s}", .{
-                description.declaration,
-                documentation,
-            });
-        }
-        return try std.fmt.allocPrint(allocator, "```zig\n{s}\n```", .{description.declaration});
-    }
-};
-
 const FunctionLocation = struct {
     document: *const Document,
     declaration: Declaration,
@@ -1526,7 +1505,7 @@ fn describeBinding(
     allocator: std.mem.Allocator,
     source_bytes: []const u8,
     binding_span: std.zig.Token.Loc,
-) !?HoverDescription {
+) !?hover.Content {
     const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
     defer allocator.free(source);
     @memcpy(source, source_bytes);
@@ -1560,7 +1539,7 @@ fn describeCaptureBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
     binding_index: usize,
-) !?HoverDescription {
+) !?hover.Content {
     var iterable_index = binding_index - 1;
     while (iterable_index > 0 and tokens[iterable_index].tag != .r_paren) : (iterable_index -= 1) {}
     if (tokens[iterable_index].tag != .r_paren or iterable_index == 0) return null;
@@ -1585,7 +1564,7 @@ fn describeTypedMemberNamed(
     allocator: std.mem.Allocator,
     source_bytes: []const u8,
     name: []const u8,
-) !?HoverDescription {
+) !?hover.Content {
     const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
     defer allocator.free(source);
     @memcpy(source, source_bytes);
@@ -1603,7 +1582,7 @@ fn describeEnumTagNamed(
     allocator: std.mem.Allocator,
     source_bytes: []const u8,
     name: []const u8,
-) !?HoverDescription {
+) !?hover.Content {
     const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
     defer allocator.free(source);
     @memcpy(source, source_bytes);
@@ -1676,7 +1655,7 @@ fn describeFunctionBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
     binding_index: usize,
-) !HoverDescription {
+) !hover.Content {
     const function_index = binding_index - 1;
     var opening_parenthesis = binding_index + 1;
     while (opening_parenthesis < tokens.len and tokens[opening_parenthesis].tag != .l_paren) : (opening_parenthesis += 1) {}
@@ -1741,7 +1720,7 @@ fn describeVariableBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
     binding_index: usize,
-) !HoverDescription {
+) !hover.Content {
     const declaration_index = binding_index - 1;
     var end_index = binding_index + 1;
     while (end_index < tokens.len and tokens[end_index].tag != .semicolon) : (end_index += 1) {}
@@ -1797,7 +1776,7 @@ fn describeTypedBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
     binding_index: usize,
-) !HoverDescription {
+) !hover.Content {
     const colon_index = binding_index + 1;
     var end_index = colon_index + 1;
     var bracket_depth: usize = 0;

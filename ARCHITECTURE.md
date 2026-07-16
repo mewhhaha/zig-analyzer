@@ -12,7 +12,8 @@ entry points                 main.zig, zig_analyzer.zig
     |
 transport and commands       lsp_server.zig, project_check.zig
     |
-boundary adapters            actions/lsp_adapter.zig, compiler_session.zig
+boundary adapters            actions/lsp_adapter.zig, compiler_session.zig,
+    |                        hover.zig
     |
 public facades/registries    analysis.zig, rules/registry.zig,
     |                        actions/registry.zig
@@ -41,6 +42,8 @@ parts. It contains little policy and should be easy to replace:
   domain types and reports precise boundary errors.
 - `actions/lsp_adapter.zig` is the only action module that converts byte spans
   and URI edits into LSP workspace edits.
+- `hover.zig` renders transport-neutral hover content as Markdown;
+  `language_hover.zig` owns the Zig language catalog rather than presentation.
 - `compiler_session.zig` isolates backend lifetime and stale-generation
   handling from language features.
 
@@ -106,6 +109,8 @@ depend on one unstable abstraction.
 | New multi-file rewrite | `actions/project.zig` |
 | New lint/profile setting | `rules/types.zig` and `rules/configuration.zig` |
 | New compiler query | `compiler_protocol.zig`, client/session boundary, then a domain result |
+| New language hover description | `language_hover.zig` |
+| New hover Markdown layout | `hover.zig` |
 | New LSP representation | `lsp_server.zig` or a focused boundary adapter |
 | New CLI filesystem behavior | `project_check.zig` |
 
@@ -126,5 +131,6 @@ Before merging a structural change:
 - run fixtures, examples, backend tests, and an editor exchange when the
   affected boundary reaches them.
 
-See `src/rules/README.md` and `src/actions/README.md` for the extension
-contracts within each subsystem.
+See [EXTENDING.md](EXTENDING.md) for fork-oriented recipes and
+`src/rules/README.md` and `src/actions/README.md` for the contracts within each
+subsystem.

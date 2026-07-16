@@ -156,9 +156,11 @@ So: not the production comptime-aware Zig language server, but a working
 argument that asking the compiler beats reimplementing it. If someone wants to
 build the real one, this is a usable starting point and it's MIT licensed.
 Fork it, rip out whatever you don't like, keep the rules if they're useful.
-[ARCHITECTURE.md](ARCHITECTURE.md) has the module boundaries and
-[`src/rules/README.md`](src/rules/README.md) has the rule contract. You don't
-need to ask permission.
+[ARCHITECTURE.md](ARCHITECTURE.md) has the module boundaries,
+[EXTENDING.md](EXTENDING.md) has fork-oriented recipes, and
+[`src/rules/README.md`](src/rules/README.md) has the rule contract. The
+[rule reference](src/rules/RULES.md) explains what every diagnostic reports,
+why it matters, and when it is appropriate. You don't need to ask permission.
 
 ## Try it
 

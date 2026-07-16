@@ -6,6 +6,10 @@ expression, ownership, language, and testing families. Each candidate contains
 a complete set of byte edits; the LSP boundary converts them to UTF-16 workspace
 edits without a resolve request.
 
+Add an action to the closest existing family. A genuinely new family is
+registered once in `registry.zig`'s ordered `action_modules` tuple; the tuple is
+the composition order and the test-import list.
+
 An action must establish its preconditions before appearing. Syntax facts are
 enough for explicit error sets, optional annotations, allocator provenance,
 format literals, and simple build declarations. Tagged-union materialization and
