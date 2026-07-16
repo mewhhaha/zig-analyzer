@@ -11,6 +11,7 @@ test {
     _ = @import("diagnostics/action_results.zig");
     _ = @import("zls/imports/main.zig");
     _ = @import("zls/hover.zig");
+    _ = @import("zls/language_hover.zig");
     _ = @import("zls/scoped_rename.zig");
     _ = @import("zls/stdlib_completion.zig");
     _ = @import("zls/struct_fields.zig");

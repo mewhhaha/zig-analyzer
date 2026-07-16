@@ -97,6 +97,13 @@ comment, and the bounded constant value. The field, import, and standard-library
 examples also provide contextual hover information for `display_name`,
 `clampToLimit`, and `eql` respectively.
 
+Use `zls/language_hover.zig` to compare reference hover. Hover `const`, `bool`,
+`true`, `@sizeOf`, and the statement terminators. zig-analyzer documents Zig
+language tokens as well as declarations. The pinned ZLS comparison documents
+`@sizeOf` and gives compact type/value summaries for `bool` and `true`, but it
+returns no hover for `const` and no language-level explanation for the
+statement terminator.
+
 Hover also follows an inferred local initialized by a function call when the
 function has an explicit return type. Imported dotted types, nested namespace
 aliases, and private backing structs are followed to the final field, so a field
