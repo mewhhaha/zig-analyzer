@@ -4139,6 +4139,7 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     var transport = TestTransport.init(&incoming);
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     server.compiler_start_attempted = true;
+    server.compiler_restart_available = false;
     defer server.deinit();
 
     try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);

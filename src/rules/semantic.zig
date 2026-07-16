@@ -2202,7 +2202,8 @@ fn findNeedlessElse(
         if (tokens[else_index - 1].tag != .r_brace) continue;
         const preceding_open = matchingOpeningToken(tokens, else_index - 1, .l_brace, .r_brace) orelse continue;
         // A loop's else runs when the loop exits without break, so it is never removable.
-        if (!precedingBlockIsIfBranch(tokens, preceding_open)) continue;
+        if (!precedingBlockIsIfStatement(tokens, preceding_open)) continue;
+        if (blockBelongsToElseIf(tokens, preceding_open)) continue;
         if (!blockAlwaysTerminates(tokens, preceding_open, else_index - 1)) continue;
         const else_close = matchingToken(tokens, else_index + 1, .l_brace, .r_brace) orelse continue;
         const edits = try allocator.alloc(Edit, 2);
@@ -2220,17 +2221,32 @@ fn findNeedlessElse(
     }
 }
 
-fn precedingBlockIsIfBranch(tokens: []const std.zig.Token, opening: usize) bool {
+fn precedingBlockIsIfStatement(tokens: []const std.zig.Token, opening: usize) bool {
+    const condition_open = ifConditionOpenForBlock(tokens, opening) orelse return false;
+    if (condition_open < 2) return false;
+    return switch (tokens[condition_open - 2].tag) {
+        .l_brace, .r_brace, .semicolon => true,
+        else => false,
+    };
+}
+
+fn blockBelongsToElseIf(tokens: []const std.zig.Token, opening: usize) bool {
+    const condition_open = ifConditionOpenForBlock(tokens, opening) orelse return false;
+    return condition_open >= 2 and tokens[condition_open - 2].tag == .keyword_else;
+}
+
+fn ifConditionOpenForBlock(tokens: []const std.zig.Token, opening: usize) ?usize {
     var cursor = opening;
     if (cursor > 0 and tokens[cursor - 1].tag == .pipe) {
         cursor -= 1;
         while (cursor > 0 and tokens[cursor - 1].tag != .pipe) cursor -= 1;
-        if (cursor == 0) return false;
+        if (cursor == 0) return null;
         cursor -= 1;
     }
-    if (cursor == 0 or tokens[cursor - 1].tag != .r_paren) return false;
-    const condition_open = matchingOpeningToken(tokens, cursor - 1, .l_paren, .r_paren) orelse return false;
-    return condition_open > 0 and tokens[condition_open - 1].tag == .keyword_if;
+    if (cursor == 0 or tokens[cursor - 1].tag != .r_paren) return null;
+    const condition_open = matchingOpeningToken(tokens, cursor - 1, .l_paren, .r_paren) orelse return null;
+    if (condition_open == 0 or tokens[condition_open - 1].tag != .keyword_if) return null;
+    return condition_open;
 }
 
 fn blockAlwaysTerminates(tokens: []const std.zig.Token, opening: usize, closing: usize) bool {
@@ -2302,14 +2318,18 @@ fn findNonIdiomaticNames(
         const is_type = declaration_tag == .keyword_const and
             declarationNamesType(source, tokens, index, &type_declaring_names);
         const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index);
-        const idiomatic = if (type_function or is_type and !is_namespace)
+        const idiomatic = if (is_namespace)
+            isSnakeCase(name) or isTitleCase(name)
+        else if (type_function or is_type)
             isTitleCase(name)
         else if (declaration_tag == .keyword_fn)
             isCamelCase(name)
         else
             isSnakeCase(name);
         if (idiomatic) continue;
-        const convention = if (type_function or is_type and !is_namespace)
+        const convention = if (is_namespace)
+            "snake_case or TitleCase"
+        else if (type_function or is_type)
             "TitleCase"
         else if (declaration_tag == .keyword_fn)
             "camelCase"
@@ -2332,7 +2352,13 @@ fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: u
     else
         identifier_index + 2;
     return switch (tokens[initializer_index].tag) {
-        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => true,
+        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => type: {
+            var opening = initializer_index + 1;
+            while (opening < tokens.len and tokens[opening].tag != .l_brace and tokens[opening].tag != .semicolon) : (opening += 1) {}
+            if (opening >= tokens.len or tokens[opening].tag != .l_brace) break :type false;
+            const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse break :type false;
+            break :type closing + 1 < tokens.len and tokens[closing + 1].tag == .semicolon;
+        },
         // 'error{...}' declares an error-set type; 'error.Name' is a value.
         .keyword_error => initializer_index + 1 < tokens.len and tokens[initializer_index + 1].tag == .l_brace,
         else => false,
@@ -2347,12 +2373,20 @@ fn declarationNamesType(
 ) bool {
     if (declarationInitializesType(tokens, identifier_index)) return true;
     if (initializerMergesErrorSets(tokens, identifier_index)) return true;
+    if (identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
+    const initializer_index = identifier_index + 2;
+    if (tokens[initializer_index].tag == .asterisk and initializer_index + 2 < tokens.len and
+        tokens[initializer_index + 1].tag == .keyword_const and tokens[initializer_index + 2].tag == .keyword_fn) return true;
+    if (tokens[initializer_index].tag == .identifier) {
+        const initializer = tokenText(source, tokens[initializer_index]);
+        if (tokenNamesPrimitiveType(initializer)) return true;
+    }
     if (identifier_index + 3 < tokens.len and tokens[identifier_index + 1].tag == .equal and
         tokens[identifier_index + 2].tag == .builtin and tokens[identifier_index + 3].tag == .l_paren)
     {
         const builtin_name = tokenText(source, tokens[identifier_index + 2]);
         const type_builtins = [_][]const u8{
-            "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple",
+            "@This", "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple",
         };
         for (type_builtins) |name| if (std.mem.eql(u8, builtin_name, name)) return true;
         if (std.mem.eql(u8, builtin_name, "@import")) {
@@ -2366,6 +2400,15 @@ fn declarationNamesType(
             if (target_index > import_end and target_index + 1 < tokens.len and
                 tokens[target_index + 1].tag == .semicolon and isTitleCase(tokenText(source, tokens[target_index]))) return true;
         }
+    }
+    const declaration_end = statementEnd(tokens, identifier_index) orelse return false;
+    const declaration_name = tokenText(source, tokens[identifier_index]);
+    const declares_error_type = std.mem.eql(u8, declaration_name, "Error") or std.mem.endsWith(u8, declaration_name, "Error");
+    for (tokens[initializer_index..declaration_end], initializer_index..) |token, index| {
+        const name = tokenText(source, token);
+        if (std.mem.eql(u8, name, "error") and index + 1 < declaration_end and tokens[index + 1].tag == .l_brace) return true;
+        if (declares_error_type and token.tag == .identifier and
+            (std.mem.eql(u8, name, "Error") or std.mem.endsWith(u8, name, "Error"))) return true;
     }
     if (identifier_index + 3 < tokens.len and tokens[identifier_index + 1].tag == .equal and
         tokens[identifier_index + 2].tag == .builtin and
@@ -2418,12 +2461,19 @@ fn initializerMergesErrorSets(tokens: []const std.zig.Token, identifier_index: u
     return false;
 }
 
+fn tokenNamesPrimitiveType(name: []const u8) bool {
+    const named = [_][]const u8{ "anyerror", "anyopaque", "bool", "comptime_float", "comptime_int", "f16", "f32", "f64", "f80", "f128", "isize", "noreturn", "type", "usize", "void" };
+    for (named) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    if (name.len < 2 or (name[0] != 'i' and name[0] != 'u')) return false;
+    for (name[1..]) |character| if (!std.ascii.isDigit(character)) return false;
+    return true;
+}
+
 /// 'pub const _foreign_name = lib._foreign_name;' re-exports a declaration
 /// under its original name, which this file does not get to choose.
 fn declarationIsSameNameAlias(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
     if (identifier_index + 3 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
-    var end = identifier_index + 2;
-    while (end < tokens.len and tokens[end].tag != .semicolon) : (end += 1) {}
+    const end = statementEnd(tokens, identifier_index) orelse return false;
     if (end >= tokens.len or end < identifier_index + 4 or tokens[end - 1].tag != .identifier or
         tokens[end - 2].tag != .period) return false;
     const name = tokenText(source, tokens[identifier_index]);
@@ -2458,6 +2508,7 @@ fn declarationKeywordStartsStatement(tokens: []const std.zig.Token, keyword_inde
 }
 
 fn declarationIsNamespace(tokens: []const std.zig.Token, identifier_index: usize) bool {
+    if (!declarationInitializesType(tokens, identifier_index)) return false;
     if (identifier_index + 3 >= tokens.len or tokens[identifier_index + 1].tag != .equal or
         tokens[identifier_index + 2].tag != .keyword_struct or tokens[identifier_index + 3].tag != .l_brace) return false;
     const closing = matchingToken(tokens, identifier_index + 3, .l_brace, .r_brace) orelse return false;
@@ -2539,7 +2590,8 @@ fn findOfficialStyleIssues(
                 ),
             });
         }
-        if (vague_level != .off and declaration_tag == .keyword_const and declarationInitializesType(tokens, index)) {
+        const public_declaration = index >= 2 and tokens[index - 2].tag == .keyword_pub;
+        if (vague_level != .off and public_declaration and declaration_tag == .keyword_const and declarationInitializesType(tokens, index)) {
             if (vagueTypeWord(name)) |word| {
                 try addFinding(allocator, source, configuration, found, .{
                     .rule = .vague_type_name,
@@ -2894,6 +2946,14 @@ fn findPointerParameterIdioms(
                 tokens[parameter_index + 2].tag != .asterisk or tokens[parameter_index + 3].tag != .identifier) continue;
             const parameter_name = tokenText(source, tokens[parameter_index]);
             if (!pointerParameterReadOnly(source, tokens, parameter_name, body_open, body_close)) continue;
+            if (pointerParameterMayOwnMutableParameter(
+                source,
+                tokens,
+                parameter_index,
+                parameters_end,
+                body_open,
+                body_close,
+            )) continue;
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{ .span = tokens[parameter_index + 2].loc, .replacement = "*const " };
             const fixes = try allocator.alloc(Fix, 1);
@@ -2911,6 +2971,49 @@ fn findPointerParameterIdioms(
             });
         }
     }
+}
+
+fn pointerParameterMayOwnMutableParameter(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    owner_parameter_index: usize,
+    parameters_end: usize,
+    body_open: usize,
+    body_close: usize,
+) bool {
+    const owner_type = tokenText(source, tokens[owner_parameter_index + 3]);
+    var parameter_index = owner_parameter_index + 4;
+    while (parameter_index + 3 < parameters_end) : (parameter_index += 1) {
+        if (tokens[parameter_index].tag != .identifier or tokens[parameter_index + 1].tag != .colon or
+            tokens[parameter_index + 2].tag != .asterisk or tokens[parameter_index + 3].tag != .identifier) continue;
+        const mutable_parameter_name = tokenText(source, tokens[parameter_index]);
+        if (pointerParameterReadOnly(source, tokens, mutable_parameter_name, body_open, body_close)) continue;
+        const mutable_parameter_type = tokenText(source, tokens[parameter_index + 3]);
+        if (structContainsFieldType(source, tokens, owner_type, mutable_parameter_type)) return true;
+    }
+    return false;
+}
+
+fn structContainsFieldType(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    owner_type: []const u8,
+    field_type: []const u8,
+) bool {
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(source, token, owner_type) or index == 0 or index + 3 >= tokens.len) continue;
+        if (tokens[index - 1].tag != .keyword_const or tokens[index + 1].tag != .equal or
+            tokens[index + 2].tag != .keyword_struct or tokens[index + 3].tag != .l_brace) continue;
+        const body_close = matchingToken(tokens, index + 3, .l_brace, .r_brace) orelse return false;
+        var depth: usize = 1;
+        for (tokens[index + 4 .. body_close]) |field_token| {
+            if (field_token.tag == .l_brace) depth += 1;
+            if (field_token.tag == .r_brace) depth -= 1;
+            if (depth == 1 and field_token.tag == .identifier and tokenIs(source, field_token, field_type)) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn pointerParameterReadOnly(
@@ -2932,6 +3035,11 @@ fn pointerParameterReadOnly(
         // 'switch (param.field)' with a '|*capture|' prong mutates through the operand.
         if (index >= 2 and tokens[index - 1].tag == .l_paren and tokens[index - 2].tag == .keyword_switch and
             switchHasPointerCapture(tokens, index - 1, body_close)) return false;
+        const address_taken = index > body_open and tokens[index - 1].tag == .ampersand or
+            index > body_open + 1 and tokens[index - 1].tag == .l_paren and tokens[index - 2].tag == .ampersand;
+        if (address_taken) return false;
+        if (usedByMutableSwitchCapture(tokens, index)) return false;
+        if (parameterUseIsWithinLoop(tokens, index)) return false;
         var cursor = index + 1;
         while (cursor < body_close) {
             switch (tokens[cursor].tag) {
@@ -2952,6 +3060,9 @@ fn pointerParameterReadOnly(
                 else => break,
             }
         }
+        if (cursor + 3 < body_close and tokens[cursor].tag == .r_paren and
+            tokens[cursor + 1].tag == .pipe and tokens[cursor + 2].tag == .asterisk and
+            tokens[cursor + 3].tag == .identifier) return false;
         if (cursor == index + 1) return false;
         if (cursor < body_close and (isAssignment(tokens[cursor].tag) or tokens[cursor].tag == .l_paren)) return false;
     }
@@ -2964,6 +3075,19 @@ fn switchHasPointerCapture(tokens: []const std.zig.Token, condition_open: usize,
     const body_close = matchingToken(tokens, condition_close + 1, .l_brace, .r_brace) orelse return false;
     for (tokens[condition_close + 2 .. @min(body_close, limit)], condition_close + 2..) |token, index| {
         if (token.tag == .pipe and index + 1 < limit and tokens[index + 1].tag == .asterisk) return true;
+    }
+    return false;
+}
+
+fn parameterUseIsWithinLoop(tokens: []const std.zig.Token, use_index: usize) bool {
+    var cursor = use_index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .l_paren => if (cursor > 0 and tokens[cursor - 1].tag == .keyword_for) return true,
+            .l_brace, .r_brace, .semicolon => return false,
+            else => {},
+        }
     }
     return false;
 }
@@ -3807,6 +3931,25 @@ test "scope-sensitive quick fixes are excluded from fix all" {
     try std.testing.expectEqual(@as(usize, 2), checked);
 }
 
+test "else after one terminating branch stays inside an else-if chain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn scan(first: bool, second: bool) void {\n" ++
+        "    if (first) { consume(); } else if (second) { return; } else { consume(); }\n" ++
+        "}\n" ++
+        "fn simple(first: bool) void { if (first) { return; } else { consume(); } }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var warning_count: usize = 0;
+    for (found) |finding| if (finding.rule == .needless_else_after_terminator) {
+        warning_count += 1;
+        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn simple").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), warning_count);
+}
+
 test "configuration reports the removed formatting profile and still loads lints" {
     const configuration = try parseConfiguration(std.testing.allocator,
         \\{"format":{"profile":"analyzer","organizeImports":true},"lints":{"profile":"idiomatic"}}
@@ -3832,13 +3975,16 @@ test "lint profiles enable official idiomatic and strict rules incrementally" {
     try std.testing.expectEqual(Level.information, idiomatic.level(.redundant_boolean_if));
     try std.testing.expectEqual(Level.information, idiomatic.level(.needless_defer_block));
     try std.testing.expectEqual(Level.information, idiomatic.level(.needless_empty_else));
-    try std.testing.expectEqual(Level.information, idiomatic.level(.unsafe_orelse_unreachable));
+    try std.testing.expectEqual(Level.off, idiomatic.level(.unsafe_orelse_unreachable));
     try std.testing.expectEqual(Level.information, idiomatic.level(.redundant_optional_unwrap));
     try std.testing.expectEqual(Level.off, idiomatic.level(.public_declaration_docs));
 
     const strict = try parseConfiguration(std.testing.allocator,
         \\{"lints":{"profile":"strict"}}
     );
+    try std.testing.expectEqual(Level.information, strict.level(.unsafe_orelse_unreachable));
+    try std.testing.expectEqual(Level.information, strict.level(.lost_error_context));
+    try std.testing.expectEqual(Level.information, strict.level(.error_collapsed_to_absence));
     try std.testing.expectEqual(Level.information, strict.level(.public_declaration_docs));
 }
 
@@ -3847,7 +3993,7 @@ test "official style rules describe names namespaces and documentation" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "const json = struct { pub const JsonValue = union(enum) { string: []const u8 }; };\n" ++
-        "const RequestData = struct {};\n" ++
+        "pub const Data = struct {};\n" ++
         "const _internal = 1;\n" ++
         "/// runTask runs a task.\n" ++
         "pub fn runTask() void {}\n" ++
@@ -3887,6 +4033,7 @@ test "naming resolves type functions aliases and namespace structs" {
         "const ReflectedType = @typeInfo(@TypeOf(generated_type)).@\"fn\".return_type.?;\n" ++
         "const ImportedType = @import(\"types.zig\").ImportedType;\n" ++
         "const parseConfiguration = semantic.parseConfiguration;\n" ++
+        "const styleAt = struct { fn styleAt(_: usize) void {} }.styleAt;\n" ++
         "const BadNamespace = struct { pub const value = 1; };\n" ++
         "fn generated_type() type { return struct { value: u32 }; }\n";
     var configuration = Configuration.defaults();
@@ -3896,7 +4043,7 @@ test "naming resolves type functions aliases and namespace structs" {
     for (found) |finding| {
         if (finding.rule == .non_idiomatic_name) naming_count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 3), naming_count);
+    try std.testing.expectEqual(@as(usize, 2), naming_count);
 }
 
 test "idiomatic rewrites are offered only for mechanically bounded forms" {
@@ -4258,6 +4405,50 @@ test "pointer parameters mutated through nested members or subscripts stay mutab
     for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
         pointer_count += 1;
         try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn observe").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), pointer_count);
+}
+
+test "pointer parameters mutated through captures or returned pointers stay mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = union(enum) { value: u32 };\n" ++
+        "const Store = struct { values: []u32, state: State };\n" ++
+        "fn update(store: *Store) void { switch (store.state) { .value => |*value| value.* += 1 } }\n" ++
+        "fn clear(store: *Store) void { for (store.values) |*value| value.* = 0; }\n" ++
+        "fn first(store: *Store) *u32 { return &store.values[0]; }\n" ++
+        "fn observe(store: *Store) usize { return store.values.len; }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var pointer_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .mutable_pointer_parameter) pointer_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), pointer_count);
+}
+
+test "pointer owner stays mutable when another parameter mutates its field type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const OwnedConfiguration = struct { compiled: bool };\n" ++
+        "const Highlighter = struct {\n" ++
+        "    configurations: []OwnedConfiguration,\n" ++
+        "    fn compileConfiguration(self: *Highlighter, owned: *OwnedConfiguration) void {\n" ++
+        "        _ = self.configurations.len;\n" ++
+        "        owned.compiled = true;\n" ++
+        "    }\n" ++
+        "    fn count(self: *Highlighter) usize { return self.configurations.len; }\n" ++
+        "};\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var pointer_count: usize = 0;
+    for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
+        pointer_count += 1;
+        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn count").?);
     };
     try std.testing.expectEqual(@as(usize, 1), pointer_count);
 }
@@ -4672,6 +4863,22 @@ test "a loop else runs on normal exit and is never needless" {
     for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
 }
 
+test "else in a switch prong remains part of the if expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(order: std.math.Order, found: bool) u8 {\n" ++
+        "    return switch (order) {\n" ++
+        "        .gt => if (found) { return 1; } else { return 2; },\n" ++
+        "        else => 0,\n" ++
+        "    };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
+}
+
 test "inline else is exhaustive by construction" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4737,7 +4944,7 @@ test "compound Context and State names describe their role" {
     const source: [:0]const u8 =
         "const LookupContext = struct { key: u32 };\n" ++
         "const CheckpointState = struct { op: u64 };\n" ++
-        "const Context = struct { key: u32 };\n";
+        "pub const Context = struct { key: u32 };\n";
     var configuration = Configuration.defaults();
     configuration.levels[@intFromEnum(Rule.vague_type_name)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);

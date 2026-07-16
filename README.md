@@ -186,6 +186,9 @@ Configure severities in `zig-analyzer.json`:
 
 ```json
 {
+  "check": {
+    "exclude": ["tests/syntax-fixtures"]
+  },
   "lints": {
     "profile": "idiomatic",
     "correctness": "warning",
@@ -204,6 +207,11 @@ optional `hint` appended to the diagnostic. Configuring a non-empty list turns
 the `banned-identifier` rule on at warning severity; `lints.rules` can still
 pick another severity.
 
+`check.exclude` accepts project-relative files or directories. It is intended
+for syntax, highlighting, and parser fixtures that deliberately contain code
+which does not resolve; excluded paths are omitted only from recursive
+`zig-analyzer check` scans.
+
 The profiles are cumulative:
 
 - `official` implements Zig's documented naming, fully-qualified namespace,
@@ -211,9 +219,10 @@ The profiles are cumulative:
 - `idiomatic` adds optional captures, direct `try` propagation, testing
   expectations, const pointer contracts, error-switch expansion, import
   cleanup, result-location initializers, conservative comptime cleanup,
-  optional-capture reuse, direct boolean expressions, compact defer forms, and
-  explicit warnings for `orelse unreachable`.
-- `strict` also requires documentation on public declarations.
+  optional-capture reuse, direct boolean expressions, and compact defer forms.
+- `strict` also requires documentation on public declarations and enables
+  policy-heavy warnings for collapsed or remapped errors, vague public type
+  names, and `catch`/`orelse unreachable` assertions.
 
 For example, the idiomatic profile diagnoses and offers explicit rewrites for:
 
