@@ -5,6 +5,7 @@ const analysis = @import("analysis.zig");
 const backend_bootstrap = @import("backend_bootstrap.zig");
 const compiler_session = @import("compiler_session.zig");
 const document_module = @import("document.zig");
+const syntax_types = @import("syntax_types.zig");
 const action_lsp = @import("actions/lsp_adapter.zig");
 const project_actions = @import("actions/project.zig");
 const zig_actions = @import("actions/registry.zig");
@@ -996,6 +997,9 @@ pub const Server = struct {
                     return try describeBinding(allocator, document.source, member.span);
                 }
             }
+            if (try server.inferredMemberHover(allocator, document, identifier_span, name)) |description| {
+                return description;
+            }
             if (std.mem.eql(u8, name, "len")) {
                 return .{ .declaration = "len: usize", .type_summary = "usize" };
             }
@@ -1015,13 +1019,62 @@ pub const Server = struct {
             }
         }
         if (try document.scopedIdentifierSpans(allocator, identifier_span.start)) |spans| {
-            if (spans.len != 0) return try describeBinding(allocator, document.source, spans[0]);
+            if (spans.len != 0) {
+                if (try describeBinding(allocator, document.source, spans[0])) |binding| {
+                    var description = binding;
+                    if (description.type_summary == null) {
+                        description.type_summary = try syntax_types.inferredBindingType(
+                            allocator,
+                            document.source,
+                            spans[0],
+                        );
+                    }
+                    return description;
+                }
+            }
         }
         if (document.declarationNamed(name)) |declaration| {
             return try describeBinding(allocator, document.source, declaration.span);
         }
         if (try describeTypedMemberNamed(allocator, document.source, name)) |description| return description;
         return try describeEnumTagNamed(allocator, document.source, name);
+    }
+
+    fn inferredMemberHover(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        member_span: std.zig.Token.Loc,
+        member_name: []const u8,
+    ) !?HoverDescription {
+        const receiver_span = receiverIdentifierSpan(document.source, member_span.start) orelse return null;
+        const receiver_bindings = try document.scopedIdentifierSpans(allocator, receiver_span.start) orelse return null;
+        if (receiver_bindings.len == 0) return null;
+        const inferred_type = try syntax_types.inferredBindingType(
+            allocator,
+            document.source,
+            receiver_bindings[0],
+        ) orelse return null;
+        const type_name = namedTypeExpression(inferred_type) orelse return null;
+        if (std.mem.indexOfScalar(u8, type_name, '.')) |separator| {
+            const import_alias = type_name[0..separator];
+            if (try server.moduleView(allocator, document, import_alias)) |view| {
+                const field_span = try syntax_types.memberSpan(
+                    allocator,
+                    view.source,
+                    type_name[separator + 1 ..],
+                    member_name,
+                ) orelse return null;
+                return try describeBinding(allocator, view.source, field_span);
+            }
+        }
+        const field_span = try syntax_types.memberSpan(
+            allocator,
+            document.source,
+            type_name,
+            member_name,
+        ) orelse return null;
+        return try describeBinding(allocator, document.source, field_span);
     }
 
     fn standardLibraryMemberHover(
@@ -1873,6 +1926,24 @@ fn memberReceiver(source: []const u8, byte_offset: usize) ?[]const u8 {
     const receiver = source[start .. byte_offset - 1];
     if (!isDottedIdentifier(receiver)) return null;
     return receiver;
+}
+
+fn receiverIdentifierSpan(source: []const u8, member_start: usize) ?std.zig.Token.Loc {
+    if (member_start < 2 or member_start > source.len or source[member_start - 1] != '.') return null;
+    const end = member_start - 1;
+    var start = end;
+    while (start > 0 and isIdentifierByte(source[start - 1])) start -= 1;
+    if (start == end or !isIdentifier(source[start..end])) return null;
+    return .{ .start = start, .end = end };
+}
+
+fn namedTypeExpression(type_expression: []const u8) ?[]const u8 {
+    var type_name = std.mem.trim(u8, type_expression, " \t\r\n");
+    if (std.mem.lastIndexOfScalar(u8, type_name, '!')) |error_separator| {
+        type_name = std.mem.trimStart(u8, type_name[error_separator + 1 ..], " \t\r\n");
+    }
+    while (type_name.len != 0 and type_name[0] == '?') type_name = type_name[1..];
+    return if (isDottedIdentifier(type_name)) type_name else null;
 }
 
 fn isDottedIdentifier(source: []const u8) bool {
@@ -3259,8 +3330,11 @@ fn analyzerFormatSource(
     var configuration = base_configuration;
     const rewritten_rules = [_]analysis.Rule{
         .redundant_bool_comparison,
+        .redundant_boolean_if,
         .needless_cast,
         .needless_else_after_terminator,
+        .needless_defer_block,
+        .needless_empty_else,
         .mixed_bitwise_arithmetic,
     };
     for (rewritten_rules) |rule| configuration.levels[@intFromEnum(rule)] = .warning;
@@ -3374,8 +3448,12 @@ test "analyzer formatting applies safe fixes and organizes imports before zig fm
         "    var value: u8 = 1;\n" ++
         "    _ = value;\n" ++
         "    _ = enabled == true;\n" ++
+        "    _ = if (enabled) true else false;\n" ++
+        "    defer { cleanup(); }\n" ++
+        "    if (enabled) { cleanup(); } else {}\n" ++
         "    _ = value + 1 << 2;\n" ++
-        "}\n";
+        "}\n" ++
+        "fn cleanup() void {}\n";
     var configuration = analysis.Configuration.defaults();
     configuration.format_profile = .analyzer;
     configuration.format_organize_imports = true;
@@ -3384,7 +3462,9 @@ test "analyzer formatting applies safe fixes and organizes imports before zig fm
     defer std.testing.allocator.free(formatted);
     try std.testing.expect(std.mem.startsWith(u8, formatted, "const std = @import(\"std\");"));
     try std.testing.expect(std.mem.indexOf(u8, formatted, "const value: u8 = 1;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "_ = enabled;") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, formatted, "_ = enabled;"));
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "defer cleanup();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "if (enabled) {\n        cleanup();\n    }") != null);
     try std.testing.expect(std.mem.indexOf(u8, formatted, "_ = (value + 1) << 2;") != null);
 }
 
@@ -3751,6 +3831,44 @@ test "LSP hover describes parameters locals functions and bounded constants" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"result\":null") != null);
 }
 
+test "LSP hover follows inferred returns through imported type aliases" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://fixtures/hover_main.zig","languageId":"zig","version":1,"text":"const types = @import(\"hover_types.zig\");\nfn make() types.Headers.View { return .{ .slice = \"zig\" }; }\nfn inspect() usize { const view = make(); return view.slice.len; }\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://fixtures/hover_main.zig"},"position":{"line":2,"character":50}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://fixtures/hover_main.zig"},"position":{"line":2,"character":55}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const view = make()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "types.Headers.View") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "slice: []const u8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Headers decoded from the used message body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":null") != null);
+}
+
 test "LSP publishes memory ownership warnings" {
     const incoming = [_][]const u8{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
@@ -3821,7 +3939,7 @@ test "LSP advertises and returns complete filtered code actions" {
     const incoming = [_][]const u8{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{"textDocument":{"codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["quickfix","refactor.extract","refactor.rewrite","source.organizeImports","source.fixAll"]}}}}}}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///actions.zig","languageId":"zig","version":1,"text":"const Mode = enum { fast, safe };\nfn run(mode: Mode, input: u32) void {\n    var value = 1;\n    _ = value;\n    const generated: u32 = missing(input, 42);\n    _ = generated;\n    switch (mode) { .fast => {} }\n}\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///actions.zig","languageId":"zig","version":1,"text":"const Mode = enum { fast, safe };\nfn run(mode: Mode, input: u32) void {\n    var value = 1;\n    _ = value;\n    const generated: u32 = missing(input, 42);\n    _ = generated;\n    switch (mode) { .fast => {} }\n    _ = if (value == 1) true else false;\n    defer { cleanup(); }\n    if (value == 1) {} else {}\n}\nfn cleanup() void {}\n"}}}
         ,
         \\{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///actions.zig"},"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":17}},"context":{"diagnostics":[],"only":["quickfix"]}}}
         ,
@@ -3829,7 +3947,7 @@ test "LSP advertises and returns complete filtered code actions" {
         ,
         \\{"jsonrpc":"2.0","id":4,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///actions.zig"},"range":{"start":{"line":4,"character":27},"end":{"line":4,"character":34}},"context":{"diagnostics":[],"only":["refactor.rewrite"]}}}
         ,
-        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///actions.zig"},"range":{"start":{"line":0,"character":0},"end":{"line":7,"character":1}},"context":{"diagnostics":[],"only":["source.fixAll"]}}}
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///actions.zig"},"range":{"start":{"line":0,"character":0},"end":{"line":11,"character":20}},"context":{"diagnostics":[],"only":["source.fixAll"]}}}
         ,
         \\{"jsonrpc":"2.0","id":6,"method":"shutdown"}
         ,
@@ -3865,6 +3983,9 @@ test "LSP advertises and returns complete filtered code actions" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "fn missing(input: u32, arg2: anytype) u32") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fix all safe zig-analyzer findings") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fill missing switch prongs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "value == 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "cleanup();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"\"") != null);
 }
 
 test "LSP returns Zig error recovery actions" {

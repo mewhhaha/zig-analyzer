@@ -17,6 +17,7 @@ pub const RelatedSpan = rule_types.RelatedSpan;
 
 pub const parseConfiguration = configuration_parser.parse;
 pub const suppressionWarning = configuration_parser.suppressionWarning;
+pub const isSuppressed = configuration_parser.isSuppressed;
 
 const ContainerKind = enum { enumeration, tagged_union, structure, error_set };
 
@@ -198,7 +199,7 @@ fn addFinding(
     found: *std.ArrayList(Finding),
     finding: Finding,
 ) !void {
-    if (finding.level == .off or suppressed(source, finding.rule.code(), finding.span.start)) return;
+    if (finding.level == .off or configuration_parser.isSuppressed(source, finding.rule, finding.span.start)) return;
     try found.append(allocator, finding);
 }
 
@@ -2885,41 +2886,6 @@ fn sortedImportText(allocator: std.mem.Allocator, source: []const u8, imports: [
     return try writer.toOwnedSlice();
 }
 
-fn suppressed(source: []const u8, rule: []const u8, offset: usize) bool {
-    const target_line_start = lineStart(source, offset);
-    if (target_line_start > 0) {
-        const previous_end = target_line_start - 1;
-        const previous_start = lineStart(source, previous_end);
-        if (directiveContains(source[previous_start..previous_end], "disable-next-line", rule)) return true;
-    }
-    var cursor: usize = 0;
-    while (cursor < source.len) {
-        const end = lineEnd(source, cursor);
-        const line = std.mem.trim(u8, source[cursor..end], " \t\r\n");
-        if (directiveContains(line, "disable-file", rule)) return true;
-        if (line.len != 0 and !std.mem.startsWith(u8, line, "//")) break;
-        cursor = end;
-    }
-    return false;
-}
-
-pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
-    return suppressed(source, rule.code(), offset);
-}
-
-fn directiveContains(line: []const u8, directive: []const u8, rule: []const u8) bool {
-    const prefix = "// zig-analyzer: ";
-    const trimmed = std.mem.trim(u8, line, " \t\r");
-    if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
-    const remainder = trimmed[prefix.len..];
-    if (!std.mem.startsWith(u8, remainder, directive)) return false;
-    var names = std.mem.splitScalar(u8, std.mem.trim(u8, remainder[directive.len..], " \t"), ',');
-    while (names.next()) |name| {
-        if (std.mem.eql(u8, std.mem.trim(u8, name, " \t"), rule)) return true;
-    }
-    return false;
-}
-
 fn lineIndentation(source: []const u8, offset: usize) []const u8 {
     const start = lineStart(source, offset);
     var end = start;
@@ -3298,13 +3264,33 @@ test "discarded error ignores an explanatory catch comment" {
 }
 
 test "suppression parser reports malformed and unknown rules" {
-    const malformed = try suppressionWarning(std.testing.allocator, "// zig-analyzer: disable-next-line\nconst x = 1;");
+    const malformed = try suppressionWarning(std.testing.allocator, "// zig-analyzer: ignore-next-line never-mutated-var\nconst x = 1;");
     defer std.testing.allocator.free(malformed.?);
     try std.testing.expect(std.mem.indexOf(u8, malformed.?, "malformed") != null);
 
     const unknown = try suppressionWarning(std.testing.allocator, "// zig-analyzer: disable-file unknown-rule\n");
     defer std.testing.allocator.free(unknown.?);
     try std.testing.expect(std.mem.indexOf(u8, unknown.?, "unknown-rule") != null);
+}
+
+test "line and scoped suppressions apply to semantic and modular rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(ready: bool) void {\n" ++
+        "    var value = if (ready) true else false; // zig-analyzer: disable-line never-mutated-var, redundant-boolean-if\n" ++
+        "    _ = value;\n" ++
+        "    defer { _ = ready; } // zig-analyzer: disable-line needless-defer-block\n" ++
+        "}";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.redundant_boolean_if)] = .information;
+    configuration.levels[@intFromEnum(Rule.needless_defer_block)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+
+    for (found) |finding| switch (finding.rule) {
+        .never_mutated_var, .redundant_boolean_if, .needless_defer_block => return error.TestUnexpectedResult,
+        else => {},
+    };
 }
 
 test "switch types resolve from function returns and inferred locals" {
@@ -3388,6 +3374,9 @@ test "lint profiles enable official idiomatic and strict rules incrementally" {
     );
     try std.testing.expectEqual(Level.information, idiomatic.level(.underscore_private_name));
     try std.testing.expectEqual(Level.warning, idiomatic.level(.prefer_try));
+    try std.testing.expectEqual(Level.information, idiomatic.level(.redundant_boolean_if));
+    try std.testing.expectEqual(Level.information, idiomatic.level(.needless_defer_block));
+    try std.testing.expectEqual(Level.information, idiomatic.level(.needless_empty_else));
     try std.testing.expectEqual(Level.information, idiomatic.level(.unsafe_orelse_unreachable));
     try std.testing.expectEqual(Level.information, idiomatic.level(.redundant_optional_unwrap));
     try std.testing.expectEqual(Level.off, idiomatic.level(.public_declaration_docs));

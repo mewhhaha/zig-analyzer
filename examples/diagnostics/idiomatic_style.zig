@@ -9,6 +9,9 @@ const json = struct {
 
 const Mode = enum { fast, safe };
 const Options = struct { count: u32 };
+const Resource = struct {
+    fn close(_: Resource) void {}
+};
 
 fn load() !u32 {
     return 42;
@@ -52,6 +55,22 @@ fn collapsedError() ?u32 {
     return load() catch null;
 }
 
+fn directBoolean(value: u32) bool {
+    return if (value != 0) true else false;
+}
+
+fn closeResource(resource: Resource) void {
+    defer {
+        resource.close();
+    }
+}
+
+fn runWhenEnabled(enabled: bool) void {
+    if (enabled) {
+        closeResource(.{});
+    } else {}
+}
+
 fn optionalPresence(optional: ?u32) bool {
     return if (optional) |_| true else false;
 }
@@ -79,6 +98,9 @@ test "idiomatic style actions preserve behavior" {
     try std.testing.expect(@abs(actual_float - expected_float) <= tolerance);
     try std.testing.expect(optionalPresence(42));
     try std.testing.expectEqual(@as(?u32, 42), collapsedError());
+    try std.testing.expect(directBoolean(1));
+    closeResource(.{});
+    runWhenEnabled(true);
     _ = manuallyTerminated;
     try std.testing.expectEqual(@as(usize, 2), @typeInfo(json.JsonValue).@"union".fields.len);
 }

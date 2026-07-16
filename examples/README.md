@@ -25,11 +25,13 @@ context-dependent.
 
 The lower half of that fixture exercises the Zig-native action registry. Request
 actions on `fallible()`, `optional()`, `values.items`, the ownership `defer`, the
-payload mutation and tag check, the format string, allocation product, pointer
-assignment, reflective loop, `Generated`, and the reflection member string.
-These cover error/optional recovery, ownership transfer, mutable captures,
-tagged-union switches, format and overflow repair, pointer casts, `inline else`,
-resolved-type materialization, reflected-member generation, and test harnesses.
+inclusive index assertion, unsigned reverse loop, payload mutation and tag
+check, the format string, allocation product, pointer assignment, reflective
+loop, `Generated`, and the reflection member string. These cover error/optional
+recovery, an ownership return invalidated by `defer`, an off-by-one bound, an
+unsigned countdown underflow, mutable captures, tagged-union switches, format
+and overflow repair, pointer casts, `inline else`, resolved-type materialization,
+reflected-member generation, and test harnesses.
 Format calls with a simple missing or extra tuple argument also offer an explicit
 arity repair.
 Build-module repair appears on a package `@import` when its uniquely named Zig
@@ -47,7 +49,9 @@ ignores an existing optional capture, and byte equality that should use
 inspected and applied independently. The same fixture covers exact
 `expectEqualSlices` and `expectError` rewrites, an advisory approximate-float
 expectation, errors collapsed to absence, an optional capture used only as a
-presence test, and a manually appended zero terminator.
+presence test, and a manually appended zero terminator. It also shows quick
+fixes for boolean-valued `if` expressions, one-statement `defer` blocks, and
+empty `else` branches; all three are safe fix-all and analyzer-format rewrites.
 
 Open `diagnostics/memory_management.zig` to exercise memory ownership warnings.
 `forgottenRelease` warns because its allocation has no cleanup. `errorPathOnly`
@@ -91,6 +95,12 @@ show declared types for parameters and locals, the function signature and doc
 comment, and the bounded constant value. The field, import, and standard-library
 examples also provide contextual hover information for `display_name`,
 `clampToLimit`, and `eql` respectively.
+
+Hover also follows an inferred local initialized by a function call when the
+function has an explicit return type. Imported dotted types, nested namespace
+aliases, and private backing structs are followed to the final field, so a field
+such as `slice: []const Header` retains its declaration and documentation even
+when the local itself has no type annotation.
 
 To compare in Helix, first use this repository's default local configuration:
 
