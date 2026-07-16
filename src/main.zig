@@ -144,7 +144,16 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
             try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: compiler backend is not bootstrapped\n");
             return 1;
         },
-        else => return err,
+        else => {
+            var buffer: [512]u8 = undefined;
+            var file_writer = std.Io.File.stderr().writer(io, &buffer);
+            try file_writer.interface.print("zig-analyzer doctor: backend manifest {s} is unreadable ({t}); rerun 'zig build backend'\n", .{
+                zig_analyzer.backend_bootstrap.manifest_path,
+                err,
+            });
+            try file_writer.interface.flush();
+            return 1;
+        },
     };
     defer manifest.deinit();
 

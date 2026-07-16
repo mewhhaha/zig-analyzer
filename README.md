@@ -118,11 +118,13 @@ with stable rule names and editor quick fixes:
 | An explicitly comptime `if` whose condition is a literal | Opt-in `constant-comptime-condition` | No diagnostic |
 | An allocation followed by a later `try` with no `errdefer` release | `missing-errdefer` with an insert-`errdefer` fix | No error-path leak diagnostic |
 | `@memcpy` between possibly overlapping slices of one buffer | `aliased-memcpy` names the shared base and suggests `std.mem.copyForwards`/`copyBackwards` | No aliasing diagnostic |
-| A `usize` or `isize` field inside an `extern` or `packed` struct or union | `usize-in-packed-struct` explains the target-dependent layout | No layout diagnostic |
+| A `usize` or `isize` field inside a `packed` struct or union | `usize-in-packed-struct` explains the target-dependent layout | No layout diagnostic |
 | `while (true)` whose body provably never exits or calls anything | `unconditional-busy-loop` | No diagnostic |
 | `!comptime` applying the negation before the comptime expression | Opt-in `negated-comptime-expression` with a parenthesizing fix | No precedence diagnostic |
 | A multi-line `if` body without braces | Opt-in `unbraced-multiline-if` with a brace-wrapping fix | No diagnostic |
 | Any use of a project-banned identifier path | `banned-identifier` reports the configured path and hint | No diagnostic |
+| `@intCast` narrowing a value whose wider type is visible, with no guard between | Opt-in `truncating-intcast` names the value and both types | No truncation diagnostic |
+| Byte-comparing structs whose layout provably contains padding | `padded-byte-compare` explains the uninitialized padding bytes | No diagnostic |
 
 Both servers still report Zig parser and compiler errors, and both can apply
 the compiler's `var` to `const` fix. zig-analyzer's broader action set includes
@@ -145,8 +147,9 @@ refactoring equivalent:
 - update an open `build.zig` for a uniquely resolved package import, extract
   repeated identical `@cImport` blocks into a new wrapper, and generate Zig test
   harnesses for declarations;
-- split a compound `assert(a and b)` into one assertion per condition, and
-  poison a `deinit` implementation with a final `self.* = undefined;`.
+- split a compound `assert(a and b)` into one assertion per condition, poison a
+  `deinit` implementation with a final `self.* = undefined;`, and rewrite
+  `expr orelse unreachable` to `expr.?`.
 
 Ownership, generated-code, build, and C-interoperability actions are always
 explicit. C-import extraction is returned only when the editor advertises

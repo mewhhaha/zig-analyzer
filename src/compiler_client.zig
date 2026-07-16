@@ -2,6 +2,14 @@ const std = @import("std");
 const build_options = @import("build_options");
 const protocol = @import("compiler_protocol.zig");
 
+/// How long the analyzer waits on the compiler backend before declaring it
+/// hung: responses to protocol requests, and process exit during shutdown.
+pub const default_response_deadline_ms: i64 = 60_000;
+
+/// A backend hello reply carries a Zig version string such as
+/// "0.16.0+zig-analyzer.1"; anything near the reader buffer size is garbage.
+const max_zig_version_length = 256;
+
 pub const Client = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -11,6 +19,7 @@ pub const Client = struct {
     writer: std.Io.net.Stream.Writer,
     next_request_id: u32 = 1,
     generation: u32 = 0,
+    response_deadline_ms: i64 = default_response_deadline_ms,
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, port: u16) !Client {
         const address: std.Io.net.IpAddress = .{ .ip6 = .loopback(port) };
@@ -47,6 +56,8 @@ pub const Client = struct {
         protocol_version: u16,
         authentication_token: []const u8,
     ) !void {
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try writeHello(
             &client.writer.interface,
@@ -70,6 +81,8 @@ pub const Client = struct {
     }
 
     pub fn workspaceSummary(client: *Client) !protocol.WorkspaceSummary {
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = 0,
@@ -96,6 +109,8 @@ pub const Client = struct {
     ) !protocol.DocumentFacts {
         if (uri.len > std.math.maxInt(u32)) return error.UriTooLong;
         if (source.len > std.math.maxInt(u32)) return error.SourceTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         const request: protocol.ReplaceOverlayRequest = .{
             .uri_length = @intCast(uri.len),
@@ -117,6 +132,8 @@ pub const Client = struct {
 
     pub fn analyzeOverlay(client: *Client, uri: []const u8, document_version: i32) !protocol.DocumentFacts {
         if (uri.len > std.math.maxInt(u32)) return error.UriTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = @intCast(@sizeOf(protocol.AnalyzeRequest) + uri.len),
@@ -135,6 +152,8 @@ pub const Client = struct {
 
     pub fn removeOverlay(client: *Client, uri: []const u8) !void {
         if (uri.len > std.math.maxInt(u32)) return error.UriTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = @intCast(@sizeOf(protocol.RemoveOverlayRequest) + uri.len),
@@ -160,6 +179,8 @@ pub const Client = struct {
         client: *Client,
         allocator: std.mem.Allocator,
     ) ![]const []const u8 {
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = 0,
@@ -201,6 +222,8 @@ pub const Client = struct {
     }
 
     pub fn diagnostics(client: *Client, allocator: std.mem.Allocator) !std.zig.ErrorBundle {
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = 0,
@@ -237,6 +260,8 @@ pub const Client = struct {
         name: []const u8,
     ) ![]const []const u8 {
         if (name.len > std.math.maxInt(u32)) return error.NameTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = @intCast(@sizeOf(protocol.TypeMembersRequest) + name.len),
@@ -258,6 +283,8 @@ pub const Client = struct {
         name: []const u8,
     ) !TypeShape {
         if (name.len > std.math.maxInt(u32)) return error.NameTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         const request_id = client.takeRequestId();
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = @intCast(@sizeOf(protocol.TypeMembersRequest) + name.len),
@@ -299,6 +326,8 @@ pub const Client = struct {
     }
 
     pub fn shutdown(client: *Client) !void {
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
         try client.writer.interface.writeStruct(protocol.Header{
             .body_length = 0,
             .request_id = client.takeRequestId(),
@@ -306,6 +335,38 @@ pub const Client = struct {
             .tag = .shutdown,
         }, .little);
         try client.writer.interface.flush();
+    }
+
+    const Watchdog = std.Io.Future(error{Canceled}!void);
+
+    fn armWatchdog(client: *Client) std.Io.ConcurrentError!Watchdog {
+        return client.io.concurrent(disconnectAfterDeadline, .{
+            client.io,
+            client.stream,
+            client.response_deadline_ms,
+        });
+    }
+
+    fn disarmWatchdog(client: *Client, watchdog: *Watchdog) void {
+        watchdog.cancel(client.io) catch |err| switch (err) {
+            error.Canceled => {},
+        };
+    }
+
+    /// Runs concurrently with one backend request; the response cancels it.
+    /// If the deadline passes first, shutting the socket down unblocks the
+    /// pending read with error.EndOfStream so the caller's failure path
+    /// (log + syntax fallback) takes over instead of hanging forever.
+    fn disconnectAfterDeadline(
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        deadline_ms: i64,
+    ) error{Canceled}!void {
+        try io.sleep(.fromMilliseconds(deadline_ms), .awake);
+        std.log.warn("compiler backend did not respond within {d} ms; disconnecting it", .{deadline_ms});
+        stream.shutdown(io, .both) catch |err| {
+            std.log.warn("failed to disconnect unresponsive compiler backend: {t}", .{err});
+        };
     }
 
     fn takeRequestId(client: *Client) u32 {
@@ -366,9 +427,11 @@ pub const Client = struct {
     fn readProtocolError(client: *Client, header: protocol.Header) !noreturn {
         if (header.body_length < @sizeOf(protocol.ErrorResponse)) return error.MalformedResponse;
         const response = try client.reader.interface.takeStruct(protocol.ErrorResponse, .little);
-        const expected_length: u32 = @sizeOf(protocol.ErrorResponse) + response.message_length;
+        const expected_length: u64 = @sizeOf(protocol.ErrorResponse) + @as(u64, response.message_length);
         if (header.body_length != expected_length) return error.MalformedResponse;
-        _ = try client.reader.interface.take(response.message_length);
+        // discardAll rather than take: the message length comes off the wire
+        // and take asserts it fits the reader buffer.
+        try client.reader.interface.discardAll(response.message_length);
         return switch (response.code) {
             .incompatible_protocol => error.IncompatibleProtocol,
             .incompatible_zig => error.IncompatibleZig,
@@ -435,6 +498,9 @@ fn readHelloResponse(reader: *std.Io.Reader, request_id: u32) !HelloResult {
     const response = try reader.takeStruct(protocol.HelloResponse, .little);
     const expected_length: u32 = @sizeOf(protocol.HelloResponse) + response.zig_version_length;
     if (header.body_length != expected_length) return error.MalformedResponse;
+    // Bound before take: the length comes off the wire and take asserts it
+    // fits the reader buffer.
+    if (response.zig_version_length > max_zig_version_length) return error.MalformedResponse;
     return .{
         .generation = header.generation,
         .status = response.status,
@@ -455,6 +521,46 @@ test "hello request carries the version and authentication token" {
     try std.testing.expectEqual(protocol.current_version, hello.protocol_version);
     try std.testing.expectEqualStrings("0.16.0", try reader.take(hello.zig_version_length));
     try std.testing.expectEqualStrings("secret", try reader.take(hello.authentication_token_length));
+}
+
+test "hello response rejects a version string that exceeds the reader buffer" {
+    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer bytes.deinit();
+    const oversized_length = max_zig_version_length + 1;
+    try bytes.writer.writeStruct(protocol.Header{
+        .body_length = @sizeOf(protocol.HelloResponse) + oversized_length,
+        .request_id = 8,
+        .generation = 2,
+        .tag = .hello_response,
+    }, .little);
+    try bytes.writer.writeStruct(protocol.HelloResponse{
+        .protocol_version = protocol.current_version,
+        .status = .accepted,
+        .zig_version_length = oversized_length,
+    }, .little);
+    try bytes.writer.splatByteAll('x', oversized_length);
+
+    var reader: std.Io.Reader = .fixed(bytes.written());
+    try std.testing.expectError(error.MalformedResponse, readHelloResponse(&reader, 8));
+}
+
+test "a request against an unresponsive backend fails once the response deadline expires" {
+    // The watchdog warn is expected here; silence it so the accumulated
+    // stderr is not attributed to whichever test fails later in this binary.
+    std.testing.log_level = .err;
+    const io = std.testing.io;
+    // A listener that never accepts nor replies stands in for a hung backend:
+    // the TCP handshake still completes, so the client's read blocks forever
+    // without the watchdog.
+    const address: std.Io.net.IpAddress = .{ .ip6 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+
+    var client = try Client.connect(io, std.testing.allocator, server.socket.address.getPort());
+    defer client.deinit();
+    client.response_deadline_ms = 50;
+
+    try std.testing.expectError(error.EndOfStream, client.workspaceSummary());
 }
 
 test "hello response rejects an unexpected request id" {

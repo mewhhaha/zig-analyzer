@@ -25,6 +25,8 @@ const unconditional_busy_loop = @import("unconditional_busy_loop.zig");
 const unsigned_reverse_loop = @import("unsigned_reverse_loop.zig");
 const unsafe_orelse_unreachable = @import("unsafe_orelse_unreachable.zig");
 const usize_in_packed_struct = @import("usize_in_packed_struct.zig");
+const truncating_intcast = @import("truncating_intcast.zig");
+const padded_byte_compare = @import("padded_byte_compare.zig");
 
 pub fn run(context: RuleRun) !void {
     try aliased_memcpy.run(context);
@@ -52,6 +54,8 @@ pub fn run(context: RuleRun) !void {
     try optional_switch_idioms.run(context);
     try prefer_testing_expect_equal_strings.run(context);
     try testing_idioms.run(context);
+    try truncating_intcast.run(context);
+    try padded_byte_compare.run(context);
 }
 
 test {
@@ -80,4 +84,6 @@ test {
     _ = unsigned_reverse_loop;
     _ = unsafe_orelse_unreachable;
     _ = usize_in_packed_struct;
+    _ = truncating_intcast;
+    _ = padded_byte_compare;
 }
