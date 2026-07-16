@@ -898,6 +898,7 @@ pub const Server = struct {
     fn ensureCompiler(server: *Server, allocator: std.mem.Allocator, uri: []const u8) !void {
         if (server.compiler != null or server.compiler_start_attempted) return;
         server.compiler_start_attempted = true;
+        const document = server.documents.getConst(uri) orelse return;
         if (!try pathExists(server.io, backend_bootstrap.backend_binary)) return;
         const root_source_path = try filePathFromUri(allocator, uri) orelse return;
         if (!try pathExists(server.io, root_source_path)) return;
@@ -912,7 +913,7 @@ pub const Server = struct {
         };
         if (server.compiler_root_uri) |previous_uri| server.allocator.free(previous_uri);
         server.compiler_root_uri = try server.allocator.dupe(u8, uri);
-        server.compiler_root_version = server.documents.getConst(uri).?.version;
+        server.compiler_root_version = document.version;
     }
 
     fn recordCompilerFailure(server: *Server, err: anyerror) void {
@@ -4096,6 +4097,115 @@ test "LSP organizes imports when the style lint is disabled" {
     const standard_comment = std.mem.indexOf(u8, transport.output(2), "// standard").?;
     const package_comment = std.mem.indexOf(u8, transport.output(2), "// package").?;
     try std.testing.expect(standard_comment < package_comment);
+}
+
+test "LSP diagnostics map positions past astral-plane characters in UTF-16" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///astral.zig","languageId":"zig","version":1,"text":"const s = \"😀\"; const broken ="}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 3), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "syntax-error") != null);
+    // The error sits at the end of the line: 32 bytes but 30 UTF-16 units.
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"character\":30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"character\":32") == null);
+}
+
+test "LSP keeps answering after an edit deletes the import behind a member access" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig","languageId":"zig","version":1,"text":"const catalog = @import(\"catalog.zig\");\nfn result() u32 { return catalog.clampToLimit(100); }\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig","version":2},"contentChanges":[{"text":"fn result() u32 { return catalog.clampToLimit(100); }\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":0,"character":35}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":0,"character":33}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 6), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"result\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":[]") != null);
+}
+
+test "LSP discards an out-of-order document version instead of clobbering newer text" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///rapid.zig","languageId":"zig","version":1,"text":"const first = 1;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///rapid.zig","version":3},"contentChanges":[{"text":"const third = 3;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///rapid.zig","version":2},"contentChanges":[{"text":"const second = 2;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///rapid.zig"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    // The stale version publishes nothing: open, newer change, symbols, shutdown.
+    try std.testing.expectEqual(@as(usize, 5), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "third") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "second") == null);
+}
+
+test "LSP survives a save notification for a document that was never opened" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///ghost.zig"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///alive.zig","languageId":"zig","version":1,"text":"const answer = 42;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///alive.zig"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 4), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "answer") != null);
 }
 
 test "LSP session covers lifecycle synchronization and broad features" {

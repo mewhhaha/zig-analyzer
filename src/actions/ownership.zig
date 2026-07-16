@@ -192,6 +192,8 @@ fn addPoisonAfterDeinit(context: ActionRun) !void {
         const function_span = std.zig.Token.Loc{ .start = token.loc.start, .end = context.tokens[body_end].loc.end };
         if (!context.selected(function_span)) continue;
         if (endsWithSelfPoison(context, body_end)) continue;
+        // '_ = self;' plus a real use of self is a "pointless discard" error.
+        if (discardsSelf(context, body_start + 1, body_end)) continue;
         const indentation = context.lineIndentation(context.tokens[body_end].loc.start);
         try context.oneEdit(
             "Poison after deinit",
@@ -201,6 +203,15 @@ fn addPoisonAfterDeinit(context: ActionRun) !void {
             false,
         );
     }
+}
+
+fn discardsSelf(context: ActionRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, "_") and index + 3 < end and
+            context.tokens[index + 1].tag == .equal and context.tokenIs(index + 2, "self") and
+            context.tokens[index + 3].tag == .semicolon) return true;
+    }
+    return false;
 }
 
 fn endsWithSelfPoison(context: ActionRun, body_end: usize) bool {
@@ -317,6 +328,17 @@ test "deinit methods offer poisoning self as their final statement" {
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings("Poison after deinit", actions[0].title);
     try std.testing.expectEqualStrings("        self.* = undefined;\n", actions[0].edits[0].replacement);
+}
+
+test "deinit stubs that discard self get no poison action" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Tight = struct { fn deinit(self: *Tight) void { _ = self; } };";
+    const name = std.mem.indexOf(u8, source, "deinit") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = name, .end = name + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
 
 test "const-self and already-poisoned deinit methods get no poison action" {

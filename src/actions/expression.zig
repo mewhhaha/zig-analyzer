@@ -306,6 +306,8 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
         if (!context.selected(statement_span)) continue;
         const conditions = try topLevelAndOperands(context, name_index + 2, closing) orelse continue;
         if (conditions.len < 2) continue;
+        // A line comment inside an operand would comment out the inserted ');'.
+        if (anyContainsComment(conditions)) continue;
         const callee = context.source[context.tokens[callee_start].loc.start..context.tokens[name_index].loc.end];
         const indentation = context.lineIndentation(statement_span.start);
         var writer: std.Io.Writer.Allocating = .init(context.allocator);
@@ -322,6 +324,11 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
             false,
         );
     }
+}
+
+fn anyContainsComment(operands: []const []const u8) bool {
+    for (operands) |operand| if (std.mem.indexOf(u8, operand, "//") != null) return true;
+    return false;
 }
 
 fn topLevelAndOperands(context: ActionRun, start: usize, end: usize) !?[]const []const u8 {
@@ -469,6 +476,17 @@ test "compound assertions split into one assert per condition" {
         "std.debug.assert(a);\n    std.debug.assert(b);\n    std.debug.assert(c);",
         actions[0].edits[0].replacement,
     );
+}
+
+test "assertions with a comment inside an operand are not split" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(a: bool, b: bool) void {\n    assert(a // invariant\n    and b);\n}";
+    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
 
 test "assertions mixing or at the top level stay together" {

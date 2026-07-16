@@ -106,10 +106,36 @@ fn findManualSentinels(context: RuleRun) !void {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const length = allocationLengthBeforePlusOne(context, declaration_index + 3, declaration_end) orelse continue;
+        const allocation = allocationLengthBeforePlusOne(context, declaration_index + 3, declaration_end) orelse continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
-        if (!writesZeroTerminator(context, binding_name, length, declaration_end + 1, scope_end)) continue;
+        const write = zeroTerminatorWrite(context, binding_name, allocation.length_text, declaration_end + 1, scope_end) orelse continue;
+        const fixes: []const types.Fix = if (allocation.rewritable and write.exact_index and write.whole_statement) fixes: {
+            var delete_start = context.tokens[write.use_index].loc.start;
+            while (delete_start > 0 and (context.source[delete_start - 1] == ' ' or context.source[delete_start - 1] == '\t')) delete_start -= 1;
+            if (delete_start > 0 and context.source[delete_start - 1] == '\n') delete_start -= 1;
+            const edits = try context.allocator.alloc(types.Edit, 3);
+            edits[0] = .{ .span = context.tokens[allocation.alloc_index].loc, .replacement = "allocSentinel" };
+            edits[1] = .{
+                .span = .{
+                    .start = context.tokens[allocation.length_end].loc.end,
+                    .end = context.tokens[allocation.one_index].loc.end,
+                },
+                .replacement = ", 0",
+            };
+            edits[2] = .{
+                .span = .{ .start = delete_start, .end = context.tokens[write.semicolon_index].loc.end },
+                .replacement = "",
+            };
+            const allocated = try context.allocator.alloc(types.Fix, 1);
+            allocated[0] = .{
+                .title = "Rewrite with allocSentinel and drop the manual terminator",
+                .kind = .quickfix,
+                .edits = edits,
+                .preferred = true,
+            };
+            break :fixes allocated;
+        } else &.{};
         try context.emit(.{
             .rule = .prefer_sentinel_termination,
             .level = level,
@@ -119,15 +145,32 @@ fn findManualSentinels(context: RuleRun) !void {
                 "buffer '{s}' manually allocates one extra element and writes a zero terminator; allocSentinel or dupeZ expresses the sentinel contract",
                 .{binding_name},
             ),
+            .fixes = fixes,
         });
     }
 }
 
-fn allocationLengthBeforePlusOne(context: RuleRun, start: usize, end: usize) ?[]const u8 {
-    var calls_alloc = false;
-    var length: ?[]const u8 = null;
+const SentinelAllocation = struct {
+    length_text: []const u8,
+    alloc_index: usize,
+    length_end: usize,
+    one_index: usize,
+    rewritable: bool,
+};
+
+fn allocationLengthBeforePlusOne(context: RuleRun, start: usize, end: usize) ?SentinelAllocation {
+    var alloc_index: ?usize = null;
+    var alloc_close: ?usize = null;
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, "alloc")) calls_alloc = true;
+        if (token.tag == .identifier and context.tokenIs(index, "alloc") and
+            index + 1 < end and context.tokens[index + 1].tag == .l_paren)
+        {
+            alloc_index = index;
+            alloc_close = context.matchingToken(index + 1, .l_paren, .r_paren);
+        }
+    }
+    var allocation: ?SentinelAllocation = null;
+    for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .plus or index + 1 >= end or context.tokens[index + 1].tag != .number_literal or
             !context.tokenIs(index + 1, "1")) continue;
         var length_start = index;
@@ -138,14 +181,33 @@ fn allocationLengthBeforePlusOne(context: RuleRun, start: usize, end: usize) ?[]
             }
         }
         if (length_start < index) {
-            length = context.source[context.tokens[length_start].loc.start..context.tokens[index - 1].loc.end];
+            allocation = .{
+                .length_text = context.source[context.tokens[length_start].loc.start..context.tokens[index - 1].loc.end],
+                .alloc_index = alloc_index orelse return null,
+                .length_end = index - 1,
+                .one_index = index + 1,
+                .rewritable = alloc_close != null and index + 2 == alloc_close.?,
+            };
         }
     }
-    if (!calls_alloc) return null;
-    return length;
+    if (alloc_index == null) return null;
+    return allocation;
 }
 
-fn writesZeroTerminator(context: RuleRun, name: []const u8, length: []const u8, start: usize, end: usize) bool {
+const TerminatorWrite = struct {
+    use_index: usize,
+    semicolon_index: usize,
+    exact_index: bool,
+    whole_statement: bool,
+};
+
+fn zeroTerminatorWrite(
+    context: RuleRun,
+    name: []const u8,
+    length: []const u8,
+    start: usize,
+    end: usize,
+) ?TerminatorWrite {
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index + 5 >= end or
             context.tokens[index + 1].tag != .l_bracket) continue;
@@ -153,10 +215,21 @@ fn writesZeroTerminator(context: RuleRun, name: []const u8, length: []const u8, 
         if (bracket_end + 2 >= end or bracket_end == index + 2 or context.tokens[bracket_end + 1].tag != .equal or
             context.tokens[bracket_end + 2].tag != .number_literal or !context.tokenIs(bracket_end + 2, "0")) continue;
         const index_text = context.source[context.tokens[index + 2].loc.start..context.tokens[bracket_end - 1].loc.end];
-        if (!std.mem.eql(u8, index_text, length) and !std.mem.endsWith(u8, index_text, ".len")) continue;
-        return true;
+        const exact_index = std.mem.eql(u8, index_text, length);
+        if (!exact_index and !std.mem.endsWith(u8, index_text, ".len")) continue;
+        const starts_statement = index == 0 or switch (context.tokens[index - 1].tag) {
+            .semicolon, .l_brace, .r_brace => true,
+            else => false,
+        };
+        const has_semicolon = bracket_end + 3 < end and context.tokens[bracket_end + 3].tag == .semicolon;
+        return .{
+            .use_index = index,
+            .semicolon_index = bracket_end + 3,
+            .exact_index = exact_index,
+            .whole_statement = starts_statement and has_semicolon,
+        };
     }
-    return false;
+    return null;
 }
 
 fn oneFix(context: RuleRun, title: []const u8, edits: []const types.Edit) ![]const types.Fix {
@@ -220,6 +293,57 @@ test "writing a value at an unrelated index is not a manual sentinel" {
     configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "manual sentinel rewrite fixes alloc and removes the terminator write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() !void {\n" ++
+        "    const result = try allocator.alloc(u8, input.len + 1);\n" ++
+        "    result[input.len] = 0;\n" ++
+        "}\n";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    const fixes = findings.items[0].fixes;
+    try std.testing.expectEqual(@as(usize, 1), fixes.len);
+    try std.testing.expect(!fixes[0].fix_all);
+    try std.testing.expectEqual(@as(usize, 3), fixes[0].edits.len);
+    var rewritten: std.ArrayList(u8) = .empty;
+    try rewritten.appendSlice(arena.allocator(), source);
+    var edit_index = fixes[0].edits.len;
+    while (edit_index > 0) {
+        edit_index -= 1;
+        const edit = fixes[0].edits[edit_index];
+        try rewritten.replaceRange(arena.allocator(), edit.span.start, edit.span.end - edit.span.start, edit.replacement);
+    }
+    try std.testing.expectEqualStrings(
+        "fn run() !void {\n" ++
+            "    const result = try allocator.allocSentinel(u8, input.len, 0);\n" ++
+            "}\n",
+        rewritten.items,
+    );
+}
+
+test "sentinel writes that cannot be rewritten mechanically keep the diagnostic only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() !void {\n" ++
+        "    const result = try allocator.alloc(u8, count + 1);\n" ++
+        "    result[other.len] = 0;\n" ++
+        "}\n";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqual(@as(usize, 0), findings.items[0].fixes.len);
 }
 
 test "unused switch else captures are removable" {
