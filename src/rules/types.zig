@@ -84,6 +84,12 @@ pub const Rule = enum {
     returning_released_value,
     inclusive_index_bound,
     unsigned_reverse_loop,
+    missing_errdefer,
+    aliased_memcpy,
+    negated_comptime_expression,
+    usize_in_packed_struct,
+    unbraced_multiline_if,
+    unconditional_busy_loop,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -162,6 +168,12 @@ pub const Rule = enum {
             .returning_released_value => "returning-released-value",
             .inclusive_index_bound => "inclusive-index-bound",
             .unsigned_reverse_loop => "unsigned-reverse-loop",
+            .missing_errdefer => "missing-errdefer",
+            .aliased_memcpy => "aliased-memcpy",
+            .negated_comptime_expression => "negated-comptime-expression",
+            .usize_in_packed_struct => "usize-in-packed-struct",
+            .unbraced_multiline_if => "unbraced-multiline-if",
+            .unconditional_busy_loop => "unconditional-busy-loop",
         };
     }
 
@@ -191,6 +203,10 @@ pub const Rule = enum {
             .duplicate_module_import,
             .returning_released_value,
             .unsigned_reverse_loop,
+            .missing_errdefer,
+            .aliased_memcpy,
+            .usize_in_packed_struct,
+            .unconditional_busy_loop,
             => .correctness,
             else => .style,
         };
@@ -245,6 +261,8 @@ pub const Rule = enum {
             .unreferenced_test_file,
             .conflicting_build_options,
             .inclusive_index_bound,
+            .negated_comptime_expression,
+            .unbraced_multiline_if,
             => .idiomatic,
             .public_declaration_docs => .strict,
             else => null,

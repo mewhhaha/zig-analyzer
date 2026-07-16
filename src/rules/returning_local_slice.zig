@@ -24,6 +24,7 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[return_index + 2].tag != .l_bracket) continue;
             const slice_end = context.matchingToken(return_index + 2, .l_bracket, .r_bracket) orelse continue;
             if (slice_end >= scope_end or !containsRange(context.tokens, return_index + 3, slice_end)) continue;
+            if (slice_end + 1 < scope_end and context.tokens[slice_end + 1].tag == .period_asterisk) continue;
             try context.emit(.{
                 .rule = .returning_local_slice,
                 .level = level,
@@ -114,6 +115,22 @@ test "returning a slice of a local array expires its storage" {
     disabled_context.findings = &disabled;
     try run(disabled_context);
     try std.testing.expectEqual(@as(usize, 0), disabled.items.len);
+}
+
+test "dereferencing the slice returns the array by value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn digest() [4]u8 { var buf = [_]u8{ 1, 2, 3, 4 }; return buf[0..4].*; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = @import("types.zig").Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 test "heap-backed slices and local array values do not warn" {

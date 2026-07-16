@@ -1,10 +1,12 @@
 const std = @import("std");
 const types = @import("types.zig");
+const tokenRefersToBinding = @import("context.zig").tokenRefersToBinding;
 
 pub const Warning = struct {
     rule: types.Rule,
     span: std.zig.Token.Loc,
     message: []const u8,
+    fixes: []const types.Fix = &.{},
 };
 
 pub const rules = [_]types.Rule{
@@ -31,7 +33,7 @@ pub fn warnings(
     defer allocator.free(tokens);
     var found: std.ArrayList(Warning) = .empty;
     errdefer {
-        for (found.items) |warning| allocator.free(warning.message);
+        for (found.items) |warning| freeWarning(allocator, warning);
         found.deinit(allocator);
     }
 
@@ -47,6 +49,9 @@ pub fn warnings(
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = findStatementEnd(tokens, declaration_index) orelse continue;
         const allocation = allocationFromValue(&tree, initializer) orelse continue;
+        if (allocation.allocator_source) |allocator_name| {
+            if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
+        }
         const scope_end = enclosingScopeEnd(tokens, declaration_index) orelse continue;
         if (statement_end >= scope_end) continue;
         const mismatched_release = try findMismatchedRelease(
@@ -110,6 +115,7 @@ const Allocation = struct {
     method: []const u8,
     release: []const u8,
     receiver: ?[]const u8,
+    allocator_source: ?[]const u8,
 };
 
 fn allocationFromValue(tree: *const std.zig.Ast, value: std.zig.Ast.Node.Index) ?Allocation {
@@ -148,7 +154,63 @@ fn allocationFromCall(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) ?A
         .method = method,
         .release = release,
         .receiver = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null,
+        .allocator_source = allocatorSourceName(tree, receiver),
     };
+}
+
+fn allocatorSourceName(tree: *const std.zig.Ast, receiver: std.zig.Ast.Node.Index) ?[]const u8 {
+    switch (tree.nodeTag(receiver)) {
+        .identifier => return tree.tokenSlice(tree.nodeMainToken(receiver)),
+        .call, .call_comma, .call_one, .call_one_comma => {
+            var buffer: [1]std.zig.Ast.Node.Index = undefined;
+            const call = tree.fullCall(&buffer, receiver) orelse return null;
+            if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
+            const base, const field_token = tree.nodeData(call.ast.fn_expr).node_and_token;
+            if (!std.mem.eql(u8, tree.tokenSlice(field_token), "allocator")) return null;
+            if (tree.nodeTag(base) != .identifier) return null;
+            return tree.tokenSlice(tree.nodeMainToken(base));
+        },
+        else => return null,
+    }
+}
+
+const arena_backed_types = [_][]const u8{ "ArenaAllocator", "FixedBufferAllocator" };
+
+fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, allocator_name: []const u8) bool {
+    var name = allocator_name;
+    var hops: usize = 0;
+    while (hops < 4) : (hops += 1) {
+        const declaration = bindingDeclarationValue(source, tokens, name) orelse return false;
+        for (tokens[declaration.start..declaration.end]) |token| {
+            if (token.tag != .identifier) continue;
+            const text = source[token.loc.start..token.loc.end];
+            for (arena_backed_types) |arena_type| if (std.mem.eql(u8, text, arena_type)) return true;
+        }
+        name = allocatorCallReceiver(source, tokens, declaration) orelse return false;
+    }
+    return false;
+}
+
+const TokenRange = struct { start: usize, end: usize };
+
+fn bindingDeclarationValue(source: []const u8, tokens: []const std.zig.Token, name: []const u8) ?TokenRange {
+    for (tokens, 0..) |token, index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or index + 2 >= tokens.len or
+            !tokenIsIdentifier(source, tokens[index + 1], name)) continue;
+        const end = findStatementEnd(tokens, index) orelse continue;
+        return .{ .start = index + 2, .end = end };
+    }
+    return null;
+}
+
+fn allocatorCallReceiver(source: []const u8, tokens: []const std.zig.Token, range: TokenRange) ?[]const u8 {
+    var index = range.start;
+    while (index + 3 < range.end) : (index += 1) {
+        if (tokens[index].tag == .identifier and tokens[index + 1].tag == .period and
+            tokenIsIdentifier(source, tokens[index + 2], "allocator") and tokens[index + 3].tag == .l_paren)
+            return source[tokens[index].loc.start..tokens[index].loc.end];
+    }
+    return null;
 }
 
 fn expressionReferencesField(
@@ -287,6 +349,7 @@ fn findReleaseOrderingIssues(
                     "allocation '{s}' has more than one visible {s} in the same control-flow scope",
                     .{ binding_name, allocation.release },
                 ),
+                .fixes = try releaseDeletionFix(allocator, tokens, release_index),
             });
         }
         if (!statementStartsWith(tokens, first_release, .keyword_defer) and
@@ -319,6 +382,30 @@ fn findReleaseOrderingIssues(
             ),
         });
     }
+}
+
+fn releaseDeletionFix(
+    allocator: std.mem.Allocator,
+    tokens: []const std.zig.Token,
+    release_index: usize,
+) ![]const types.Fix {
+    var statement_start = release_index;
+    while (statement_start > 0) {
+        switch (tokens[statement_start - 1].tag) {
+            .semicolon, .l_brace, .r_brace => break,
+            else => statement_start -= 1,
+        }
+    }
+    const statement_end = findStatementEnd(tokens, release_index) orelse release_index;
+    const edits = try allocator.alloc(types.Edit, 1);
+    errdefer allocator.free(edits);
+    edits[0] = .{
+        .span = .{ .start = tokens[statement_start].loc.start, .end = tokens[statement_end].loc.end },
+        .replacement = "",
+    };
+    const fixes = try allocator.alloc(types.Fix, 1);
+    fixes[0] = .{ .title = "Delete the duplicate release", .kind = .quickfix, .edits = edits };
+    return fixes;
 }
 
 fn releaseCallContainsBinding(
@@ -354,8 +441,8 @@ fn releaseArgumentContainsBinding(
     start: usize,
     end: usize,
 ) bool {
-    for (tokens[start..end], start..) |token, index| {
-        if (!tokenIsIdentifier(source, token, binding_name) or
+    for (start..end) |index| {
+        if (!tokenRefersToBinding(source, tokens, index, binding_name) or
             !identifierRefersToBinding(source, tokens, binding_name, binding_index, index)) continue;
         if (index + 1 < end and (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket)) continue;
         return true;
@@ -414,8 +501,8 @@ fn firstUseAfterRelease(
     release_indices: []const usize,
 ) ?usize {
     const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
-    for (tokens[start..end], start..) |token, index| {
-        if (!tokenIsIdentifier(source, token, binding_name) or
+    for (start..end) |index| {
+        if (!tokenRefersToBinding(source, tokens, index, binding_name) or
             !identifierRefersToBinding(source, tokens, binding_name, binding_index, index)) continue;
         const use_scope = enclosingScope(tokens, index) orelse continue;
         if (use_scope.opening != declaration_scope.opening) continue;
@@ -431,7 +518,7 @@ fn firstUseAfterRelease(
             };
         }
         if (belongs_to_release) continue;
-        if (index + 1 < tokens.len and tokens[index + 1].tag == .equal) continue;
+        if (index + 1 < tokens.len and tokens[index + 1].tag == .equal) return null;
         return index;
     }
     return null;
@@ -454,11 +541,22 @@ fn owningAssignment(
         const assignment_scope = enclosingScope(tokens, index) orelse continue;
         if (assignment_scope.opening != declaration_scope.opening) continue;
         const statement_end = findStatementEnd(tokens, index) orelse continue;
-        for (tokens[index + 2 .. @min(statement_end, end)]) |rhs_token| {
+        const value_end = @min(statement_end, end);
+        var replaces_with_allocation = false;
+        var realloc_consumes_original = false;
+        for (tokens[index + 2 .. value_end], index + 2..) |rhs_token, rhs_index| {
             if (rhs_token.tag != .identifier) continue;
             const method = source[rhs_token.loc.start..rhs_token.loc.end];
-            if (allocationRelease(method) != null) return index;
+            if (allocationRelease(method) == null) continue;
+            replaces_with_allocation = true;
+            if (!std.mem.eql(u8, method, "realloc") or rhs_index + 1 >= tokens.len or
+                tokens[rhs_index + 1].tag != .l_paren) continue;
+            const closing = matchingToken(tokens, rhs_index + 1, .l_paren, .r_paren) orelse continue;
+            if (containsBinding(source, tokens, binding_name, binding_index, rhs_index + 2, @min(closing, value_end))) {
+                realloc_consumes_original = true;
+            }
         }
+        if (replaces_with_allocation and !realloc_consumes_original) return index;
     }
     return null;
 }
@@ -540,7 +638,9 @@ fn bindingEscapes(
     release_method: []const u8,
 ) bool {
     for (tokens[start..end], start..) |token, index| {
-        if (token.tag == .l_paren and index > 0 and tokens[index - 1].tag == .identifier) {
+        if (token.tag == .l_paren and index > 0 and
+            (tokens[index - 1].tag == .identifier or tokens[index - 1].tag == .builtin))
+        {
             const closing = matchingToken(tokens, index, .l_paren, .r_paren) orelse continue;
             if (closing >= end or !containsBinding(source, tokens, binding_name, binding_index, index + 1, closing)) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
@@ -922,7 +1022,99 @@ test "overwriting an owning allocation before release is reported" {
     try std.testing.expect(saw_overwrite);
 }
 
+test "allocations through a binding derived from a local arena are exempt" {
+    const source =
+        "fn tally(gpa: std.mem.Allocator) !void {" ++
+        "var scratch = std.heap.ArenaAllocator.init(gpa);" ++
+        "defer scratch.deinit();" ++
+        "const aa = scratch.allocator();" ++
+        "const counts = try aa.alloc(usize, 4);" ++
+        "_ = counts;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "releasing a field of the same name is not a release of the local binding" {
+    const source =
+        "fn rename(self: *Thing, a: std.mem.Allocator, new: []const u8) !void {" ++
+        "const name = try a.dupe(u8, new);" ++
+        "a.free(self.name);" ++
+        "self.name = name;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "reassigning the binding after release ends the released lifetime" {
+    const source =
+        "fn refill(a: std.mem.Allocator) !void {" ++
+        "var buf = try a.alloc(u8, 16);" ++
+        "a.free(buf);" ++
+        "buf = try a.alloc(u8, 32);" ++
+        "fill(buf);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "realloc of the binding itself does not overwrite the owning value" {
+    const source =
+        "fn grow(a: std.mem.Allocator) !void {" ++
+        "var buf = try a.alloc(u8, 8);" ++
+        "buf = try a.realloc(buf, 16);" ++
+        "a.free(buf);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "passing an allocation to a builtin call is treated as an escape" {
+    const source =
+        "fn zero(a: std.mem.Allocator) !void {" ++
+        "const counts = try a.alloc(u8, 4);" ++
+        "@memset(counts, 0);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "double release offers deletion of the duplicate statement" {
+    const source =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const buffer = try allocator.alloc(u8, 16);" ++
+        "allocator.free(buffer);" ++
+        "allocator.free(buffer);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    var double: ?Warning = null;
+    for (found) |warning| {
+        if (warning.rule == .double_release) double = warning;
+    }
+    try std.testing.expect(double != null);
+    try std.testing.expectEqual(@as(usize, 1), double.?.fixes.len);
+    try std.testing.expect(!double.?.fixes[0].fix_all);
+    const edit = double.?.fixes[0].edits[0];
+    try std.testing.expectEqualStrings("", edit.replacement);
+    try std.testing.expectEqualStrings("allocator.free(buffer);", source[edit.span.start..edit.span.end]);
+}
+
+fn freeWarning(allocator: std.mem.Allocator, warning: Warning) void {
+    allocator.free(warning.message);
+    for (warning.fixes) |fix| {
+        for (fix.edits) |edit| allocator.free(edit.replacement);
+        allocator.free(fix.edits);
+    }
+    allocator.free(warning.fixes);
+}
+
 fn freeWarnings(allocator: std.mem.Allocator, found: []Warning) void {
-    for (found) |warning| allocator.free(warning.message);
+    for (found) |warning| freeWarning(allocator, warning);
     allocator.free(found);
 }

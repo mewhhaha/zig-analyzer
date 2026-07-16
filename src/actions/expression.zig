@@ -6,12 +6,14 @@ const ActionRun = action_context.ActionRun;
 pub fn run(context: ActionRun) !void {
     try addErrorAndOptionalActions(context);
     try addPointerCastAction(context);
+    try addSplitCompoundAssertion(context);
 }
 
 const ReturnKind = struct {
     fallible: bool = false,
     optional: bool = false,
     errors: []const []const u8 = &.{},
+    merged_error_sets: bool = false,
 };
 
 const Expression = struct {
@@ -30,7 +32,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
     const source_expression = context.source[expression.span.start..expression.span.end];
     const function = action_context.containingFunction(context, expression.token_index);
 
-    if (return_kind.fallible) {
+    if (return_kind.fallible and statementContext(context, expression)) {
         if (function != null and function.?.returnsError(context)) {
             try context.oneEdit(
                 "Propagate the error with try",
@@ -40,19 +42,20 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 false,
             );
         }
+        // A discarded |err| capture is a compile error in Zig 0.16, so the catch stays captureless.
         try context.oneEdit(
             "Handle the error with catch",
             .refactor_rewrite,
             expression.span,
-            try std.fmt.allocPrint(context.allocator, "{s} catch |err| {{ _ = err; @panic(\"TODO\"); }}", .{source_expression}),
+            try std.fmt.allocPrint(context.allocator, "{s} catch @panic(\"TODO\")", .{source_expression}),
             false,
         );
-        if (return_kind.errors.len != 0) {
+        if (return_kind.errors.len != 0 and !return_kind.merged_error_sets) {
             try context.oneEdit(
                 "Handle every error with a switch",
                 .refactor_rewrite,
                 expression.span,
-                try errorSwitchReplacement(context, source_expression, return_kind.errors),
+                try errorSwitchReplacement(context, source_expression, return_kind.errors, try errorCaptureName(context)),
                 false,
             );
         }
@@ -63,7 +66,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
             "Unwrap the optional or stop",
             .refactor_rewrite,
             expression.span,
-            try std.fmt.allocPrint(context.allocator, "({s} orelse unreachable)", .{source_expression}),
+            try std.fmt.allocPrint(context.allocator, "{s}.?", .{source_expression}),
             false,
         );
         if (function != null and function.?.returnsVoid(context)) {
@@ -112,10 +115,12 @@ fn selectedExpression(context: ActionRun) ?Expression {
 }
 
 fn declaredReturnKind(context: ActionRun, name: []const u8) !ReturnKind {
+    var declared: ?ReturnKind = null;
     for (context.tokens, 0..) |token, index| {
         if (token.tag != .keyword_fn or index + 2 >= context.tokens.len or
             context.tokens[index + 1].tag != .identifier or !context.tokenIs(index + 1, name) or
             context.tokens[index + 2].tag != .l_paren) continue;
+        if (declared != null) return .{};
         const parameters_end = context.matchingToken(index + 2, .l_paren, .r_paren) orelse continue;
         var return_end = parameters_end + 1;
         while (return_end < context.tokens.len and context.tokens[return_end].tag != .semicolon) {
@@ -128,14 +133,16 @@ fn declaredReturnKind(context: ActionRun, name: []const u8) !ReturnKind {
             if (context.tokens[return_end].tag == .l_brace) break;
             return_end += 1;
         }
-        return returnKind(context, parameters_end + 1, return_end);
+        declared = returnKind(context, parameters_end + 1, return_end);
     }
-    return .{};
+    return declared orelse .{};
 }
 
 fn declaredBindingKind(context: ActionRun, name: []const u8, before: usize) ReturnKind {
+    const function = action_context.containingFunction(context, before);
+    const lower = if (function) |enclosing| enclosing.fn_index else 0;
     var index = before;
-    while (index > 0) {
+    while (index > lower) {
         index -= 1;
         if (!context.tokenIs(index, name) or index + 2 >= context.tokens.len or context.tokens[index + 1].tag != .colon) continue;
         var type_end = index + 2;
@@ -152,10 +159,37 @@ fn returnKind(context: ActionRun, start: usize, end: usize) ReturnKind {
     for (context.tokens[start..end]) |token| switch (token.tag) {
         .bang => kind.fallible = true,
         .question_mark => kind.optional = true,
+        .pipe_pipe => kind.merged_error_sets = true,
         else => {},
     };
     kind.errors = explicitErrors(context, start, end);
     return kind;
+}
+
+fn statementContext(context: ActionRun, expression: Expression) bool {
+    if (standaloneStatement(context, expression.span) != null) return true;
+    if (expression.token_index == 0) return false;
+    const previous = context.tokens[expression.token_index - 1].tag;
+    if (previous != .equal and previous != .keyword_return) return false;
+    var end = expression.span.end;
+    while (end < context.source.len and (context.source[end] == ' ' or context.source[end] == '\t')) : (end += 1) {}
+    return end < context.source.len and context.source[end] == ';';
+}
+
+fn errorCaptureName(context: ActionRun) ![]const u8 {
+    if (!identifierExists(context, "err")) return "err";
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(context.allocator, "err{d}", .{suffix});
+        if (!identifierExists(context, candidate)) return candidate;
+    }
+}
+
+fn identifierExists(context: ActionRun, name: []const u8) bool {
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, name)) return true;
+    }
+    return false;
 }
 
 fn explicitErrors(context: ActionRun, start: usize, end: usize) []const []const u8 {
@@ -178,10 +212,15 @@ fn explicitErrors(context: ActionRun, start: usize, end: usize) []const []const 
     return &.{};
 }
 
-fn errorSwitchReplacement(context: ActionRun, expression: []const u8, errors: []const []const u8) ![]const u8 {
+fn errorSwitchReplacement(
+    context: ActionRun,
+    expression: []const u8,
+    errors: []const []const u8,
+    capture: []const u8,
+) ![]const u8 {
     var writer: std.Io.Writer.Allocating = .init(context.allocator);
     defer writer.deinit();
-    try writer.writer.print("{s} catch |err| switch (err) {{\n", .{expression});
+    try writer.writer.print("{s} catch |{s}| switch ({s}) {{\n", .{ expression, capture, capture });
     for (errors) |name| try writer.writer.print("    error.{s} => @panic(\"TODO\"),\n", .{name});
     try writer.writer.writeAll("}");
     return try writer.toOwnedSlice();
@@ -205,8 +244,8 @@ fn addPointerCastAction(context: ActionRun) !void {
     if (std.mem.indexOfScalar(u8, source_type, '*') == null or std.mem.indexOfScalar(u8, assignment.target_type, '*') == null) return;
     const needs_alignment = std.mem.indexOf(u8, assignment.target_type, "align(") != null and
         std.mem.indexOf(u8, source_type, "align(") == null;
-    const needs_const_removal = std.mem.indexOf(u8, source_type, "const") != null and
-        std.mem.indexOf(u8, assignment.target_type, "const") == null;
+    const needs_const_removal = try constQualified(context, source_type) and
+        !try constQualified(context, assignment.target_type);
     const needs_pointer_cast = !std.mem.eql(u8, pointeeName(source_type), pointeeName(assignment.target_type));
     if (!needs_alignment and !needs_const_removal and !needs_pointer_cast) return;
 
@@ -214,7 +253,21 @@ fn addPointerCastAction(context: ActionRun) !void {
     if (needs_alignment) replacement = try std.fmt.allocPrint(context.allocator, "@alignCast({s})", .{replacement});
     if (needs_pointer_cast) replacement = try std.fmt.allocPrint(context.allocator, "@ptrCast({s})", .{replacement});
     if (needs_const_removal) replacement = try std.fmt.allocPrint(context.allocator, "@constCast({s})", .{replacement});
-    try context.oneEdit("Insert the required pointer casts", .quickfix, expression.span, replacement, false);
+    const title = if (needs_const_removal)
+        "Insert pointer casts including @constCast (removes const — verify writes are safe)"
+    else
+        "Insert the required pointer casts";
+    try context.oneEdit(title, .quickfix, expression.span, replacement, false);
+}
+
+fn constQualified(context: ActionRun, type_text: []const u8) !bool {
+    const buffer = try context.allocator.dupeZ(u8, type_text);
+    var tokenizer = std.zig.Tokenizer.init(buffer);
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) return false;
+        if (token.tag == .keyword_const) return true;
+    }
 }
 
 fn pointeeName(pointer_type: []const u8) []const u8 {
@@ -235,6 +288,64 @@ fn typedAssignmentBefore(context: ActionRun, expression_index: usize) ?TypedAssi
     const start = context.tokens[colon + 1].loc.start;
     const end = context.tokens[expression_index - 1].loc.start;
     return .{ .target_type = std.mem.trim(u8, context.source[start..end], " \t\r\n") };
+}
+
+fn addSplitCompoundAssertion(context: ActionRun) !void {
+    for (context.tokens, 0..) |token, name_index| {
+        if (token.tag != .identifier or !context.tokenIs(name_index, "assert") or
+            name_index + 1 >= context.tokens.len or context.tokens[name_index + 1].tag != .l_paren) continue;
+        var callee_start = name_index;
+        while (callee_start >= 2 and context.tokens[callee_start - 1].tag == .period and
+            context.tokens[callee_start - 2].tag == .identifier) callee_start -= 2;
+        const closing = context.matchingToken(name_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_span = std.zig.Token.Loc{
+            .start = context.tokens[callee_start].loc.start,
+            .end = context.tokens[closing].loc.end,
+        };
+        const statement_span = standaloneStatement(context, call_span) orelse continue;
+        if (!context.selected(statement_span)) continue;
+        const conditions = try topLevelAndOperands(context, name_index + 2, closing) orelse continue;
+        if (conditions.len < 2) continue;
+        const callee = context.source[context.tokens[callee_start].loc.start..context.tokens[name_index].loc.end];
+        const indentation = context.lineIndentation(statement_span.start);
+        var writer: std.Io.Writer.Allocating = .init(context.allocator);
+        defer writer.deinit();
+        for (conditions, 0..) |condition, index| {
+            if (index != 0) try writer.writer.print("\n{s}", .{indentation});
+            try writer.writer.print("{s}({s});", .{ callee, std.mem.trim(u8, condition, " \t\r\n") });
+        }
+        try context.oneEdit(
+            "Split compound assertion",
+            .refactor_rewrite,
+            statement_span,
+            try writer.toOwnedSlice(),
+            false,
+        );
+    }
+}
+
+fn topLevelAndOperands(context: ActionRun, start: usize, end: usize) !?[]const []const u8 {
+    if (start >= end) return null;
+    var operands: std.ArrayList([]const u8) = .empty;
+    var operand_start = start;
+    var depth: usize = 0;
+    for (context.tokens[start..end], start..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .keyword_or, .comma => if (depth == 0) return null,
+        .keyword_and => if (depth == 0) {
+            if (operand_start == index) return null;
+            try operands.append(context.allocator, context.source[context.tokens[operand_start].loc.start..token.loc.start]);
+            operand_start = index + 1;
+        },
+        else => {},
+    };
+    if (operand_start >= end) return null;
+    try operands.append(
+        context.allocator,
+        context.source[context.tokens[operand_start].loc.start..context.tokens[end - 1].loc.end],
+    );
+    return try operands.toOwnedSlice(context.allocator);
 }
 
 fn declaredType(context: ActionRun, name: []const u8, before: usize) ?[]const u8 {
@@ -263,6 +374,62 @@ test "fallible and optional expressions get Zig recovery actions" {
     const maybe_start = std.mem.lastIndexOf(u8, source, "maybe()") orelse unreachable;
     const optional = try registry.actions(arena.allocator(), source, .{ .start = maybe_start, .end = maybe_start + 5 }, &.{});
     try std.testing.expect(optional.len >= 2);
+    try std.testing.expectEqualStrings("maybe().?", optional[0].edits[0].replacement);
+}
+
+test "fallible calls embedded in larger expressions get no rewrite" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load() error{Missing}!u8 { return 1; } fn run() !void { const x = load() + 1; _ = x; }";
+    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
+}
+
+test "ambiguous same-named functions get no error rewrite" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const A = struct { fn get() !u8 { return 1; } }; " ++
+        "const B = struct { fn get() u8 { return 2; } fn run() void { _ = get(); } };";
+    const get_start = std.mem.lastIndexOf(u8, source, "get()") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = get_start, .end = get_start + 3 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
+}
+
+test "error switch captures avoid shadowing an existing err binding" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load() error{Missing}!u8 { return 1; } fn run() void { const err = 1; _ = err; _ = load(); }";
+    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
+    var found_switch = false;
+    for (actions) |action| {
+        const replacement = action.edits[0].replacement;
+        if (std.mem.indexOf(u8, replacement, "switch") == null) continue;
+        found_switch = true;
+        try std.testing.expect(std.mem.indexOf(u8, replacement, "catch |err2| switch (err2)") != null);
+    }
+    try std.testing.expect(found_switch);
+}
+
+test "merged error sets get no exhaustive switch" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load() (error{A} || error{B})!u8 { return 1; } fn run() !void { _ = load(); }";
+    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
+    try std.testing.expect(actions.len >= 1);
+    for (actions) |action| {
+        try std.testing.expect(std.mem.indexOf(u8, action.edits[0].replacement, "switch") == null);
+    }
 }
 
 test "pointer casts are composed in Zig order" {
@@ -274,4 +441,42 @@ test "pointer casts are composed in Zig order" {
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "@constCast(@ptrCast(@alignCast(source)))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, actions[0].title, "@constCast") != null);
+}
+
+test "type paths containing 'const' letters get no spurious @constCast" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn run(source: *constants.Config) void { const target: *config.Config = source; _ = target; }";
+    const start = std.mem.indexOfPos(u8, source, 30, "source;") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqualStrings("@ptrCast(source)", actions[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("Insert the required pointer casts", actions[0].title);
+}
+
+test "compound assertions split into one assert per condition" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(a: bool, b: bool, c: bool) void {\n    std.debug.assert(a and b and c);\n}";
+    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqualStrings(
+        "std.debug.assert(a);\n    std.debug.assert(b);\n    std.debug.assert(c);",
+        actions[0].edits[0].replacement,
+    );
+}
+
+test "assertions mixing or at the top level stay together" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn run(a: bool, b: bool, c: bool) void {\n    assert(a and b or c);\n}";
+    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
 }

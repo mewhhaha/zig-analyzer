@@ -31,6 +31,7 @@ const Container = struct {
     fields: []const Field,
     scope: TokenScope,
     resolved: bool,
+    has_usingnamespace: bool,
 };
 
 const TokenScope = struct {
@@ -83,6 +84,7 @@ pub fn findingsWithShapes(
             .fields = fields,
             .scope = .{ .opening = null, .closing = tokens.len },
             .resolved = true,
+            .has_usingnamespace = false,
         });
     }
     var found: std.ArrayList(Finding) = .empty;
@@ -101,7 +103,9 @@ pub fn findingsWithShapes(
     try findConstantComptimeConditions(allocator, source, tokens, configuration, &found);
     try findSwitches(allocator, source, tokens, containers.items, configuration, &found);
     try findStructInitializers(allocator, source, tokens, &tree, containers.items, configuration, &found);
-    try findCleanupDefersInLoops(allocator, source, tokens, configuration, &found);
+    // defer_cleanup_in_loop is intentionally inert: a defer in a loop body runs at the
+    // end of each iteration, not at function exit, so the rule's premise was false.
+    // The Rule enum entry remains so existing configurations still parse.
     try findNeedlessCasts(allocator, source, tokens, configuration, &found);
     try findNeedlessElse(allocator, source, tokens, configuration, &found);
     try findNonIdiomaticNames(allocator, source, tokens, configuration, &found);
@@ -121,6 +125,7 @@ pub fn findingsWithShapes(
             .level = configuration.level(finding.rule),
             .span = finding.span,
             .message = finding.message,
+            .fixes = finding.fixes,
         });
     }
     try rule_registry.run(.{
@@ -155,6 +160,7 @@ pub fn fileNameFinding(
     defer allocator.free(tokens);
     var brace_depth: usize = 0;
     var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
     var has_top_level_fields = false;
     for (tokens, 0..) |token, index| {
         switch (token.tag) {
@@ -162,7 +168,9 @@ pub fn fileNameFinding(
             .r_brace => brace_depth -|= 1,
             .l_paren => parenthesis_depth += 1,
             .r_paren => parenthesis_depth -|= 1,
-            .identifier => if (brace_depth == 0 and parenthesis_depth == 0 and index + 1 < tokens.len and
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .identifier => if (brace_depth == 0 and parenthesis_depth == 0 and bracket_depth == 0 and index + 1 < tokens.len and
                 tokens[index + 1].tag == .colon and (index == 0 or switch (tokens[index - 1].tag) {
                 .keyword_const, .keyword_var, .keyword_fn => false,
                 else => true,
@@ -211,6 +219,8 @@ fn findUnresolvedCalls(
 ) !void {
     const level = configuration.level(.unresolved_call);
     if (level == .off) return;
+    // usingnamespace brings names into scope that this file-local scan cannot see.
+    for (tokens) |token| if (tokenIs(source, token, "usingnamespace")) return;
     var declared_names: std.StringHashMapUnmanaged(void) = .empty;
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier) continue;
@@ -360,12 +370,26 @@ fn bindingIsMutated(
         if (index + 1 >= tokens.len) continue;
         if (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket) return true;
         if (isAssignment(tokens[index + 1].tag)) return true;
+        if (identifierIsDestructuredAssignmentTarget(tokens, index)) return true;
         var mutation_cursor = index + 1;
         while (mutation_cursor < tokens.len and mutation_cursor < index + 32) : (mutation_cursor += 1) {
             switch (tokens[mutation_cursor].tag) {
                 .semicolon, .comma => break,
                 else => if (isAssignment(tokens[mutation_cursor].tag)) return true,
             }
+        }
+    }
+    return false;
+}
+
+fn identifierIsDestructuredAssignmentTarget(tokens: []const std.zig.Token, index: usize) bool {
+    if (index + 1 >= tokens.len or tokens[index + 1].tag != .comma) return false;
+    var cursor = index + 1;
+    while (cursor < tokens.len) : (cursor += 1) {
+        switch (tokens[cursor].tag) {
+            .comma, .identifier, .period, .l_bracket, .r_bracket, .number_literal => {},
+            .equal => return true,
+            else => return false,
         }
     }
     return false;
@@ -446,11 +470,7 @@ fn findDiscardedErrors(
     if (level == .off) return;
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_catch) continue;
-        var opening = index + 1;
-        if (opening < tokens.len and tokens[opening].tag == .pipe) {
-            opening = matchingToken(tokens, opening, .pipe, .pipe) orelse continue;
-            opening += 1;
-        }
+        const opening = catchBodyStart(tokens, index) orelse continue;
         if (opening + 1 >= tokens.len or tokens[opening].tag != .l_brace or tokens[opening + 1].tag != .r_brace) continue;
         const body = source[tokens[opening].loc.end..tokens[opening + 1].loc.start];
         if (std.mem.trim(u8, body, &std.ascii.whitespace).len != 0) continue;
@@ -480,11 +500,26 @@ fn findCatchDiagnostics(
         if (unreachable_level != .off and tokens[body_start].tag == .keyword_unreachable and
             catchExpressionIsKnownFallible(source, tokens, catch_index))
         {
+            const fixes: []const Fix = fixes: {
+                if (!enclosingFunctionReturnsErrorUnion(tokens, catch_index)) break :fixes &.{};
+                const call_open = matchingOpeningToken(tokens, catch_index - 1, .l_paren, .r_paren) orelse break :fixes &.{};
+                const expression_start = callExpressionStart(tokens, call_open) orelse break :fixes &.{};
+                const expression = std.mem.trim(u8, source[tokens[expression_start].loc.start..token.loc.start], " \t\r\n");
+                const edits = try allocator.alloc(Edit, 1);
+                edits[0] = .{
+                    .span = .{ .start = tokens[expression_start].loc.start, .end = tokens[body_start].loc.end },
+                    .replacement = try std.fmt.allocPrint(allocator, "try {s}", .{expression}),
+                };
+                const allocated = try allocator.alloc(Fix, 1);
+                allocated[0] = .{ .title = "Propagate the error with try", .kind = .quickfix, .edits = edits };
+                break :fixes allocated;
+            };
             try addFinding(allocator, source, configuration, found, .{
                 .rule = .unsafe_catch_unreachable,
                 .level = unreachable_level,
                 .span = tokens[body_start].loc,
                 .message = try allocator.dupe(u8, "catch unreachable asserts that a proven fallible operation cannot fail"),
+                .fixes = fixes,
             });
         }
         if (context_level == .off) continue;
@@ -512,6 +547,43 @@ fn catchBodyStart(tokens: []const std.zig.Token, catch_index: usize) ?usize {
         index += 1;
     }
     return if (index < tokens.len) index else null;
+}
+
+fn enclosingFunctionReturnsErrorUnion(tokens: []const std.zig.Token, index: usize) bool {
+    var nested_closing_braces: usize = 0;
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_brace => nested_closing_braces += 1,
+            .l_brace => {
+                if (nested_closing_braces != 0) {
+                    nested_closing_braces -= 1;
+                    continue;
+                }
+                var signature_cursor = cursor;
+                while (signature_cursor > 0) {
+                    signature_cursor -= 1;
+                    switch (tokens[signature_cursor].tag) {
+                        .keyword_fn => {
+                            var parameters_open = signature_cursor + 1;
+                            while (parameters_open < cursor and tokens[parameters_open].tag != .l_paren) : (parameters_open += 1) {}
+                            if (parameters_open >= cursor) return false;
+                            const parameters_end = matchingToken(tokens, parameters_open, .l_paren, .r_paren) orelse return false;
+                            for (tokens[parameters_end + 1 .. cursor]) |return_token| {
+                                if (return_token.tag == .bang) return true;
+                            }
+                            return false;
+                        },
+                        .semicolon, .l_brace, .r_brace => break,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn catchExpressionIsKnownFallible(source: []const u8, tokens: []const std.zig.Token, catch_index: usize) bool {
@@ -551,18 +623,31 @@ fn remappedErrorToken(
     tokens: []const std.zig.Token,
     body_start: usize,
 ) ?std.zig.Token {
-    var return_index = body_start;
+    var index = body_start;
     var limit = @min(tokens.len, body_start + 16);
-    if (tokens[body_start].tag == .l_brace) {
+    const braced = tokens[body_start].tag == .l_brace;
+    if (braced) {
         const closing = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return null;
         limit = closing;
-        return_index += 1;
+        index += 1;
     }
-    while (return_index < limit and tokens[return_index].tag != .keyword_return) : (return_index += 1) {}
-    if (return_index + 2 >= limit or !tokenIs(source, tokens[return_index + 1], "error") or
-        tokens[return_index + 2].tag != .period or return_index + 3 >= limit or
-        tokens[return_index + 3].tag != .identifier) return null;
-    return tokens[return_index + 3];
+    var remapped: ?std.zig.Token = null;
+    while (index < limit) : (index += 1) {
+        switch (tokens[index].tag) {
+            // Branching means only some failures are remapped, not every one.
+            .keyword_if, .keyword_switch => return null,
+            .keyword_return => {
+                if (remapped != null) return null;
+                if (index + 3 >= limit or !tokenIs(source, tokens[index + 1], "error") or
+                    tokens[index + 2].tag != .period or tokens[index + 3].tag != .identifier) return null;
+                remapped = tokens[index + 3];
+                index += 3;
+            },
+            .semicolon => if (!braced) break,
+            else => {},
+        }
+    }
+    return remapped;
 }
 
 const ResourcePair = struct {
@@ -636,6 +721,11 @@ fn findMissingResourceCleanup(
         if (!tokenIs(source, token, "lock") or lock_index < 2 or lock_index + 2 >= tokens.len or
             tokens[lock_index - 1].tag != .period or tokens[lock_index - 2].tag != .identifier or
             tokens[lock_index + 1].tag != .l_paren or tokens[lock_index + 2].tag != .r_paren) continue;
+        // A bound result means this is a guard-style lock, not std's void-returning Mutex.lock.
+        var receiver_start = lock_index - 2;
+        while (receiver_start >= 2 and tokens[receiver_start - 1].tag == .period and
+            tokens[receiver_start - 2].tag == .identifier) receiver_start -= 2;
+        if (receiver_start > 0 and tokens[receiver_start - 1].tag == .equal) continue;
         const scope_end = enclosingScopeEnd(tokens, lock_index) orelse continue;
         const receiver = tokenText(source, tokens[lock_index - 2]);
         if (bindingHasRelease(source, tokens, receiver, lock_index + 3, scope_end, "unlock", null)) continue;
@@ -767,6 +857,7 @@ fn findUndefinedValueEscapes(
                 continue;
             }
             if (index + 1 < tokens.len and tokens[index + 1].tag == .equal) break;
+            if (identifierIsDestructuredAssignmentTarget(tokens, index)) break;
             if (index > 0 and tokens[index - 1].tag == .ampersand or usedByAssembly(tokens, index)) break;
             if (usedByFieldMutation(source, tokens, index)) break;
             if (index + 2 < tokens.len and tokens[index + 1].tag == .period and
@@ -1038,8 +1129,47 @@ fn findUnusedPrivateDeclarations(
                 "private {s} '{s}' is never referenced",
                 .{ @tagName(declaration.kind), name },
             ),
+            .fixes = try unusedDeclarationFixes(allocator, source, tokens, declaration),
         });
     }
+}
+
+fn unusedDeclarationFixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    declaration: PrivateDeclaration,
+) ![]const Fix {
+    const keyword_index = declaration.name_index - 1;
+    var declaration_start = keyword_index;
+    while (declaration_start > 0) {
+        switch (tokens[declaration_start - 1].tag) {
+            .keyword_inline, .keyword_noinline, .keyword_comptime, .keyword_threadlocal => declaration_start -= 1,
+            else => break,
+        }
+    }
+    const last_index: ?usize = switch (declaration.kind) {
+        .constant => statementEnd(tokens, keyword_index),
+        .function => end: {
+            if (declaration.name_index + 1 >= tokens.len or tokens[declaration.name_index + 1].tag != .l_paren) break :end null;
+            const parameters_end = matchingToken(tokens, declaration.name_index + 1, .l_paren, .r_paren) orelse break :end null;
+            var body_open = parameters_end + 1;
+            while (body_open < tokens.len and tokens[body_open].tag != .l_brace and tokens[body_open].tag != .semicolon) : (body_open += 1) {}
+            if (body_open >= tokens.len or tokens[body_open].tag != .l_brace) break :end null;
+            break :end matchingToken(tokens, body_open, .l_brace, .r_brace);
+        },
+    };
+    const end_index = last_index orelse return &.{};
+    const declaration_span = std.zig.Token.Loc{
+        .start = lineStart(source, tokens[declaration_start].loc.start),
+        .end = lineEnd(source, tokens[end_index].loc.end),
+    };
+    if (attachedCommentStart(source, declaration_span.start) != declaration_span.start) return &.{};
+    const edits = try allocator.alloc(Edit, 1);
+    edits[0] = .{ .span = declaration_span, .replacement = "" };
+    const fixes = try allocator.alloc(Fix, 1);
+    fixes[0] = .{ .title = "Remove unused declaration", .kind = .quickfix, .edits = edits };
+    return fixes;
 }
 
 fn declarationIsPrivate(tokens: []const std.zig.Token, keyword_index: usize) bool {
@@ -1110,12 +1240,16 @@ fn bindingHasType(
     before: usize,
 ) bool {
     var index = before;
+    var proven = false;
     while (index > 0) {
         index -= 1;
+        if (tokens[index].tag == .keyword_fn) break;
         if (!tokenIs(source, tokens[index], binding_name)) continue;
-        if (index + 2 < tokens.len and tokens[index + 1].tag == .colon and tokenIs(source, tokens[index + 2], type_name)) return true;
+        if (index + 2 >= tokens.len or tokens[index + 1].tag != .colon) continue;
+        if (!tokenIs(source, tokens[index + 2], type_name)) return false;
+        proven = true;
     }
-    return false;
+    return proven;
 }
 
 fn collectContainers(
@@ -1156,6 +1290,7 @@ fn collectContainers(
             .fields = fields,
             .scope = enclosingTokenScope(tokens, index),
             .resolved = false,
+            .has_usingnamespace = tokensBeforeContain(source, tokens, opening + 1, closing, "usingnamespace"),
         });
     }
     return try containers.toOwnedSlice(allocator);
@@ -1237,6 +1372,8 @@ fn findComptimeReflectionIssues(
         if (literal.len < 2) continue;
         const member_name = literal[1 .. literal.len - 1];
         const has_field = tokenIs(source, token, "@hasField");
+        // usingnamespace mixes in members this analysis cannot see.
+        if (container.has_usingnamespace) continue;
         if (has_field and container.kind == .enumeration or !has_field and container.resolved) continue;
         const exists = if (has_field)
             containerHasField(container, member_name)
@@ -1347,6 +1484,8 @@ fn findSwitches(
         var missing: std.ArrayList([]const u8) = .empty;
         var else_index: ?usize = null;
         for (container.fields) |field| {
+            // '_' marks a non-exhaustive enum, not a nameable case; '._ =>' does not compile.
+            if (std.mem.eql(u8, field.name, "_")) continue;
             if (!switchContainsCase(source, tokens, opening, closing, field.name)) try missing.append(allocator, field.name);
         }
         var cursor = opening + 1;
@@ -1628,10 +1767,12 @@ fn switchContainsCase(
     for (tokens[opening + 1 .. closing], opening + 1..) |token, index| {
         if (token.tag != .period or index + 2 >= closing or !tokenIs(source, tokens[index + 1], name)) continue;
         var cursor = index + 2;
-        while (cursor < closing and cursor < index + 16) : (cursor += 1) {
-            if (std.mem.indexOfScalar(u8, source[tokens[index + 1].loc.end..tokens[cursor].loc.start], '\n') != null) break;
-            if (tokens[cursor].tag == .equal_angle_bracket_right) return true;
-            if (tokens[cursor].tag == .semicolon or tokens[cursor].tag == .l_brace) break;
+        while (cursor < closing) : (cursor += 1) {
+            switch (tokens[cursor].tag) {
+                .equal_angle_bracket_right => return true,
+                .comma, .period, .identifier => {},
+                else => break,
+            }
         }
     }
     return false;
@@ -1838,46 +1979,6 @@ fn missingMessage(
     return try writer.toOwnedSlice();
 }
 
-fn findCleanupDefersInLoops(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    configuration: Configuration,
-    found: *std.ArrayList(Finding),
-) !void {
-    const level = configuration.level(.defer_cleanup_in_loop);
-    if (level == .off) return;
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_defer or !loopBodyIsBareDefer(tokens, index)) continue;
-        var cursor = index + 1;
-        var release: ?[]const u8 = null;
-        while (cursor < tokens.len and tokens[cursor].tag != .semicolon and tokens[cursor].tag != .r_brace) : (cursor += 1) {
-            if (tokenIs(source, tokens[cursor], "free")) release = "free";
-            if (tokenIs(source, tokens[cursor], "destroy")) release = "destroy";
-        }
-        const release_name = release orelse continue;
-        try addFinding(allocator, source, configuration, found, .{
-            .rule = .defer_cleanup_in_loop,
-            .level = level,
-            .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "deferred {s} inside this loop is delayed until the containing function exits", .{release_name}),
-        });
-    }
-}
-
-fn loopBodyIsBareDefer(tokens: []const std.zig.Token, index: usize) bool {
-    var cursor = index;
-    while (cursor > 0 and index - cursor < 64) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .keyword_for, .keyword_while => return true,
-            .l_brace, .r_brace, .semicolon => return false,
-            else => {},
-        }
-    }
-    return false;
-}
-
 fn findNeedlessCasts(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -2073,9 +2174,17 @@ fn declarationNamesType(source: []const u8, tokens: []const std.zig.Token, ident
     {
         target_index += 2;
     }
-    if (target_index + 1 >= tokens.len or tokens[target_index + 1].tag != .semicolon) return false;
+    if (target_index + 1 >= tokens.len) return false;
     const target = tokenText(source, tokens[target_index]);
-    if (target_index != identifier_index + 2 and isTitleCase(target)) return true;
+    switch (tokens[target_index + 1].tag) {
+        .semicolon => if (target_index != identifier_index + 2 and isTitleCase(target)) return true,
+        .l_paren => {
+            const call_end = matchingToken(tokens, target_index + 1, .l_paren, .r_paren) orelse return false;
+            if (call_end + 1 >= tokens.len or tokens[call_end + 1].tag != .semicolon) return false;
+            if (isTitleCase(target)) return true;
+        },
+        else => return false,
+    }
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or !tokenIs(source, token, target) or index == 0) continue;
         if (tokens[index - 1].tag == .keyword_const and declarationInitializesType(tokens, index)) return true;
@@ -2225,13 +2334,15 @@ fn findOfficialStyleIssues(
         else
             null;
         if (docs_level != .off and doc_index != null) {
-            const raw_comment = tokenText(source, tokens[doc_index.?]);
+            var first_doc_index = doc_index.?;
+            while (first_doc_index > 0 and tokens[first_doc_index - 1].tag == .doc_comment) first_doc_index -= 1;
+            const raw_comment = tokenText(source, tokens[first_doc_index]);
             const comment = std.mem.trim(u8, raw_comment[@min(raw_comment.len, 3)..], " \t");
             if (commentStartsWithName(comment, name)) {
                 try addFinding(allocator, source, configuration, found, .{
                     .rule = .doc_comment_style,
                     .level = docs_level,
-                    .span = tokens[doc_index.?].loc,
+                    .span = tokens[first_doc_index].loc,
                     .message = try std.fmt.allocPrint(
                         allocator,
                         "documentation for '{s}' repeats information already provided by its name",
@@ -2333,6 +2444,8 @@ fn findOptionalCaptureIdioms(
         var unsafe = false;
         for (tokens[body_start..body_close], body_start..) |body_token, body_index| {
             if (body_token.tag != .identifier or !tokenIs(source, body_token, optional_name)) continue;
+            // A preceding period means this is a same-named field of another value.
+            if (body_index > 0 and tokens[body_index - 1].tag == .period) continue;
             if (body_index + 1 < body_close and isAssignment(tokens[body_index + 1].tag)) {
                 unsafe = true;
                 break;
@@ -2340,6 +2453,10 @@ fn findOptionalCaptureIdioms(
             if (body_index + 2 < body_close and tokens[body_index + 1].tag == .period and
                 tokenIs(source, tokens[body_index + 2], "?"))
             {
+                if (body_index + 3 < body_close and isAssignment(tokens[body_index + 3].tag)) {
+                    unsafe = true;
+                    break;
+                }
                 try unwraps.append(allocator, .{ .start = body_token.loc.start, .end = tokens[body_index + 2].loc.end });
             }
         }
@@ -2433,7 +2550,22 @@ fn findTryIdioms(
 fn callExpressionStart(tokens: []const std.zig.Token, opening: usize) ?usize {
     if (opening == 0 or tokens[opening - 1].tag != .identifier) return null;
     var start = opening - 1;
-    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
+    while (start >= 2 and tokens[start - 1].tag == .period) {
+        switch (tokens[start - 2].tag) {
+            .identifier => start -= 2,
+            .r_paren => {
+                const group_open = matchingOpeningToken(tokens, start - 2, .l_paren, .r_paren) orelse return null;
+                if (group_open == 0 or tokens[group_open - 1].tag != .identifier) return null;
+                start = group_open - 1;
+            },
+            .r_bracket => {
+                const group_open = matchingOpeningToken(tokens, start - 2, .l_bracket, .r_bracket) orelse return null;
+                if (group_open == 0 or tokens[group_open - 1].tag != .identifier) return null;
+                start = group_open - 1;
+            },
+            else => return null,
+        }
+    }
     return start;
 }
 
@@ -2545,13 +2677,24 @@ fn pointerParameterReadOnly(
     for (tokens[body_open + 1 .. body_close], body_open + 1..) |token, index| {
         if (token.tag != .identifier or !tokenIs(source, token, parameter_name)) continue;
         uses += 1;
-        if (index + 1 >= body_close) return false;
-        if (tokenIs(source, tokens[index + 1], ".*")) {
-            if (index + 2 < body_close and isAssignment(tokens[index + 2].tag)) return false;
-            continue;
+        var cursor = index + 1;
+        while (cursor < body_close) {
+            switch (tokens[cursor].tag) {
+                .period_asterisk => cursor += 1,
+                .period => {
+                    if (cursor + 1 >= body_close or tokens[cursor + 1].tag != .identifier) return false;
+                    cursor += 2;
+                },
+                .l_bracket => {
+                    const subscript_close = matchingToken(tokens, cursor, .l_bracket, .r_bracket) orelse return false;
+                    if (subscript_close >= body_close) return false;
+                    cursor = subscript_close + 1;
+                },
+                else => break,
+            }
         }
-        if (tokens[index + 1].tag != .period or index + 2 >= body_close) return false;
-        if (index + 3 < body_close and (isAssignment(tokens[index + 3].tag) or tokens[index + 3].tag == .l_paren)) return false;
+        if (cursor == index + 1) return false;
+        if (cursor < body_close and (isAssignment(tokens[cursor].tag) or tokens[cursor].tag == .l_paren)) return false;
     }
     return uses != 0;
 }
@@ -2831,6 +2974,7 @@ fn attachedCommentStart(source: []const u8, declaration_start: usize) usize {
         const previous_start = lineStart(source, previous_end);
         const previous_line = std.mem.trim(u8, source[previous_start..previous_end], " \t\r");
         if (!std.mem.startsWith(u8, previous_line, "//")) break;
+        if (std.mem.startsWith(u8, previous_line, "//!")) break;
         start = previous_start;
     }
     return start;
@@ -3114,7 +3258,7 @@ test "organize imports preserves directly attached comments" {
     try std.testing.expect(std.mem.indexOf(u8, replacement, "// package docs\nconst package") != null);
 }
 
-test "cleanup defer warns only for a bare loop body" {
+test "cleanup defer in a loop never fires because it runs each iteration" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
@@ -3123,11 +3267,7 @@ test "cleanup defer warns only for a bare loop body" {
         "    for (values) |value| { defer allocator.free(value); }\n" ++
         "}\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
-    var warning_count: usize = 0;
-    for (found) |finding| if (finding.rule == .defer_cleanup_in_loop) {
-        warning_count += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), warning_count);
+    for (found) |finding| try std.testing.expect(finding.rule != .defer_cleanup_in_loop);
 }
 
 test "style findings require proven operands and expose safe fixes" {
@@ -3635,4 +3775,417 @@ test "comptime hints use proven container members and explicit constant conditio
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), generated_member_count);
+}
+
+test "switch analysis reads multiline multi-value prongs as present cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { fast, safe, slow };\n" ++
+        "fn run(mode: Mode) void {\n" ++
+        "    switch (mode) {\n" ++
+        "        .fast,\n" ++
+        "        .safe,\n" ++
+        "        => {},\n" ++
+        "        .slow => {},\n" ++
+        "    }\n" ++
+        "    switch (mode) {\n" ++
+        "        .fast,\n" ++
+        "        .safe,\n" ++
+        "        => {},\n" ++
+        "    }\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var missing_switch_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_switch_prong) {
+        missing_switch_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".slow") != null);
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".fast") == null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
+}
+
+test "switch prongs never propose the non-exhaustive '_' marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Tag = Factory();\n" ++
+        "fn run(tag: Tag) void {\n" ++
+        "    switch (tag) { .a => {} }\n" ++
+        "}\n";
+    const found = try findingsWithShapes(arena.allocator(), source, Configuration.defaults(), &.{.{
+        .type_name = "Tag",
+        .kind = .enumeration,
+        .fields = &.{ "a", "b", "_" },
+    }});
+    var missing_switch_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_switch_prong) {
+        missing_switch_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".b") != null);
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "._") == null);
+        try std.testing.expect(std.mem.indexOf(u8, finding.fixes[0].edits[0].replacement, "._") == null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
+}
+
+test "pointer parameters mutated through nested members or subscripts stay mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Inner = struct { count: u32 };\n" ++
+        "const State = struct { inner: Inner };\n" ++
+        "const Buffer = struct { bytes: [4]u8 };\n" ++
+        "fn touch(state: *State, buffer: *Buffer, counter: *u32) void {\n" ++
+        "    state.inner.count = 1;\n" ++
+        "    buffer.bytes[0] = 0;\n" ++
+        "    counter.* += 1;\n" ++
+        "}\n" ++
+        "fn observe(state: *State) u32 {\n" ++
+        "    return state.inner.count;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var pointer_count: usize = 0;
+    for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
+        pointer_count += 1;
+        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn observe").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), pointer_count);
+}
+
+test "type aliases built from type-returning calls expect TitleCase" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const MyList = std.ArrayList(u8);\n" ++
+        "const bad_list = std.ArrayList(u8);\n" ++
+        "fn run() void { const items = std.ArrayList(u8).init; _ = items; _ = MyList; _ = bad_list; }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("bad_list", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "destructuring assignment counts as mutation of its targets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn divmod(a: u32, b: u32) struct { u32, u32 } { return .{ a / b, a % b }; }\n" ++
+        "fn run() void {\n" ++
+        "    var quotient: u32 = 0;\n" ++
+        "    var remainder: u32 = 0;\n" ++
+        "    var untouched: u32 = 0;\n" ++
+        "    quotient, remainder = divmod(1, 2);\n" ++
+        "    _ = quotient; _ = remainder; _ = untouched;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var mutation_count: usize = 0;
+    for (found) |finding| if (finding.rule == .never_mutated_var) {
+        mutation_count += 1;
+        try std.testing.expectEqualStrings("untouched", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), mutation_count);
+}
+
+test "undefined values initialized by destructuring do not escape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn divmod(a: u32, b: u32) struct { u32, u32 } { return .{ a / b, a % b }; }\n" ++
+        "fn run() u32 {\n" ++
+        "    var quotient: u32 = undefined;\n" ++
+        "    var remainder: u32 = undefined;\n" ++
+        "    quotient, remainder = divmod(1, 2);\n" ++
+        "    return quotient + remainder;\n" ++
+        "}\n" ++
+        "fn leak() u32 { var escaped: u32 = undefined; return escaped; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var escape_count: usize = 0;
+    for (found) |finding| if (finding.rule == .undefined_value_escape) {
+        escape_count += 1;
+        try std.testing.expectEqualStrings("escaped", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), escape_count);
+}
+
+test "needless cast proof stays within the enclosing function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn widen(size: u32) u32 { return @as(u32, size); }\n" ++
+        "fn narrow(size: u16) u32 { return @as(u32, size); }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_cast)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var cast_count: usize = 0;
+    for (found) |finding| if (finding.rule == .needless_cast) {
+        cast_count += 1;
+        try std.testing.expect(finding.span.start < std.mem.indexOf(u8, source, "fn narrow").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cast_count);
+}
+
+test "organize imports leaves container doc comments in place" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "//! Module documentation.\n" ++
+        "const zebra = @import(\"zebra.zig\");\n" ++
+        "const apple = @import(\"apple.zig\");\n" ++
+        "fn use() void { _ = zebra; _ = apple; }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unsorted_imports)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var import_count: usize = 0;
+    for (found) |finding| if (finding.rule == .unsorted_imports) {
+        import_count += 1;
+        try std.testing.expectEqual(std.mem.indexOf(u8, source, "const zebra").?, finding.fixes[0].edits[0].span.start);
+        try std.testing.expect(std.mem.indexOf(u8, finding.fixes[0].edits[0].replacement, "//!") == null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), import_count);
+}
+
+test "prefer try rewrites chained calls from the expression start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(stream: anytype, data: []const u8) !void {\n" ++
+        "    const written = stream.getWriter().write(data) catch |err| return err;\n" ++
+        "    _ = written;\n" ++
+        "}\n" ++
+        "fn opaque_receiver(data: []const u8) !void {\n" ++
+        "    const written = (makeWriter()).write(data) catch |err| return err;\n" ++
+        "    _ = written;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.prefer_try)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var try_count: usize = 0;
+    for (found) |finding| if (finding.rule == .prefer_try) {
+        try_count += 1;
+        try std.testing.expectEqualStrings("try stream.getWriter().write(data)", finding.fixes[0].edits[0].replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), try_count);
+}
+
+test "optional capture skips foreign fields and assigned unwraps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn read(y: ?u32, box: anytype) u32 {\n" ++
+        "    if (y != null) { return y.? + box.y.?; }\n" ++
+        "    return 0;\n" ++
+        "}\n" ++
+        "fn bump(count: ?u32) void {\n" ++
+        "    var y = count;\n" ++
+        "    if (y != null) { y.? += 1; }\n" ++
+        "    _ = y;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.prefer_optional_capture)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var capture_count: usize = 0;
+    for (found) |finding| if (finding.rule == .prefer_optional_capture) {
+        capture_count += 1;
+        try std.testing.expectEqual(@as(usize, 2), finding.fixes[0].edits.len);
+        try std.testing.expectEqual(std.mem.indexOf(u8, source, "y.? + box").?, finding.fixes[0].edits[1].span.start);
+    };
+    try std.testing.expectEqual(@as(usize, 1), capture_count);
+}
+
+test "discarded error is reported even with an unused capture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load() !u32 { return 1; }\n" ++
+        "fn run() void {\n" ++
+        "    load() catch |err| {};\n" ++
+        "    load() catch |err| { log(err); };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.discarded_error)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var discard_count: usize = 0;
+    for (found) |finding| if (finding.rule == .discarded_error) {
+        discard_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), discard_count);
+}
+
+test "lost error context ignores conditional remaps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load() !u32 { return 1; }\n" ++
+        "fn conditional() !u32 {\n" ++
+        "    return load() catch |err| {\n" ++
+        "        if (err == error.FileNotFound) return error.ConfigMissing;\n" ++
+        "        return err;\n" ++
+        "    };\n" ++
+        "}\n" ++
+        "fn unconditional() !u32 {\n" ++
+        "    return load() catch { return error.LoadFailed; };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.lost_error_context)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var context_count: usize = 0;
+    for (found) |finding| if (finding.rule == .lost_error_context) {
+        context_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "LoadFailed") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), context_count);
+}
+
+test "usingnamespace suppresses member and call resolution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mixin = struct { pub const shared = 1; };\n" ++
+        "const Widget = struct {\n" ++
+        "    usingnamespace Mixin;\n" ++
+        "    count: u32,\n" ++
+        "};\n" ++
+        "const Plain = struct { count: u32 };\n" ++
+        "fn run() void {\n" ++
+        "    _ = @hasDecl(Widget, \"shared\");\n" ++
+        "    _ = @hasDecl(Plain, \"missing\");\n" ++
+        "    borrowed();\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .hint;
+    const found = try findings(arena.allocator(), source, configuration);
+    var member_count: usize = 0;
+    for (found) |finding| {
+        try std.testing.expect(finding.rule != .unresolved_call);
+        if (finding.rule == .unknown_comptime_member) {
+            member_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Plain'") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), member_count);
+
+    const control: [:0]const u8 = "fn run() void { borrowed(); }\n";
+    const control_findings = try findings(arena.allocator(), control, configuration);
+    var unresolved_count: usize = 0;
+    for (control_findings) |finding| if (finding.rule == .unresolved_call) {
+        unresolved_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), unresolved_count);
+}
+
+test "doc comment style checks the first line of a multi-line comment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "/// Returns the parsed config.\n" ++
+        "/// parse errors are returned verbatim.\n" ++
+        "pub fn parse() void {}\n" ++
+        "/// render draws the frame.\n" ++
+        "/// Later lines may say anything.\n" ++
+        "pub fn render() void {}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.doc_comment_style)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var docs_count: usize = 0;
+    for (found) |finding| if (finding.rule == .doc_comment_style) {
+        docs_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'render'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), docs_count);
+}
+
+test "top-level sentinel arrays do not make a file a type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_file_name)] = .information;
+    const source: [:0]const u8 = "pub const table = [_:0]u8{ 1, 2, 3 };\npub fn run() void {}\n";
+    try std.testing.expect((try fileNameFinding(arena.allocator(), source, "tables.zig", configuration)) == null);
+    try std.testing.expect((try fileNameFinding(arena.allocator(), source, "Tables.zig", configuration)) != null);
+}
+
+test "bound lock results are guards not mutex locks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn guarded(db: anytype) void {\n" ++
+        "    const guard = db.lock();\n" ++
+        "    defer guard.deinit();\n" ++
+        "}\n" ++
+        "fn leaky(mutex: anytype) void {\n" ++
+        "    mutex.lock();\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var lock_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        lock_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'mutex'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), lock_count);
+}
+
+test "catch unreachable offers try only inside fallible functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn fail() !void { return error.Failed; }\n" ++
+        "fn propagate() !void {\n" ++
+        "    fail() catch unreachable;\n" ++
+        "}\n" ++
+        "fn swallow() void {\n" ++
+        "    fail() catch unreachable;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unsafe_catch_unreachable)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var unreachable_count: usize = 0;
+    for (found) |finding| if (finding.rule == .unsafe_catch_unreachable) {
+        unreachable_count += 1;
+        if (finding.span.start < std.mem.indexOf(u8, source, "fn swallow").?) {
+            try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+            try std.testing.expectEqualStrings("try fail()", finding.fixes[0].edits[0].replacement);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 2), unreachable_count);
+}
+
+test "unused private declarations offer whole declaration removal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const unused = 2;\n" ++
+        "// The comment blocks deletion.\n" ++
+        "const commented = 3;\n" ++
+        "fn orphan() void {}\n" ++
+        "pub fn run() void {}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unused_private_declaration)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var declaration_count: usize = 0;
+    for (found) |finding| if (finding.rule == .unused_private_declaration) {
+        declaration_count += 1;
+        const name = source[finding.span.start..finding.span.end];
+        if (std.mem.eql(u8, name, "unused")) {
+            try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+            const span = finding.fixes[0].edits[0].span;
+            try std.testing.expectEqualStrings("const unused = 2;\n", source[span.start..span.end]);
+        } else if (std.mem.eql(u8, name, "commented")) {
+            try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+        } else if (std.mem.eql(u8, name, "orphan")) {
+            try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+            const span = finding.fixes[0].edits[0].span;
+            try std.testing.expectEqualStrings("fn orphan() void {}\n", source[span.start..span.end]);
+        } else return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(@as(usize, 3), declaration_count);
 }

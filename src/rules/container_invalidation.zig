@@ -95,15 +95,33 @@ fn firstInvalidation(context: RuleRun, name: []const u8, start: usize, end: usiz
 }
 
 fn firstMapMutation(context: RuleRun, name: []const u8, start: usize, end: usize) ?Mutation {
-    const methods = [_][]const u8{ "put", "putNoClobber", "fetchPut", "remove", "clearAndFree", "clearRetainingCapacity", "rehash" };
+    const methods = [_][]const u8{ "put", "putNoClobber", "fetchPut", "getOrPut", "remove", "clearAndFree", "clearRetainingCapacity", "rehash" };
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index + 3 >= end or
             context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
             context.tokens[index + 3].tag != .l_paren) continue;
         const method = context.tokenText(index + 2);
-        for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return .{ .index = index + 2, .method = method };
+        var mutates = false;
+        for (methods) |candidate| {
+            if (std.mem.eql(u8, method, candidate)) mutates = true;
+        }
+        if (!mutates or mutationExitsLoop(context, index, end)) continue;
+        return .{ .index = index + 2, .method = method };
     }
     return null;
+}
+
+fn mutationExitsLoop(context: RuleRun, mutation_index: usize, body_end: usize) bool {
+    const statement_end = context.statementEnd(mutation_index) orelse return false;
+    var cursor = statement_end + 1;
+    if (cursor >= body_end) return false;
+    if (context.tokens[cursor].tag != .keyword_break and context.tokens[cursor].tag != .keyword_return) return false;
+    const exit_end = context.statementEnd(cursor) orelse return false;
+    cursor = exit_end + 1;
+    while (cursor < body_end) : (cursor += 1) {
+        if (context.tokens[cursor].tag != .r_brace and context.tokens[cursor].tag != .semicolon) return false;
+    }
+    return true;
 }
 
 fn containsKnownContainer(context: RuleRun, start: usize, end: usize) bool {
@@ -126,7 +144,9 @@ fn containsMethodCall(context: RuleRun, receiver: []const u8, method: []const u8
 
 fn usedAfter(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, name)) return true;
+        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+        if (index + 1 < end and context.tokens[index + 1].tag == .equal) return false;
+        return true;
     }
     return false;
 }
@@ -142,6 +162,43 @@ test "element pointers and active map iterators are invalidated by mutation" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
+}
+
+test "refreshing the element pointer after mutation is not a stale use" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn list(allocator: anytype) !void { var values = std.ArrayList(u8).empty; var first = &values.items[0]; try values.append(allocator, 1); first = &values.items[0]; use(first); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "removing an entry and immediately leaving the loop is safe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn evict() !void { var values = std.AutoHashMap(u8, u8).init(a); var iterator = values.iterator(); while (iterator.next()) |entry| { if (match(entry)) { _ = values.remove(1); break; } } }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "getOrPut during iteration invalidates the iterator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn map() !void { var values = std.AutoHashMap(u8, u8).init(a); var iterator = values.iterator(); while (iterator.next()) |_| { _ = try values.getOrPut(1); } }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "getOrPut") != null);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {

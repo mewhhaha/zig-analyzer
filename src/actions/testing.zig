@@ -6,6 +6,7 @@ const ActionRun = action_context.ActionRun;
 pub fn run(context: ActionRun) !void {
     const selected_index = action_context.selectedTokenIndex(context) orelse return;
     if (context.tokens[selected_index].tag != .identifier or selected_index == 0) return;
+    if (!atTopLevel(context, selected_index)) return;
     const name = context.tokenText(selected_index);
     if (context.tokens[selected_index - 1].tag == .keyword_fn) {
         if (testNamed(context, name)) return;
@@ -31,6 +32,16 @@ pub fn run(context: ActionRun) !void {
         ),
         false,
     );
+}
+
+fn atTopLevel(context: ActionRun, name_index: usize) bool {
+    var depth: usize = 0;
+    for (context.tokens[0..name_index]) |token| switch (token.tag) {
+        .l_brace => depth += 1,
+        .r_brace => depth -|= 1,
+        else => {},
+    };
+    return depth == 0;
 }
 
 fn isContainerDeclaration(context: ActionRun, name_index: usize) bool {
@@ -65,4 +76,14 @@ test "functions and containers get Zig test harnesses" {
     const container_start = std.mem.indexOf(u8, container_source, "Config") orelse unreachable;
     const container_actions = try registry.actions(arena.allocator(), container_source, .{ .start = container_start, .end = container_start + 6 }, &.{});
     try std.testing.expect(std.mem.indexOf(u8, container_actions[0].edits[0].replacement, "refAllDecls") != null);
+}
+
+test "nested declarations get no file-scope test harness" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "const S = struct { fn parse() void {} };";
+    const start = std.mem.indexOf(u8, source, "parse") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 5 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
 }

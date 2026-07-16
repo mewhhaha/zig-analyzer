@@ -53,12 +53,19 @@ fn buildImportAction(
     const build_document = uniqueBuildDocument(documents) orelse return null;
     const existing_import = try std.fmt.allocPrint(allocator, "addImport(\"{s}\"", .{import_name});
     if (std.mem.indexOf(u8, build_document.source, existing_import) != null) return null;
-    const artifact_name = try firstRootModuleReceiver(allocator, build_document.source) orelse return null;
+    const build_tokens = try action_context.tokenize(allocator, build_document.source);
+    const build_body = buildFunctionBody(build_tokens, build_document.source) orelse return null;
+    const artifact_name = firstRootModuleReceiver(
+        build_document.source,
+        build_tokens,
+        build_body.start,
+        build_body.end,
+    ) orelse return null;
     const build_path = uriPath(build_document.uri) orelse return null;
     const module_path = uriPath(module_document.uri) orelse return null;
     const build_directory = std.fs.path.dirname(build_path) orelse return null;
     const relative_path = try std.fs.path.relative(allocator, "/", null, build_directory, module_path);
-    const insertion = lastFunctionBrace(build_document.source) orelse return null;
+    const insertion = build_tokens[build_body.end].loc.start;
     const edits = try allocator.alloc(FileEdit, 1);
     edits[0] = .{
         .uri = build_document.uri,
@@ -120,23 +127,33 @@ fn uniqueBuildDocument(documents: []const OpenDocument) ?OpenDocument {
     return selected;
 }
 
-fn firstRootModuleReceiver(allocator: std.mem.Allocator, source: [:0]const u8) !?[]const u8 {
-    const tokens = try action_context.tokenize(allocator, source);
+const BuildFunctionBody = struct { start: usize, end: usize };
+
+fn buildFunctionBody(tokens: []const std.zig.Token, source: [:0]const u8) ?BuildFunctionBody {
     for (tokens, 0..) |token, index| {
-        if (token.tag == .identifier and index + 2 < tokens.len and tokens[index + 1].tag == .period and
-            tokenIs(source, tokens[index + 2], "root_module")) return source[token.loc.start..token.loc.end];
+        if (token.tag != .keyword_fn or index + 2 >= tokens.len or tokens[index + 1].tag != .identifier or
+            !tokenIs(source, tokens[index + 1], "build") or tokens[index + 2].tag != .l_paren) continue;
+        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse return null;
+        var body_start = parameters_end + 1;
+        while (body_start < tokens.len and tokens[body_start].tag != .l_brace) : (body_start += 1) {}
+        if (body_start >= tokens.len) return null;
+        const body_end = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return null;
+        return .{ .start = body_start, .end = body_end };
     }
     return null;
 }
 
-fn lastFunctionBrace(source: [:0]const u8) ?usize {
-    var tokenizer = std.zig.Tokenizer.init(source);
-    var last: ?usize = null;
-    while (true) {
-        const token = tokenizer.next();
-        if (token.tag == .eof) return last;
-        if (token.tag == .r_brace) last = token.loc.start;
+fn firstRootModuleReceiver(
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    body_start: usize,
+    body_end: usize,
+) ?[]const u8 {
+    for (tokens[body_start..body_end], body_start..) |token, index| {
+        if (token.tag == .identifier and index + 2 < body_end and tokens[index + 1].tag == .period and
+            tokenIs(source, tokens[index + 2], "root_module")) return source[token.loc.start..token.loc.end];
     }
+    return null;
 }
 
 fn cImportAction(
@@ -250,7 +267,10 @@ fn uriPath(uri: []const u8) ?[]const u8 {
 test "project actions repair build imports and consolidate c imports" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const build: [:0]const u8 = "const std = @import(\"std\"); pub fn build(b: *std.Build) void { const exe = b.addExecutable(.{ .name = \"app\" }); _ = exe.root_module; }";
+    const build: [:0]const u8 =
+        "const std = @import(\"std\"); pub fn build(b: *std.Build) void { " ++
+        "const exe = b.addExecutable(.{ .name = \"app\" }); _ = exe.root_module; } " ++
+        "fn helper() void { const local = 1; _ = local; }";
     const main: [:0]const u8 = "const feature = @import(\"feature\"); const c = @cImport({ @cInclude(\"x.h\"); });";
     const feature: [:0]const u8 = "const c = @cImport({ @cInclude(\"x.h\"); });";
     const documents = [_]OpenDocument{
@@ -262,6 +282,9 @@ test "project actions repair build imports and consolidate c imports" {
     const build_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = import_start, .end = import_start + 9 }, &documents);
     try std.testing.expectEqual(@as(usize, 1), build_actions.len);
     try std.testing.expect(std.mem.indexOf(u8, build_actions[0].edits[0].edit.replacement, "root_module.addImport") != null);
+    const build_close = (std.mem.indexOf(u8, build, "} fn helper") orelse unreachable);
+    try std.testing.expectEqual(build_close, build_actions[0].edits[0].edit.span.start);
+    try std.testing.expectEqualStrings("exe", build_actions[0].edits[0].edit.replacement[4..7]);
 
     const c_import = std.mem.indexOf(u8, main, "@cImport") orelse unreachable;
     const c_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = c_import, .end = c_import + 8 }, &documents);
