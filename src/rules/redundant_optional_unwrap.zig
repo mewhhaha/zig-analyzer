@@ -19,10 +19,11 @@ pub fn run(context: RuleRun) !void {
         const optional_name = context.tokenText(condition_index + 2);
         const capture_name = context.tokenText(condition_index + 5);
         if (bindingChangesOrIsShadowed(context, optional_name, condition_index + 8, body_end)) continue;
+        if (bindingIsMutatedThroughUnwrap(context, optional_name, condition_index + 8, body_end)) continue;
 
         var edits: std.ArrayList(types.Edit) = .empty;
         for (context.tokens[condition_index + 8 .. body_end], condition_index + 8..) |body_token, index| {
-            if (body_token.tag != .identifier or !context.tokenIs(index, optional_name) or index + 2 >= body_end or
+            if (body_token.tag != .identifier or !context.refersToBinding(index, optional_name) or index + 2 >= body_end or
                 context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .question_mark) continue;
             try edits.append(context.allocator, .{
                 .span = .{ .start = body_token.loc.start, .end = context.tokens[index + 2].loc.end },
@@ -61,6 +62,42 @@ fn bindingChangesOrIsShadowed(context: RuleRun, name: []const u8, start: usize, 
     return false;
 }
 
+fn bindingIsMutatedThroughUnwrap(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or !context.refersToBinding(index, name)) continue;
+        if (index > start and context.tokens[index - 1].tag == .ampersand) return true;
+        if (index + 3 < end and context.tokens[index + 1].tag == .period and
+            context.tokens[index + 2].tag == .question_mark and
+            isAssignmentOperator(context.tokens[index + 3].tag)) return true;
+    }
+    return false;
+}
+
+fn isAssignmentOperator(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .equal,
+        .plus_equal,
+        .minus_equal,
+        .asterisk_equal,
+        .slash_equal,
+        .percent_equal,
+        .ampersand_equal,
+        .pipe_equal,
+        .caret_equal,
+        .plus_percent_equal,
+        .minus_percent_equal,
+        .asterisk_percent_equal,
+        .plus_pipe_equal,
+        .minus_pipe_equal,
+        .asterisk_pipe_equal,
+        .angle_bracket_angle_bracket_left_equal,
+        .angle_bracket_angle_bracket_left_pipe_equal,
+        .angle_bracket_angle_bracket_right_equal,
+        => true,
+        else => false,
+    };
+}
+
 test "optional captures replace repeated force unwraps" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -84,6 +121,42 @@ test "reassigned optionals do not produce capture rewrites" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "if (optional) |value| { optional = other; consume(optional.?); _ = value; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = configuration,
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "a field named like the optional binding is not the binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "if (optional) |value| { consume(config.optional.?); _ = value; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = configuration,
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "assigning through the forced unwrap disqualifies the capture rewrite" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "if (optional) |value| { optional.? = compute(value); consume(optional.?); }";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();

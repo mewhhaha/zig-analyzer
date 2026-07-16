@@ -108,7 +108,10 @@ fn deferredCleanup(
 
 fn fallibleOperationBetween(context: RuleRun, start: usize, end: usize, scope_opening: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .keyword_try and context.enclosingOpeningBrace(index) == scope_opening) return true;
+        if (token.tag != .keyword_try) continue;
+        const enclosing = context.enclosingOpeningBrace(index) orelse continue;
+        if (enclosing == scope_opening) return true;
+        if (context.enclosingOpeningBrace(enclosing) == scope_opening) return true;
     }
     return false;
 }
@@ -121,6 +124,28 @@ test "resource cleanup registered after try can be skipped" {
         "fn load(dir: std.fs.Dir) !void {\n" ++
         "    var file = try dir.openFile(\"input\", .{});\n" ++
         "    try validate();\n" ++
+        "    defer file.close();\n" ++
+        "}";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+}
+
+test "a fallible operation one block deep can still skip the cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn load(dir: std.fs.Dir, flag: bool) !void {\n" ++
+        "    var file = try dir.openFile(\"input\", .{});\n" ++
+        "    if (flag) { try validate(); }\n" ++
         "    defer file.close();\n" ++
         "}";
     const tokens = try tokenize(arena.allocator(), source);

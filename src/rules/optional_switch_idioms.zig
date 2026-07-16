@@ -18,6 +18,8 @@ fn findOptionalPresenceTests(context: RuleRun) !void {
             !context.tokenIs(index + 5, "_") or context.tokens[index + 6].tag != .pipe or
             context.tokens[index + 7].tag != .identifier or context.tokens[index + 8].tag != .keyword_else or
             context.tokens[index + 9].tag != .identifier) continue;
+        if (index + 10 < context.tokens.len and !endsExpression(context.tokens[index + 10].tag)) continue;
+        if (containsComment(context.source[token.loc.start..context.tokens[index + 9].loc.end])) continue;
         const when_present = context.tokenText(index + 7);
         const when_absent = context.tokenText(index + 9);
         const operator = if (std.mem.eql(u8, when_present, "true") and std.mem.eql(u8, when_absent, "false"))
@@ -45,6 +47,17 @@ fn findOptionalPresenceTests(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+fn endsExpression(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .semicolon, .comma, .r_paren, .r_bracket, .r_brace => true,
+        else => false,
+    };
+}
+
+fn containsComment(source: []const u8) bool {
+    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
 }
 
 fn findUnusedElseCaptures(context: RuleRun) !void {
@@ -93,10 +106,10 @@ fn findManualSentinels(context: RuleRun) !void {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        if (!allocationAddsOne(context, declaration_index + 3, declaration_end)) continue;
+        const length = allocationLengthBeforePlusOne(context, declaration_index + 3, declaration_end) orelse continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
-        if (!writesZeroTerminator(context, binding_name, declaration_end + 1, scope_end)) continue;
+        if (!writesZeroTerminator(context, binding_name, length, declaration_end + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .prefer_sentinel_termination,
             .level = level,
@@ -110,23 +123,37 @@ fn findManualSentinels(context: RuleRun) !void {
     }
 }
 
-fn allocationAddsOne(context: RuleRun, start: usize, end: usize) bool {
+fn allocationLengthBeforePlusOne(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     var calls_alloc = false;
-    var adds_one = false;
+    var length: ?[]const u8 = null;
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag == .identifier and context.tokenIs(index, "alloc")) calls_alloc = true;
-        if (token.tag == .plus and index + 1 < end and context.tokens[index + 1].tag == .number_literal and context.tokenIs(index + 1, "1")) adds_one = true;
+        if (token.tag != .plus or index + 1 >= end or context.tokens[index + 1].tag != .number_literal or
+            !context.tokenIs(index + 1, "1")) continue;
+        var length_start = index;
+        while (length_start > start) : (length_start -= 1) {
+            switch (context.tokens[length_start - 1].tag) {
+                .identifier, .period, .number_literal => {},
+                else => break,
+            }
+        }
+        if (length_start < index) {
+            length = context.source[context.tokens[length_start].loc.start..context.tokens[index - 1].loc.end];
+        }
     }
-    return calls_alloc and adds_one;
+    if (!calls_alloc) return null;
+    return length;
 }
 
-fn writesZeroTerminator(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+fn writesZeroTerminator(context: RuleRun, name: []const u8, length: []const u8, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index + 5 >= end or
             context.tokens[index + 1].tag != .l_bracket) continue;
         const bracket_end = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
-        if (bracket_end + 2 >= end or context.tokens[bracket_end + 1].tag != .equal or
+        if (bracket_end + 2 >= end or bracket_end == index + 2 or context.tokens[bracket_end + 1].tag != .equal or
             context.tokens[bracket_end + 2].tag != .number_literal or !context.tokenIs(bracket_end + 2, "0")) continue;
+        const index_text = context.source[context.tokens[index + 2].loc.start..context.tokens[bracket_end - 1].loc.end];
+        if (!std.mem.eql(u8, index_text, length) and !std.mem.endsWith(u8, index_text, ".len")) continue;
         return true;
     }
     return false;
@@ -168,6 +195,31 @@ test "optional presence and sentinel idioms are recognized" {
     configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
+}
+
+test "a compared presence test keeps its capture form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "const compared = if (optional) |_| false else true == other;";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_optional_presence_test)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "writing a value at an unrelated index is not a manual sentinel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() !void { const grid = try allocator.alloc(u8, w * h + 1); grid[0] = 0; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 test "unused switch else captures are removable" {

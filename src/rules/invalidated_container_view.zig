@@ -122,6 +122,7 @@ fn viewUsedAfter(context: RuleRun, view_name: []const u8, start: usize, end: usi
         if (token.tag != .identifier or !context.tokenIs(index, view_name) or
             context.enclosingOpeningBrace(index) != scope_opening) continue;
         if (index > start and (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var)) return false;
+        if (index + 1 < end and context.tokens[index + 1].tag == .equal) return false;
         return true;
     }
     return false;
@@ -161,6 +162,30 @@ test "views not used after mutation stay clean" {
         "    const old_items = list.items;\n" ++
         "    consume(old_items);\n" ++
         "    try list.append(allocator, 1);\n" ++
+        "}";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "reassigning the view after mutation refreshes it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn update(allocator: std.mem.Allocator) !void {\n" ++
+        "    var list = std.ArrayList(u8).empty;\n" ++
+        "    var view = list.items;\n" ++
+        "    try list.append(allocator, 1);\n" ++
+        "    view = list.items;\n" ++
+        "    consume(view);\n" ++
         "}";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;

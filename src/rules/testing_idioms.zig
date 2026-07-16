@@ -13,7 +13,7 @@ fn findSliceExpectations(context: RuleRun) !void {
     if (level == .off) return;
     for (context.tokens, 0..) |token, expect_index| {
         if (!context.tokenIs(expect_index, "expect") or token.tag != .identifier or expect_index + 10 >= context.tokens.len or
-            context.tokens[expect_index + 1].tag != .l_paren) continue;
+            context.tokens[expect_index + 1].tag != .l_paren or !calleeIsTestingQualified(context, expect_index)) continue;
         const expect_end = context.matchingToken(expect_index + 1, .l_paren, .r_paren) orelse continue;
         const eql_index = expect_index + 6;
         if (!qualifiedMemEql(context, expect_index, eql_index)) continue;
@@ -67,9 +67,14 @@ fn findManualErrorExpectations(context: RuleRun) !void {
             !context.tokenIs(body_end + 3, "error") or context.tokens[body_end + 4].tag != .period or
             !context.tokenIs(body_end + 5, "TestExpectedError") or context.tokens[body_end + 6].tag != .semicolon) continue;
         const expression_start = statementStart(context.tokens, catch_index);
+        var operation_start = expression_start;
+        if (context.tokenIs(operation_start, "_") and operation_start + 1 < catch_index and
+            context.tokens[operation_start + 1].tag == .equal) operation_start += 2;
+        if (operation_start >= catch_index or
+            operationHasAssignment(context.tokens, operation_start, catch_index)) continue;
         const operation = std.mem.trim(
             u8,
-            context.source[context.tokens[expression_start].loc.start..token.loc.start],
+            context.source[context.tokens[operation_start].loc.start..token.loc.start],
             " \t\r\n",
         );
         if (operation.len == 0) continue;
@@ -113,6 +118,24 @@ fn findApproximateExpectations(context: RuleRun) !void {
             .message = try context.allocator.dupe(u8, "manual absolute-difference assertion produces a less useful failure than expectApproxEqAbs"),
         });
     }
+}
+
+fn calleeIsTestingQualified(context: RuleRun, expect_index: usize) bool {
+    if (expect_index == 0 or context.tokens[expect_index - 1].tag != .period) return true;
+    return expect_index >= 2 and context.tokens[expect_index - 2].tag == .identifier and
+        context.tokenIs(expect_index - 2, "testing");
+}
+
+fn operationHasAssignment(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    for (tokens[start..end]) |token| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .equal => if (depth == 0) return true,
+        .keyword_const, .keyword_var => return true,
+        else => {},
+    };
+    return false;
 }
 
 fn qualifiedMemEql(context: RuleRun, expect_index: usize, eql_index: usize) bool {
@@ -212,6 +235,58 @@ test "manual catch assertion becomes expectError" {
         "try std.testing.expectError(error.NotFound, operation());",
         findings.items[0].fixes[0].edits[0].replacement,
     );
+}
+
+test "a discarded operation loses its discard in the expectError rewrite" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "_ = operation() catch |err| {\n" ++
+        "    try std.testing.expectEqual(error.NotFound, err);\n" ++
+        "    return;\n" ++
+        "};\n" ++
+        "return error.TestExpectedError;";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_error)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    const edit = findings.items[0].fixes[0].edits[0];
+    try std.testing.expectEqualStrings(
+        "try std.testing.expectError(error.NotFound, operation());",
+        edit.replacement,
+    );
+    try std.testing.expectEqual(@as(usize, 0), edit.span.start);
+}
+
+test "an operation bound to a name is not rewritten to expectError" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const outcome = operation() catch |err| {\n" ++
+        "    try std.testing.expectEqual(error.NotFound, err);\n" ++
+        "    return;\n" ++
+        "};\n" ++
+        "return error.TestExpectedError;";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_error)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "a custom expect harness is not rewritten to expectEqualSlices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "try harness.expect(std.mem.eql(u32, expected, actual));";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_slices)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {

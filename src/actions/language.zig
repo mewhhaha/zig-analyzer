@@ -25,11 +25,26 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
             context.tokens[string_index + 2].tag != .period or context.tokens[string_index + 3].tag != .l_brace) continue;
         const tuple_end = context.matchingToken(string_index + 3, .l_brace, .r_brace) orelse continue;
         const arguments = (try simpleTupleArguments(context, string_index + 4, tuple_end)) orelse continue;
-        const placeholder_count = formatPlaceholderCount(context.tokenText(string_index));
+        const format = context.tokenText(string_index);
+        const placeholder_count = formatPlaceholderCount(format);
         if (placeholder_count == arguments.len or placeholder_count > 16) continue;
 
         var writer: std.Io.Writer.Allocating = .init(context.allocator);
         defer writer.deinit();
+        if (placeholder_count < arguments.len) {
+            if (format.len < 2 or format[format.len - 1] != '"') continue;
+            try writer.writer.writeAll(format[0 .. format.len - 1]);
+            for (placeholder_count..arguments.len) |_| try writer.writer.writeAll(" {any}");
+            try writer.writer.writeAll("\"");
+            try context.oneEdit(
+                "Add missing format placeholders",
+                .refactor_rewrite,
+                token.loc,
+                try writer.toOwnedSlice(),
+                false,
+            );
+            continue;
+        }
         try writer.writer.writeAll(".{");
         for (0..placeholder_count) |index| {
             if (index != 0) try writer.writer.writeAll(", ");
@@ -37,12 +52,13 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
                 const argument = arguments[index];
                 try writer.writer.writeAll(context.source[argument.start..argument.end]);
             } else {
+                // @panic("TODO") is a compiling noreturn tuple filler; undefined is not formattable.
                 try writer.writer.writeAll("@panic(\"TODO\")");
             }
         }
         try writer.writer.writeAll("}");
         try context.oneEdit(
-            if (placeholder_count < arguments.len) "Remove extra format arguments" else "Add missing format arguments",
+            "Add missing format arguments",
             .refactor_rewrite,
             .{
                 .start = context.tokens[string_index + 2].loc.start,
@@ -96,6 +112,25 @@ fn formatPlaceholderCount(format: []const u8) usize {
     return count;
 }
 
+fn loneEmptyPlaceholder(format: []const u8) ?usize {
+    var empty_placeholder: ?usize = null;
+    var placeholder_count: usize = 0;
+    var index: usize = 1;
+    while (index + 1 < format.len) : (index += 1) {
+        if (format[index] != '{') continue;
+        if (format[index + 1] == '{') {
+            index += 1;
+            continue;
+        }
+        const closing = std.mem.indexOfScalarPos(u8, format, index + 1, '}') orelse break;
+        placeholder_count += 1;
+        if (closing == index + 1) empty_placeholder = index;
+        index = closing;
+    }
+    if (placeholder_count != 1) return null;
+    return empty_placeholder;
+}
+
 fn addMutableCapture(context: ActionRun) !void {
     for (context.tokens, 0..) |token, capture_index| {
         if (token.tag != .identifier or capture_index == 0 or capture_index + 1 >= context.tokens.len or
@@ -104,13 +139,23 @@ fn addMutableCapture(context: ActionRun) !void {
         if (body_start >= context.tokens.len or context.tokens[body_start].tag != .l_brace) continue;
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
         if (!captureSourceMutable(context, capture_index)) continue;
-        const mutation = captureMutation(context, context.tokenText(capture_index), body_start + 1, body_end) orelse continue;
-        if (!context.selected(token.loc) and !context.selected(context.tokens[mutation].loc)) continue;
-        try context.oneEdit(
+        const mutations = (try captureMutations(context, context.tokenText(capture_index), body_start + 1, body_end)) orelse continue;
+        if (mutations.len == 0) continue;
+        var selected = context.selected(token.loc);
+        for (mutations) |mutation| {
+            if (context.selected(context.tokens[mutation].loc)) selected = true;
+        }
+        if (!selected) continue;
+        const edits = try context.allocator.alloc(analysis.Edit, mutations.len + 1);
+        edits[0] = .{ .span = .{ .start = token.loc.start, .end = token.loc.start }, .replacement = "*" };
+        for (mutations, edits[1..]) |mutation, *edit| {
+            const mutated = context.tokens[mutation];
+            edit.* = .{ .span = .{ .start = mutated.loc.end, .end = mutated.loc.end }, .replacement = ".*" };
+        }
+        try context.add(
             try std.fmt.allocPrint(context.allocator, "Capture '{s}' by pointer", .{context.tokenText(capture_index)}),
             .quickfix,
-            .{ .start = token.loc.start, .end = token.loc.start },
-            "*",
+            edits,
             false,
         );
     }
@@ -151,8 +196,10 @@ fn captureSourceMutable(context: ActionRun, capture_index: usize) bool {
 }
 
 fn mutableLocalBinding(context: ActionRun, name: []const u8, before: usize) bool {
+    const function = action_context.containingFunction(context, before);
+    const lower = if (function) |enclosing| enclosing.body_start else 0;
     var index = before;
-    while (index > 0) {
+    while (index > lower) {
         index -= 1;
         if (context.tokenIs(index, name) and index > 0 and context.tokens[index - 1].tag == .keyword_var) return true;
     }
@@ -176,14 +223,19 @@ fn mutablePointerBinding(context: ActionRun, name: []const u8, before: usize) bo
     return false;
 }
 
-fn captureMutation(context: ActionRun, name: []const u8, start: usize, end: usize) ?usize {
+fn captureMutations(context: ActionRun, name: []const u8, start: usize, end: usize) !?[]const usize {
+    var mutations: std.ArrayList(usize) = .empty;
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index + 1 >= end) continue;
-        if (isAssignment(context.tokens[index + 1].tag)) return index;
-        if (index + 2 < end and context.tokens[index + 1].tag == .period and
-            context.tokens[index + 2].tag == .asterisk and index + 3 < end and isAssignment(context.tokens[index + 3].tag)) return index;
+        if (isAssignment(context.tokens[index + 1].tag)) {
+            try mutations.append(context.allocator, index);
+            continue;
+        }
+        // Field access auto-dereferences through the pointer capture; any other
+        // use of the name would change type once it becomes a pointer.
+        if (context.tokens[index + 1].tag != .period) return null;
     }
-    return null;
+    return try mutations.toOwnedSlice(context.allocator);
 }
 
 fn isAssignment(tag: std.zig.Token.Tag) bool {
@@ -220,10 +272,9 @@ fn addTaggedUnionSwitch(context: ActionRun) !void {
         const shape = context.shapeNamed(type_name) orelse continue;
         if (shape.kind != .tagged_union or !shapeContains(shape, tag_name)) continue;
         const body_end = context.matchingToken(if_index + 7, .l_brace, .r_brace) orelse continue;
-        const body = context.source[context.tokens[if_index + 7].loc.end..context.tokens[body_end].loc.start];
-        const field_access = try std.fmt.allocPrint(context.allocator, "{s}.{s}", .{ value_name, tag_name });
-        if (std.mem.indexOf(u8, body, field_access) == null) continue;
-        const rewritten_body = try std.mem.replaceOwned(u8, context.allocator, body, field_access, "payload");
+        if (body_end + 1 < context.tokens.len and context.tokens[body_end + 1].tag == .keyword_else) continue;
+        const capture = try payloadCaptureName(context, if_index + 8, body_end);
+        const rewritten_body = (try payloadRewrittenBody(context, value_name, tag_name, capture, if_index + 8, body_end)) orelse continue;
         const indentation = context.lineIndentation(token.loc.start);
         try context.oneEdit(
             "Use a tagged-union switch and payload capture",
@@ -231,12 +282,57 @@ fn addTaggedUnionSwitch(context: ActionRun) !void {
             .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
             try std.fmt.allocPrint(
                 context.allocator,
-                "switch ({s}) {{\n{s}    .{s} => |payload| {{{s}}},\n{s}    else => {{}},\n{s}}}",
-                .{ value_name, indentation, tag_name, rewritten_body, indentation, indentation },
+                "switch ({s}) {{\n{s}    .{s} => |{s}| {{{s}}},\n{s}    else => {{}},\n{s}}}",
+                .{ value_name, indentation, tag_name, capture, rewritten_body, indentation, indentation },
             ),
             false,
         );
     }
+}
+
+fn payloadCaptureName(context: ActionRun, start: usize, end: usize) ![]const u8 {
+    if (!identifierWithin(context, "payload", start, end)) return "payload";
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(context.allocator, "payload{d}", .{suffix});
+        if (!identifierWithin(context, candidate, start, end)) return candidate;
+    }
+}
+
+fn identifierWithin(context: ActionRun, name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, name)) return true;
+    }
+    return false;
+}
+
+fn payloadRewrittenBody(
+    context: ActionRun,
+    value_name: []const u8,
+    tag_name: []const u8,
+    capture: []const u8,
+    start: usize,
+    end: usize,
+) !?[]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(context.allocator);
+    defer writer.deinit();
+    var cursor = context.tokens[start - 1].loc.end;
+    var replaced = false;
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (context.tokens[index].tag != .identifier or !context.tokenIs(index, value_name)) continue;
+        if (context.tokens[index - 1].tag == .period) continue;
+        if (index + 2 >= end or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 2].tag != .identifier or !context.tokenIs(index + 2, tag_name)) continue;
+        try writer.writer.writeAll(context.source[cursor..context.tokens[index].loc.start]);
+        try writer.writer.writeAll(capture);
+        cursor = context.tokens[index + 2].loc.end;
+        index += 2;
+        replaced = true;
+    }
+    if (!replaced) return null;
+    try writer.writer.writeAll(context.source[cursor..context.tokens[end].loc.start]);
+    return try writer.toOwnedSlice();
 }
 
 fn bindingType(context: ActionRun, name: []const u8, before: usize) ?[]const u8 {
@@ -263,13 +359,18 @@ fn addFormatRepair(context: ActionRun) !void {
         if (!std.mem.eql(u8, callee, "print") and !std.mem.eql(u8, callee, "format") and
             !std.mem.eql(u8, callee, "allocPrint") and !std.mem.eql(u8, callee, "bufPrint")) continue;
         const format = context.tokenText(string_index);
-        if (std.mem.count(u8, format, "{}") != 1 or string_index + 5 >= context.tokens.len or
+        const empty_placeholder = loneEmptyPlaceholder(format) orelse continue;
+        if (string_index + 5 >= context.tokens.len or
             context.tokens[string_index + 1].tag != .comma or context.tokens[string_index + 2].tag != .period or
             context.tokens[string_index + 3].tag != .l_brace) continue;
         const argument_index = string_index + 4;
         if (context.tokens[argument_index + 1].tag != .r_brace) continue;
         const specifier = formatSpecifier(context, argument_index) orelse continue;
-        const replacement = try std.mem.replaceOwned(u8, context.allocator, format, "{}", specifier);
+        const replacement = try std.fmt.allocPrint(
+            context.allocator,
+            "{s}{s}{s}",
+            .{ format[0..empty_placeholder], specifier, format[empty_placeholder + 2 ..] },
+        );
         try context.oneEdit(
             try std.fmt.allocPrint(context.allocator, "Use the '{s}' format specifier", .{specifier}),
             .quickfix,
@@ -315,10 +416,13 @@ fn addInlineElseRefactor(context: ActionRun) !void {
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
         const value_name = reflectedDispatchValue(context, body_start + 1, body_end) orelse continue;
         const field_name = reflectedFieldCapture(context, header_end + 1, body_start) orelse continue;
-        if (!returnsReflectedField(context, value_name, field_name, body_start + 1, body_end)) continue;
+        if (!loopBodyIsGuardedReturn(context, value_name, field_name, body_start, body_end)) continue;
+        const trailing_unreachable = body_end + 2 < context.tokens.len and
+            context.tokens[body_end + 1].tag == .keyword_unreachable and context.tokens[body_end + 2].tag == .semicolon;
+        const at_function_end = body_end + 1 < context.tokens.len and context.tokens[body_end + 1].tag == .r_brace;
+        if (!trailing_unreachable and !at_function_end) continue;
         var replacement_end = context.tokens[body_end].loc.end;
-        if (body_end + 2 < context.tokens.len and context.tokens[body_end + 1].tag == .keyword_unreachable and
-            context.tokens[body_end + 2].tag == .semicolon) replacement_end = context.tokens[body_end + 2].loc.end;
+        if (trailing_unreachable) replacement_end = context.tokens[body_end + 2].loc.end;
         const indentation = context.lineIndentation(token.loc.start);
         try context.oneEdit(
             "Use an inline-else switch",
@@ -389,16 +493,67 @@ fn reflectedDispatchValue(context: ActionRun, start: usize, end: usize) ?[]const
     return null;
 }
 
-fn returnsReflectedField(context: ActionRun, value: []const u8, field: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .keyword_return or index + 7 >= end or context.tokens[index + 1].tag != .builtin or
-            !context.tokenIs(index + 1, "@field") or context.tokens[index + 2].tag != .l_paren or
-            !context.tokenIs(index + 3, value) or context.tokens[index + 4].tag != .comma or
-            !context.tokenIs(index + 5, field) or context.tokens[index + 6].tag != .period or
-            !context.tokenIs(index + 7, "name")) continue;
-        return true;
+fn loopBodyIsGuardedReturn(context: ActionRun, value: []const u8, field: []const u8, body_start: usize, body_end: usize) bool {
+    const tokens = context.tokens;
+    var index = body_start + 1;
+    if (index + 2 >= body_end or tokens[index].tag != .keyword_if or tokens[index + 1].tag != .l_paren) return false;
+    index += 2;
+    if (tokens[index].tag != .identifier) return false;
+    var callee_end = index;
+    index += 1;
+    while (index + 1 < body_end and tokens[index].tag == .period and tokens[index + 1].tag == .identifier) {
+        callee_end = index + 1;
+        index += 2;
     }
-    return false;
+    if (!context.tokenIs(callee_end, "eql")) return false;
+    if (index + 2 >= body_end or tokens[index].tag != .l_paren) return false;
+    index += 1;
+    if (tokens[index].tag != .identifier or !context.tokenIs(index, "u8")) return false;
+    index += 1;
+    if (tokens[index].tag != .comma) return false;
+    index += 1;
+    var compares_field = false;
+    var compares_tag = false;
+    index = eqlOperandEnd(context, index, body_end, value, field, &compares_field, &compares_tag) orelse return false;
+    if (index >= body_end or tokens[index].tag != .comma) return false;
+    index += 1;
+    index = eqlOperandEnd(context, index, body_end, value, field, &compares_field, &compares_tag) orelse return false;
+    if (!compares_field or !compares_tag) return false;
+    if (index + 1 >= body_end or tokens[index].tag != .r_paren or tokens[index + 1].tag != .r_paren) return false;
+    index += 2;
+    if (index + 10 != body_end) return false;
+    return tokens[index].tag == .keyword_return and
+        tokens[index + 1].tag == .builtin and context.tokenIs(index + 1, "@field") and
+        tokens[index + 2].tag == .l_paren and context.tokenIs(index + 3, value) and
+        tokens[index + 4].tag == .comma and context.tokenIs(index + 5, field) and
+        tokens[index + 6].tag == .period and context.tokenIs(index + 7, "name") and
+        tokens[index + 8].tag == .r_paren and tokens[index + 9].tag == .semicolon;
+}
+
+fn eqlOperandEnd(
+    context: ActionRun,
+    index: usize,
+    end: usize,
+    value: []const u8,
+    field: []const u8,
+    compares_field: *bool,
+    compares_tag: *bool,
+) ?usize {
+    const tokens = context.tokens;
+    if (index + 2 < end and tokens[index].tag == .identifier and context.tokenIs(index, field) and
+        tokens[index + 1].tag == .period and tokens[index + 2].tag == .identifier and context.tokenIs(index + 2, "name"))
+    {
+        compares_field.* = true;
+        return index + 3;
+    }
+    if (index + 3 < end and tokens[index].tag == .builtin and context.tokenIs(index, "@tagName") and
+        tokens[index + 1].tag == .l_paren and tokens[index + 2].tag == .identifier and
+        context.tokenIs(index + 2, value) and tokens[index + 3].tag == .r_paren)
+    {
+        compares_tag.* = true;
+        return index + 4;
+    }
+    return null;
 }
 
 fn addMaterializedType(context: ActionRun) !void {
@@ -456,8 +611,11 @@ fn addReflectedDeclaration(context: ActionRun) !void {
             context.tokens[builtin_index + 4].tag != .string_literal or !context.selected(context.tokens[builtin_index + 4].loc)) continue;
         const type_name = context.tokenText(builtin_index + 2);
         const member_name = stringValue(context.tokenText(builtin_index + 4)) orelse continue;
-        if (context.shapeNamed(type_name)) |shape| if (shapeContains(shape, member_name)) continue;
-        const container_end = localContainerEnd(context, type_name) orelse continue;
+        if (context.shapeNamed(type_name)) |shape| {
+            if (shape.kind != .structure) continue;
+            if (shapeContains(shape, member_name)) continue;
+        }
+        const container_end = localPlainStructEnd(context, type_name) orelse continue;
         const indentation = context.lineIndentation(context.tokens[container_end].loc.start);
         const declaration = if (context.tokenIs(builtin_index, "@hasField"))
             try std.fmt.allocPrint(context.allocator, "{s}    @\"{s}\": void = {{}},\n", .{ indentation, member_name })
@@ -473,16 +631,12 @@ fn addReflectedDeclaration(context: ActionRun) !void {
     }
 }
 
-fn localContainerEnd(context: ActionRun, name: []const u8) ?usize {
+fn localPlainStructEnd(context: ActionRun, name: []const u8) ?usize {
     for (context.tokens, 0..) |token, index| {
         if (token.tag != .keyword_const or index + 4 >= context.tokens.len or !context.tokenIs(index + 1, name) or
             context.tokens[index + 2].tag != .equal) continue;
-        var opening = index + 4;
-        if (context.tokens[index + 3].tag == .keyword_union and context.tokens[opening].tag == .l_paren) {
-            opening = (context.matchingToken(opening, .l_paren, .r_paren) orelse continue) + 1;
-        }
-        if (opening >= context.tokens.len or context.tokens[opening].tag != .l_brace) continue;
-        return context.matchingToken(opening, .l_brace, .r_brace);
+        if (context.tokens[index + 3].tag != .keyword_struct or context.tokens[index + 4].tag != .l_brace) continue;
+        return context.matchingToken(index + 4, .l_brace, .r_brace);
     }
     return null;
 }
@@ -501,7 +655,11 @@ test "mutable captures format strings and reflected declarations have actions" {
     const capture_source: [:0]const u8 = "fn run(value: ?u8) void { var current = value; if (current) |payload| { payload += 1; } }";
     const capture = std.mem.indexOf(u8, capture_source, "payload") orelse unreachable;
     const capture_actions = try registry.actions(arena.allocator(), capture_source, .{ .start = capture, .end = capture + 7 }, &.{});
+    try std.testing.expectEqual(@as(usize, 2), capture_actions[0].edits.len);
     try std.testing.expectEqualStrings("*", capture_actions[0].edits[0].replacement);
+    try std.testing.expectEqualStrings(".*", capture_actions[0].edits[1].replacement);
+    const mutation = std.mem.lastIndexOf(u8, capture_source, "payload") orelse unreachable;
+    try std.testing.expectEqual(mutation + 7, capture_actions[0].edits[1].span.start);
 
     const format_source: [:0]const u8 = "fn run() void { std.debug.print(\"name {}\", .{\"zig\"}); }";
     const format = std.mem.indexOf(u8, format_source, "\"name {}\"") orelse unreachable;
@@ -526,7 +684,32 @@ test "format argument arity gets explicit tuple repairs" {
     const extra_source: [:0]const u8 = "fn run(one: u8, two: u8) void { std.debug.print(\"{}\", .{one, two}); }";
     const extra_format = std.mem.indexOf(u8, extra_source, "\"{}\"") orelse unreachable;
     const extra = try registry.actions(arena.allocator(), extra_source, .{ .start = extra_format, .end = extra_format + 4 }, &.{});
-    try std.testing.expectEqualStrings(".{one}", extra[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("Add missing format placeholders", extra[0].title);
+    try std.testing.expectEqualStrings("\"{} {any}\"", extra[0].edits[0].replacement);
+    try std.testing.expectEqual(extra_format, extra[0].edits[0].span.start);
+}
+
+test "escaped format braces are counted and replaced escape-aware" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn run() void { std.debug.print(\"{{}} {}\", .{\"zig\"}); }";
+    const format = std.mem.indexOf(u8, source, "\"{{}} {}\"") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = format, .end = format + 9 }, &.{});
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqualStrings("\"{{}} {s}\"", actions[0].edits[0].replacement);
+}
+
+test "out-of-scope var bindings do not enable pointer captures" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn other() void { var current: ?u8 = 1; _ = current; } " ++
+        "fn run(value: ?u8) void { const current = value; if (current) |payload| { payload += 1; } }";
+    const capture = std.mem.lastIndexOf(u8, source, "payload") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = capture, .end = capture + 7 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
 
 test "compiler shapes drive tagged union and materialization actions" {
@@ -546,6 +729,68 @@ test "compiler shapes drive tagged union and materialization actions" {
     try std.testing.expect(std.mem.indexOf(u8, materialize_actions[0].edits[0].replacement, "union(enum)") != null);
 }
 
+test "tagged union switches leave dangling else branches alone" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_][]const u8{ "number", "text" };
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
+    const source: [:0]const u8 = "fn run(value: Value) void { if (value == .number) { _ = value.number; } else { _ = value; } }";
+    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), actions.len);
+}
+
+test "tagged union payload rewrites spare string literals and longer identifiers" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_][]const u8{ "number", "text" };
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
+    const source: [:0]const u8 =
+        "fn run(value: Value) void { if (value == .number) { " ++
+        "std.debug.print(\"value.number={d}\", .{value.number}); _ = value.number_total; } }";
+    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    const replacement = actions[0].edits[0].replacement;
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "\"value.number={d}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, ".{payload}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replacement, "value.number_total") != null);
+}
+
+test "tagged union payload captures avoid names already used in the body" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_][]const u8{ "number", "text" };
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
+    const source: [:0]const u8 =
+        "fn run(value: Value) void { if (value == .number) { const payload = value.number; _ = payload; } }";
+    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "|payload2|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "const payload = payload2;") != null);
+}
+
+test "reflected fields only land in plain struct containers" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const union_source: [:0]const u8 =
+        "const Value = union(enum) { number: u8 }; comptime { _ = @hasField(Value, \"text\"); }";
+    const union_member = std.mem.indexOf(u8, union_source, "\"text\"") orelse unreachable;
+    const union_actions = try registry.actions(arena.allocator(), union_source, .{ .start = union_member, .end = union_member + 6 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), union_actions.len);
+
+    const extern_source: [:0]const u8 =
+        "const Raw = extern struct { a: u8 }; comptime { _ = @hasField(Raw, \"b\"); }";
+    const extern_member = std.mem.indexOf(u8, extern_source, "\"b\"") orelse unreachable;
+    const extern_actions = try registry.actions(arena.allocator(), extern_source, .{ .start = extern_member, .end = extern_member + 3 }, &.{});
+    try std.testing.expectEqual(@as(usize, 0), extern_actions.len);
+}
+
 test "reflection dispatch can become an inline-else switch" {
     const registry = @import("registry.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -561,6 +806,14 @@ test "reflection dispatch can become an inline-else switch" {
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "inline else") != null);
 
+    const swapped_source: [:0]const u8 =
+        "const Value = union(enum) { number: u8, code: u8, }; " ++
+        "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
+        "if (std.mem.eql(u8, @tagName(value), field.name)) return @field(value, field.name); } unreachable; }";
+    const swapped_start = std.mem.indexOf(u8, swapped_source, "inline") orelse unreachable;
+    const swapped = try registry.actions(arena.allocator(), swapped_source, .{ .start = swapped_start, .end = swapped_start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 1), swapped.len);
+
     const mixed_source: [:0]const u8 =
         "const Value = union(enum) { number: u8, code: u16, }; " ++
         "fn get(value: Value) u16 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
@@ -568,4 +821,37 @@ test "reflection dispatch can become an inline-else switch" {
     const mixed_start = std.mem.indexOf(u8, mixed_source, "inline") orelse unreachable;
     const mixed_actions = try registry.actions(arena.allocator(), mixed_source, .{ .start = mixed_start, .end = mixed_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), mixed_actions.len);
+}
+
+test "reflection dispatch loops that are not the exact guarded return stay put" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_][]const u8{ "number", "code" };
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
+
+    const negated_source: [:0]const u8 =
+        "const Value = union(enum) { number: u8, code: u8, }; " ++
+        "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
+        "if (!std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
+    const negated_start = std.mem.indexOf(u8, negated_source, "inline") orelse unreachable;
+    const negated = try registry.actions(arena.allocator(), negated_source, .{ .start = negated_start, .end = negated_start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), negated.len);
+
+    const effect_source: [:0]const u8 =
+        "const Value = union(enum) { number: u8, code: u8, }; " ++
+        "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
+        "std.debug.print(\"x\", .{}); " ++
+        "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
+    const effect_start = std.mem.indexOf(u8, effect_source, "inline") orelse unreachable;
+    const effect = try registry.actions(arena.allocator(), effect_source, .{ .start = effect_start, .end = effect_start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), effect.len);
+
+    const trailing_source: [:0]const u8 =
+        "const Value = union(enum) { number: u8, code: u8, }; " ++
+        "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
+        "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } return 0; }";
+    const trailing_start = std.mem.indexOf(u8, trailing_source, "inline") orelse unreachable;
+    const trailing = try registry.actions(arena.allocator(), trailing_source, .{ .start = trailing_start, .end = trailing_start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), trailing.len);
 }
