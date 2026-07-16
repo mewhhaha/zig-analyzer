@@ -92,14 +92,23 @@ fn findDeferredRelease(
 ) ?DeferredRelease {
     for (context.tokens[start..end], start..) |token, defer_index| {
         if (token.tag != .keyword_defer or context.enclosingOpeningBrace(defer_index) != scope_opening) continue;
-        const statement_end = context.statementEnd(defer_index) orelse continue;
+        const statement_end = if (defer_index + 1 < end and context.tokens[defer_index + 1].tag == .l_brace)
+            context.matchingToken(defer_index + 1, .l_brace, .r_brace) orelse continue
+        else
+            context.statementEnd(defer_index) orelse continue;
         for (context.tokens[defer_index + 1 .. statement_end], defer_index + 1..) |method, method_index| {
             if (method.tag != .identifier or !context.tokenIs(method_index, release_method) or
                 !releaseReferencesBinding(context, binding_name, method_index, statement_end)) continue;
+            if (containsTag(context.tokens, defer_index + 1, method_index, .keyword_if)) break;
             return .{ .method_index = method_index, .statement_end = statement_end };
         }
     }
     return null;
+}
+
+fn containsTag(tokens: []const std.zig.Token, start: usize, end: usize, tag: std.zig.Token.Tag) bool {
+    for (tokens[start..end]) |token| if (token.tag == tag) return true;
+    return false;
 }
 
 fn releaseReferencesBinding(context: RuleRun, binding_name: []const u8, method_index: usize, end: usize) bool {
@@ -146,6 +155,29 @@ test "ownership returns and error-only cleanup remain valid" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "a conditionally guarded defer can transfer ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn bytes(a: anytype) ![]u8 { var done = false; const value = try a.alloc(u8, 8); defer if (!done) a.free(value); done = true; return value; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "a block-bodied defer still releases the returned value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn bytes(allocator: anytype) ![]u8 { const value = try allocator.alloc(u8, 8); defer { allocator.free(value); } return value; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqualStrings("value", source[findings.items[0].span.start..findings.items[0].span.end]);
 }
 
 test "released return diagnostics honor suppression" {

@@ -124,7 +124,8 @@ fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
             if (!releaseReferencesBinding(context, binding_name, index, scope_end)) continue;
             if (statement_start == .keyword_errdefer) error_cleanup = true else normal_cleanup = true;
         }
-        if (!error_cleanup or normal_cleanup or bindingTransferred(context, binding_name, declaration_end + 1, scope_end)) continue;
+        if (!error_cleanup or normal_cleanup or
+            bindingTransferred(context, binding_name, resource.release, declaration_end + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .resource_cleanup_on_error_only,
             .level = level,
@@ -138,7 +139,7 @@ fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
     }
 }
 
-fn bindingTransferred(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+fn bindingTransferred(context: RuleRun, name: []const u8, release: []const u8, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag == .identifier and context.tokenIs(index, name) and index > start and
             context.tokens[index - 1].tag == .equal) return true;
@@ -146,6 +147,15 @@ fn bindingTransferred(context: RuleRun, name: []const u8, start: usize, end: usi
             const return_end = context.statementEnd(index) orelse continue;
             for (context.tokens[index + 1 .. @min(return_end, end)], index + 1..) |return_token, return_index| {
                 if (return_token.tag == .identifier and context.tokenIs(return_index, name)) return true;
+            }
+        }
+        if (token.tag == .l_paren and index > start and context.tokens[index - 1].tag == .identifier and
+            !context.tokenIs(index - 1, release))
+        {
+            const closing = context.matchingToken(index, .l_paren, .r_paren) orelse continue;
+            if (closing >= end) continue;
+            for (index + 1..closing) |argument_index| {
+                if (context.refersToBinding(argument_index, name)) return true;
             }
         }
     }
@@ -273,7 +283,11 @@ fn identifierIsRuntimeBound(context: RuleRun, identifier_index: usize, use_index
     for (context.tokens[body_start + 1 .. use_index], body_start + 1..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
         if (index > body_start + 1 and
-            (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var)) return true;
+            (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var))
+        {
+            if (declarationValueIsComptime(context, index)) continue;
+            return true;
+        }
         if (index > body_start and context.tokens[index - 1].tag == .pipe) return true;
         if (index > body_start + 1 and context.tokens[index - 1].tag == .asterisk and context.tokens[index - 2].tag == .pipe) return true;
     }
@@ -286,6 +300,20 @@ fn identifierIsRuntimeBound(context: RuleRun, identifier_index: usize, use_index
             context.tokens[index + 1].tag == .colon) return true;
     }
     return false;
+}
+
+fn declarationValueIsComptime(context: RuleRun, name_index: usize) bool {
+    const end = context.statementEnd(name_index) orelse return false;
+    var index = name_index + 1;
+    while (index < end and context.tokens[index].tag != .equal) : (index += 1) {}
+    if (index + 1 >= end) return false;
+    for (context.tokens[index + 1 .. end]) |token| {
+        switch (token.tag) {
+            .number_literal, .char_literal, .plus, .minus, .asterisk, .slash, .percent, .l_paren, .r_paren => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn containingRuntimeBodyStart(context: RuleRun, use_index: usize) ?usize {
@@ -349,6 +377,30 @@ test "allocSentinel checks the length rather than the sentinel" {
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.allocation_size_overflow, findings.items[0].rule);
+}
+
+test "appending a resource to a container transfers ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn add(self: anytype, dir: anytype, gpa: anytype) !void { var file = try dir.openFile(\"x\", .{}); errdefer file.close(); try self.files.append(gpa, file); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "locally declared literal factors are not runtime overflow risks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn run(a: anytype) !void { const w = 640; const h = 480; const bytes = try a.alloc(u8, w * h); defer a.free(bytes); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 test "defer loop captures do not bind later declarations" {

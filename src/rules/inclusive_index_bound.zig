@@ -20,6 +20,7 @@ pub fn run(context: RuleRun) !void {
         const next_statement_end = context.statementEnd(assertion_end + 1) orelse continue;
         if (context.enclosingOpeningBrace(operator_index) != context.enclosingOpeningBrace(assertion_end + 1) or
             !statementIndexes(context, sequence_path, index_path, assertion_end + 1, next_statement_end)) continue;
+        if (sequenceHasSentinelType(context, sequence_path)) continue;
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{ .span = operator.loc, .replacement = "<" };
@@ -100,6 +101,23 @@ fn pathText(context: RuleRun, path: Path) []const u8 {
     return context.source[context.tokens[path.start].loc.start..context.tokens[path.end - 1].loc.end];
 }
 
+fn sequenceHasSentinelType(context: RuleRun, sequence: Path) bool {
+    const name = context.tokenText(sequence.end - 1);
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, name) or index + 2 >= context.tokens.len or
+            context.tokens[index + 1].tag != .colon) continue;
+        var cursor = index + 2;
+        while (cursor + 1 < context.tokens.len) : (cursor += 1) {
+            switch (context.tokens[cursor].tag) {
+                .equal, .comma, .semicolon, .r_paren, .l_brace => break,
+                .l_bracket => if (context.tokens[cursor + 1].tag == .colon) return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
 test "inclusive bounds immediately followed by indexing warn and offer a fix" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -120,6 +138,18 @@ test "slice bounds and already strict index guards remain valid" {
     const source: [:0]const u8 =
         "fn prefix(values: []u8, end: usize) []u8 { std.debug.assert(end <= values.len); return values[0..end]; }\n" ++
         "fn read(values: []u8, index: usize) u8 { std.debug.assert(index < values.len); return values[index]; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.inclusive_index_bound)] = .information;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "sentinel-terminated sequences may be indexed at their length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn read(values: [:0]const u8, index: usize) u8 { std.debug.assert(index <= values.len); return values[index]; }";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
