@@ -79,6 +79,37 @@ progress](https://github.com/zigtools/zls/tree/0.16.0#features). The comparison
 also includes cases where both servers agree so the corpus measures behavior
 instead of assuming zig-analyzer wins every request.
 
+## What is actually different from ZLS
+
+ZLS 0.16.0 is a capable general-purpose Zig language server. It has workspace
+symbols, cross-file references, build-aware imports, branching-type hover,
+error-set switch completion, fix-all, import organization, and `zig fmt`
+formatting. zig-analyzer is not claiming those features are absent. The
+difference is what happens after source-level analysis stops being enough, and
+what the tool can check beyond compiler errors.
+
+| Area | zig-analyzer | ZLS 0.16.0 |
+| --- | --- | --- |
+| Analysis model | Uses a patched compiler protocol for resolved values and container shapes, with syntax fallback for incomplete files | Analyzes source and build metadata itself; its documentation describes comptime and semantic analysis as work in progress |
+| Comptime branches | Reports the one active compiler-resolved type and its generated members | Can show all possible branching types, but does not necessarily determine the active branch |
+| Native diagnostics | Configurable correctness, ownership, lifetime, comptime, testing, and idiom rules with stable codes and source suppressions | Parser/AstGen diagnostics, build-on-save compiler output, and a small built-in style diagnostic set |
+| Project linting | `zig-analyzer check .` scans the project without an editor; `check --fix .` applies only the conservative CLI fix set | No standalone project lint-and-fix command |
+| Editor fixes | Diagnostic quick fixes plus Zig-specific refactors, `source.fixAll`, and project-aware actions | Compiler quick fixes, discard fixes, string-literal conversions, `source.fixAll`, and import organization |
+| Hover | Declarations and resolved types, plus reference help for keywords, `@` builtins, primitive types and values, literals, operators, and punctuation | Declarations and inferred types, `@` builtins, enum/field/label access, and compact primitive or literal summaries |
+| Formatting | Delegates to `zig fmt` | Delegates to `zig fmt` |
+
+The ZLS column is based on the pinned comparison build above, its
+[0.16.0 release notes](https://zigtools.org/zls/releases/0.16.0/), and its
+[documented editor actions](https://zigtools.org/zls/editors/vscode/). The
+point is not that ZLS has no semantic features; it is that syntax-derived
+possibilities and compiler-resolved facts are different answers for heavily
+comptime-driven code.
+
+The [side-by-side comparison gallery](docs/index.html) walks through the exact
+code, request location, and captured response for completion, hover, warnings,
+and compiler errors. Every result names the compared versions and links back to
+its checked-in fixture.
+
 ## Useful diagnostics, not just completion
 
 Resolving the program also makes it possible to find mistakes that are valid

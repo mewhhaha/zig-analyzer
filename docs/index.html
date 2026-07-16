@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A reproducible, side-by-side comparison of zig-analyzer and ZLS 0.16.0.">
+  <title>zig-analyzer compared with ZLS</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: #0b1020;
+      --surface: #121a2d;
+      --surface-raised: #18233a;
+      --border: #2b3957;
+      --text: #edf2ff;
+      --muted: #a6b0c7;
+      --accent: #7dd3fc;
+      --accent-strong: #38bdf8;
+      --analyzer: #86efac;
+      --zls: #fbbf24;
+      --focus: rgba(56, 189, 248, 0.13);
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% -10%, rgba(56, 189, 248, 0.16), transparent 34rem),
+        radial-gradient(circle at 95% 20%, rgba(134, 239, 172, 0.08), transparent 28rem),
+        var(--background);
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    a:hover {
+      color: var(--text);
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button:focus-visible,
+    a:focus-visible {
+      outline: 3px solid var(--accent-strong);
+      outline-offset: 3px;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 56px 0 72px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 850px;
+      margin: 0;
+      font-size: clamp(2.4rem, 7vw, 5.4rem);
+      line-height: 0.98;
+      letter-spacing: -0.055em;
+    }
+
+    .lede {
+      max-width: 790px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: clamp(1.05rem, 2vw, 1.24rem);
+      line-height: 1.65;
+    }
+
+    .version-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+
+    .version {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 6px 11px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(18, 26, 45, 0.72);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.78rem;
+    }
+
+    .filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 44px 0 18px;
+    }
+
+    .filter {
+      min-height: 40px;
+      padding: 8px 14px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .filter:hover,
+    .filter[aria-pressed="true"] {
+      border-color: var(--accent-strong);
+      color: var(--text);
+      background: rgba(56, 189, 248, 0.1);
+    }
+
+    .gallery {
+      display: grid;
+      grid-template-columns: minmax(210px, 0.28fr) minmax(0, 1fr);
+      min-height: 710px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: rgba(18, 26, 45, 0.86);
+      box-shadow: var(--shadow);
+    }
+
+    .example-list {
+      margin: 0;
+      padding: 12px;
+      border-right: 1px solid var(--border);
+      list-style: none;
+      background: rgba(11, 16, 32, 0.38);
+    }
+
+    .example-list li + li {
+      margin-top: 6px;
+    }
+
+    .example-button {
+      width: 100%;
+      padding: 13px 14px;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+    }
+
+    .example-button:hover {
+      color: var(--text);
+      background: rgba(125, 211, 252, 0.06);
+    }
+
+    .example-button[aria-current="true"] {
+      border-color: rgba(56, 189, 248, 0.38);
+      color: var(--text);
+      background: rgba(56, 189, 248, 0.11);
+    }
+
+    .example-kind {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .example-name {
+      display: block;
+      font-weight: 750;
+      line-height: 1.3;
+    }
+
+    .comparison {
+      min-width: 0;
+      padding: clamp(22px, 4vw, 42px);
+    }
+
+    .comparison-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    .comparison h2 {
+      margin: 0;
+      font-size: clamp(1.65rem, 4vw, 2.55rem);
+      letter-spacing: -0.035em;
+    }
+
+    .summary {
+      max-width: 760px;
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .fixture-link {
+      flex: 0 0 auto;
+      margin-top: 6px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .request {
+      margin: 24px 0 10px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+
+    .request code {
+      color: var(--text);
+    }
+
+    .source {
+      overflow-x: auto;
+      margin: 0;
+      padding: 16px 0;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #090e1a;
+      font: 0.84rem/1.65 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      tab-size: 4;
+    }
+
+    .example-list,
+    .source,
+    .output {
+      scrollbar-color: var(--border) transparent;
+      scrollbar-width: thin;
+    }
+
+    .source-line {
+      display: grid;
+      grid-template-columns: 3.5ch minmax(max-content, 1fr);
+      min-height: 1.65em;
+      padding: 0 16px 0 10px;
+    }
+
+    .source-line.focused {
+      background: var(--focus);
+      box-shadow: inset 3px 0 0 var(--accent-strong);
+    }
+
+    .line-number {
+      padding-right: 1.2ch;
+      color: #586782;
+      text-align: right;
+      user-select: none;
+    }
+
+    .result-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .result-panel {
+      min-width: 0;
+      padding: 17px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--surface-raised);
+    }
+
+    .result-panel.analyzer {
+      border-top: 3px solid var(--analyzer);
+    }
+
+    .result-panel.zls {
+      border-top: 3px solid var(--zls);
+    }
+
+    .result-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .result-label h3 {
+      margin: 0;
+      font-size: 0.95rem;
+    }
+
+    .result-count {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+
+    .output {
+      min-height: 92px;
+      overflow-x: auto;
+      margin: 0;
+      color: #dce7ff;
+      white-space: pre-wrap;
+      font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    .observation {
+      margin: 18px 0 0;
+      padding-left: 14px;
+      border-left: 3px solid var(--accent-strong);
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .observation strong {
+      color: var(--text);
+    }
+
+    .pager {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .pager button {
+      min-width: 116px;
+      min-height: 42px;
+      padding: 9px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+    }
+
+    .pager button:hover:not(:disabled) {
+      border-color: var(--accent-strong);
+      background: rgba(56, 189, 248, 0.08);
+    }
+
+    .pager button:disabled {
+      cursor: not-allowed;
+      opacity: 0.36;
+    }
+
+    .methodology {
+      display: grid;
+      grid-template-columns: minmax(0, 0.65fr) minmax(260px, 0.35fr);
+      gap: 30px;
+      margin-top: 42px;
+      padding: clamp(24px, 4vw, 38px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(18, 26, 45, 0.58);
+    }
+
+    .methodology h2 {
+      margin: 0 0 12px;
+      font-size: 1.35rem;
+    }
+
+    .methodology p,
+    .methodology li {
+      color: var(--muted);
+      line-height: 1.65;
+    }
+
+    .methodology ul {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    .serve {
+      align-self: start;
+      padding: 16px;
+      border-radius: 12px;
+      background: #090e1a;
+    }
+
+    .serve p {
+      margin: 0 0 9px;
+      color: var(--text);
+      font-size: 0.82rem;
+      font-weight: 750;
+    }
+
+    .serve code {
+      color: var(--analyzer);
+      font: 0.78rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      text-align: center;
+    }
+
+    @media (max-width: 820px) {
+      .page {
+        width: min(100% - 20px, 680px);
+        padding-top: 34px;
+      }
+
+      .gallery {
+        display: block;
+      }
+
+      .example-list {
+        display: flex;
+        gap: 6px;
+        overflow-x: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .example-list li {
+        flex: 0 0 190px;
+      }
+
+      .example-list li + li {
+        margin-top: 0;
+      }
+
+      .result-grid,
+      .methodology {
+        grid-template-columns: 1fr;
+      }
+
+      .comparison-header {
+        display: block;
+      }
+
+      .fixture-link {
+        display: inline-block;
+        margin-top: 12px;
+      }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .filter,
+      .example-button,
+      .pager button {
+        transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <p class="eyebrow">Versioned regression corpus</p>
+    <h1>Same Zig. Different answers.</h1>
+    <p class="lede">
+      These are captured Language Server Protocol responses, not invented feature claims.
+      Choose an example to see the same valid Zig source and request sent to zig-analyzer
+      and ZLS 0.16.0 side by side.
+    </p>
+    <div class="version-row" aria-label="Compared versions">
+      <span class="version">Zig 0.16.0</span>
+      <span class="version">zig-analyzer compiler protocol v4</span>
+      <span class="version">ZLS 0.16.0 · 4944862</span>
+      <span class="version">captured 2026-07-16</span>
+    </div>
+
+    <div class="filters" aria-label="Filter examples">
+      <button class="filter" type="button" data-filter="all" aria-pressed="true">All</button>
+      <button class="filter" type="button" data-filter="completion" aria-pressed="false">Completion</button>
+      <button class="filter" type="button" data-filter="hover" aria-pressed="false">Hover</button>
+      <button class="filter" type="button" data-filter="diagnostic" aria-pressed="false">Diagnostics</button>
+    </div>
+
+    <section class="gallery" aria-label="Language server comparisons">
+      <ol class="example-list" id="example-list"></ol>
+      <article class="comparison" aria-live="polite">
+        <div class="comparison-header">
+          <div>
+            <p class="eyebrow" id="example-category"></p>
+            <h2 id="example-title"></h2>
+            <p class="summary" id="example-summary"></p>
+          </div>
+          <a class="fixture-link" id="fixture-link" href="../examples/">Open fixture ↗</a>
+        </div>
+
+        <p class="request" id="example-request"></p>
+        <pre class="source" id="example-source" aria-label="Zig source excerpt"></pre>
+
+        <div class="result-grid">
+          <section class="result-panel analyzer" aria-labelledby="analyzer-title">
+            <div class="result-label">
+              <h3 id="analyzer-title">zig-analyzer</h3>
+              <span class="result-count" id="analyzer-caption"></span>
+            </div>
+            <pre class="output" id="analyzer-output"></pre>
+          </section>
+          <section class="result-panel zls" aria-labelledby="zls-title">
+            <div class="result-label">
+              <h3 id="zls-title">ZLS 0.16.0</h3>
+              <span class="result-count" id="zls-caption"></span>
+            </div>
+            <pre class="output" id="zls-output"></pre>
+          </section>
+        </div>
+
+        <p class="observation" id="example-observation"></p>
+
+        <div class="pager" aria-label="Example navigation">
+          <button type="button" id="previous-example">← Previous</button>
+          <button type="button" id="next-example">Next →</button>
+        </div>
+      </article>
+    </section>
+
+    <noscript>
+      <p>This comparison gallery requires JavaScript to switch between its checked-in examples.</p>
+    </noscript>
+
+    <section class="methodology">
+      <div>
+        <h2>How these results were captured</h2>
+        <ul>
+          <li>Both servers received the same file URI, source text, cursor position, and LSP request.</li>
+          <li>Completion and hover results came from fresh server processes using stock configuration.</li>
+          <li>Diagnostic comparisons use zig-analyzer's repository configuration and stock ZLS source analysis.</li>
+          <li>ZLS can surface semantic compiler errors through optional build-on-save; that distinction is called out instead of hidden.</li>
+          <li>Every normal comparison fixture is compiled by <code>zig build examples</code>.</li>
+        </ul>
+        <p>
+          This page is a static, reviewable snapshot rather than a browser emulator. Re-run the
+          requests when either server changes, update the capture date, and keep old claims pinned
+          to the version that produced them.
+        </p>
+      </div>
+      <div class="serve">
+        <p>View locally</p>
+        <code>python3 -m http.server 8000 --directory docs</code>
+        <p style="margin-top: 16px">Then open</p>
+        <code>http://localhost:8000/</code>
+      </div>
+    </section>
+
+    <footer>
+      <a href="../README.md">Project README</a> ·
+      <a href="../examples/README.md">Manual reproduction guide</a> ·
+      <a href="https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d">Compared ZLS commit</a>
+    </footer>
+  </main>
+
+  <script>
+    const comparisonExamples = [
+      {
+        id: "pipeline",
+        category: "completion",
+        title: "A type assembled by inline for",
+        summary: "The final container is Traced(Buffered(Source)). The request asks for members of that resolved type, not the loop's initial type.",
+        fixture: "../examples/compiler/comptime_pipeline.zig",
+        request: "textDocument/completion after pipeline. at LSP position 45:20",
+        source: `fn Pipeline(comptime stages: []const Stage) type {
+    comptime var current = Source;
+    inline for (stages) |stage| {
+        current = switch (stage) {
+            .buffered => Buffered(current),
+            .traced => Traced(current),
+        };
+    }
+    return current;
+}
+
+const ActivePipeline = Pipeline(&.{ .buffered, .traced });
+
+fn result() u32 {
+    const pipeline: ActivePipeline = .{ .inner = .{ .inner = .{ .value = 42 } } };
+    return pipeline.trace();
+}`,
+        focusLine: 16,
+        analyzerCaption: "3 candidates",
+        analyzerOutput: "Self\ninner\ntrace",
+        zlsCaption: "1 candidate",
+        zlsOutput: "value",
+        observation: "zig-analyzer asks the compiler for ActivePipeline's final shape. ZLS follows the mutable comptime binding only as far as Source and offers a member that does not exist on the final outer container."
+      },
+      {
+        id: "indirect-field",
+        category: "completion",
+        title: "A type selected through @field",
+        summary: "The string argument selects Implementations.checked at comptime, so the selected container has one member: verify.",
+        fixture: "../examples/compiler/indirect_type_lookup.zig",
+        request: "textDocument/completion after ActiveImplementation. at LSP position 21:32",
+        source: `const Implementations = struct {
+    const compact = struct {
+        fn pack(value: u32) u32 { return value; }
+    };
+    const checked = struct {
+        fn verify(value: u32) bool { return value == 42; }
+    };
+};
+
+fn Implementation(comptime name: []const u8) type {
+    return @field(Implementations, name);
+}
+
+const ActiveImplementation = Implementation("checked");
+
+fn result() bool {
+    return ActiveImplementation.verify(42);
+}`,
+        focusLine: 17,
+        analyzerCaption: "1 candidate",
+        analyzerOutput: "verify",
+        zlsCaption: "no candidates",
+        zlsOutput: "[]",
+        observation: "The source contains no direct syntax edge from ActiveImplementation to the checked declaration. Compiler resolution supplies that edge to zig-analyzer."
+      },
+      {
+        id: "active-branch",
+        category: "completion",
+        title: "The active comptime branch",
+        summary: "The feature list contains metrics, so only the first anonymous struct is the result of Api for this call.",
+        fixture: "../examples/compiler/conditional_api.zig",
+        request: "textDocument/completion after ActiveApi. at LSP position 20:21",
+        source: `fn Api(comptime features: []const []const u8) type {
+    comptime var metrics_enabled = false;
+    inline for (features) |feature| {
+        if (std.mem.eql(u8, feature, "metrics")) metrics_enabled = true;
+    }
+
+    return if (metrics_enabled) struct {
+        fn recordMetric(value: u32) u32 { return value + 1; }
+    } else struct {
+        fn disabled() void {}
+    };
+}
+
+const ActiveApi = Api(&.{ "logging", "metrics" });
+
+fn result() u32 {
+    return ActiveApi.recordMetric(41);
+}`,
+        focusLine: 18,
+        analyzerCaption: "active member",
+        analyzerOutput: "recordMetric",
+        zlsCaption: "both possibilities",
+        zlsOutput: "disabled\nrecordMetric",
+        observation: "ZLS 0.16 improved branching-type analysis and exposes both possibilities. zig-analyzer reports the branch the compiler actually selected for this instantiation."
+      },
+      {
+        id: "keyword-hover",
+        category: "hover",
+        title: "Reference hover on Zig itself",
+        summary: "Declaration hover is useful after a symbol exists. Language-token hover also explains the syntax used to create that symbol.",
+        fixture: "../examples/zls/language_hover.zig",
+        request: "textDocument/hover on const at LSP position 0:1",
+        source: `const enabled: bool = true;
+
+fn enabledSize() usize {
+    return if (enabled) @sizeOf(u8) else 0;
+}`,
+        focusLine: 1,
+        analyzerCaption: "markdown hover",
+        analyzerOutput: `const
+(keyword)
+
+Declares a binding that cannot be reassigned.
+On a pointer type, it prevents mutation through that pointer.
+
+Zig language reference ↗`,
+        zlsCaption: "no hover",
+        zlsOutput: "null",
+        observation: "ZLS does provide hover for declarations, @ builtins, enum and field access, labels, and compact type/value summaries such as bool and true. The difference here is explanatory language-reference coverage for Zig syntax itself, including keywords, operators, literals, and punctuation."
+      },
+      {
+        id: "cleanup-warning",
+        category: "diagnostic",
+        title: "Cleanup registered after failure can occur",
+        summary: "If the second allocation fails, control returns before the first defer is registered. The compiler accepts the function, but the first allocation can leak.",
+        fixture: "../examples/diagnostics/memory_management.zig",
+        request: "textDocument/publishDiagnostics after opening the valid file",
+        source: `pub fn cleanupRegisteredTooLate(allocator: std.mem.Allocator) !void {
+    const first = try allocator.alloc(u8, 128);
+    const second = try allocator.alloc(u8, 128);
+    defer allocator.free(first);
+    defer allocator.free(second);
+}`,
+        focusLine: 4,
+        analyzerCaption: "warning + quick fix",
+        analyzerOutput: `cleanup-after-fallible-operation
+
+cleanup for allocation 'first' is registered after a fallible
+operation; an earlier error can leak it`,
+        zlsCaption: "no ownership diagnostic",
+        zlsOutput: "[]",
+        observation: "zig-analyzer's warning is conservative and local: it sees a resource acquisition, a later fallible operation, and cleanup registered too late. Its action moves the cleanup directly after the acquisition."
+      },
+      {
+        id: "compiler-error",
+        category: "diagnostic",
+        title: "A semantic compiler error",
+        summary: "The source parses, but a string literal cannot be returned as u32. This separates parser diagnostics from compiler-backed semantic diagnostics.",
+        fixture: "../examples/diagnostics/compiler_error.zig",
+        request: "textDocument/publishDiagnostics after opening the file",
+        source: `export fn invalidResult() u32 {
+    return "not a number";
+}`,
+        focusLine: 2,
+        analyzerCaption: "zig compiler",
+        analyzerOutput: `expected type 'u32', found '*const [12:0]u8'`,
+        zlsCaption: "stock source analysis",
+        zlsOutput: `[]
+
+With ZLS build-on-save enabled, the Zig compiler can report
+the same error after running the configured build step.`,
+        observation: "This is an architectural difference, not a claim that ZLS can never show compiler errors. zig-analyzer's compiler session is part of normal analysis; ZLS exposes compiler output through its optional build-on-save workflow."
+      }
+    ];
+
+    const categoryNames = {
+      completion: "Completion",
+      hover: "Hover",
+      diagnostic: "Diagnostic"
+    };
+
+    const exampleList = document.querySelector("#example-list");
+    const filterButtons = [...document.querySelectorAll(".filter")];
+    const previousButton = document.querySelector("#previous-example");
+    const nextButton = document.querySelector("#next-example");
+    let activeFilter = "all";
+    let selectedExampleId = comparisonExamples[0].id;
+
+    function visibleExamples() {
+      if (activeFilter === "all") return comparisonExamples;
+      return comparisonExamples.filter((example) => example.category === activeFilter);
+    }
+
+    function populateSource(source, focusLine) {
+      const sourceElement = document.querySelector("#example-source");
+      sourceElement.replaceChildren();
+      source.split("\n").forEach((line, lineIndex) => {
+        const sourceLine = document.createElement("span");
+        sourceLine.className = "source-line";
+        if (lineIndex + 1 === focusLine) sourceLine.classList.add("focused");
+
+        const lineNumber = document.createElement("span");
+        lineNumber.className = "line-number";
+        lineNumber.textContent = String(lineIndex + 1);
+
+        const lineSource = document.createElement("span");
+        lineSource.textContent = line || " ";
+
+        sourceLine.append(lineNumber, lineSource);
+        sourceElement.append(sourceLine);
+      });
+    }
+
+    function populateExample(example) {
+      document.title = `${example.title} · zig-analyzer compared with ZLS`;
+      document.querySelector("#example-category").textContent = categoryNames[example.category];
+      document.querySelector("#example-title").textContent = example.title;
+      document.querySelector("#example-summary").textContent = example.summary;
+      document.querySelector("#example-request").textContent = example.request;
+      document.querySelector("#fixture-link").href = example.fixture;
+      document.querySelector("#analyzer-caption").textContent = example.analyzerCaption;
+      document.querySelector("#analyzer-output").textContent = example.analyzerOutput;
+      document.querySelector("#zls-caption").textContent = example.zlsCaption;
+      document.querySelector("#zls-output").textContent = example.zlsOutput;
+
+      const observation = document.querySelector("#example-observation");
+      observation.replaceChildren();
+      const observationLabel = document.createElement("strong");
+      observationLabel.textContent = "What this demonstrates. ";
+      observation.append(observationLabel, example.observation);
+
+      populateSource(example.source, example.focusLine);
+    }
+
+    function populateNavigation() {
+      const availableExamples = visibleExamples();
+      if (!availableExamples.some((example) => example.id === selectedExampleId)) {
+        selectedExampleId = availableExamples[0].id;
+      }
+
+      exampleList.replaceChildren();
+      availableExamples.forEach((example) => {
+        const listEntry = document.createElement("li");
+        const exampleButton = document.createElement("button");
+        exampleButton.type = "button";
+        exampleButton.className = "example-button";
+        exampleButton.dataset.exampleId = example.id;
+        exampleButton.setAttribute("aria-current", String(example.id === selectedExampleId));
+
+        const kind = document.createElement("span");
+        kind.className = "example-kind";
+        kind.textContent = categoryNames[example.category];
+        const name = document.createElement("span");
+        name.className = "example-name";
+        name.textContent = example.title;
+        exampleButton.append(kind, name);
+
+        exampleButton.addEventListener("click", () => selectExample(example.id));
+        listEntry.append(exampleButton);
+        exampleList.append(listEntry);
+      });
+
+      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
+      previousButton.disabled = selectedIndex === 0;
+      nextButton.disabled = selectedIndex === availableExamples.length - 1;
+      populateExample(availableExamples[selectedIndex]);
+    }
+
+    function selectExample(exampleId) {
+      selectedExampleId = exampleId;
+      try {
+        history.replaceState(null, "", `#${exampleId}`);
+      } catch {
+        window.location.hash = exampleId;
+      }
+      populateNavigation();
+    }
+
+    filterButtons.forEach((filterButton) => {
+      filterButton.addEventListener("click", () => {
+        activeFilter = filterButton.dataset.filter;
+        filterButtons.forEach((candidate) => {
+          candidate.setAttribute("aria-pressed", String(candidate === filterButton));
+        });
+        populateNavigation();
+      });
+    });
+
+    previousButton.addEventListener("click", () => {
+      const availableExamples = visibleExamples();
+      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
+      if (selectedIndex > 0) selectExample(availableExamples[selectedIndex - 1].id);
+    });
+
+    nextButton.addEventListener("click", () => {
+      const availableExamples = visibleExamples();
+      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
+      if (selectedIndex + 1 < availableExamples.length) selectExample(availableExamples[selectedIndex + 1].id);
+    });
+
+    const requestedExampleId = window.location.hash.slice(1);
+    if (comparisonExamples.some((example) => example.id === requestedExampleId)) {
+      selectedExampleId = requestedExampleId;
+    }
+    populateNavigation();
+  </script>
+</body>
+</html>
