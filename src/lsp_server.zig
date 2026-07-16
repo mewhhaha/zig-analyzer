@@ -5,6 +5,7 @@ const analysis = @import("analysis.zig");
 const backend_bootstrap = @import("backend_bootstrap.zig");
 const compiler_session = @import("compiler_session.zig");
 const document_module = @import("document.zig");
+const language_hover = @import("language_hover.zig");
 const syntax_types = @import("syntax_types.zig");
 const action_lsp = @import("actions/lsp_adapter.zig");
 const project_actions = @import("actions/project.zig");
@@ -313,11 +314,19 @@ pub const Server = struct {
         params: lsp.ParamsType("textDocument/hover"),
     ) !lsp.ResultType("textDocument/hover") {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
-        const identifier_span = document.identifierAt(document.byteOffset(params.position)) orelse return null;
-        const description = try server.hoverDescription(arena, document, identifier_span) orelse return null;
+        const token = document.tokenAt(document.byteOffset(params.position)) orelse return null;
+        const spelling = document.source[token.loc.start..token.loc.end];
+        const description = if (try language_hover.describe(arena, spelling, token.tag)) |language| HoverDescription{
+            .declaration = language.syntax,
+            .type_summary = language.category,
+            .documentation = try language.renderDocumentation(arena),
+        } else if (token.tag == .identifier)
+            try server.hoverDescription(arena, document, token.loc) orelse return null
+        else
+            return null;
         return .{
             .contents = .{ .markup_content = .{ .kind = .markdown, .value = try description.render(arena) } },
-            .range = document.range(identifier_span),
+            .range = document.range(token.loc),
         };
     }
 
@@ -3772,6 +3781,86 @@ test "LSP hover describes parameters locals functions and bounded constants" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "Adds an incoming sample") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "```zig\\nconst retry_limit: u8 = 3\\n```\\n```zig\\n(u8 = 3)\\n```") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Maximum number of attempts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"result\":null") != null);
+}
+
+test "LSP hover documents Zig keywords primitive types and values" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///language.zig","languageId":"zig","version":1,"text":"const count: u8 = 1;\nvar enabled: bool = true;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language.zig"},"position":{"line":0,"character":1}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language.zig"},"position":{"line":0,"character":13}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language.zig"},"position":{"line":1,"character":1}}}
+        ,
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language.zig"},"position":{"line":1,"character":13}}}
+        ,
+        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language.zig"},"position":{"line":1,"character":21}}}
+        ,
+        \\{"jsonrpc":"2.0","id":7,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    server.compiler_restart_available = false;
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 8), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "```zig\\nconst\\n```\\n```zig\\n(keyword)\\n```") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "cannot be reassigned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "#Keyword-Reference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "An unsigned integer type with 8 bits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "mutable binding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "boolean type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "primitive value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "#Primitive-Values") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
+}
+
+test "LSP hover documents builtins operators literals and semicolons" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tokens.zig","languageId":"zig","version":1,"text":"const value = @as(u8, 1 + 2);\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tokens.zig"},"position":{"line":0,"character":15}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tokens.zig"},"position":{"line":0,"character":22}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tokens.zig"},"position":{"line":0,"character":24}}}
+        ,
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///tokens.zig"},"position":{"line":0,"character":28}}}
+        ,
+        \\{"jsonrpc":"2.0","id":6,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    server.compiler_restart_available = false;
+    defer server.deinit();
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 7), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "@as(comptime T: type, expression: anytype) T") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "builtin function") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "#@as") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "integer literal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "comptime_int") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "(operator)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Terminates a declaration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "#Grammar") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"result\":null") != null);
 }
 
