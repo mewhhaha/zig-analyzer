@@ -3932,6 +3932,7 @@ test "LSP advertises and returns complete filtered code actions" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "fn missing(input: u32, arg2: anytype) u32") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fix all safe zig-analyzer findings") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fill missing switch prongs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"const\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "value == 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "cleanup();") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"\"") != null);

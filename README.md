@@ -164,10 +164,11 @@ zig-analyzer check .
 zig-analyzer check --fix .
 ```
 
-`--fix` applies only semantics-preserving rewrites such as `var` to `const`,
-boolean simplification, compact single-statement defers, proven cast removal,
-and empty or needless-`else` flattening. Allocation cleanup, generated code,
-renames, and other judgment calls remain explicit editor actions.
+`--fix` applies only locally provable rewrites such as boolean simplification,
+compact single-statement defers, proven cast removal, and empty-`else`
+removal. Scope-sensitive changes such as `var` to `const` and flattening an
+`else` remain explicit editor actions, alongside allocation cleanup, generated
+code, renames, and other judgment calls.
 
 ### Formatting
 
