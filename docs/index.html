@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Captured LSP responses from zig-analyzer and ZLS for the same Zig source, side by side.">
+  <meta name="description" content="Hover real Zig code and replay captured LSP responses from zig-analyzer and ZLS at every position.">
   <title>zig-analyzer vs ZLS</title>
   <link rel="preconnect" href="https://rsms.me/">
   <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
@@ -64,14 +64,14 @@
     }
 
     .page {
-      max-width: 62rem;
+      max-width: 68rem;
       margin: 0 auto;
       padding: 24px 16px 48px;
     }
 
     @media (min-width: 40rem) {
       .page {
-        padding: 32px 24px 64px;
+        padding: 28px 24px 64px;
       }
     }
 
@@ -80,7 +80,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      padding-bottom: 40px;
+      padding-bottom: 28px;
     }
 
     .wordmark {
@@ -92,7 +92,6 @@
 
     .site-header nav {
       font-size: 0.875rem;
-      color: var(--muted);
     }
 
     .site-header nav a {
@@ -106,42 +105,32 @@
       text-underline-offset: 3px;
     }
 
-    .eyebrow {
-      margin: 0;
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--accent);
-    }
-
     h1 {
-      max-width: 24ch;
-      margin: 16px 0 0;
-      font-size: clamp(2rem, 5.5vw, 3rem);
+      max-width: 30ch;
+      margin: 0;
+      font-size: clamp(1.5rem, 4vw, 2rem);
       font-weight: 600;
-      line-height: 1.1;
+      line-height: 1.2;
       letter-spacing: -0.025em;
       text-wrap: balance;
     }
 
     .lede {
-      max-width: 56ch;
-      margin: 20px 0 0;
+      max-width: 62ch;
+      margin: 10px 0 0;
       color: var(--muted);
-      font-size: 1.0625rem;
+      font-size: 1rem;
       text-wrap: pretty;
     }
 
     @media (min-width: 40rem) {
       .lede {
-        font-size: 1rem;
+        font-size: 0.9375rem;
       }
     }
 
     .carousel {
-      margin-top: 40px;
+      margin-top: 28px;
     }
 
     .slide {
@@ -153,41 +142,7 @@
 
     @media (min-width: 40rem) {
       .slide {
-        padding: 32px;
-      }
-    }
-
-    @media (prefers-reduced-motion: no-preference) {
-      .slide.entering {
-        animation: slide-in 240ms ease-out;
-      }
-
-      @keyframes slide-in {
-        from {
-          opacity: 0;
-          transform: translateX(12px);
-        }
-
-        to {
-          opacity: 1;
-          transform: translateX(0);
-        }
-      }
-
-      .slide.entering.reverse {
-        animation-name: slide-in-reverse;
-      }
-
-      @keyframes slide-in-reverse {
-        from {
-          opacity: 0;
-          transform: translateX(-12px);
-        }
-
-        to {
-          opacity: 1;
-          transform: translateX(0);
-        }
+        padding: 28px;
       }
     }
 
@@ -219,8 +174,8 @@
 
     .slide h2 {
       max-width: 40ch;
-      margin: 8px 0 0;
-      font-size: 1.375rem;
+      margin: 6px 0 0;
+      font-size: 1.25rem;
       font-weight: 600;
       line-height: 1.3;
       letter-spacing: -0.025em;
@@ -228,8 +183,8 @@
     }
 
     .slide-summary {
-      max-width: 64ch;
-      margin: 10px 0 0;
+      max-width: 68ch;
+      margin: 8px 0 0;
       color: var(--muted);
       font-size: 1rem;
       text-wrap: pretty;
@@ -241,24 +196,22 @@
       }
     }
 
-    .request {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 6px 12px;
-      margin: 24px 0 0;
-      font-family: var(--font-mono);
-      font-size: 0.8125rem;
-      color: var(--faint);
+    .workbench {
+      display: grid;
+      gap: 12px;
+      margin-top: 20px;
     }
 
-    .request code {
-      color: var(--muted);
+    @media (min-width: 64rem) {
+      .workbench {
+        grid-template-columns: minmax(0, 11fr) minmax(0, 9fr);
+        align-items: start;
+      }
     }
 
     .source {
       overflow-x: auto;
-      margin: 10px 0 0;
+      margin: 0;
       padding: 14px 0;
       border-radius: calc(var(--radius-card) - 8px);
       background: var(--well);
@@ -273,11 +226,6 @@
       padding: 0 16px 0 8px;
     }
 
-    .source-line.focused {
-      background: rgba(251, 191, 36, 0.08);
-      box-shadow: inset 2px 0 0 var(--accent);
-    }
-
     .line-number {
       padding-right: 1.5ch;
       color: #52525c;
@@ -285,30 +233,81 @@
       user-select: none;
     }
 
-    .token-keyword {
-      color: #fda4af;
+    .token {
+      border-radius: 3px;
+      cursor: pointer;
     }
 
-    .token-string {
-      color: #bef264;
+    .token:hover {
+      background: rgba(255, 255, 255, 0.12);
     }
 
-    .token-builtin {
-      color: #7dd3fc;
+    .token.active {
+      background: rgba(251, 191, 36, 0.22);
+      box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.4);
     }
 
-    .token-comment {
-      color: #71717a;
+    .token.diagnostic {
+      text-decoration: underline wavy var(--accent) 1px;
+      text-underline-offset: 4px;
     }
 
-    .token-number {
-      color: #fdba74;
+    .caret {
+      display: inline-block;
+      width: 3px;
+      height: 1.15em;
+      margin: 0 1px;
+      padding: 0;
+      border: 0;
+      border-radius: 2px;
+      background: var(--accent);
+      cursor: pointer;
+      vertical-align: text-bottom;
+    }
+
+    .caret.active {
+      box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.25);
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .caret {
+        animation: caret-blink 1.2s steps(2, jump-none) infinite;
+      }
+
+      .caret.active,
+      .caret:hover {
+        animation: none;
+      }
+
+      @keyframes caret-blink {
+        50% {
+          opacity: 0.25;
+        }
+      }
+    }
+
+    .inspector {
+      min-width: 0;
+    }
+
+    .status {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 12px;
+      margin: 0 0 10px;
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      color: var(--faint);
+    }
+
+    .status code {
+      color: var(--muted);
     }
 
     .results {
       display: grid;
       gap: 12px;
-      margin-top: 20px;
     }
 
     @media (min-width: 40rem) {
@@ -317,9 +316,15 @@
       }
     }
 
+    @media (min-width: 64rem) {
+      .results {
+        grid-template-columns: 1fr;
+      }
+    }
+
     .result {
       min-width: 0;
-      padding: 16px;
+      padding: 14px 16px;
       border-radius: calc(var(--radius-card) - 8px);
       background: var(--well);
       box-shadow: inset 0 0 0 1px var(--line-faint);
@@ -358,23 +363,84 @@
       font-family: var(--font-mono);
       font-size: 0.75rem;
       color: var(--faint);
+      text-align: right;
     }
 
     .result-output {
-      min-height: 72px;
-      overflow-x: auto;
-      margin: 12px 0 0;
+      height: 148px;
+      overflow: auto;
+      margin: 10px 0 0;
       color: var(--muted);
-      white-space: pre-wrap;
-      font: 0.8125rem/1.6 var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.55;
+      scrollbar-width: thin;
     }
 
     .result.analyzer .result-output {
       color: #d4d4d8;
     }
 
+    .result-output p {
+      margin: 0;
+      text-wrap: pretty;
+    }
+
+    .result-output p + p,
+    .result-output pre + p,
+    .result-output p + pre,
+    .result-output pre + pre {
+      margin-top: 8px;
+    }
+
+    .result-output pre {
+      overflow-x: auto;
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      font: 0.8125rem/1.6 var(--font-mono);
+      white-space: pre-wrap;
+    }
+
+    .result-output code {
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+    }
+
+    .result-output .empty {
+      color: var(--faint);
+      font-family: var(--font-mono);
+    }
+
+    .result-output .diagnostic-code {
+      display: block;
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      color: var(--accent);
+    }
+
+    .token-keyword {
+      color: #fda4af;
+    }
+
+    .token-string {
+      color: #bef264;
+    }
+
+    .token-builtin {
+      color: #7dd3fc;
+    }
+
+    .token-comment {
+      color: #71717a;
+    }
+
+    .token-number {
+      color: #fdba74;
+    }
+
     .observation {
-      max-width: 72ch;
+      max-width: 76ch;
       margin: 20px 0 0;
       padding-top: 16px;
       border-top: 1px solid var(--line-faint);
@@ -496,30 +562,8 @@
       }
     }
 
-    .hint {
-      display: none;
-      margin: 12px 0 0;
-      color: var(--faint);
-      font-size: 0.8125rem;
-      text-align: center;
-    }
-
-    @media (min-width: 40rem) {
-      .hint {
-        display: block;
-      }
-    }
-
-    kbd {
-      padding: 1px 5px;
-      border-radius: 5px;
-      box-shadow: inset 0 0 0 1px var(--line);
-      font-family: var(--font-mono);
-      font-size: 0.75rem;
-    }
-
     .site-footer {
-      margin-top: 48px;
+      margin-top: 40px;
       padding-top: 24px;
       border-top: 1px solid var(--line-faint);
       color: var(--faint);
@@ -527,7 +571,6 @@
     }
 
     .site-footer p {
-      max-width: none;
       margin: 0;
       text-wrap: pretty;
     }
@@ -543,6 +586,11 @@
     .site-footer a:hover {
       color: var(--text);
     }
+
+    .site-footer code {
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+    }
   </style>
 </head>
 <body>
@@ -555,15 +603,14 @@
     </header>
 
     <main>
-      <p class="eyebrow">Captured LSP responses</p>
-      <h1>Same source. Same request. Two answers.</h1>
+      <h1>Hover the code. Both servers answer.</h1>
       <p class="lede">
-        Each example sends one LSP request over the same Zig file to zig-analyzer and to ZLS,
-        and shows both responses exactly as captured. Step through them.
+        Real Zig files, with the responses zig-analyzer and ZLS 0.16.0 gave at every position,
+        recorded and replayed here. Hover or tap any token; the blinking cursor shows completion.
       </p>
 
       <section class="carousel" aria-label="Comparison examples">
-        <article class="slide" id="slide" aria-live="polite">
+        <article class="slide" id="slide">
           <div class="slide-header">
             <p class="slide-kind" id="slide-kind"></p>
             <p class="slide-counter" id="slide-counter"></p>
@@ -571,28 +618,32 @@
           <h2 id="slide-title"></h2>
           <p class="slide-summary" id="slide-summary"></p>
 
-          <p class="request" id="slide-request"></p>
-          <pre class="source" id="slide-source" aria-label="Zig source"></pre>
-
-          <div class="results">
-            <section class="result analyzer" aria-label="zig-analyzer response">
-              <div class="result-label">
-                <h3>zig-analyzer</h3>
-                <span class="result-caption" id="analyzer-caption"></span>
+          <div class="workbench">
+            <pre class="source" id="slide-source" tabindex="0"
+              aria-label="Zig source. Use the arrow keys to move between tokens; both server responses update as you move."></pre>
+            <div class="inspector">
+              <p class="status" id="status" aria-live="polite"></p>
+              <div class="results">
+                <section class="result analyzer" aria-label="zig-analyzer response">
+                  <div class="result-label">
+                    <h3>zig-analyzer</h3>
+                    <span class="result-caption" id="analyzer-caption"></span>
+                  </div>
+                  <div class="result-output" id="analyzer-output"></div>
+                </section>
+                <section class="result" aria-label="ZLS response">
+                  <div class="result-label">
+                    <h3>ZLS 0.16.0</h3>
+                    <span class="result-caption" id="zls-caption"></span>
+                  </div>
+                  <div class="result-output" id="zls-output"></div>
+                </section>
               </div>
-              <pre class="result-output" id="analyzer-output"></pre>
-            </section>
-            <section class="result" aria-label="ZLS response">
-              <div class="result-label">
-                <h3>ZLS 0.16.0</h3>
-                <span class="result-caption" id="zls-caption"></span>
-              </div>
-              <pre class="result-output" id="zls-output"></pre>
-            </section>
+            </div>
           </div>
 
           <p class="observation" id="slide-observation"></p>
-          <p class="fixture"><a id="fixture-link" href="https://github.com/mewhhaha/zig-analyzer">Reproduce from the fixture</a></p>
+          <p class="fixture"><a id="fixture-link" href="https://github.com/mewhhaha/zig-analyzer">Open the fixture</a></p>
         </article>
 
         <div class="controls">
@@ -600,271 +651,306 @@
           <ol class="dots" id="dots" role="list" aria-label="Go to example"></ol>
           <button class="step" type="button" id="next">Next &rarr;</button>
         </div>
-        <p class="hint">Or use <kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move between examples.</p>
       </section>
 
       <noscript>
-        <p>Stepping through the checked-in examples requires JavaScript.</p>
+        <p>Replaying the captured responses requires JavaScript.</p>
       </noscript>
     </main>
 
     <footer class="site-footer">
       <p>
-        Captured 2026-07-16 against Zig 0.16.0 and
-        <a href="https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d">ZLS 0.16.0 at 4944862</a>,
-        both with stock configuration. ZLS can surface compiler errors through optional
-        build-on-save; the diagnostic examples note where that applies.
+        Nothing here is mocked, but nothing runs live either: both servers were run over these files
+        and their responses were recorded per position on 2026-07-16, against Zig 0.16.0 and
+        <a href="https://builds.zigtools.org/zls-x86_64-linux-0.16.0.tar.xz">ZLS 0.16.0</a>
+        with this repository's configuration. ZLS can also surface compiler errors through its
+        optional build-on-save workflow, which is not enabled here.
       </p>
       <p>
-        Every fixture compiles under <code>zig build examples</code> and lives in
+        Re-capture with <code>python docs/tools/capture_comparisons.py</code>. The fixtures compile under
+        <code>zig build examples</code> and live in
         <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,
         with a <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">manual reproduction guide</a>.
       </p>
     </footer>
   </div>
 
+  <script src="comparison-data.js"></script>
   <script>
-    const examples = [
-      {
-        id: "pipeline",
-        kind: "Completion",
-        title: "A type assembled by inline for",
-        summary: "The final container is Traced(Buffered(Source)). The request asks for members of that resolved type, not the loop's initial type.",
-        fixture: "examples/compiler/comptime_pipeline.zig",
-        request: "textDocument/completion after pipeline. at 45:20",
-        source: `fn Pipeline(comptime stages: []const Stage) type {
-    comptime var current = Source;
-    inline for (stages) |stage| {
-        current = switch (stage) {
-            .buffered => Buffered(current),
-            .traced => Traced(current),
-        };
-    }
-    return current;
-}
-
-const ActivePipeline = Pipeline(&.{ .buffered, .traced });
-
-fn result() u32 {
-    const pipeline: ActivePipeline = .{ .inner = .{ .inner = .{ .value = 42 } } };
-    return pipeline.trace();
-}`,
-        focusLine: 16,
-        analyzerCaption: "3 candidates",
-        analyzerOutput: "Self\ninner\ntrace",
-        zlsCaption: "1 candidate",
-        zlsOutput: "value",
-        observation: "zig-analyzer asks the compiler for ActivePipeline's final shape. ZLS follows the mutable comptime binding only as far as Source and offers a member that does not exist on the final outer container."
-      },
-      {
-        id: "indirect-field",
-        kind: "Completion",
-        title: "A type selected through @field",
-        summary: "The string argument selects Implementations.checked at comptime, so the selected container has one member: verify.",
-        fixture: "examples/compiler/indirect_type_lookup.zig",
-        request: "textDocument/completion after ActiveImplementation. at 21:32",
-        source: `const Implementations = struct {
-    const compact = struct {
-        fn pack(value: u32) u32 { return value; }
-    };
-    const checked = struct {
-        fn verify(value: u32) bool { return value == 42; }
-    };
-};
-
-fn Implementation(comptime name: []const u8) type {
-    return @field(Implementations, name);
-}
-
-const ActiveImplementation = Implementation("checked");
-
-fn result() bool {
-    return ActiveImplementation.verify(42);
-}`,
-        focusLine: 17,
-        analyzerCaption: "1 candidate",
-        analyzerOutput: "verify",
-        zlsCaption: "no candidates",
-        zlsOutput: "[]",
-        observation: "The source contains no direct syntax edge from ActiveImplementation to the checked declaration. Compiler resolution supplies that edge to zig-analyzer."
-      },
-      {
-        id: "active-branch",
-        kind: "Completion",
-        title: "The active comptime branch",
-        summary: "The feature list contains metrics, so only the first anonymous struct is the result of Api for this call.",
-        fixture: "examples/compiler/conditional_api.zig",
-        request: "textDocument/completion after ActiveApi. at 20:21",
-        source: `fn Api(comptime features: []const []const u8) type {
-    comptime var metrics_enabled = false;
-    inline for (features) |feature| {
-        if (std.mem.eql(u8, feature, "metrics")) metrics_enabled = true;
-    }
-
-    return if (metrics_enabled) struct {
-        fn recordMetric(value: u32) u32 { return value + 1; }
-    } else struct {
-        fn disabled() void {}
-    };
-}
-
-const ActiveApi = Api(&.{ "logging", "metrics" });
-
-fn result() u32 {
-    return ActiveApi.recordMetric(41);
-}`,
-        focusLine: 18,
-        analyzerCaption: "active member",
-        analyzerOutput: "recordMetric",
-        zlsCaption: "both possibilities",
-        zlsOutput: "disabled\nrecordMetric",
-        observation: "ZLS 0.16 improved branching-type analysis and exposes both possibilities. zig-analyzer reports the branch the compiler actually selected for this instantiation."
-      },
-      {
-        id: "keyword-hover",
-        kind: "Hover",
-        title: "Reference hover on Zig itself",
-        summary: "Declaration hover is useful after a symbol exists. Language-token hover also explains the syntax used to create that symbol.",
-        fixture: "examples/zls/language_hover.zig",
-        request: "textDocument/hover on const at 0:1",
-        source: `const enabled: bool = true;
-
-fn enabledSize() usize {
-    return if (enabled) @sizeOf(u8) else 0;
-}`,
-        focusLine: 1,
-        analyzerCaption: "markdown hover",
-        analyzerOutput: `const
-(keyword)
-
-Declares a binding that cannot be reassigned.
-On a pointer type, it prevents mutation through that pointer.
-
-Zig language reference`,
-        zlsCaption: "no hover",
-        zlsOutput: "null",
-        observation: "ZLS does provide hover for declarations, @ builtins, enum and field access, and labels. The difference here is explanatory language-reference coverage for Zig syntax itself: keywords, operators, literals, and punctuation."
-      },
-      {
-        id: "cleanup-warning",
-        kind: "Diagnostics",
-        title: "Cleanup registered after failure can occur",
-        summary: "If the second allocation fails, control returns before the first defer is registered. The compiler accepts the function, but the first allocation can leak.",
-        fixture: "examples/diagnostics/memory_management.zig",
-        request: "textDocument/publishDiagnostics after opening the valid file",
-        source: `pub fn cleanupRegisteredTooLate(allocator: std.mem.Allocator) !void {
-    const first = try allocator.alloc(u8, 128);
-    const second = try allocator.alloc(u8, 128);
-    defer allocator.free(first);
-    defer allocator.free(second);
-}`,
-        focusLine: 4,
-        analyzerCaption: "warning + quick fix",
-        analyzerOutput: `cleanup-after-fallible-operation
-
-cleanup for allocation 'first' is registered after a fallible
-operation; an earlier error can leak it`,
-        zlsCaption: "no ownership diagnostic",
-        zlsOutput: "[]",
-        observation: "zig-analyzer's warning is conservative and local: it sees a resource acquisition, a later fallible operation, and cleanup registered too late. Its quick fix moves the cleanup directly after the acquisition."
-      },
-      {
-        id: "compiler-error",
-        kind: "Diagnostics",
-        title: "A semantic compiler error",
-        summary: "The source parses, but a string literal cannot be returned as u32. This separates parser diagnostics from compiler-backed semantic diagnostics.",
-        fixture: "examples/diagnostics/compiler_error.zig",
-        request: "textDocument/publishDiagnostics after opening the file",
-        source: `export fn invalidResult() u32 {
-    return "not a number";
-}`,
-        focusLine: 2,
-        analyzerCaption: "zig compiler",
-        analyzerOutput: `expected type 'u32', found '*const [12:0]u8'`,
-        zlsCaption: "stock source analysis",
-        zlsOutput: `[]
-
-With build-on-save enabled, ZLS can report the same error after running the configured build step.`,
-        observation: "This is an architectural difference, not a claim that ZLS can never show compiler errors. zig-analyzer's compiler session is part of normal analysis; ZLS exposes compiler output through its optional build-on-save workflow."
-      }
-    ];
-
     const repositoryFileUrl = "https://github.com/mewhhaha/zig-analyzer/blob/main/";
+    const { strings, examples } = comparisonData;
 
     const zigTokenPattern = new RegExp(
       [
         String.raw`(?<comment>//[^\n]*)`,
         String.raw`(?<string>"(?:[^"\\]|\\.)*")`,
         String.raw`(?<builtin>@[A-Za-z]\w*)`,
-        String.raw`(?<keyword>\b(?:fn|const|var|comptime|inline|for|while|if|else|switch|return|try|defer|errdefer|struct|enum|union|pub|export|and|or|orelse|unreachable|break|continue|catch|type|void|bool|usize|u8|u32|u64|i32|i64)\b)`,
+        String.raw`(?<keyword>\b(?:fn|const|var|comptime|inline|for|while|if|else|switch|return|try|defer|errdefer|struct|enum|union|pub|export|and|or|orelse|unreachable|break|continue|catch|test|type|void|bool|usize|u8|u32|u64|i32|i64)\b)`,
         String.raw`(?<number>\b\d[\w.]*\b)`
       ].join("|"),
       "g"
     );
 
-    function highlightZig(line) {
-      const fragment = document.createDocumentFragment();
+    function highlightZig(line, target) {
       let consumedUpTo = 0;
       for (const match of line.matchAll(zigTokenPattern)) {
         if (match.index > consumedUpTo) {
-          fragment.append(line.slice(consumedUpTo, match.index));
+          target.append(line.slice(consumedUpTo, match.index));
         }
         const tokenKind = Object.keys(match.groups).find((kind) => match.groups[kind] !== undefined);
         const token = document.createElement("span");
         token.className = `token-${tokenKind}`;
         token.textContent = match[0];
-        fragment.append(token);
+        target.append(token);
         consumedUpTo = match.index + match[0].length;
       }
-      fragment.append(line.slice(consumedUpTo) || (consumedUpTo === 0 ? " " : ""));
-      return fragment;
+      if (consumedUpTo < line.length) target.append(line.slice(consumedUpTo));
     }
 
-    const slide = document.querySelector("#slide");
+    function appendProse(text, target) {
+      for (const paragraph of text.split(/\n{2,}/)) {
+        if (!paragraph.trim()) continue;
+        const element = document.createElement("p");
+        const inline = /\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`/g;
+        let consumedUpTo = 0;
+        for (const match of paragraph.matchAll(inline)) {
+          if (match.index > consumedUpTo) element.append(paragraph.slice(consumedUpTo, match.index));
+          if (match[1] !== undefined) {
+            const link = document.createElement("a");
+            link.href = match[2];
+            link.textContent = match[1];
+            link.target = "_blank";
+            link.rel = "noopener";
+            element.append(link);
+          } else {
+            const code = document.createElement("code");
+            code.textContent = match[3];
+            element.append(code);
+          }
+          consumedUpTo = match.index + match[0].length;
+        }
+        element.append(paragraph.slice(consumedUpTo));
+        target.append(element);
+      }
+    }
+
+    function renderMarkdown(text, target) {
+      target.replaceChildren();
+      const segments = text.split(/```(?:zig)?\n?/);
+      segments.forEach((segment, index) => {
+        if (index % 2 === 1) {
+          const block = document.createElement("pre");
+          segment.replace(/\n$/, "").split("\n").forEach((line, lineIndex) => {
+            if (lineIndex > 0) block.append("\n");
+            highlightZig(line, block);
+          });
+          target.append(block);
+        } else {
+          appendProse(segment, target);
+        }
+      });
+    }
+
+    function renderEmpty(target, label) {
+      target.replaceChildren();
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = label;
+      target.append(empty);
+    }
+
+    function renderList(target, labels) {
+      target.replaceChildren();
+      if (!labels.length) return renderEmpty(target, "[]");
+      const block = document.createElement("pre");
+      block.textContent = labels.join("\n");
+      target.append(block);
+    }
+
+    function renderDiagnostics(target, entries) {
+      target.replaceChildren();
+      if (!entries.length) return renderEmpty(target, "[]");
+      for (const entry of entries) {
+        const paragraph = document.createElement("p");
+        const code = document.createElement("span");
+        code.className = "diagnostic-code";
+        code.textContent = entry.code;
+        paragraph.append(code, entry.message);
+        target.append(paragraph);
+      }
+    }
+
+    const sourceElement = document.querySelector("#slide-source");
+    const statusElement = document.querySelector("#status");
+    const analyzerOutput = document.querySelector("#analyzer-output");
+    const analyzerCaption = document.querySelector("#analyzer-caption");
+    const zlsOutput = document.querySelector("#zls-output");
+    const zlsCaption = document.querySelector("#zls-caption");
     const dots = document.querySelector("#dots");
     const previousButton = document.querySelector("#previous");
     const nextButton = document.querySelector("#next");
-    let selectedIndex = 0;
 
-    function populateSource(source, focusLine) {
-      const sourceElement = document.querySelector("#slide-source");
+    let selectedIndex = 0;
+    let interactives = [];
+    let pinned = null;
+    let keyboardCursor = -1;
+
+    function currentExample() {
+      return examples[selectedIndex];
+    }
+
+    function fileName(example) {
+      return example.fixture.split("/").pop();
+    }
+
+    function setStatus(method, position) {
+      statusElement.replaceChildren();
+      const methodCode = document.createElement("code");
+      methodCode.textContent = method;
+      statusElement.append(methodCode, ` ${position}`);
+    }
+
+    function showHover(element) {
+      const example = currentExample();
+      const line = Number(element.dataset.line);
+      const column = Number(element.dataset.column);
+      setStatus("textDocument/hover", `${fileName(example)}:${line + 1}:${column + 1}`);
+      const analyzerIndex = Number(element.dataset.analyzer);
+      const zlsIndex = Number(element.dataset.zls);
+      analyzerCaption.textContent = analyzerIndex === -1 ? "no hover" : "markdown hover";
+      if (analyzerIndex === -1) renderEmpty(analyzerOutput, "null");
+      else renderMarkdown(strings[analyzerIndex], analyzerOutput);
+      zlsCaption.textContent = zlsIndex === -1 ? "no hover" : "markdown hover";
+      if (zlsIndex === -1) renderEmpty(zlsOutput, "null");
+      else renderMarkdown(strings[zlsIndex], zlsOutput);
+    }
+
+    function showCompletion() {
+      const example = currentExample();
+      const completion = example.completion;
+      setStatus("textDocument/completion", `${fileName(example)}:${completion.line + 1}:${completion.character + 1}`);
+      const caption = (labels) => labels.length === 1 ? "1 candidate" : `${labels.length} candidates`;
+      analyzerCaption.textContent = caption(completion.analyzer);
+      renderList(analyzerOutput, completion.analyzer);
+      zlsCaption.textContent = caption(completion.zls);
+      renderList(zlsOutput, completion.zls);
+    }
+
+    function showDiagnostics() {
+      const example = currentExample();
+      setStatus("textDocument/publishDiagnostics", fileName(example));
+      const caption = (entries) => entries.length === 1 ? "1 diagnostic" : `${entries.length} diagnostics`;
+      analyzerCaption.textContent = caption(example.diagnostics.analyzer);
+      renderDiagnostics(analyzerOutput, example.diagnostics.analyzer);
+      zlsCaption.textContent = caption(example.diagnostics.zls);
+      renderDiagnostics(zlsOutput, example.diagnostics.zls);
+    }
+
+    function activate(element) {
+      for (const interactive of interactives) interactive.classList.remove("active");
+      if (element) {
+        element.classList.add("active");
+        if (element.classList.contains("caret")) showCompletion();
+        else showHover(element);
+        return;
+      }
+      const example = currentExample();
+      if (example.kind === "Diagnostics") return showDiagnostics();
+      if (example.completion) {
+        const caret = interactives.find((candidate) => candidate.classList.contains("caret"));
+        if (caret) {
+          caret.classList.add("active");
+          return showCompletion();
+        }
+      }
+      if (interactives.length) {
+        interactives[0].classList.add("active");
+        showHover(interactives[0]);
+      }
+    }
+
+    function pin(element) {
+      pinned = element;
+      keyboardCursor = interactives.indexOf(element);
+      activate(element);
+    }
+
+    function intersectsDiagnostic(example, line, start, length) {
+      const entries = example.diagnostics ? example.diagnostics.analyzer : [];
+      return entries.some((entry) => {
+        if (line < entry.startLine || line > entry.endLine) return false;
+        const from = line === entry.startLine ? entry.startChar : 0;
+        const to = line === entry.endLine ? entry.endChar : Infinity;
+        return start < to && start + length > from;
+      });
+    }
+
+    function appendCaret(target) {
+      const caret = document.createElement("button");
+      caret.type = "button";
+      caret.className = "caret";
+      caret.setAttribute("aria-label", "Completion cursor: show completion candidates from both servers");
+      caret.addEventListener("mouseenter", () => activate(caret));
+      caret.addEventListener("mouseleave", () => activate(pinned));
+      caret.addEventListener("click", (event) => {
+        event.stopPropagation();
+        pin(caret);
+      });
+      target.append(caret);
+      interactives.push(caret);
+    }
+
+    function buildSource(example) {
       sourceElement.replaceChildren();
-      source.split("\n").forEach((line, lineIndex) => {
+      interactives = [];
+      example.lines.forEach((line, offset) => {
+        const fileLine = example.displayStart + offset;
         const sourceLine = document.createElement("span");
         sourceLine.className = "source-line";
-        if (lineIndex + 1 === focusLine) sourceLine.classList.add("focused");
 
         const lineNumber = document.createElement("span");
         lineNumber.className = "line-number";
-        lineNumber.textContent = String(lineIndex + 1);
+        lineNumber.textContent = String(fileLine + 1);
 
-        const lineSource = document.createElement("span");
-        lineSource.append(highlightZig(line));
+        const content = document.createElement("span");
+        const caretColumn =
+          example.completion && example.completion.line === fileLine ? example.completion.character : -1;
+        let consumedUpTo = 0;
+        for (const [start, length, analyzerIndex, zlsIndex] of example.tokens[offset]) {
+          if (caretColumn > consumedUpTo - 1 && caretColumn <= start && caretColumn !== 0) appendCaret(content);
+          if (start > consumedUpTo) content.append(line.slice(consumedUpTo, start));
+          const token = document.createElement("span");
+          token.className = "token";
+          token.dataset.line = fileLine;
+          token.dataset.column = start;
+          token.dataset.analyzer = analyzerIndex;
+          token.dataset.zls = zlsIndex;
+          if (intersectsDiagnostic(example, fileLine, start, length)) token.classList.add("diagnostic");
+          highlightZig(line.slice(start, start + length), token);
+          token.addEventListener("mouseenter", () => activate(token));
+          token.addEventListener("mouseleave", () => activate(pinned));
+          token.addEventListener("click", () => pin(token));
+          content.append(token);
+          interactives.push(token);
+          consumedUpTo = start + length;
+        }
+        if (consumedUpTo < line.length) content.append(line.slice(consumedUpTo));
+        if (!line.length) content.append(" ");
 
-        sourceLine.append(lineNumber, lineSource);
+        sourceLine.append(lineNumber, content);
         sourceElement.append(sourceLine);
       });
     }
 
-    function populateSlide(direction) {
-      const example = examples[selectedIndex];
+    function populateSlide() {
+      const example = currentExample();
+      pinned = null;
+      keyboardCursor = -1;
       document.title = `${example.title} · zig-analyzer vs ZLS`;
       document.querySelector("#slide-kind").textContent = example.kind;
       document.querySelector("#slide-counter").textContent = `${selectedIndex + 1} / ${examples.length}`;
       document.querySelector("#slide-title").textContent = example.title;
       document.querySelector("#slide-summary").textContent = example.summary;
-      document.querySelector("#analyzer-caption").textContent = example.analyzerCaption;
-      document.querySelector("#analyzer-output").textContent = example.analyzerOutput;
-      document.querySelector("#zls-caption").textContent = example.zlsCaption;
-      document.querySelector("#zls-output").textContent = example.zlsOutput;
-      document.querySelector("#fixture-link").href = repositoryFileUrl + example.fixture;
-      document.querySelector("#fixture-link").textContent = `Reproduce from ${example.fixture}`;
-
-      const request = document.querySelector("#slide-request");
-      request.replaceChildren();
-      const requestCode = document.createElement("code");
-      requestCode.textContent = example.request;
-      request.append("Request", requestCode);
 
       const observation = document.querySelector("#slide-observation");
       observation.replaceChildren();
@@ -872,26 +958,24 @@ With build-on-save enabled, ZLS can report the same error after running the conf
       observationLabel.textContent = "What this demonstrates. ";
       observation.append(observationLabel, example.observation);
 
-      populateSource(example.source, example.focusLine);
+      const fixtureLink = document.querySelector("#fixture-link");
+      fixtureLink.href = `${repositoryFileUrl}${example.fixture}#L${example.displayStart + 1}`;
+      fixtureLink.textContent = `Open ${example.fixture}`;
+
+      buildSource(example);
+      activate(null);
 
       previousButton.disabled = selectedIndex === 0;
       nextButton.disabled = selectedIndex === examples.length - 1;
       [...dots.children].forEach((entry, index) => {
         entry.firstChild.setAttribute("aria-current", String(index === selectedIndex));
       });
-
-      if (direction) {
-        slide.classList.remove("entering", "reverse");
-        void slide.offsetWidth;
-        slide.classList.add("entering");
-        if (direction === "backward") slide.classList.add("reverse");
-      }
     }
 
-    function selectExample(index, direction) {
+    function selectExample(index) {
       selectedIndex = index;
       history.replaceState(null, "", `#${examples[index].id}`);
-      populateSlide(direction);
+      populateSlide();
     }
 
     examples.forEach((example, index) => {
@@ -900,9 +984,7 @@ With build-on-save enabled, ZLS can report the same error after running the conf
       dot.type = "button";
       dot.className = "dot";
       dot.setAttribute("aria-label", `${example.kind}: ${example.title}`);
-      dot.addEventListener("click", () => {
-        selectExample(index, index >= selectedIndex ? "forward" : "backward");
-      });
+      dot.addEventListener("click", () => selectExample(index));
       const touchTarget = document.createElement("span");
       touchTarget.className = "touch-target";
       touchTarget.setAttribute("aria-hidden", "true");
@@ -912,22 +994,51 @@ With build-on-save enabled, ZLS can report the same error after running the conf
     });
 
     previousButton.addEventListener("click", () => {
-      if (selectedIndex > 0) selectExample(selectedIndex - 1, "backward");
+      if (selectedIndex > 0) selectExample(selectedIndex - 1);
     });
 
     nextButton.addEventListener("click", () => {
-      if (selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1, "forward");
+      if (selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1);
+    });
+
+    sourceElement.addEventListener("keydown", (event) => {
+      const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[event.key];
+      if (step === undefined) return;
+      event.preventDefault();
+      keyboardCursor = Math.min(Math.max(keyboardCursor + step, 0), interactives.length - 1);
+      pinned = interactives[keyboardCursor];
+      activate(pinned);
+      pinned.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
 
     document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        pinned = null;
+        keyboardCursor = -1;
+        activate(null);
+        return;
+      }
+      if (sourceElement.contains(document.activeElement) || document.activeElement === sourceElement) return;
       if (event.target instanceof HTMLElement && /^(input|textarea|select)$/i.test(event.target.tagName)) return;
-      if (event.key === "ArrowLeft" && selectedIndex > 0) selectExample(selectedIndex - 1, "backward");
-      if (event.key === "ArrowRight" && selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1, "forward");
+      if (event.key === "ArrowLeft" && selectedIndex > 0) selectExample(selectedIndex - 1);
+      if (event.key === "ArrowRight" && selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1);
     });
 
-    const requestedIndex = examples.findIndex((example) => example.id === window.location.hash.slice(1));
+    const requested = window.location.hash.slice(1);
+    const [requestedId, requestedPosition] = requested.split("@");
+    const requestedIndex = examples.findIndex((example) => example.id === requestedId);
     if (requestedIndex !== -1) selectedIndex = requestedIndex;
     populateSlide();
+    if (requestedIndex !== -1 && requestedPosition) {
+      const [line, column] = requestedPosition.split(":").map(Number);
+      const match = interactives.find(
+        (candidate) =>
+          Number(candidate.dataset.line) === line - 1 &&
+          Number(candidate.dataset.column) <= column - 1 &&
+          column - 1 < Number(candidate.dataset.column) + candidate.textContent.length
+      );
+      if (match) pin(match);
+    }
   </script>
 </body>
 </html>
