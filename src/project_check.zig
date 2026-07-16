@@ -407,8 +407,12 @@ test "check fixes safe findings recursively and skips dependency directories" {
     try temporary.dir.createDirPath(io, "src");
     try temporary.dir.createDirPath(io, "node_modules/package");
     try temporary.dir.writeFile(io, .{
+        .sub_path = "zig-analyzer.json",
+        .data = "{\"lints\":{\"rules\":{\"redundant-boolean-if\":\"warning\"}}}\n",
+    });
+    try temporary.dir.writeFile(io, .{
         .sub_path = "src/main.zig",
-        .data = "fn main() void { var answer: u32 = 42; _ = answer; missing(); }\n",
+        .data = "fn main(ready: bool) void { var answer: u32 = 42; _ = answer; _ = if (ready) true else false; missing(); }\n",
     });
     try temporary.dir.writeFile(io, .{
         .sub_path = "node_modules/package/ignored.zig",
@@ -424,7 +428,7 @@ test "check fixes safe findings recursively and skips dependency directories" {
     try std.testing.expectEqual(@as(u8, 1), exit_code);
     const fixed = try temporary.dir.readFileAlloc(io, "src/main.zig", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(fixed);
-    try std.testing.expectEqualStrings("fn main() void { const answer: u32 = 42; _ = answer; missing(); }\n", fixed);
+    try std.testing.expectEqualStrings("fn main(ready: bool) void { var answer: u32 = 42; _ = answer; _ = ready; missing(); }\n", fixed);
     const ignored = try temporary.dir.readFileAlloc(io, "node_modules/package/ignored.zig", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(ignored);
     try std.testing.expect(std.mem.indexOf(u8, ignored, "var dependency") != null);

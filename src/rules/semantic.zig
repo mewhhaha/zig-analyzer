@@ -253,16 +253,16 @@ fn identifierIsCaptureBinding(tokens: []const std.zig.Token, index: usize) bool 
         opening -= 1;
         switch (tokens[opening].tag) {
             .pipe => break,
-            .l_brace, .r_brace, .semicolon => return false,
-            else => {},
+            .identifier, .asterisk, .comma => {},
+            else => return false,
         }
     } else return false;
     var closing = index + 1;
     while (closing < tokens.len and closing - index < 16) : (closing += 1) {
         switch (tokens[closing].tag) {
             .pipe => return true,
-            .l_brace, .r_brace, .semicolon => return false,
-            else => {},
+            .identifier, .asterisk, .comma => {},
+            else => return false,
         }
     }
     return false;
@@ -294,7 +294,6 @@ fn findNeverMutatedVariables(
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
-            .fix_all = true,
         };
         try addFinding(allocator, source, configuration, found, .{
             .rule = .never_mutated_var,
@@ -366,6 +365,7 @@ fn bindingIsMutated(
         if (index > 0 and tokens[index - 1].tag == .ampersand) return true;
         if (usedByAssembly(tokens, index)) return true;
         if (usedByFieldMutation(source, tokens, index)) return true;
+        if (usedByMutableOptionalCapture(tokens, index)) return true;
         if (usedByMutableSwitchCapture(tokens, index)) return true;
         if (index + 1 >= tokens.len) continue;
         if (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket) return true;
@@ -439,6 +439,17 @@ fn usedByFieldMutation(source: []const u8, tokens: []const std.zig.Token, use_in
     const closing = matchingToken(tokens, use_index - 1, .l_paren, .r_paren) orelse return false;
     if (closing + 1 < tokens.len and isAssignment(tokens[closing + 1].tag)) return true;
     return use_index >= 3 and tokens[use_index - 3].tag == .ampersand;
+}
+
+fn usedByMutableOptionalCapture(tokens: []const std.zig.Token, use_index: usize) bool {
+    if (use_index < 2 or use_index + 5 >= tokens.len) return false;
+    if (tokens[use_index - 1].tag != .l_paren or
+        (tokens[use_index - 2].tag != .keyword_if and tokens[use_index - 2].tag != .keyword_while)) return false;
+    return tokens[use_index + 1].tag == .r_paren and
+        tokens[use_index + 2].tag == .pipe and
+        tokens[use_index + 3].tag == .asterisk and
+        tokens[use_index + 4].tag == .identifier and
+        tokens[use_index + 5].tag == .pipe;
 }
 
 fn usedByMutableSwitchCapture(tokens: []const std.zig.Token, use_index: usize) bool {
@@ -2049,7 +2060,7 @@ fn findNeedlessElse(
         edits[0] = .{ .span = .{ .start = token.loc.start, .end = tokens[else_index + 1].loc.end }, .replacement = "" };
         edits[1] = .{ .span = tokens[else_close].loc, .replacement = "" };
         const fixes = try allocator.alloc(Fix, 1);
-        fixes[0] = .{ .title = "Flatten else after terminating branch", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
+        fixes[0] = .{ .title = "Flatten else after terminating branch", .kind = .quickfix, .edits = edits, .preferred = true };
         try addFinding(allocator, source, configuration, found, .{
             .rule = .needless_else_after_terminator,
             .level = level,
@@ -3484,6 +3495,58 @@ test "never-mutated analysis omits top-level state and possible mutable receiver
         "}\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
+}
+
+test "never-mutated analysis recognizes mutable optional captures and nested assignments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(optional: ?Resource, root: *const Node) void {\n" ++
+        "    var owned = optional;\n" ++
+        "    defer if (owned) |*resource| resource.deinit();\n" ++
+        "    var current = optional;\n" ++
+        "    while (current) |*resource| { resource.advance(); break; }\n" ++
+        "    var node = root;\n" ++
+        "    var remaining: usize = 2;\n" ++
+        "    while (true) {\n" ++
+        "        switch (node.content) {\n" ++
+        "            .leaf => |leaf| return leaf.bytes[remaining],\n" ++
+        "            .branch => |branch| {\n" ++
+        "                if (remaining < branch.count) {\n" ++
+        "                    node = branch.left;\n" ++
+        "                } else {\n" ++
+        "                    remaining -= branch.count;\n" ++
+        "                    node = branch.right;\n" ++
+        "                }\n" ++
+        "            },\n" ++
+        "        }\n" ++
+        "    }\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
+}
+
+test "scope-sensitive quick fixes are excluded from fix all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(enabled: bool) void {\n" ++
+        "    var value = enabled;\n" ++
+        "    _ = value;\n" ++
+        "    if (enabled) { return; } else { consume(); }\n" ++
+        "}\n";
+    const configuration = try parseConfiguration(arena.allocator(),
+        \\{"lints":{"rules":{"needless-else-after-terminator":"information"}}}
+    );
+    const found = try findings(arena.allocator(), source, configuration);
+    var checked: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .never_mutated_var and finding.rule != .needless_else_after_terminator) continue;
+        try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+        try std.testing.expect(!finding.fixes[0].fix_all);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
 }
 
 test "configuration reports the removed formatting profile and still loads lints" {
