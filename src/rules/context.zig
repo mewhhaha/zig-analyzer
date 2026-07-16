@@ -1,4 +1,5 @@
 const std = @import("std");
+const configuration = @import("configuration.zig");
 const types = @import("types.zig");
 
 pub const RuleRun = struct {
@@ -13,7 +14,7 @@ pub const RuleRun = struct {
     }
 
     pub fn emit(context: RuleRun, finding: types.Finding) !void {
-        if (finding.level == .off or suppressed(context.source, finding.rule.code(), finding.span.start)) return;
+        if (finding.level == .off or configuration.isSuppressed(context.source, finding.rule, finding.span.start)) return;
         try context.findings.append(context.allocator, finding);
     }
 
@@ -86,29 +87,3 @@ pub const RuleRun = struct {
         return context.matchingToken(opening, .l_brace, .r_brace);
     }
 };
-
-fn suppressed(source: []const u8, rule: []const u8, offset: usize) bool {
-    const prefix = source[0..@min(offset, source.len)];
-    var lines = std.mem.splitScalar(u8, prefix, '\n');
-    var previous: []const u8 = "";
-    var current: []const u8 = "";
-    while (lines.next()) |line| {
-        if (directiveContains(line, "disable-file", rule)) return true;
-        previous = current;
-        current = line;
-    }
-    return directiveContains(previous, "disable-next-line", rule);
-}
-
-fn directiveContains(line: []const u8, directive: []const u8, rule: []const u8) bool {
-    const marker = "// zig-analyzer:";
-    const marker_index = std.mem.indexOf(u8, line, marker) orelse return false;
-    var remainder = std.mem.trim(u8, line[marker_index + marker.len ..], " \t\r");
-    if (!std.mem.startsWith(u8, remainder, directive)) return false;
-    remainder = std.mem.trim(u8, remainder[directive.len..], " \t\r");
-    var names = std.mem.splitScalar(u8, remainder, ',');
-    while (names.next()) |name| {
-        if (std.mem.eql(u8, std.mem.trim(u8, name, " \t\r"), rule)) return true;
-    }
-    return false;
-}

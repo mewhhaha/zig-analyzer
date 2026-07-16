@@ -49,6 +49,19 @@ fn transferOwnership(allocator: std.mem.Allocator) ![]u8 {
     return value;
 }
 
+fn readAfterInclusiveBound(values: []const u8, index: usize) u8 {
+    std.debug.assert(index <= values.len);
+    return values[index];
+}
+
+fn reverseWithUnsignedIndex(values: []const u8) void {
+    if (values.len == 0) return;
+    var index: usize = values.len - 1;
+    while (index >= 0) : (index -= 1) {
+        _ = values[index];
+    }
+}
+
 const Payload = union(enum) {
     number: u8,
     code: u8,

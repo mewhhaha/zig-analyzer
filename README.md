@@ -100,6 +100,9 @@ with stable rule names and editor quick fixes:
 | Returning memory owned by a locally deinitialized arena | `returning-arena-allocation` | No arena-lifetime diagnostic |
 | Keeping `&list.items[index]` across a possible reallocation | `invalidated-element-pointer` | No element-pointer lifetime diagnostic |
 | Reassigning a cleanup binding without releasing its previous resource | `defer-uses-reassigned-binding` | No deferred-capture ownership diagnostic |
+| Returning an allocation or file that a normal `defer` frees or closes | `returning-released-value` links the return to its deferred release | No ownership-return diagnostic |
+| Asserting `index <= values.len` immediately before `values[index]` | Opt-in `inclusive-index-bound` notes that the assertion itself is weaker than the access and offers a strict-bound fix | No weak-bound guidance |
+| Counting down an explicit unsigned index with `index >= 0` and `index -= 1` | `unsigned-reverse-loop` explains the non-terminating condition and underflow | No diagnostic |
 | Converting every error to `null`, `false`, or `0` | `error-collapsed-to-absence` | No diagnostic |
 | Passing unchecked runtime multiplication as an allocation length | `allocation-size-overflow` | No release-mode overflow guidance |
 | Cleaning a file/container only through `errdefer` | `resource-cleanup-on-error-only` | No success-path resource diagnostic |
@@ -154,9 +157,9 @@ zig-analyzer check --fix .
 ```
 
 `--fix` applies only semantics-preserving rewrites such as `var` to `const`,
-boolean simplification, proven cast removal, and needless-`else` flattening.
-Allocation cleanup, generated code, renames, and other judgment calls remain
-explicit editor actions.
+boolean simplification, compact single-statement defers, proven cast removal,
+and empty or needless-`else` flattening. Allocation cleanup, generated code,
+renames, and other judgment calls remain explicit editor actions.
 
 ### Opinionated formatting
 
@@ -164,7 +167,9 @@ The default `zig` formatting profile returns the exact result of `zig fmt`.
 The opt-in `analyzer` profile first applies only proven source rewrites, then
 runs `zig fmt` over the result. It changes unmutated `var` declarations to
 `const`, simplifies proven boolean comparisons and casts, flattens needless
-`else` blocks, parenthesizes mixed arithmetic/bitwise expressions, and can
+`else` blocks, removes empty `else` and one-statement defer blocks, reduces
+boolean-valued `if` expressions, parenthesizes mixed arithmetic/bitwise
+expressions, and can
 organize unambiguous import blocks.
 
 It deliberately does not rename declarations, insert cleanup, generate code,
@@ -196,7 +201,8 @@ The profiles are cumulative:
 - `idiomatic` adds optional captures, direct `try` propagation, testing
   expectations, const pointer contracts, error-switch expansion, import
   cleanup, result-location initializers, conservative comptime cleanup,
-  optional-capture reuse, and explicit warnings for `orelse unreachable`.
+  optional-capture reuse, direct boolean expressions, compact defer forms, and
+  explicit warnings for `orelse unreachable`.
 - `strict` also requires documentation on public declarations.
 
 For example, the idiomatic profile diagnoses and offers explicit rewrites for:
@@ -206,11 +212,17 @@ if (optional != null) use(optional.?);
 const value = load() catch |err| return err;
 try std.testing.expect(actual == 42);
 const mode: Mode = Mode.fast;
+const ready = if (state.isReady()) true else false;
+defer { file.close(); }
+if (ready) { use(value); } else {}
 ```
 
-The actions use an optional capture, `try`, `expectEqual`, and `.fast`
-respectively. Renames, file naming, pointer constness, and other API-facing
-changes are never formatter or fix-all edits.
+The actions use an optional capture, `try`, `expectEqual`, `.fast`, the boolean
+condition, `defer file.close();`, and no empty `else`, respectively. These
+syntax-bounded rewrites are available as quick fixes and safe fix-all edits
+under `redundant-boolean-if`, `needless-defer-block`, and
+`needless-empty-else`. Renames, file naming, pointer constness, and other
+API-facing changes are never formatter or fix-all edits.
 
 The idiomatic testing rules prefer `expectEqualStrings`, `expectEqualSlices`,
 and `expectError` when an exact equivalent is proven. They also diagnose manual
@@ -232,10 +244,24 @@ and suppressions, and one registry provides deterministic composition. The
 extension contract is documented in [`src/rules/README.md`](src/rules/README.md).
 
 Rules accept `off`, `hint`, `information`, `warning`, and `error`. Per-rule
-settings override their tier. Local suppressions use
-`// zig-analyzer: disable-next-line rule-a` or a top-of-file
-`// zig-analyzer: disable-file rule-a, rule-b` directive. Unknown rules and
-malformed configuration produce warnings instead of silently doing nothing.
+settings override their tier. Source suppressions use ESLint-style comments:
+
+```zig
+// zig-analyzer: disable-file rule-a, rule-b
+const first = value(); // zig-analyzer: disable-line rule-a
+// zig-analyzer: disable-next-line rule-a, rule-b
+const second = value();
+// zig-analyzer: disable rule-a, rule-b
+const third = value();
+// zig-analyzer: enable rule-a
+const fourth = value();
+// zig-analyzer: enable all
+```
+
+Omitting the rule list, or naming `all`, targets every rule. `disable` remains
+active until a matching `enable`; `disable-file` must appear before code.
+Unknown rules, malformed directives, and malformed configuration produce
+warnings instead of silently doing nothing.
 
 ## Try it
 

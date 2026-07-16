@@ -18,7 +18,7 @@ public facades/registries    analysis.zig, rules/registry.zig,
     |                        actions/registry.zig
     |
 proof and policy engines     rules/*.zig, actions/{expression,language,
-                             ownership,testing,project}.zig
+                             ownership,testing,project}.zig, syntax_types.zig
     |
 shared domain types          rules/types.zig, rules/context.zig,
                              actions/context.zig, compiler_protocol.zig
@@ -65,6 +65,9 @@ globals:
   rules do not belong there.
 - Action family modules own the proof that a rewrite is safe. They return byte
   edits and never construct LSP values.
+- `syntax_types.zig` follows explicit syntax facts such as function return
+  types, imported dotted paths, and type aliases. Hover uses it as a fallback
+  when no compiler expression type is available.
 
 Large thick modules should be split along a proof boundary, not at an arbitrary
 line count. A good extraction removes an input or dependency from the original

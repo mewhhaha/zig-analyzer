@@ -158,8 +158,9 @@ Acceptance:
   retain compiler notes as related information.
 - [x] Quick fixes, extraction/rewrite refactors, import organization, and safe
   fix-all are advertised and returned without a resolve round trip.
-- [x] Configuration levels, per-rule overrides, and line/file suppressions
-  report malformed or unknown values instead of silently ignoring them.
+- [x] Configuration levels, per-rule overrides, and line, file, next-line, and
+  scoped multi-rule suppressions report malformed or unknown values instead of
+  silently ignoring them.
 
 ## ZA-012 — Lifetime diagnostics and opinionated formatting
 
@@ -191,7 +192,8 @@ resolved comptime code easier to read, navigate, and rewrite safely.
 Acceptance:
 
 - [x] Official, idiomatic, and strict profiles compose with tier and per-rule
-  overrides, file/line suppressions, and precise configuration warnings.
+  overrides, ESLint-style source suppressions, and precise configuration
+  warnings.
 - [x] Naming, documentation, optional/error flow, testing, pointer constness,
   finite error switches, imports, comptime markers, and result-location idioms
   have positive, negative, and action coverage.
@@ -262,3 +264,41 @@ Acceptance:
   generation without guessing unresolved shapes.
 - [x] Open-workspace build imports, repeated C-import extraction, and generated
   test harnesses return complete edits; file creation is capability-gated.
+
+## ZA-017 — Deferred-release and boundary diagnostics
+
+Status: complete  
+Depends on: ZA-014, ZA-015
+
+Outcome: narrow ownership and integer-loop proofs catch additional
+compiler-missed correctness failures, while locally weak index assertions remain
+an idiomatic advisory when nonlocal invariants may already prove safety.
+
+Acceptance:
+
+- [x] Returning a directly acquired allocation or resource that normal `defer`
+  releases reports the expired value and related cleanup location; `errdefer`
+  ownership transfer stays clean.
+- [x] An inclusive `<= sequence.len` assertion immediately followed by indexing
+  the same sequence and path reports opt-in weak-bound guidance with an explicit
+  local quick fix that remains outside fix-all.
+- [x] Explicit unsigned countdown variables using `>= 0` and a `-= 1` loop
+  update report the non-terminating condition and eventual underflow.
+- [x] Each rule has positive, negative, and suppression coverage; corpus review
+  demonstrated why weak-bound guidance cannot claim path-sensitive unsafety.
+
+## ZA-018 — Syntax-bounded idiomatic rewrites
+
+Status: complete
+Depends on: ZA-014
+
+Outcome: common verbose Zig expressions receive low-noise diagnostics and
+mechanically safe rewrites in quick fixes, fix-all, and analyzer formatting.
+
+Acceptance:
+
+- [x] Boolean-valued `if` expressions, empty `else` branches, and
+  single-expression `defer` or `errdefer` blocks have independent rules.
+- [x] Rewrites preserve comments by declining ambiguous forms and have
+  positive, negative, suppression, and fix-all coverage.
+- [x] The idiomatic example compiles and documents each editor-visible action.

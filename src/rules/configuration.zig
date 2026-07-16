@@ -138,37 +138,221 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
 pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]const u8 {
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
+    var file_header = true;
     while (lines.next()) |line| {
         line_number += 1;
-        const marker = "// zig-analyzer:";
-        const trimmed_line = std.mem.trimStart(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed_line, marker)) continue;
-        const directive = std.mem.trim(u8, trimmed_line[marker.len..], " \t\r");
-        const names_text = if (std.mem.startsWith(u8, directive, "disable-next-line "))
-            directive["disable-next-line ".len..]
-        else if (std.mem.startsWith(u8, directive, "disable-file "))
-            directive["disable-file ".len..]
-        else
-            return try std.fmt.allocPrint(allocator, "malformed zig-analyzer suppression on line {d}", .{line_number});
-        var names = std.mem.splitScalar(u8, names_text, ',');
-        var name_count: usize = 0;
-        while (names.next()) |raw_name| {
-            const name = std.mem.trim(u8, raw_name, " \t\r");
-            if (name.len == 0) {
-                return try std.fmt.allocPrint(allocator, "empty lint rule in zig-analyzer suppression on line {d}", .{line_number});
-            }
-            name_count += 1;
-            if (ruleNamed(name) == null) {
+        const parsed = directiveOnLine(line);
+        if (parsed) |directive| {
+            if (directive.kind == .disable_file and (!file_header or lineHasCodeBeforeDirective(line, directive.comment_start))) {
                 return try std.fmt.allocPrint(
                     allocator,
-                    "zig-analyzer suppression on line {d} contains unknown lint rule '{s}'",
-                    .{ line_number, name },
+                    "zig-analyzer disable-file suppression on line {d} must appear before code",
+                    .{line_number},
                 );
             }
+            if (try invalidDirectiveTargets(allocator, directive.targets, line_number)) |warning| return warning;
+        } else if (containsDirectiveMarker(line)) {
+            return try std.fmt.allocPrint(allocator, "malformed zig-analyzer suppression on line {d}", .{line_number});
         }
-        if (name_count == 0) return try std.fmt.allocPrint(allocator, "zig-analyzer suppression on line {d} names no lint rules", .{line_number});
+        if (lineHasCode(line)) file_header = false;
     }
     return null;
+}
+
+pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
+    if (std.mem.indexOf(u8, source, "// zig-analyzer:") == null) return false;
+    const target_offset = @min(offset, source.len);
+    const target_line_start = lineStart(source, target_offset);
+    var cursor: usize = 0;
+    var disabled = false;
+    var disable_next_line = false;
+    var file_header = true;
+
+    while (cursor <= target_line_start and cursor < source.len) {
+        const end = lineEnd(source, cursor);
+        const line = source[cursor..end];
+        if (directiveOnLine(line)) |directive| {
+            const targets_rule = directiveTargetsRule(directive.targets, rule);
+            if (directive.kind == .disable_file and file_header and
+                !lineHasCodeBeforeDirective(line, directive.comment_start) and targets_rule) return true;
+
+            if (cursor < target_line_start) {
+                switch (directive.kind) {
+                    .disable => if (targets_rule) {
+                        disabled = true;
+                    },
+                    .enable => if (targets_rule) {
+                        disabled = false;
+                    },
+                    .disable_next_line => disable_next_line = targets_rule,
+                    else => {},
+                }
+            } else {
+                if (directive.kind == .disable_line and targets_rule) return true;
+                const absolute_comment_start = cursor + directive.comment_start;
+                if (absolute_comment_start <= target_offset) switch (directive.kind) {
+                    .disable => if (targets_rule) {
+                        disabled = true;
+                    },
+                    .enable => if (targets_rule) {
+                        disabled = false;
+                    },
+                    else => {},
+                };
+            }
+        }
+
+        if (cursor < target_line_start) {
+            const next_start = if (end < source.len) end + 1 else source.len;
+            if (next_start == target_line_start and disable_next_line) return true;
+            if (next_start != target_line_start) disable_next_line = false;
+        }
+        if (lineHasCode(line)) file_header = false;
+        if (end == source.len) break;
+        cursor = end + 1;
+    }
+    return disabled;
+}
+
+const DirectiveKind = enum {
+    disable_file,
+    disable_line,
+    disable_next_line,
+    disable,
+    enable,
+};
+
+const Directive = struct {
+    kind: DirectiveKind,
+    targets: []const u8,
+    comment_start: usize,
+};
+
+fn directiveOnLine(line: []const u8) ?Directive {
+    const comment_start = lineCommentStart(line) orelse return null;
+    const marker = "// zig-analyzer:";
+    const comment = std.mem.trimStart(u8, line[comment_start..], " \t\r");
+    if (!std.mem.startsWith(u8, comment, marker)) return null;
+    const remainder = std.mem.trim(u8, comment[marker.len..], " \t\r");
+    const name_end = std.mem.indexOfAny(u8, remainder, " \t\r") orelse remainder.len;
+    const name = remainder[0..name_end];
+    const kind: DirectiveKind = if (std.mem.eql(u8, name, "disable-file"))
+        .disable_file
+    else if (std.mem.eql(u8, name, "disable-line"))
+        .disable_line
+    else if (std.mem.eql(u8, name, "disable-next-line"))
+        .disable_next_line
+    else if (std.mem.eql(u8, name, "disable"))
+        .disable
+    else if (std.mem.eql(u8, name, "enable"))
+        .enable
+    else
+        return null;
+    return .{
+        .kind = kind,
+        .targets = std.mem.trim(u8, remainder[name_end..], " \t\r"),
+        .comment_start = comment_start,
+    };
+}
+
+fn invalidDirectiveTargets(
+    allocator: std.mem.Allocator,
+    targets: []const u8,
+    line_number: usize,
+) !?[]const u8 {
+    if (targets.len == 0) return null;
+    var names = std.mem.splitScalar(u8, targets, ',');
+    var name_count: usize = 0;
+    var names_all = false;
+    while (names.next()) |raw_name| {
+        const name = std.mem.trim(u8, raw_name, " \t\r");
+        if (name.len == 0) {
+            return try std.fmt.allocPrint(allocator, "empty lint rule in zig-analyzer suppression on line {d}", .{line_number});
+        }
+        name_count += 1;
+        if (std.mem.eql(u8, name, "all")) {
+            names_all = true;
+            continue;
+        }
+        if (ruleNamed(name) == null) {
+            return try std.fmt.allocPrint(
+                allocator,
+                "zig-analyzer suppression on line {d} contains unknown lint rule '{s}'",
+                .{ line_number, name },
+            );
+        }
+    }
+    if (names_all and name_count != 1) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "zig-analyzer suppression on line {d} cannot combine 'all' with named rules",
+            .{line_number},
+        );
+    }
+    return null;
+}
+
+fn directiveTargetsRule(targets: []const u8, rule: Rule) bool {
+    if (targets.len == 0 or std.mem.eql(u8, targets, "all")) return true;
+    var names = std.mem.splitScalar(u8, targets, ',');
+    while (names.next()) |raw_name| {
+        if (std.mem.eql(u8, std.mem.trim(u8, raw_name, " \t\r"), rule.code())) return true;
+    }
+    return false;
+}
+
+fn containsDirectiveMarker(line: []const u8) bool {
+    const comment_start = lineCommentStart(line) orelse return false;
+    return std.mem.startsWith(u8, std.mem.trimStart(u8, line[comment_start..], " \t\r"), "// zig-analyzer:");
+}
+
+fn lineHasCode(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    if (trimmed.len == 0) return false;
+    const comment_start = lineCommentStart(line) orelse return true;
+    return lineHasCodeBeforeDirective(line, comment_start);
+}
+
+fn lineHasCodeBeforeDirective(line: []const u8, comment_start: usize) bool {
+    return std.mem.trim(u8, line[0..comment_start], " \t\r").len != 0;
+}
+
+fn lineCommentStart(line: []const u8) ?usize {
+    const trimmed = std.mem.trimStart(u8, line, " \t\r");
+    if (std.mem.startsWith(u8, trimmed, "\\\\")) return null;
+    var quote: ?u8 = null;
+    var escaped = false;
+    var index: usize = 0;
+    while (index + 1 < line.len) : (index += 1) {
+        const byte = line[index];
+        if (quote) |delimiter| {
+            if (escaped) {
+                escaped = false;
+            } else if (byte == '\\') {
+                escaped = true;
+            } else if (byte == delimiter) {
+                quote = null;
+            }
+            continue;
+        }
+        if (byte == '"' or byte == '\'') {
+            quote = byte;
+            continue;
+        }
+        if (byte == '\\' and line[index + 1] == '\\') return null;
+        if (byte == '/' and line[index + 1] == '/') return index;
+    }
+    return null;
+}
+
+fn lineStart(source: []const u8, offset: usize) usize {
+    return (std.mem.lastIndexOfScalar(u8, source[0..@min(offset, source.len)], '\n') orelse return 0) + 1;
+}
+
+fn lineEnd(source: []const u8, offset: usize) usize {
+    const start = @min(offset, source.len);
+    const relative = std.mem.indexOfScalar(u8, source[start..], '\n') orelse return source.len;
+    return start + relative;
 }
 
 fn parseLevel(value: std.json.Value) ?Level {
@@ -233,4 +417,87 @@ test "suppression reports its source line" {
         "zig-analyzer suppression on line 2 contains unknown lint rule 'not-a-rule'",
         warning,
     );
+}
+
+test "line next-line and scoped suppressions target several rules" {
+    const source =
+        "var line_value = 1; // zig-analyzer: disable-line never-mutated-var, redundant-boolean-if\n" ++
+        "// zig-analyzer: disable-next-line never-mutated-var, needless-defer-block\n" ++
+        "var next_value = 2;\n" ++
+        "// zig-analyzer: disable never-mutated-var, needless-defer-block\n" ++
+        "var scoped_value = 3;\n" ++
+        "// zig-analyzer: enable never-mutated-var\n" ++
+        "var enabled_value = 4;\n" ++
+        "defer { close(); }\n" ++
+        "// zig-analyzer: enable all\n" ++
+        "defer { closeAgain(); }\n";
+
+    const line_value = std.mem.indexOf(u8, source, "line_value").?;
+    const next_value = std.mem.indexOf(u8, source, "next_value").?;
+    const scoped_value = std.mem.indexOf(u8, source, "scoped_value").?;
+    const enabled_value = std.mem.indexOf(u8, source, "enabled_value").?;
+    const first_defer = std.mem.indexOf(u8, source, "defer { close(); }").?;
+    const second_defer = std.mem.indexOf(u8, source, "defer { closeAgain(); }").?;
+
+    try std.testing.expect(isSuppressed(source, .never_mutated_var, line_value));
+    try std.testing.expect(!isSuppressed(source, .needless_defer_block, line_value));
+    try std.testing.expect(isSuppressed(source, .never_mutated_var, next_value));
+    try std.testing.expect(isSuppressed(source, .never_mutated_var, scoped_value));
+    try std.testing.expect(!isSuppressed(source, .never_mutated_var, enabled_value));
+    try std.testing.expect(isSuppressed(source, .needless_defer_block, first_defer));
+    try std.testing.expect(!isSuppressed(source, .needless_defer_block, second_defer));
+}
+
+test "file and unnamed suppressions target all rules" {
+    const file_source =
+        "// zig-analyzer: disable-file never-mutated-var, needless-defer-block\n" ++
+        "var value = 1;\n";
+    const value = std.mem.indexOf(u8, file_source, "value").?;
+    try std.testing.expect(isSuppressed(file_source, .never_mutated_var, value));
+    try std.testing.expect(isSuppressed(file_source, .needless_defer_block, value));
+    try std.testing.expect(!isSuppressed(file_source, .redundant_boolean_if, value));
+
+    const scoped_source =
+        "// zig-analyzer: disable\n" ++
+        "var disabled = 1;\n" ++
+        "// zig-analyzer: enable\n" ++
+        "var enabled = 2;\n";
+    const disabled = std.mem.indexOf(u8, scoped_source, "disabled").?;
+    const enabled = std.mem.indexOf(u8, scoped_source, "enabled =").?;
+    try std.testing.expect(isSuppressed(scoped_source, .never_mutated_var, disabled));
+    try std.testing.expect(!isSuppressed(scoped_source, .never_mutated_var, enabled));
+}
+
+test "suppression validation accepts eslint-style forms and rejects ambiguous targets" {
+    const valid = try suppressionWarning(
+        std.testing.allocator,
+        "const value = 1; // zig-analyzer: disable-line never-mutated-var, redundant-boolean-if\n" ++
+            "// zig-analyzer: disable-next-line all\n" ++
+            "// zig-analyzer: disable\n" ++
+            "// zig-analyzer: enable needless-defer-block\n",
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), valid);
+
+    const ambiguous = (try suppressionWarning(
+        std.testing.allocator,
+        "// zig-analyzer: disable all, never-mutated-var\n",
+    )).?;
+    defer std.testing.allocator.free(ambiguous);
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "cannot combine 'all'") != null);
+
+    const misplaced = (try suppressionWarning(
+        std.testing.allocator,
+        "const value = 1;\n// zig-analyzer: disable-file never-mutated-var\n",
+    )).?;
+    defer std.testing.allocator.free(misplaced);
+    try std.testing.expect(std.mem.indexOf(u8, misplaced, "must appear before code") != null);
+}
+
+test "directive markers inside strings are ignored" {
+    const source =
+        "const marker = \"// zig-analyzer: disable-line never-mutated-var\";\n" ++
+        "const multiline = \\\\// zig-analyzer: disable-file all;\n";
+    try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(std.testing.allocator, source));
+    const marker = std.mem.indexOf(u8, source, "marker").?;
+    try std.testing.expect(!isSuppressed(source, .never_mutated_var, marker));
 }
