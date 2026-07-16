@@ -804,12 +804,7 @@ pub const Server = struct {
         params: lsp.ParamsType("textDocument/formatting"),
     ) !lsp.ResultType("textDocument/formatting") {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
-        const configuration = try server.loadConfiguration(arena);
-        const format_input = if (configuration.format_profile == .analyzer)
-            try analyzerFormatSource(arena, document.source, configuration)
-        else
-            document.source;
-        const formatted = try formatSource(server.io, arena, format_input);
+        const formatted = try formatSource(server.io, arena, document.source);
         if (std.mem.eql(u8, formatted, document.source)) return &.{};
         const edits = try arena.alloc(lsp.types.TextEdit, 1);
         edits[0] = .{
@@ -3322,52 +3317,6 @@ fn formatSource(io: std.Io, allocator: std.mem.Allocator, source: []const u8) ![
     return formatted;
 }
 
-fn analyzerFormatSource(
-    allocator: std.mem.Allocator,
-    source: [:0]const u8,
-    base_configuration: analysis.Configuration,
-) ![:0]const u8 {
-    var configuration = base_configuration;
-    const rewritten_rules = [_]analysis.Rule{
-        .redundant_bool_comparison,
-        .redundant_boolean_if,
-        .needless_cast,
-        .needless_else_after_terminator,
-        .needless_defer_block,
-        .needless_empty_else,
-        .mixed_bitwise_arithmetic,
-    };
-    for (rewritten_rules) |rule| configuration.levels[@intFromEnum(rule)] = .warning;
-    if (configuration.format_organize_imports) {
-        configuration.levels[@intFromEnum(analysis.Rule.unsorted_imports)] = .warning;
-    }
-
-    const findings = try analysis.findings(allocator, source, configuration);
-    var candidates: std.ArrayList(analysis.Edit) = .empty;
-    for (findings) |finding| {
-        for (finding.fixes) |fix| {
-            const formatter_fix = fix.fix_all or
-                finding.rule == .mixed_bitwise_arithmetic or
-                finding.rule == .unsorted_imports and configuration.format_organize_imports;
-            if (formatter_fix) try candidates.appendSlice(allocator, fix.edits);
-        }
-    }
-    const edits = try nonOverlappingEdits(allocator, candidates.items);
-    if (edits.len == 0) return try allocator.dupeZ(u8, source);
-
-    var rewritten: std.ArrayList(u8) = .empty;
-    var source_offset: usize = 0;
-    for (edits) |edit| {
-        std.debug.assert(source_offset <= edit.span.start);
-        std.debug.assert(edit.span.end <= source.len);
-        try rewritten.appendSlice(allocator, source[source_offset..edit.span.start]);
-        try rewritten.appendSlice(allocator, edit.replacement);
-        source_offset = edit.span.end;
-    }
-    try rewritten.appendSlice(allocator, source[source_offset..]);
-    return try rewritten.toOwnedSliceSentinel(allocator, 0);
-}
-
 fn pathExists(io: std.Io, path: []const u8) !bool {
     std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -3437,35 +3386,35 @@ test "formatting returns the Zig formatter result" {
     try std.testing.expectEqualStrings("const answer = 42;\n", formatted);
 }
 
-test "analyzer formatting applies safe fixes and organizes imports before zig fmt" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const source: [:0]const u8 =
-        "const package = @import(\"package\");\n" ++
-        "const std = @import(\"std\");\n" ++
-        "fn run(enabled: bool) void {\n" ++
-        "    var value: u8 = 1;\n" ++
-        "    _ = value;\n" ++
-        "    _ = enabled == true;\n" ++
-        "    _ = if (enabled) true else false;\n" ++
-        "    defer { cleanup(); }\n" ++
-        "    if (enabled) { cleanup(); } else {}\n" ++
-        "    _ = value + 1 << 2;\n" ++
-        "}\n" ++
-        "fn cleanup() void {}\n";
-    var configuration = analysis.Configuration.defaults();
-    configuration.format_profile = .analyzer;
-    configuration.format_organize_imports = true;
-    const rewritten = try analyzerFormatSource(arena, source, configuration);
-    const formatted = try formatSource(std.testing.io, std.testing.allocator, rewritten);
-    defer std.testing.allocator.free(formatted);
-    try std.testing.expect(std.mem.startsWith(u8, formatted, "const std = @import(\"std\");"));
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "const value: u8 = 1;") != null);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, formatted, "_ = enabled;"));
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "defer cleanup();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "if (enabled) {\n        cleanup();\n    }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, formatted, "_ = (value + 1) << 2;") != null);
+test "LSP formatting delegates to zig fmt without applying lint fixes" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///format.zig","languageId":"zig","version":1,"text":"fn run(enabled:bool)void{var value=if(enabled)true else false;_=value;}\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///format.zig"},"options":{"tabSize":4,"insertSpaces":true}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "var value = if (enabled) true else false;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const value") == null);
 }
 
 test "late allocation cleanup action moves the existing defer" {

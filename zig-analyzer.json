@@ -1,8 +1,4 @@
 {
-  "format": {
-    "profile": "analyzer",
-    "organizeImports": true
-  },
   "lints": {
     "profile": "idiomatic",
     "correctness": "warning",

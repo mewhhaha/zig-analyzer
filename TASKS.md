@@ -167,8 +167,8 @@ Acceptance:
 Status: complete  
 Depends on: ZA-011
 
-Outcome: conservative resource/error/comptime findings and an opt-in analyzer
-formatting profile improve correctness without changing the default Zig format.
+Outcome: conservative resource/error/comptime findings and explicit safe
+rewrites improve correctness while Zig remains the sole formatting authority.
 
 Acceptance:
 
@@ -176,8 +176,8 @@ Acceptance:
   and overwritten ownership in mechanically proven scopes.
 - [x] Standard resource cleanup, unsafe error assertions, lost error identity,
   undefined escape, and comptime reflection findings have clean counterexamples.
-- [x] The analyzer formatting profile applies non-overlapping safe rewrites and
-  optional import organization before the pinned Zig formatter.
+- [x] LSP formatting delegates directly to the pinned Zig formatter; safe
+  rewrites and import organization remain separate source actions.
 - [x] Default and style-enabled corpus scans complete deterministically without
   crashes; default new findings remain limited to high-confidence cases.
 
@@ -198,7 +198,7 @@ Acceptance:
   finite error switches, imports, comptime markers, and result-location idioms
   have positive, negative, and action coverage.
 - [x] Reflection string references participate in field rename, while API and
-  file-name changes stay out of formatter and fix-all output.
+  file-name changes stay out of fix-all; formatting remains owned by Zig.
 - [x] Resolved comptime type hover/code lenses, call hierarchy, format/import
   completion, semantic modifiers, and enum-value hints pass LSP tests.
 
@@ -293,7 +293,7 @@ Status: complete
 Depends on: ZA-014
 
 Outcome: common verbose Zig expressions receive low-noise diagnostics and
-mechanically safe rewrites in quick fixes, fix-all, and analyzer formatting.
+mechanically safe rewrites in quick fixes and fix-all.
 
 Acceptance:
 

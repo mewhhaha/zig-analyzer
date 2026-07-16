@@ -3,7 +3,6 @@ const semantic = @import("rules/semantic.zig");
 pub const Level = semantic.Level;
 pub const Rule = semantic.Rule;
 pub const Configuration = semantic.Configuration;
-pub const FormatProfile = semantic.FormatProfile;
 pub const LintProfile = semantic.LintProfile;
 pub const Edit = semantic.Edit;
 pub const ActionKind = semantic.ActionKind;

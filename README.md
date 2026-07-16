@@ -161,29 +161,18 @@ boolean simplification, compact single-statement defers, proven cast removal,
 and empty or needless-`else` flattening. Allocation cleanup, generated code,
 renames, and other judgment calls remain explicit editor actions.
 
-### Opinionated formatting
+### Formatting
 
-The default `zig` formatting profile returns the exact result of `zig fmt`.
-The opt-in `analyzer` profile first applies only proven source rewrites, then
-runs `zig fmt` over the result. It changes unmutated `var` declarations to
-`const`, simplifies proven boolean comparisons and casts, flattens needless
-`else` blocks, removes empty `else` and one-statement defer blocks, reduces
-boolean-valued `if` expressions, parenthesizes mixed arithmetic/bitwise
-expressions, and can
-organize unambiguous import blocks.
-
-It deliberately does not rename declarations, insert cleanup, generate code,
-or expand switches and initializers. Those remain visible code actions because
-format-on-save should not make decisions about ownership or public APIs.
+LSP formatting passes the document directly to `zig fmt` and returns its exact
+result. Lint rewrites remain explicit quick fixes or `source.fixAll` actions,
+and import organization remains a separate `source.organizeImports` action.
+This keeps formatting identical to the Zig toolchain in editors, CI, and the
+command line.
 
 Configure severities in `zig-analyzer.json`:
 
 ```json
 {
-  "format": {
-    "profile": "analyzer",
-    "organizeImports": true
-  },
   "lints": {
     "profile": "idiomatic",
     "correctness": "warning",

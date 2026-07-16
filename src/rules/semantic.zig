@@ -7,7 +7,6 @@ const rule_registry = @import("registry.zig");
 pub const Level = rule_types.Level;
 pub const Rule = rule_types.Rule;
 pub const Configuration = rule_types.Configuration;
-pub const FormatProfile = rule_types.FormatProfile;
 pub const LintProfile = rule_types.LintProfile;
 pub const Edit = rule_types.Edit;
 pub const ActionKind = rule_types.ActionKind;
@@ -3347,18 +3346,13 @@ test "never-mutated analysis omits top-level state and possible mutable receiver
     for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
 }
 
-test "configuration parses the analyzer formatting profile" {
+test "configuration reports the removed formatting profile and still loads lints" {
     const configuration = try parseConfiguration(std.testing.allocator,
-        \\{"format":{"profile":"analyzer","organizeImports":true}}
+        \\{"format":{"profile":"analyzer","organizeImports":true},"lints":{"profile":"idiomatic"}}
     );
-    try std.testing.expectEqual(FormatProfile.analyzer, configuration.format_profile);
-    try std.testing.expect(configuration.format_organize_imports);
-
-    const malformed = try parseConfiguration(std.testing.allocator,
-        \\{"format":{"profile":"creative"}}
-    );
-    defer std.testing.allocator.free(malformed.warning.?);
-    try std.testing.expect(std.mem.indexOf(u8, malformed.warning.?, "format.profile") != null);
+    defer std.testing.allocator.free(configuration.warning.?);
+    try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, "always delegates to zig fmt") != null);
+    try std.testing.expectEqual(LintProfile.idiomatic, configuration.lint_profile);
 }
 
 test "lint profiles enable official idiomatic and strict rules incrementally" {
