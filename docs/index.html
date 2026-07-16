@@ -1,587 +1,637 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="color-scheme: dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="A reproducible, side-by-side comparison of zig-analyzer and ZLS 0.16.0.">
-  <title>zig-analyzer compared with ZLS</title>
+  <meta name="description" content="Captured LSP responses from zig-analyzer and ZLS for the same Zig source, side by side.">
+  <title>zig-analyzer vs ZLS</title>
+  <link rel="preconnect" href="https://rsms.me/">
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
   <style>
     :root {
-      color-scheme: dark;
-      --background: #0b1020;
-      --surface: #121a2d;
-      --surface-raised: #18233a;
-      --border: #2b3957;
-      --text: #edf2ff;
-      --muted: #a6b0c7;
-      --accent: #7dd3fc;
-      --accent-strong: #38bdf8;
-      --analyzer: #86efac;
-      --zls: #fbbf24;
-      --focus: rgba(56, 189, 248, 0.13);
-      --shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --background: #09090b;
+      --card: #18181b;
+      --well: #09090b;
+      --line: rgba(255, 255, 255, 0.1);
+      --line-faint: rgba(255, 255, 255, 0.05);
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --faint: #71717a;
+      --accent: #fbbf24;
+      --analyzer: #34d399;
+      --focus-ring: #f59e0b;
+      --radius-card: 16px;
+      --font-sans: InterVariable, ui-sans-serif, system-ui, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
     * {
       box-sizing: border-box;
     }
 
+    html {
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
     body {
       margin: 0;
-      min-height: 100vh;
+      min-height: 100dvh;
+      background: var(--background);
       color: var(--text);
-      background:
-        radial-gradient(circle at 15% -10%, rgba(56, 189, 248, 0.16), transparent 34rem),
-        radial-gradient(circle at 95% 20%, rgba(134, 239, 172, 0.08), transparent 28rem),
-        var(--background);
+      font: 1rem/1.6 var(--font-sans);
+      font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01", "ss03";
     }
 
     a {
-      color: var(--accent);
+      color: var(--text);
+      text-decoration-color: var(--faint);
+      text-underline-offset: 3px;
     }
 
     a:hover {
-      color: var(--text);
+      text-decoration-color: var(--text);
     }
 
-    button,
-    a {
-      -webkit-tap-highlight-color: transparent;
+    button {
+      font: inherit;
+      color: inherit;
     }
 
-    button:focus-visible,
-    a:focus-visible {
-      outline: 3px solid var(--accent-strong);
-      outline-offset: 3px;
+    :focus-visible {
+      outline: 2px solid var(--focus-ring);
+      outline-offset: 2px;
     }
 
     .page {
-      width: min(1180px, calc(100% - 32px));
+      max-width: 62rem;
       margin: 0 auto;
-      padding: 56px 0 72px;
+      padding: 24px 16px 48px;
+    }
+
+    @media (min-width: 40rem) {
+      .page {
+        padding: 32px 24px 64px;
+      }
+    }
+
+    .site-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding-bottom: 40px;
+    }
+
+    .wordmark {
+      font-family: var(--font-mono);
+      font-size: 0.9375rem;
+      font-weight: 600;
+      text-decoration: none;
+    }
+
+    .site-header nav {
+      font-size: 0.875rem;
+      color: var(--muted);
+    }
+
+    .site-header nav a {
+      color: var(--muted);
+      text-decoration: none;
+    }
+
+    .site-header nav a:hover {
+      color: var(--text);
+      text-decoration: underline;
+      text-underline-offset: 3px;
     }
 
     .eyebrow {
-      margin: 0 0 12px;
-      color: var(--accent);
-      font-size: 0.78rem;
-      font-weight: 800;
-      letter-spacing: 0.14em;
+      margin: 0;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
       text-transform: uppercase;
+      color: var(--accent);
     }
 
     h1 {
-      max-width: 850px;
-      margin: 0;
-      font-size: clamp(2.4rem, 7vw, 5.4rem);
-      line-height: 0.98;
-      letter-spacing: -0.055em;
+      max-width: 24ch;
+      margin: 16px 0 0;
+      font-size: clamp(2rem, 5.5vw, 3rem);
+      font-weight: 600;
+      line-height: 1.1;
+      letter-spacing: -0.025em;
+      text-wrap: balance;
     }
 
     .lede {
-      max-width: 790px;
-      margin: 24px 0 0;
+      max-width: 56ch;
+      margin: 20px 0 0;
       color: var(--muted);
-      font-size: clamp(1.05rem, 2vw, 1.24rem);
-      line-height: 1.65;
+      font-size: 1.0625rem;
+      text-wrap: pretty;
     }
 
-    .version-row {
+    @media (min-width: 40rem) {
+      .lede {
+        font-size: 1rem;
+      }
+    }
+
+    .carousel {
+      margin-top: 40px;
+    }
+
+    .slide {
+      border-radius: var(--radius-card);
+      background: var(--card);
+      box-shadow: inset 0 0 0 1px var(--line-faint);
+      padding: 20px;
+    }
+
+    @media (min-width: 40rem) {
+      .slide {
+        padding: 32px;
+      }
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .slide.entering {
+        animation: slide-in 240ms ease-out;
+      }
+
+      @keyframes slide-in {
+        from {
+          opacity: 0;
+          transform: translateX(12px);
+        }
+
+        to {
+          opacity: 1;
+          transform: translateX(0);
+        }
+      }
+
+      .slide.entering.reverse {
+        animation-name: slide-in-reverse;
+      }
+
+      @keyframes slide-in-reverse {
+        from {
+          opacity: 0;
+          transform: translateX(-12px);
+        }
+
+        to {
+          opacity: 1;
+          transform: translateX(0);
+        }
+      }
+    }
+
+    .slide-header {
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 26px;
-    }
-
-    .version {
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      padding: 6px 11px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      color: var(--muted);
-      background: rgba(18, 26, 45, 0.72);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 0.78rem;
-    }
-
-    .filters {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 44px 0 18px;
-    }
-
-    .filter {
-      min-height: 40px;
-      padding: 8px 14px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      color: var(--muted);
-      background: transparent;
-      cursor: pointer;
-      font: inherit;
-      font-size: 0.9rem;
-      font-weight: 700;
-    }
-
-    .filter:hover,
-    .filter[aria-pressed="true"] {
-      border-color: var(--accent-strong);
-      color: var(--text);
-      background: rgba(56, 189, 248, 0.1);
-    }
-
-    .gallery {
-      display: grid;
-      grid-template-columns: minmax(210px, 0.28fr) minmax(0, 1fr);
-      min-height: 710px;
-      overflow: hidden;
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      background: rgba(18, 26, 45, 0.86);
-      box-shadow: var(--shadow);
-    }
-
-    .example-list {
-      margin: 0;
-      padding: 12px;
-      border-right: 1px solid var(--border);
-      list-style: none;
-      background: rgba(11, 16, 32, 0.38);
-    }
-
-    .example-list li + li {
-      margin-top: 6px;
-    }
-
-    .example-button {
-      width: 100%;
-      padding: 13px 14px;
-      border: 1px solid transparent;
-      border-radius: 12px;
-      color: var(--muted);
-      background: transparent;
-      cursor: pointer;
-      font: inherit;
-      text-align: left;
-    }
-
-    .example-button:hover {
-      color: var(--text);
-      background: rgba(125, 211, 252, 0.06);
-    }
-
-    .example-button[aria-current="true"] {
-      border-color: rgba(56, 189, 248, 0.38);
-      color: var(--text);
-      background: rgba(56, 189, 248, 0.11);
-    }
-
-    .example-kind {
-      display: block;
-      margin-bottom: 4px;
-      color: var(--accent);
-      font-size: 0.68rem;
-      font-weight: 800;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-    }
-
-    .example-name {
-      display: block;
-      font-weight: 750;
-      line-height: 1.3;
-    }
-
-    .comparison {
-      min-width: 0;
-      padding: clamp(22px, 4vw, 42px);
-    }
-
-    .comparison-header {
-      display: flex;
-      align-items: flex-start;
+      align-items: baseline;
       justify-content: space-between;
-      gap: 20px;
+      gap: 16px;
     }
 
-    .comparison h2 {
+    .slide-kind {
       margin: 0;
-      font-size: clamp(1.65rem, 4vw, 2.55rem);
-      letter-spacing: -0.035em;
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--accent);
     }
 
-    .summary {
-      max-width: 760px;
-      margin: 12px 0 0;
+    .slide-counter {
+      margin: 0;
+      flex-shrink: 0;
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      font-variant-numeric: tabular-nums;
+      color: var(--faint);
+    }
+
+    .slide h2 {
+      max-width: 40ch;
+      margin: 8px 0 0;
+      font-size: 1.375rem;
+      font-weight: 600;
+      line-height: 1.3;
+      letter-spacing: -0.025em;
+      text-wrap: balance;
+    }
+
+    .slide-summary {
+      max-width: 64ch;
+      margin: 10px 0 0;
       color: var(--muted);
-      line-height: 1.6;
+      font-size: 1rem;
+      text-wrap: pretty;
     }
 
-    .fixture-link {
-      flex: 0 0 auto;
-      margin-top: 6px;
-      font-size: 0.85rem;
-      font-weight: 700;
-      white-space: nowrap;
+    @media (min-width: 40rem) {
+      .slide-summary {
+        font-size: 0.9375rem;
+      }
     }
 
     .request {
-      margin: 24px 0 10px;
-      color: var(--muted);
-      font-size: 0.82rem;
-      font-weight: 700;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 6px 12px;
+      margin: 24px 0 0;
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      color: var(--faint);
     }
 
     .request code {
-      color: var(--text);
+      color: var(--muted);
     }
 
     .source {
       overflow-x: auto;
-      margin: 0;
-      padding: 16px 0;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      background: #090e1a;
-      font: 0.84rem/1.65 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      margin: 10px 0 0;
+      padding: 14px 0;
+      border-radius: calc(var(--radius-card) - 8px);
+      background: var(--well);
+      box-shadow: inset 0 0 0 1px var(--line-faint);
+      font: 0.8125rem/1.7 var(--font-mono);
       tab-size: 4;
-    }
-
-    .example-list,
-    .source,
-    .output {
-      scrollbar-color: var(--border) transparent;
-      scrollbar-width: thin;
     }
 
     .source-line {
       display: grid;
       grid-template-columns: 3.5ch minmax(max-content, 1fr);
-      min-height: 1.65em;
-      padding: 0 16px 0 10px;
+      padding: 0 16px 0 8px;
     }
 
     .source-line.focused {
-      background: var(--focus);
-      box-shadow: inset 3px 0 0 var(--accent-strong);
+      background: rgba(251, 191, 36, 0.08);
+      box-shadow: inset 2px 0 0 var(--accent);
     }
 
     .line-number {
-      padding-right: 1.2ch;
-      color: #586782;
+      padding-right: 1.5ch;
+      color: #52525c;
       text-align: right;
       user-select: none;
     }
 
-    .result-grid {
+    .token-keyword {
+      color: #fda4af;
+    }
+
+    .token-string {
+      color: #bef264;
+    }
+
+    .token-builtin {
+      color: #7dd3fc;
+    }
+
+    .token-comment {
+      color: #71717a;
+    }
+
+    .token-number {
+      color: #fdba74;
+    }
+
+    .results {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      margin-top: 18px;
+      gap: 12px;
+      margin-top: 20px;
     }
 
-    .result-panel {
+    @media (min-width: 40rem) {
+      .results {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    .result {
       min-width: 0;
-      padding: 17px;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      background: var(--surface-raised);
-    }
-
-    .result-panel.analyzer {
-      border-top: 3px solid var(--analyzer);
-    }
-
-    .result-panel.zls {
-      border-top: 3px solid var(--zls);
+      padding: 16px;
+      border-radius: calc(var(--radius-card) - 8px);
+      background: var(--well);
+      box-shadow: inset 0 0 0 1px var(--line-faint);
     }
 
     .result-label {
       display: flex;
-      align-items: center;
+      align-items: baseline;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 12px;
     }
 
     .result-label h3 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       margin: 0;
-      font-size: 0.95rem;
+      font-size: 0.875rem;
+      font-weight: 600;
     }
 
-    .result-count {
-      color: var(--muted);
-      font-size: 0.72rem;
-      font-weight: 700;
+    .result-label h3::before {
+      content: "";
+      flex-shrink: 0;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--faint);
     }
 
-    .output {
-      min-height: 92px;
+    .result.analyzer .result-label h3::before {
+      background: var(--analyzer);
+    }
+
+    .result-caption {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--faint);
+    }
+
+    .result-output {
+      min-height: 72px;
       overflow-x: auto;
-      margin: 0;
-      color: #dce7ff;
+      margin: 12px 0 0;
+      color: var(--muted);
       white-space: pre-wrap;
-      font: 0.8rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font: 0.8125rem/1.6 var(--font-mono);
+    }
+
+    .result.analyzer .result-output {
+      color: #d4d4d8;
     }
 
     .observation {
-      margin: 18px 0 0;
-      padding-left: 14px;
-      border-left: 3px solid var(--accent-strong);
+      max-width: 72ch;
+      margin: 20px 0 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--line-faint);
       color: var(--muted);
-      line-height: 1.6;
+      font-size: 1rem;
+      text-wrap: pretty;
+    }
+
+    @media (min-width: 40rem) {
+      .observation {
+        font-size: 0.9375rem;
+      }
     }
 
     .observation strong {
       color: var(--text);
+      font-weight: 600;
     }
 
-    .pager {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      margin-top: 24px;
+    .fixture {
+      margin: 12px 0 0;
+      font-size: 0.875rem;
     }
 
-    .pager button {
-      min-width: 116px;
-      min-height: 42px;
-      padding: 9px 14px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
+    .fixture a {
+      color: var(--muted);
+    }
+
+    .fixture a:hover {
       color: var(--text);
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .step {
+      min-height: 38px;
+      padding: 6px 12px;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      box-shadow: inset 0 0 0 1px var(--line);
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+
+    .step:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .step:disabled {
+      cursor: default;
+      opacity: 0.35;
+    }
+
+    .dots {
+      display: none;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      gap: 4px;
+    }
+
+    @media (min-width: 40rem) {
+      .dots {
+        display: flex;
+      }
+    }
+
+    .dot {
+      position: relative;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: 0;
+      border-radius: 999px;
       background: transparent;
       cursor: pointer;
-      font: inherit;
-      font-weight: 700;
     }
 
-    .pager button:hover:not(:disabled) {
-      border-color: var(--accent-strong);
-      background: rgba(56, 189, 248, 0.08);
+    .dot::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--line);
+      transform: translate(-50%, -50%);
     }
 
-    .pager button:disabled {
-      cursor: not-allowed;
-      opacity: 0.36;
+    .dot:hover::after {
+      background: var(--faint);
     }
 
-    .methodology {
-      display: grid;
-      grid-template-columns: minmax(0, 0.65fr) minmax(260px, 0.35fr);
-      gap: 30px;
-      margin-top: 42px;
-      padding: clamp(24px, 4vw, 38px);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      background: rgba(18, 26, 45, 0.58);
+    .dot[aria-current="true"]::after {
+      background: var(--text);
     }
 
-    .methodology h2 {
-      margin: 0 0 12px;
-      font-size: 1.35rem;
+    .dot .touch-target {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: max(100%, 3rem);
+      height: max(100%, 3rem);
+      transform: translate(-50%, -50%);
     }
 
-    .methodology p,
-    .methodology li {
-      color: var(--muted);
-      line-height: 1.65;
+    @media (pointer: fine) {
+      .dot .touch-target {
+        display: none;
+      }
     }
 
-    .methodology ul {
-      margin: 0;
-      padding-left: 20px;
-    }
-
-    .serve {
-      align-self: start;
-      padding: 16px;
-      border-radius: 12px;
-      background: #090e1a;
-    }
-
-    .serve p {
-      margin: 0 0 9px;
-      color: var(--text);
-      font-size: 0.82rem;
-      font-weight: 750;
-    }
-
-    .serve code {
-      color: var(--analyzer);
-      font: 0.78rem/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      overflow-wrap: anywhere;
-    }
-
-    footer {
-      margin-top: 28px;
-      color: var(--muted);
-      font-size: 0.82rem;
+    .hint {
+      display: none;
+      margin: 12px 0 0;
+      color: var(--faint);
+      font-size: 0.8125rem;
       text-align: center;
     }
 
-    @media (max-width: 820px) {
-      .page {
-        width: min(100% - 20px, 680px);
-        padding-top: 34px;
-      }
-
-      .gallery {
+    @media (min-width: 40rem) {
+      .hint {
         display: block;
-      }
-
-      .example-list {
-        display: flex;
-        gap: 6px;
-        overflow-x: auto;
-        border-right: 0;
-        border-bottom: 1px solid var(--border);
-      }
-
-      .example-list li {
-        flex: 0 0 190px;
-      }
-
-      .example-list li + li {
-        margin-top: 0;
-      }
-
-      .result-grid,
-      .methodology {
-        grid-template-columns: 1fr;
-      }
-
-      .comparison-header {
-        display: block;
-      }
-
-      .fixture-link {
-        display: inline-block;
-        margin-top: 12px;
       }
     }
 
-    @media (prefers-reduced-motion: no-preference) {
-      .filter,
-      .example-button,
-      .pager button {
-        transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
-      }
+    kbd {
+      padding: 1px 5px;
+      border-radius: 5px;
+      box-shadow: inset 0 0 0 1px var(--line);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+    }
+
+    .site-footer {
+      margin-top: 48px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line-faint);
+      color: var(--faint);
+      font-size: 0.875rem;
+    }
+
+    .site-footer p {
+      max-width: none;
+      margin: 0;
+      text-wrap: pretty;
+    }
+
+    .site-footer p + p {
+      margin-top: 8px;
+    }
+
+    .site-footer a {
+      color: var(--muted);
+    }
+
+    .site-footer a:hover {
+      color: var(--text);
     }
   </style>
 </head>
 <body>
-  <main class="page">
-    <p class="eyebrow">Versioned regression corpus</p>
-    <h1>Same Zig. Different answers.</h1>
-    <p class="lede">
-      These are captured Language Server Protocol responses, not invented feature claims.
-      Choose an example to see the same valid Zig source and request sent to zig-analyzer
-      and ZLS 0.16.0 side by side.
-    </p>
-    <div class="version-row" aria-label="Compared versions">
-      <span class="version">Zig 0.16.0</span>
-      <span class="version">zig-analyzer compiler protocol v4</span>
-      <span class="version">ZLS 0.16.0 · 4944862</span>
-      <span class="version">captured 2026-07-16</span>
-    </div>
+  <div class="page">
+    <header class="site-header">
+      <a class="wordmark" href="https://github.com/mewhhaha/zig-analyzer">zig-analyzer</a>
+      <nav aria-label="Project links">
+        <a href="https://github.com/mewhhaha/zig-analyzer">GitHub</a>
+      </nav>
+    </header>
 
-    <div class="filters" aria-label="Filter examples">
-      <button class="filter" type="button" data-filter="all" aria-pressed="true">All</button>
-      <button class="filter" type="button" data-filter="completion" aria-pressed="false">Completion</button>
-      <button class="filter" type="button" data-filter="hover" aria-pressed="false">Hover</button>
-      <button class="filter" type="button" data-filter="diagnostic" aria-pressed="false">Diagnostics</button>
-    </div>
+    <main>
+      <p class="eyebrow">Captured LSP responses</p>
+      <h1>Same source. Same request. Two answers.</h1>
+      <p class="lede">
+        Each example sends one LSP request over the same Zig file to zig-analyzer and to ZLS,
+        and shows both responses exactly as captured. Step through them.
+      </p>
 
-    <section class="gallery" aria-label="Language server comparisons">
-      <ol class="example-list" id="example-list"></ol>
-      <article class="comparison" aria-live="polite">
-        <div class="comparison-header">
-          <div>
-            <p class="eyebrow" id="example-category"></p>
-            <h2 id="example-title"></h2>
-            <p class="summary" id="example-summary"></p>
+      <section class="carousel" aria-label="Comparison examples">
+        <article class="slide" id="slide" aria-live="polite">
+          <div class="slide-header">
+            <p class="slide-kind" id="slide-kind"></p>
+            <p class="slide-counter" id="slide-counter"></p>
           </div>
-          <a class="fixture-link" id="fixture-link" href="../examples/">Open fixture ↗</a>
+          <h2 id="slide-title"></h2>
+          <p class="slide-summary" id="slide-summary"></p>
+
+          <p class="request" id="slide-request"></p>
+          <pre class="source" id="slide-source" aria-label="Zig source"></pre>
+
+          <div class="results">
+            <section class="result analyzer" aria-label="zig-analyzer response">
+              <div class="result-label">
+                <h3>zig-analyzer</h3>
+                <span class="result-caption" id="analyzer-caption"></span>
+              </div>
+              <pre class="result-output" id="analyzer-output"></pre>
+            </section>
+            <section class="result" aria-label="ZLS response">
+              <div class="result-label">
+                <h3>ZLS 0.16.0</h3>
+                <span class="result-caption" id="zls-caption"></span>
+              </div>
+              <pre class="result-output" id="zls-output"></pre>
+            </section>
+          </div>
+
+          <p class="observation" id="slide-observation"></p>
+          <p class="fixture"><a id="fixture-link" href="https://github.com/mewhhaha/zig-analyzer">Reproduce from the fixture</a></p>
+        </article>
+
+        <div class="controls">
+          <button class="step" type="button" id="previous">&larr; Previous</button>
+          <ol class="dots" id="dots" role="list" aria-label="Go to example"></ol>
+          <button class="step" type="button" id="next">Next &rarr;</button>
         </div>
+        <p class="hint">Or use <kbd>&larr;</kbd> <kbd>&rarr;</kbd> to move between examples.</p>
+      </section>
 
-        <p class="request" id="example-request"></p>
-        <pre class="source" id="example-source" aria-label="Zig source excerpt"></pre>
+      <noscript>
+        <p>Stepping through the checked-in examples requires JavaScript.</p>
+      </noscript>
+    </main>
 
-        <div class="result-grid">
-          <section class="result-panel analyzer" aria-labelledby="analyzer-title">
-            <div class="result-label">
-              <h3 id="analyzer-title">zig-analyzer</h3>
-              <span class="result-count" id="analyzer-caption"></span>
-            </div>
-            <pre class="output" id="analyzer-output"></pre>
-          </section>
-          <section class="result-panel zls" aria-labelledby="zls-title">
-            <div class="result-label">
-              <h3 id="zls-title">ZLS 0.16.0</h3>
-              <span class="result-count" id="zls-caption"></span>
-            </div>
-            <pre class="output" id="zls-output"></pre>
-          </section>
-        </div>
-
-        <p class="observation" id="example-observation"></p>
-
-        <div class="pager" aria-label="Example navigation">
-          <button type="button" id="previous-example">← Previous</button>
-          <button type="button" id="next-example">Next →</button>
-        </div>
-      </article>
-    </section>
-
-    <noscript>
-      <p>This comparison gallery requires JavaScript to switch between its checked-in examples.</p>
-    </noscript>
-
-    <section class="methodology">
-      <div>
-        <h2>How these results were captured</h2>
-        <ul>
-          <li>Both servers received the same file URI, source text, cursor position, and LSP request.</li>
-          <li>Completion and hover results came from fresh server processes using stock configuration.</li>
-          <li>Diagnostic comparisons use zig-analyzer's repository configuration and stock ZLS source analysis.</li>
-          <li>ZLS can surface semantic compiler errors through optional build-on-save; that distinction is called out instead of hidden.</li>
-          <li>Every normal comparison fixture is compiled by <code>zig build examples</code>.</li>
-        </ul>
-        <p>
-          This page is a static, reviewable snapshot rather than a browser emulator. Re-run the
-          requests when either server changes, update the capture date, and keep old claims pinned
-          to the version that produced them.
-        </p>
-      </div>
-      <div class="serve">
-        <p>View locally</p>
-        <code>just docs</code>
-        <p style="margin-top: 16px">Then open</p>
-        <code>http://localhost:8000/</code>
-      </div>
-    </section>
-
-    <footer>
-      <a href="https://github.com/mewhhaha/zig-analyzer">Project repository</a> ·
-      <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">Manual reproduction guide</a> ·
-      <a href="https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d">Compared ZLS commit</a>
+    <footer class="site-footer">
+      <p>
+        Captured 2026-07-16 against Zig 0.16.0 and
+        <a href="https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d">ZLS 0.16.0 at 4944862</a>,
+        both with stock configuration. ZLS can surface compiler errors through optional
+        build-on-save; the diagnostic examples note where that applies.
+      </p>
+      <p>
+        Every fixture compiles under <code>zig build examples</code> and lives in
+        <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,
+        with a <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">manual reproduction guide</a>.
+      </p>
     </footer>
-  </main>
+  </div>
 
   <script>
-    const comparisonExamples = [
+    const examples = [
       {
         id: "pipeline",
-        category: "completion",
+        kind: "Completion",
         title: "A type assembled by inline for",
         summary: "The final container is Traced(Buffered(Source)). The request asks for members of that resolved type, not the loop's initial type.",
         fixture: "examples/compiler/comptime_pipeline.zig",
-        request: "textDocument/completion after pipeline. at LSP position 45:20",
+        request: "textDocument/completion after pipeline. at 45:20",
         source: `fn Pipeline(comptime stages: []const Stage) type {
     comptime var current = Source;
     inline for (stages) |stage| {
@@ -608,11 +658,11 @@ fn result() u32 {
       },
       {
         id: "indirect-field",
-        category: "completion",
+        kind: "Completion",
         title: "A type selected through @field",
         summary: "The string argument selects Implementations.checked at comptime, so the selected container has one member: verify.",
         fixture: "examples/compiler/indirect_type_lookup.zig",
-        request: "textDocument/completion after ActiveImplementation. at LSP position 21:32",
+        request: "textDocument/completion after ActiveImplementation. at 21:32",
         source: `const Implementations = struct {
     const compact = struct {
         fn pack(value: u32) u32 { return value; }
@@ -640,11 +690,11 @@ fn result() bool {
       },
       {
         id: "active-branch",
-        category: "completion",
+        kind: "Completion",
         title: "The active comptime branch",
         summary: "The feature list contains metrics, so only the first anonymous struct is the result of Api for this call.",
         fixture: "examples/compiler/conditional_api.zig",
-        request: "textDocument/completion after ActiveApi. at LSP position 20:21",
+        request: "textDocument/completion after ActiveApi. at 20:21",
         source: `fn Api(comptime features: []const []const u8) type {
     comptime var metrics_enabled = false;
     inline for (features) |feature| {
@@ -672,11 +722,11 @@ fn result() u32 {
       },
       {
         id: "keyword-hover",
-        category: "hover",
+        kind: "Hover",
         title: "Reference hover on Zig itself",
         summary: "Declaration hover is useful after a symbol exists. Language-token hover also explains the syntax used to create that symbol.",
         fixture: "examples/zls/language_hover.zig",
-        request: "textDocument/hover on const at LSP position 0:1",
+        request: "textDocument/hover on const at 0:1",
         source: `const enabled: bool = true;
 
 fn enabledSize() usize {
@@ -690,14 +740,14 @@ fn enabledSize() usize {
 Declares a binding that cannot be reassigned.
 On a pointer type, it prevents mutation through that pointer.
 
-Zig language reference ↗`,
+Zig language reference`,
         zlsCaption: "no hover",
         zlsOutput: "null",
-        observation: "ZLS does provide hover for declarations, @ builtins, enum and field access, labels, and compact type/value summaries such as bool and true. The difference here is explanatory language-reference coverage for Zig syntax itself, including keywords, operators, literals, and punctuation."
+        observation: "ZLS does provide hover for declarations, @ builtins, enum and field access, and labels. The difference here is explanatory language-reference coverage for Zig syntax itself: keywords, operators, literals, and punctuation."
       },
       {
         id: "cleanup-warning",
-        category: "diagnostic",
+        kind: "Diagnostics",
         title: "Cleanup registered after failure can occur",
         summary: "If the second allocation fails, control returns before the first defer is registered. The compiler accepts the function, but the first allocation can leak.",
         fixture: "examples/diagnostics/memory_management.zig",
@@ -716,11 +766,11 @@ cleanup for allocation 'first' is registered after a fallible
 operation; an earlier error can leak it`,
         zlsCaption: "no ownership diagnostic",
         zlsOutput: "[]",
-        observation: "zig-analyzer's warning is conservative and local: it sees a resource acquisition, a later fallible operation, and cleanup registered too late. Its action moves the cleanup directly after the acquisition."
+        observation: "zig-analyzer's warning is conservative and local: it sees a resource acquisition, a later fallible operation, and cleanup registered too late. Its quick fix moves the cleanup directly after the acquisition."
       },
       {
         id: "compiler-error",
-        category: "diagnostic",
+        kind: "Diagnostics",
         title: "A semantic compiler error",
         summary: "The source parses, but a string literal cannot be returned as u32. This separates parser diagnostics from compiler-backed semantic diagnostics.",
         fixture: "examples/diagnostics/compiler_error.zig",
@@ -734,34 +784,50 @@ operation; an earlier error can leak it`,
         zlsCaption: "stock source analysis",
         zlsOutput: `[]
 
-With ZLS build-on-save enabled, the Zig compiler can report
-the same error after running the configured build step.`,
+With build-on-save enabled, ZLS can report the same error after running the configured build step.`,
         observation: "This is an architectural difference, not a claim that ZLS can never show compiler errors. zig-analyzer's compiler session is part of normal analysis; ZLS exposes compiler output through its optional build-on-save workflow."
       }
     ];
 
-    const categoryNames = {
-      completion: "Completion",
-      hover: "Hover",
-      diagnostic: "Diagnostic"
-    };
-
     const repositoryFileUrl = "https://github.com/mewhhaha/zig-analyzer/blob/main/";
 
-    const exampleList = document.querySelector("#example-list");
-    const filterButtons = [...document.querySelectorAll(".filter")];
-    const previousButton = document.querySelector("#previous-example");
-    const nextButton = document.querySelector("#next-example");
-    let activeFilter = "all";
-    let selectedExampleId = comparisonExamples[0].id;
+    const zigTokenPattern = new RegExp(
+      [
+        String.raw`(?<comment>//[^\n]*)`,
+        String.raw`(?<string>"(?:[^"\\]|\\.)*")`,
+        String.raw`(?<builtin>@[A-Za-z]\w*)`,
+        String.raw`(?<keyword>\b(?:fn|const|var|comptime|inline|for|while|if|else|switch|return|try|defer|errdefer|struct|enum|union|pub|export|and|or|orelse|unreachable|break|continue|catch|type|void|bool|usize|u8|u32|u64|i32|i64)\b)`,
+        String.raw`(?<number>\b\d[\w.]*\b)`
+      ].join("|"),
+      "g"
+    );
 
-    function visibleExamples() {
-      if (activeFilter === "all") return comparisonExamples;
-      return comparisonExamples.filter((example) => example.category === activeFilter);
+    function highlightZig(line) {
+      const fragment = document.createDocumentFragment();
+      let consumedUpTo = 0;
+      for (const match of line.matchAll(zigTokenPattern)) {
+        if (match.index > consumedUpTo) {
+          fragment.append(line.slice(consumedUpTo, match.index));
+        }
+        const tokenKind = Object.keys(match.groups).find((kind) => match.groups[kind] !== undefined);
+        const token = document.createElement("span");
+        token.className = `token-${tokenKind}`;
+        token.textContent = match[0];
+        fragment.append(token);
+        consumedUpTo = match.index + match[0].length;
+      }
+      fragment.append(line.slice(consumedUpTo) || (consumedUpTo === 0 ? " " : ""));
+      return fragment;
     }
 
+    const slide = document.querySelector("#slide");
+    const dots = document.querySelector("#dots");
+    const previousButton = document.querySelector("#previous");
+    const nextButton = document.querySelector("#next");
+    let selectedIndex = 0;
+
     function populateSource(source, focusLine) {
-      const sourceElement = document.querySelector("#example-source");
+      const sourceElement = document.querySelector("#slide-source");
       sourceElement.replaceChildren();
       source.split("\n").forEach((line, lineIndex) => {
         const sourceLine = document.createElement("span");
@@ -773,105 +839,95 @@ the same error after running the configured build step.`,
         lineNumber.textContent = String(lineIndex + 1);
 
         const lineSource = document.createElement("span");
-        lineSource.textContent = line || " ";
+        lineSource.append(highlightZig(line));
 
         sourceLine.append(lineNumber, lineSource);
         sourceElement.append(sourceLine);
       });
     }
 
-    function populateExample(example) {
-      document.title = `${example.title} · zig-analyzer compared with ZLS`;
-      document.querySelector("#example-category").textContent = categoryNames[example.category];
-      document.querySelector("#example-title").textContent = example.title;
-      document.querySelector("#example-summary").textContent = example.summary;
-      document.querySelector("#example-request").textContent = example.request;
-      document.querySelector("#fixture-link").href = repositoryFileUrl + example.fixture;
+    function populateSlide(direction) {
+      const example = examples[selectedIndex];
+      document.title = `${example.title} · zig-analyzer vs ZLS`;
+      document.querySelector("#slide-kind").textContent = example.kind;
+      document.querySelector("#slide-counter").textContent = `${selectedIndex + 1} / ${examples.length}`;
+      document.querySelector("#slide-title").textContent = example.title;
+      document.querySelector("#slide-summary").textContent = example.summary;
       document.querySelector("#analyzer-caption").textContent = example.analyzerCaption;
       document.querySelector("#analyzer-output").textContent = example.analyzerOutput;
       document.querySelector("#zls-caption").textContent = example.zlsCaption;
       document.querySelector("#zls-output").textContent = example.zlsOutput;
+      document.querySelector("#fixture-link").href = repositoryFileUrl + example.fixture;
+      document.querySelector("#fixture-link").textContent = `Reproduce from ${example.fixture}`;
 
-      const observation = document.querySelector("#example-observation");
+      const request = document.querySelector("#slide-request");
+      request.replaceChildren();
+      const requestCode = document.createElement("code");
+      requestCode.textContent = example.request;
+      request.append("Request", requestCode);
+
+      const observation = document.querySelector("#slide-observation");
       observation.replaceChildren();
       const observationLabel = document.createElement("strong");
       observationLabel.textContent = "What this demonstrates. ";
       observation.append(observationLabel, example.observation);
 
       populateSource(example.source, example.focusLine);
-    }
 
-    function populateNavigation() {
-      const availableExamples = visibleExamples();
-      if (!availableExamples.some((example) => example.id === selectedExampleId)) {
-        selectedExampleId = availableExamples[0].id;
-      }
-
-      exampleList.replaceChildren();
-      availableExamples.forEach((example) => {
-        const listEntry = document.createElement("li");
-        const exampleButton = document.createElement("button");
-        exampleButton.type = "button";
-        exampleButton.className = "example-button";
-        exampleButton.dataset.exampleId = example.id;
-        exampleButton.setAttribute("aria-current", String(example.id === selectedExampleId));
-
-        const kind = document.createElement("span");
-        kind.className = "example-kind";
-        kind.textContent = categoryNames[example.category];
-        const name = document.createElement("span");
-        name.className = "example-name";
-        name.textContent = example.title;
-        exampleButton.append(kind, name);
-
-        exampleButton.addEventListener("click", () => selectExample(example.id));
-        listEntry.append(exampleButton);
-        exampleList.append(listEntry);
-      });
-
-      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
       previousButton.disabled = selectedIndex === 0;
-      nextButton.disabled = selectedIndex === availableExamples.length - 1;
-      populateExample(availableExamples[selectedIndex]);
-    }
-
-    function selectExample(exampleId) {
-      selectedExampleId = exampleId;
-      try {
-        history.replaceState(null, "", `#${exampleId}`);
-      } catch {
-        window.location.hash = exampleId;
-      }
-      populateNavigation();
-    }
-
-    filterButtons.forEach((filterButton) => {
-      filterButton.addEventListener("click", () => {
-        activeFilter = filterButton.dataset.filter;
-        filterButtons.forEach((candidate) => {
-          candidate.setAttribute("aria-pressed", String(candidate === filterButton));
-        });
-        populateNavigation();
+      nextButton.disabled = selectedIndex === examples.length - 1;
+      [...dots.children].forEach((entry, index) => {
+        entry.firstChild.setAttribute("aria-current", String(index === selectedIndex));
       });
+
+      if (direction) {
+        slide.classList.remove("entering", "reverse");
+        void slide.offsetWidth;
+        slide.classList.add("entering");
+        if (direction === "backward") slide.classList.add("reverse");
+      }
+    }
+
+    function selectExample(index, direction) {
+      selectedIndex = index;
+      history.replaceState(null, "", `#${examples[index].id}`);
+      populateSlide(direction);
+    }
+
+    examples.forEach((example, index) => {
+      const entry = document.createElement("li");
+      const dot = document.createElement("button");
+      dot.type = "button";
+      dot.className = "dot";
+      dot.setAttribute("aria-label", `${example.kind}: ${example.title}`);
+      dot.addEventListener("click", () => {
+        selectExample(index, index >= selectedIndex ? "forward" : "backward");
+      });
+      const touchTarget = document.createElement("span");
+      touchTarget.className = "touch-target";
+      touchTarget.setAttribute("aria-hidden", "true");
+      dot.append(touchTarget);
+      entry.append(dot);
+      dots.append(entry);
     });
 
     previousButton.addEventListener("click", () => {
-      const availableExamples = visibleExamples();
-      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
-      if (selectedIndex > 0) selectExample(availableExamples[selectedIndex - 1].id);
+      if (selectedIndex > 0) selectExample(selectedIndex - 1, "backward");
     });
 
     nextButton.addEventListener("click", () => {
-      const availableExamples = visibleExamples();
-      const selectedIndex = availableExamples.findIndex((example) => example.id === selectedExampleId);
-      if (selectedIndex + 1 < availableExamples.length) selectExample(availableExamples[selectedIndex + 1].id);
+      if (selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1, "forward");
     });
 
-    const requestedExampleId = window.location.hash.slice(1);
-    if (comparisonExamples.some((example) => example.id === requestedExampleId)) {
-      selectedExampleId = requestedExampleId;
-    }
-    populateNavigation();
+    document.addEventListener("keydown", (event) => {
+      if (event.target instanceof HTMLElement && /^(input|textarea|select)$/i.test(event.target.tagName)) return;
+      if (event.key === "ArrowLeft" && selectedIndex > 0) selectExample(selectedIndex - 1, "backward");
+      if (event.key === "ArrowRight" && selectedIndex + 1 < examples.length) selectExample(selectedIndex + 1, "forward");
+    });
+
+    const requestedIndex = examples.findIndex((example) => example.id === window.location.hash.slice(1));
+    if (requestedIndex !== -1) selectedIndex = requestedIndex;
+    populateSlide();
   </script>
 </body>
 </html>
