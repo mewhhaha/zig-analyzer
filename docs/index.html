@@ -560,15 +560,15 @@
       </div>
       <div class="serve">
         <p>View locally</p>
-        <code>python3 -m http.server 8000 --directory docs</code>
+        <code>just docs</code>
         <p style="margin-top: 16px">Then open</p>
         <code>http://localhost:8000/</code>
       </div>
     </section>
 
     <footer>
-      <a href="../README.md">Project README</a> ·
-      <a href="../examples/README.md">Manual reproduction guide</a> ·
+      <a href="https://github.com/mewhhaha/zig-analyzer">Project repository</a> ·
+      <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">Manual reproduction guide</a> ·
       <a href="https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d">Compared ZLS commit</a>
     </footer>
   </main>
@@ -580,7 +580,7 @@
         category: "completion",
         title: "A type assembled by inline for",
         summary: "The final container is Traced(Buffered(Source)). The request asks for members of that resolved type, not the loop's initial type.",
-        fixture: "../examples/compiler/comptime_pipeline.zig",
+        fixture: "examples/compiler/comptime_pipeline.zig",
         request: "textDocument/completion after pipeline. at LSP position 45:20",
         source: `fn Pipeline(comptime stages: []const Stage) type {
     comptime var current = Source;
@@ -611,7 +611,7 @@ fn result() u32 {
         category: "completion",
         title: "A type selected through @field",
         summary: "The string argument selects Implementations.checked at comptime, so the selected container has one member: verify.",
-        fixture: "../examples/compiler/indirect_type_lookup.zig",
+        fixture: "examples/compiler/indirect_type_lookup.zig",
         request: "textDocument/completion after ActiveImplementation. at LSP position 21:32",
         source: `const Implementations = struct {
     const compact = struct {
@@ -643,7 +643,7 @@ fn result() bool {
         category: "completion",
         title: "The active comptime branch",
         summary: "The feature list contains metrics, so only the first anonymous struct is the result of Api for this call.",
-        fixture: "../examples/compiler/conditional_api.zig",
+        fixture: "examples/compiler/conditional_api.zig",
         request: "textDocument/completion after ActiveApi. at LSP position 20:21",
         source: `fn Api(comptime features: []const []const u8) type {
     comptime var metrics_enabled = false;
@@ -675,7 +675,7 @@ fn result() u32 {
         category: "hover",
         title: "Reference hover on Zig itself",
         summary: "Declaration hover is useful after a symbol exists. Language-token hover also explains the syntax used to create that symbol.",
-        fixture: "../examples/zls/language_hover.zig",
+        fixture: "examples/zls/language_hover.zig",
         request: "textDocument/hover on const at LSP position 0:1",
         source: `const enabled: bool = true;
 
@@ -700,7 +700,7 @@ Zig language reference ↗`,
         category: "diagnostic",
         title: "Cleanup registered after failure can occur",
         summary: "If the second allocation fails, control returns before the first defer is registered. The compiler accepts the function, but the first allocation can leak.",
-        fixture: "../examples/diagnostics/memory_management.zig",
+        fixture: "examples/diagnostics/memory_management.zig",
         request: "textDocument/publishDiagnostics after opening the valid file",
         source: `pub fn cleanupRegisteredTooLate(allocator: std.mem.Allocator) !void {
     const first = try allocator.alloc(u8, 128);
@@ -723,7 +723,7 @@ operation; an earlier error can leak it`,
         category: "diagnostic",
         title: "A semantic compiler error",
         summary: "The source parses, but a string literal cannot be returned as u32. This separates parser diagnostics from compiler-backed semantic diagnostics.",
-        fixture: "../examples/diagnostics/compiler_error.zig",
+        fixture: "examples/diagnostics/compiler_error.zig",
         request: "textDocument/publishDiagnostics after opening the file",
         source: `export fn invalidResult() u32 {
     return "not a number";
@@ -745,6 +745,8 @@ the same error after running the configured build step.`,
       hover: "Hover",
       diagnostic: "Diagnostic"
     };
+
+    const repositoryFileUrl = "https://github.com/mewhhaha/zig-analyzer/blob/main/";
 
     const exampleList = document.querySelector("#example-list");
     const filterButtons = [...document.querySelectorAll(".filter")];
@@ -784,7 +786,7 @@ the same error after running the configured build step.`,
       document.querySelector("#example-title").textContent = example.title;
       document.querySelector("#example-summary").textContent = example.summary;
       document.querySelector("#example-request").textContent = example.request;
-      document.querySelector("#fixture-link").href = example.fixture;
+      document.querySelector("#fixture-link").href = repositoryFileUrl + example.fixture;
       document.querySelector("#analyzer-caption").textContent = example.analyzerCaption;
       document.querySelector("#analyzer-output").textContent = example.analyzerOutput;
       document.querySelector("#zls-caption").textContent = example.zlsCaption;
