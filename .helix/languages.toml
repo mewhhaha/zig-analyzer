@@ -1,0 +1,9 @@
+[language-server.zig-analyzer-local]
+command = "zig-out/bin/zig-analyzer"
+args = ["lsp"]
+required-root-patterns = ["build.zig.zon"]
+
+[[language]]
+name = "zig"
+language-servers = ["zig-analyzer-local"]
+auto-format = true

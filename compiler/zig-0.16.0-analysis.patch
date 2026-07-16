@@ -1,0 +1,799 @@
+diff --git a/src/IncrementalDebugServer.zig b/src/IncrementalDebugServer.zig
+index 1252d74e..e5c54459 100644
+--- a/src/IncrementalDebugServer.zig
++++ b/src/IncrementalDebugServer.zig
+@@ -18,31 +18,49 @@ future: ?Io.Future(void),
+ /// Held by our owner when an update is in-progress, and held by us when responding to a command.
+ /// So, essentially guards all access to `Compilation`, including `Zcu`.
+ mutex: std.Io.Mutex,
++protocol_port: u16,
++authentication_token: []const u8,
++analysis_generation: u32,
++overlays: std.StringHashMapUnmanaged(Overlay),
+ 
+ pub fn init(zcu: *Zcu) IncrementalDebugServer {
++    const protocol_port = if (zcu.comp.environ_map.get("ZIG_ANALYZER_PORT")) |port_text|
++        std.fmt.parseInt(u16, port_text, 10) catch port
++    else
++        port;
+     return .{
+         .zcu = zcu,
+         .future = null,
+         .mutex = .init,
++        .protocol_port = protocol_port,
++        .authentication_token = zcu.comp.environ_map.get("ZIG_ANALYZER_TOKEN") orelse "",
++        .analysis_generation = 1,
++        .overlays = .empty,
+     };
+ }
+ 
+ pub fn deinit(ids: *IncrementalDebugServer) void {
+     const io = ids.zcu.comp.io;
+     if (ids.future) |*f| f.cancel(io);
++    var iterator = ids.overlays.iterator();
++    while (iterator.next()) |entry| {
++        ids.zcu.gpa.free(entry.key_ptr.*);
++        ids.zcu.gpa.free(entry.value_ptr.source);
++    }
++    ids.overlays.deinit(ids.zcu.gpa);
+ }
+ 
+ const port = 7623;
+ pub fn spawn(ids: *IncrementalDebugServer) void {
+     const io = ids.zcu.comp.io;
+-    std.debug.print("spawning incremental debug server on port {d}\n", .{port});
++    std.debug.print("spawning incremental debug server on port {d}\n", .{ids.protocol_port});
+     ids.future = io.concurrent(runServer, .{ids}) catch |err|
+         std.process.fatal("failed to start incremental debug server: {s}", .{@errorName(err)});
+ }
+ fn runServer(ids: *IncrementalDebugServer) void {
+     const io = ids.zcu.comp.io;
+ 
+-    const addr: Io.net.IpAddress = .{ .ip6 = .loopback(port) };
++    const addr: Io.net.IpAddress = .{ .ip6 = .loopback(ids.protocol_port) };
+     var server = addr.listen(io, .{}) catch |err| switch (err) {
+         error.Canceled => return,
+         else => |e| {
+@@ -69,7 +87,11 @@ fn runServer(ids: *IncrementalDebugServer) void {
+         var cmd_buf: [1024]u8 = undefined;
+         var reader = stream.reader(io, &cmd_buf);
+         var writer = stream.writer(io, &.{});
+-        ids.serveStream(&reader.interface, &writer.interface) catch |orig_err| {
++        const serve_result = if (ids.authentication_token.len == 0)
++            ids.serveStream(&reader.interface, &writer.interface)
++        else
++            ids.serveProtocolStream(&reader.interface, &writer.interface);
++        serve_result catch |orig_err| {
+             const actual_err = switch (orig_err) {
+                 error.Canceled,
+                 error.OutOfMemory,
+@@ -109,6 +131,547 @@ fn runServer(ids: *IncrementalDebugServer) void {
+     }
+ }
+ 
++fn serveProtocolStream(
++    ids: *IncrementalDebugServer,
++    stream_reader: *Io.Reader,
++    stream_writer: *Io.Writer,
++) error{
++    Canceled,
++    OutOfMemory,
++    EndOfStream,
++    StreamTooLong,
++    ReadFailed,
++    WriteFailed,
++}!noreturn {
++    const io = ids.zcu.comp.io;
++    var authenticated = false;
++    while (true) {
++        const header = try stream_reader.takeStruct(AnalysisProtocol.Header, .little);
++        if (header.reserved != 0 or header.body_length > 16 * 1024 * 1024) return error.StreamTooLong;
++
++        switch (header.tag) {
++            .hello => {
++                if (header.body_length < @sizeOf(AnalysisProtocol.Hello)) return error.EndOfStream;
++                const hello = try stream_reader.takeStruct(AnalysisProtocol.Hello, .little);
++                const expected_body_length: u32 = @sizeOf(AnalysisProtocol.Hello) +
++                    @as(u32, hello.zig_version_length) + hello.authentication_token_length;
++                if (header.body_length != expected_body_length) return error.EndOfStream;
++                const zig_version = try stream_reader.take(hello.zig_version_length);
++                const zig_version_is_compatible = std.mem.eql(u8, zig_version, "0.16.0");
++                const authentication_token = try stream_reader.take(hello.authentication_token_length);
++                const status: AnalysisProtocol.HandshakeStatus = if (hello.protocol_version != AnalysisProtocol.version)
++                    .incompatible_protocol
++                else if (!zig_version_is_compatible)
++                    .incompatible_zig
++                else if (!std.mem.eql(u8, authentication_token, ids.authentication_token))
++                    .authentication_failed
++                else
++                    .accepted;
++                authenticated = status == .accepted;
++                try writeHelloResponse(stream_writer, header.request_id, ids.analysis_generation, status);
++            },
++            .replace_overlay => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.ReplaceOverlayRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.ReplaceOverlayRequest, .little);
++                const expected_length: u64 = @sizeOf(AnalysisProtocol.ReplaceOverlayRequest) +
++                    @as(u64, request.uri_length) + request.source_length;
++                if (request.reserved != 0 or header.body_length != expected_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.ReplaceOverlayRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay request length is invalid");
++                    continue;
++                }
++                const uri = try stream_reader.take(request.uri_length);
++                const owned_uri = try ids.zcu.gpa.dupe(u8, uri);
++                defer ids.zcu.gpa.free(owned_uri);
++                const source = try stream_reader.take(request.source_length);
++                try ids.replaceOverlay(owned_uri, request.document_version, source);
++                const facts = try ids.documentFacts(owned_uri, request.document_version);
++                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .document_facts, AnalysisProtocol.DocumentFacts, facts);
++            },
++            .analyze => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.AnalyzeRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "analysis request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.AnalyzeRequest, .little);
++                const expected_length: u64 = @sizeOf(AnalysisProtocol.AnalyzeRequest) + @as(u64, request.uri_length);
++                if (header.body_length != expected_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.AnalyzeRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "analysis request length is invalid");
++                    continue;
++                }
++                const uri = try stream_reader.take(request.uri_length);
++                const overlay = ids.overlays.get(uri) orelse {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document overlay is unavailable");
++                    continue;
++                };
++                if (overlay.document_version != request.expected_document_version) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "document version is stale");
++                    continue;
++                }
++                const facts = try ids.documentFacts(uri, request.expected_document_version);
++                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .document_facts, AnalysisProtocol.DocumentFacts, facts);
++            },
++            .diagnostics => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.body_length != 0) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "diagnostics request must be empty");
++                    continue;
++                }
++                try ids.writeDiagnostics(stream_writer, header.request_id);
++            },
++            .type_members => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.TypeMembersRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type members request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.TypeMembersRequest, .little);
++                if (header.body_length != @sizeOf(AnalysisProtocol.TypeMembersRequest) + request.name_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.TypeMembersRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type members request length is invalid");
++                    continue;
++                }
++                const name = try stream_reader.take(request.name_length);
++                if (!try ids.writeTypeMembers(stream_writer, header.request_id, name)) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "resolved container type is unavailable");
++                }
++            },
++            .type_shape => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.TypeMembersRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type shape request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.TypeMembersRequest, .little);
++                if (header.body_length != @sizeOf(AnalysisProtocol.TypeMembersRequest) + request.name_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.TypeMembersRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type shape request length is invalid");
++                    continue;
++                }
++                const name = try stream_reader.take(request.name_length);
++                if (!try ids.writeTypeShape(stream_writer, header.request_id, name)) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "finite enum, tagged union, or struct shape is unavailable");
++                }
++            },
++            .remove_overlay => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.RemoveOverlayRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay removal request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.RemoveOverlayRequest, .little);
++                const expected_length: u64 = @sizeOf(AnalysisProtocol.RemoveOverlayRequest) + @as(u64, request.uri_length);
++                if (header.body_length != expected_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.RemoveOverlayRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay removal length is invalid");
++                    continue;
++                }
++                const uri = try stream_reader.take(request.uri_length);
++                if (ids.overlays.fetchRemove(uri)) |removed| {
++                    ids.zcu.gpa.free(removed.key);
++                    ids.zcu.gpa.free(removed.value.source);
++                    ids.analysis_generation +%= 1;
++                    if (ids.analysis_generation == 0) ids.analysis_generation = 1;
++                }
++                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .remove_overlay, AnalysisProtocol.RemoveOverlayRequest, .{ .uri_length = 0 });
++            },
++            .workspace_declarations => {
++                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++                if (!authenticated) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                const summary: AnalysisProtocol.WorkspaceSummary = summary: {
++                    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++                    defer ids.mutex.unlock(io);
++                    break :summary .{
++                        .type_count = @intCast(ids.zcu.incremental_debug_state.types.count()),
++                        .declaration_count = @intCast(ids.zcu.incremental_debug_state.navs.count()),
++                        .analysis_unit_count = @intCast(ids.zcu.incremental_debug_state.units.count()),
++                        .last_generation = ids.analysis_generation,
++                    };
++                };
++                try writeStructResponse(
++                    stream_writer,
++                    header.request_id,
++                    ids.analysis_generation,
++                    .workspace_declarations,
++                    AnalysisProtocol.WorkspaceSummary,
++                    summary,
++                );
++            },
++            .workspace_declaration_names => {
++                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++                if (!authenticated) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                try ids.writeWorkspaceDeclarationNames(stream_writer, header.request_id);
++            },
++            .shutdown => return error.EndOfStream,
++            else => {
++                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++            },
++        }
++    }
++}
++
++const Overlay = struct {
++    document_version: i32,
++    source: [:0]u8,
++};
++
++fn replaceOverlay(ids: *IncrementalDebugServer, uri: []const u8, document_version: i32, source: []const u8) !void {
++    const owned_source = try ids.zcu.gpa.allocSentinel(u8, source.len, 0);
++    errdefer ids.zcu.gpa.free(owned_source);
++    @memcpy(owned_source, source);
++    const result = try ids.overlays.getOrPut(ids.zcu.gpa, uri);
++    errdefer if (!result.found_existing) {
++        _ = ids.overlays.remove(uri);
++    };
++    if (result.found_existing) {
++        ids.zcu.gpa.free(result.value_ptr.source);
++    } else {
++        result.key_ptr.* = try ids.zcu.gpa.dupe(u8, uri);
++    }
++    result.value_ptr.* = .{ .document_version = document_version, .source = owned_source };
++    ids.analysis_generation +%= 1;
++    if (ids.analysis_generation == 0) ids.analysis_generation = 1;
++}
++
++fn writeWorkspaceDeclarationNames(
++    ids: *IncrementalDebugServer,
++    writer: *Io.Writer,
++    request_id: u32,
++) !void {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const gpa = ids.zcu.gpa;
++    const ip = &ids.zcu.intern_pool;
++    var body: Io.Writer.Allocating = .init(gpa);
++    defer body.deinit();
++    var names_length: u32 = 0;
++    for (ids.zcu.incremental_debug_state.navs.keys()) |nav_index| {
++        const name = ip.getNav(nav_index).fqn.toSlice(ip);
++        names_length = std.math.add(u32, names_length, @intCast(name.len)) catch return error.StreamTooLong;
++    }
++    try body.writer.writeStruct(AnalysisProtocol.DeclarationList{
++        .declaration_count = @intCast(ids.zcu.incremental_debug_state.navs.count()),
++        .names_length = names_length,
++    }, .little);
++    for (ids.zcu.incremental_debug_state.navs.keys()) |nav_index| {
++        const name = ip.getNav(nav_index).fqn.toSlice(ip);
++        try body.writer.writeInt(u32, @intCast(name.len), .little);
++        try body.writer.writeAll(name);
++    }
++    const bytes = body.written();
++    if (bytes.len > 16 * 1024 * 1024) return error.StreamTooLong;
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(bytes.len),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .workspace_declaration_names,
++    }, .little);
++    try writer.writeAll(bytes);
++    try writer.flush();
++}
++
++fn writeDiagnostics(ids: *IncrementalDebugServer, writer: *Io.Writer, request_id: u32) !void {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const gpa = ids.zcu.gpa;
++    var errors = try ids.zcu.comp.getAllErrorsAlloc();
++    defer errors.deinit(gpa);
++    const body_length = @sizeOf(AnalysisProtocol.DiagnosticBundle) +
++        errors.extra.len * @sizeOf(u32) + errors.string_bytes.len;
++    if (body_length > 16 * 1024 * 1024) return error.StreamTooLong;
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(body_length),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .diagnostics,
++    }, .little);
++    try writer.writeStruct(AnalysisProtocol.DiagnosticBundle{
++        .extra_length = @intCast(errors.extra.len),
++        .string_bytes_length = @intCast(errors.string_bytes.len),
++    }, .little);
++    try writer.writeSliceEndian(u32, errors.extra, .little);
++    try writer.writeAll(errors.string_bytes);
++    try writer.flush();
++}
++
++fn writeTypeMembers(ids: *IncrementalDebugServer, writer: *Io.Writer, request_id: u32, requested_name: []const u8) !bool {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const zcu = ids.zcu;
++    const ip = &zcu.intern_pool;
++    const pt: Zcu.PerThread = .activate(zcu, .main);
++    defer pt.deactivate();
++    const type_index = for (zcu.incremental_debug_state.navs.keys()) |nav_index| {
++        var nav = ip.getNav(nav_index);
++        if (!std.mem.eql(u8, nav.name.toSlice(ip), requested_name) and
++            !std.mem.eql(u8, nav.fqn.toSlice(ip), requested_name)) continue;
++        if (nav.resolved == null or nav.resolved.?.value == .none) {
++            pt.ensureNavValUpToDate(nav_index, null) catch |err| switch (err) {
++                error.AnalysisFail => continue,
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Canceled => return error.Canceled,
++            };
++            nav = ip.getNav(nav_index);
++        }
++        const resolved = nav.resolved.?;
++        switch (ip.indexToKey(resolved.value)) {
++            .struct_type, .union_type, .enum_type, .opaque_type => break resolved.value,
++            else => continue,
++        }
++    } else return false;
++
++    const namespace = zcu.namespacePtr(Type.fromInterned(type_index).getNamespaceIndex(zcu));
++    const field_names: []const InternPool.NullTerminatedString = switch (ip.indexToKey(type_index)) {
++        .struct_type => ip.loadStructType(type_index).field_names.get(ip),
++        .union_type => &.{},
++        .enum_type => ip.loadEnumType(type_index).field_names.get(ip),
++        .opaque_type => &.{},
++        else => unreachable,
++    };
++    const declaration_count = field_names.len + namespace.pub_decls.count() + namespace.priv_decls.count();
++    var names_length: usize = 0;
++    for (field_names) |name| names_length += name.toSlice(ip).len;
++    for (namespace.pub_decls.keys()) |nav_index| names_length += ip.getNav(nav_index).name.toSlice(ip).len;
++    for (namespace.priv_decls.keys()) |nav_index| names_length += ip.getNav(nav_index).name.toSlice(ip).len;
++    const body_length = @sizeOf(AnalysisProtocol.DeclarationList) + declaration_count * @sizeOf(u32) + names_length;
++    if (body_length > 16 * 1024 * 1024) return error.StreamTooLong;
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(body_length),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .type_members,
++    }, .little);
++    try writer.writeStruct(AnalysisProtocol.DeclarationList{
++        .declaration_count = @intCast(declaration_count),
++        .names_length = @intCast(names_length),
++    }, .little);
++    for (field_names) |name| try writeName(writer, name.toSlice(ip));
++    for (namespace.pub_decls.keys()) |nav_index| try writeName(writer, ip.getNav(nav_index).name.toSlice(ip));
++    for (namespace.priv_decls.keys()) |nav_index| try writeName(writer, ip.getNav(nav_index).name.toSlice(ip));
++    try writer.flush();
++    return true;
++}
++
++fn writeTypeShape(ids: *IncrementalDebugServer, writer: *Io.Writer, request_id: u32, requested_name: []const u8) !bool {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const zcu = ids.zcu;
++    const ip = &zcu.intern_pool;
++    const pt: Zcu.PerThread = .activate(zcu, .main);
++    defer pt.deactivate();
++    const type_index = for (zcu.incremental_debug_state.navs.keys()) |nav_index| {
++        var nav = ip.getNav(nav_index);
++        if (!std.mem.eql(u8, nav.name.toSlice(ip), requested_name) and
++            !std.mem.eql(u8, nav.fqn.toSlice(ip), requested_name)) continue;
++        if (nav.resolved == null or nav.resolved.?.value == .none) {
++            pt.ensureNavValUpToDate(nav_index, null) catch |err| switch (err) {
++                error.AnalysisFail => continue,
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Canceled => return error.Canceled,
++            };
++            nav = ip.getNav(nav_index);
++        }
++        const resolved = nav.resolved.?;
++        switch (ip.indexToKey(resolved.value)) {
++            .struct_type, .union_type, .enum_type => break resolved.value,
++            else => continue,
++        }
++    } else return false;
++
++    pt.ensureTypeLayoutUpToDate(Type.fromInterned(type_index), null) catch |err| switch (err) {
++        error.AnalysisFail => return false,
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Canceled => return error.Canceled,
++    };
++    const kind: AnalysisProtocol.TypeShapeKind, const field_names: []const InternPool.NullTerminatedString = switch (ip.indexToKey(type_index)) {
++        .struct_type => .{ .structure, ip.loadStructType(type_index).field_names.get(ip) },
++        .enum_type => .{ .enumeration, ip.loadEnumType(type_index).field_names.get(ip) },
++        .union_type => shape: {
++            const union_type = ip.loadUnionType(type_index);
++            if (union_type.tag_usage != .tagged or union_type.enum_tag_type == .none) return false;
++            break :shape .{ .tagged_union, ip.loadEnumType(union_type.enum_tag_type).field_names.get(ip) };
++        },
++        else => unreachable,
++    };
++    var names_length: usize = 0;
++    for (field_names) |name| names_length += name.toSlice(ip).len;
++    const body_length = @sizeOf(AnalysisProtocol.TypeShape) + field_names.len * @sizeOf(u32) + names_length;
++    if (body_length > 16 * 1024 * 1024) return error.StreamTooLong;
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(body_length),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .type_shape,
++    }, .little);
++    try writer.writeStruct(AnalysisProtocol.TypeShape{
++        .kind = kind,
++        .field_count = @intCast(field_names.len),
++        .names_length = @intCast(names_length),
++    }, .little);
++    for (field_names) |name| try writeName(writer, name.toSlice(ip));
++    try writer.flush();
++    return true;
++}
++
++fn writeName(writer: *Io.Writer, name: []const u8) !void {
++    try writer.writeInt(u32, @intCast(name.len), .little);
++    try writer.writeAll(name);
++}
++
++fn documentFacts(ids: *IncrementalDebugServer, uri: []const u8, document_version: i32) !AnalysisProtocol.DocumentFacts {
++    const overlay = ids.overlays.get(uri) orelse return error.EndOfStream;
++    var tree = try std.zig.Ast.parse(ids.zcu.gpa, overlay.source, .zig);
++    defer tree.deinit(ids.zcu.gpa);
++    return .{
++        .document_version = document_version,
++        .declaration_count = @intCast(tree.rootDecls().len),
++        .syntax_error_count = @intCast(tree.errors.len),
++        .source_hash = std.hash.Wyhash.hash(0, overlay.source),
++    };
++}
++
++fn discardBody(reader: *Io.Reader, body_length: u32) Io.Reader.Error!void {
++    if (body_length != 0) _ = try reader.take(body_length);
++}
++
++fn writeHelloResponse(
++    writer: *Io.Writer,
++    request_id: u32,
++    generation: u32,
++    status: AnalysisProtocol.HandshakeStatus,
++) Io.Writer.Error!void {
++    const zig_version = "0.16.0";
++    const response: AnalysisProtocol.HelloResponse = .{
++        .protocol_version = AnalysisProtocol.version,
++        .status = status,
++        .zig_version_length = @intCast(zig_version.len),
++    };
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(@sizeOf(AnalysisProtocol.HelloResponse) + zig_version.len),
++        .request_id = request_id,
++        .generation = generation,
++        .tag = .hello_response,
++    }, .little);
++    try writer.writeStruct(response, .little);
++    try writer.writeAll(zig_version);
++    try writer.flush();
++}
++
++fn writeStructResponse(
++    writer: *Io.Writer,
++    request_id: u32,
++    generation: u32,
++    tag: AnalysisProtocol.Tag,
++    comptime Body: type,
++    body: Body,
++) Io.Writer.Error!void {
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(@sizeOf(Body)),
++        .request_id = request_id,
++        .generation = generation,
++        .tag = tag,
++    }, .little);
++    try writer.writeStruct(body, .little);
++    try writer.flush();
++}
++
++fn writeErrorResponse(
++    writer: *Io.Writer,
++    request_id: u32,
++    generation: u32,
++    code: AnalysisProtocol.ErrorCode,
++    message: []const u8,
++) Io.Writer.Error!void {
++    const response: AnalysisProtocol.ErrorResponse = .{
++        .code = code,
++        .observed_generation = generation,
++        .message_length = @intCast(message.len),
++    };
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(@sizeOf(AnalysisProtocol.ErrorResponse) + message.len),
++        .request_id = request_id,
++        .generation = generation,
++        .tag = .response_error,
++    }, .little);
++    try writer.writeStruct(response, .little);
++    try writer.writeAll(message);
++    try writer.flush();
++}
++
+ fn serveStream(
+     ids: *IncrementalDebugServer,
+     stream_reader: *Io.Reader,
+@@ -454,5 +1017,6 @@ const Zcu = @import("Zcu.zig");
+ const InternPool = @import("InternPool.zig");
+ const Type = @import("Type.zig");
+ const AnalUnit = InternPool.AnalUnit;
++const AnalysisProtocol = @import("AnalysisProtocol.zig");
+ 
+ const IncrementalDebugServer = @This();
+diff --git a/src/main.zig b/src/main.zig
+index 0395a21a..b4d818e1 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -33,9 +33,11 @@ const crash_report = @import("crash_report.zig");
+ const Zcu = @import("Zcu.zig");
+ const mingw = @import("libs/mingw.zig");
+ const dev = @import("dev.zig");
++const AnalysisProtocol = @import("AnalysisProtocol.zig");
+ 
+ test {
+     _ = Package;
++    _ = AnalysisProtocol;
+     _ = @import("codegen.zig");
+ }
+ 
+diff --git a/src/AnalysisProtocol.zig b/src/AnalysisProtocol.zig
+new file mode 100644
+index 00000000..894aedb0
+--- /dev/null
++++ b/src/AnalysisProtocol.zig
+@@ -0,0 +1,153 @@
++const std = @import("std");
++
++pub const version: u16 = 4;
++
++pub const Header = extern struct {
++    body_length: u32,
++    request_id: u32,
++    generation: u32,
++    tag: Tag,
++    reserved: u16 = 0,
++};
++
++pub const Hello = extern struct {
++    protocol_version: u16,
++    zig_version_length: u16,
++    authentication_token_length: u16,
++    reserved: u16 = 0,
++};
++
++pub const HelloResponse = extern struct {
++    protocol_version: u16,
++    status: HandshakeStatus,
++    zig_version_length: u16,
++    reserved: u16 = 0,
++};
++
++pub const HandshakeStatus = enum(u16) {
++    accepted,
++    incompatible_protocol,
++    incompatible_zig,
++    authentication_failed,
++    _,
++};
++
++pub const WorkspaceSummary = extern struct {
++    type_count: u32,
++    declaration_count: u32,
++    analysis_unit_count: u32,
++    last_generation: u32,
++};
++
++pub const ReplaceOverlayRequest = extern struct {
++    uri_length: u32,
++    source_length: u32,
++    document_version: i32,
++    reserved: u32 = 0,
++};
++
++pub const AnalyzeRequest = extern struct {
++    uri_length: u32,
++    expected_document_version: i32,
++};
++
++pub const RemoveOverlayRequest = extern struct {
++    uri_length: u32,
++};
++
++pub const TypeMembersRequest = extern struct {
++    name_length: u32,
++};
++
++pub const TypeShape = extern struct {
++    kind: TypeShapeKind,
++    reserved: u16 = 0,
++    field_count: u32,
++    names_length: u32,
++};
++
++pub const TypeShapeKind = enum(u16) {
++    enumeration,
++    tagged_union,
++    structure,
++    _,
++};
++
++pub const DocumentFacts = extern struct {
++    document_version: i32,
++    declaration_count: u32,
++    syntax_error_count: u32,
++    reserved: u32 = 0,
++    source_hash: u64,
++};
++
++pub const ErrorResponse = extern struct {
++    code: ErrorCode,
++    reserved: u16 = 0,
++    observed_generation: u32,
++    message_length: u32,
++};
++
++pub const DeclarationList = extern struct {
++    declaration_count: u32,
++    names_length: u32,
++};
++
++pub const DiagnosticBundle = extern struct {
++    extra_length: u32,
++    string_bytes_length: u32,
++};
++
++pub const ErrorCode = enum(u16) {
++    incompatible_protocol,
++    incompatible_zig,
++    authentication_failed,
++    stale_generation,
++    unknown_compile_unit,
++    unavailable,
++    malformed_request,
++    internal_failure,
++    _,
++};
++
++pub const Tag = enum(u16) {
++    hello,
++    hello_response,
++    register_compile_unit,
++    replace_overlay,
++    remove_overlay,
++    analyze,
++    diagnostics,
++    document_facts,
++    resolve_symbol,
++    type_members,
++    workspace_declarations,
++    cancel,
++    shutdown,
++    response_error,
++    workspace_declaration_names,
++    type_shape,
++    _,
++};
++
++pub const SourceSpan = extern struct {
++    start: u32,
++    end: u32,
++};
++
++comptime {
++    std.debug.assert(@sizeOf(Header) == 16);
++    std.debug.assert(@sizeOf(Hello) == 8);
++    std.debug.assert(@sizeOf(HelloResponse) == 8);
++    std.debug.assert(@sizeOf(SourceSpan) == 8);
++    std.debug.assert(@sizeOf(WorkspaceSummary) == 16);
++    std.debug.assert(@sizeOf(ReplaceOverlayRequest) == 16);
++    std.debug.assert(@sizeOf(AnalyzeRequest) == 8);
++    std.debug.assert(@sizeOf(RemoveOverlayRequest) == 4);
++    std.debug.assert(@sizeOf(TypeMembersRequest) == 4);
++    std.debug.assert(@sizeOf(TypeShape) == 12);
++    std.debug.assert(@sizeOf(DocumentFacts) == 24);
++    std.debug.assert(@sizeOf(ErrorResponse) == 12);
++    std.debug.assert(@sizeOf(DeclarationList) == 8);
++    std.debug.assert(@sizeOf(DiagnosticBundle) == 8);
++}

@@ -1,0 +1,258 @@
+const std = @import("std");
+const build_options = @import("build_options");
+
+pub const source_directory = ".zig-analyzer/zig-0.16.0";
+pub const backend_directory = "zig-out/backend";
+pub const backend_binary = backend_directory ++ "/bin/zig";
+pub const manifest_path = backend_directory ++ "/zig-analyzer-backend.json";
+pub const patch_path = "compiler/zig-0.16.0-analysis.patch";
+
+const upstream_url = "https://codeberg.org/ziglang/zig";
+
+pub const Manifest = struct {
+    analyzer_version: []const u8,
+    zig_version: []const u8,
+    zig_commit: []const u8,
+    patch_sha256: []const u8,
+    compiler_protocol_version: u16,
+};
+
+pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator) !void {
+    try verifyBootstrapCompiler(io, allocator);
+    try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer");
+
+    const expected_patch_sha256 = try patchSha256(io, allocator);
+    defer allocator.free(expected_patch_sha256);
+    if (readManifest(io, allocator)) |manifest_result| {
+        var manifest = manifest_result;
+        defer manifest.deinit();
+        if (!std.mem.eql(u8, manifest.value.patch_sha256, expected_patch_sha256) and
+            try pathExists(io, source_directory))
+        {
+            try std.Io.Dir.cwd().deleteTree(io, source_directory);
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return printFailure(io, "failed to read backend manifest {s}: {s}\n", .{ manifest_path, @errorName(err) }),
+    }
+
+    if (!try pathExists(io, source_directory ++ "/.git")) {
+        try runChecked(io, allocator, null, &.{
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            build_options.zig_version,
+            upstream_url,
+            source_directory,
+        });
+    }
+
+    const actual_commit = try commandOutput(io, allocator, source_directory, &.{ "git", "rev-parse", "HEAD" });
+    defer allocator.free(actual_commit);
+    if (!std.mem.eql(u8, actual_commit, build_options.zig_commit)) {
+        return printFailure(io, "compiler source {s} is at commit {s}; expected {s}\n", .{
+            source_directory,
+            actual_commit,
+            build_options.zig_commit,
+        });
+    }
+
+    const patch_state = try detectPatchState(io, allocator);
+    switch (patch_state) {
+        .not_applied => try runChecked(io, allocator, source_directory, &.{ "git", "apply", "../../" ++ patch_path }),
+        .applied => {},
+        .conflicted => return printFailure(io, "compiler patch does not apply cleanly in {s}\n", .{source_directory}),
+    }
+
+    try std.Io.Dir.cwd().createDirPath(io, backend_directory);
+    try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/compiler-cache");
+    try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/compiler-global-cache");
+
+    const project_root = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(project_root);
+    const absolute_backend_directory = try std.Io.Dir.path.join(allocator, &.{ project_root, backend_directory });
+    defer allocator.free(absolute_backend_directory);
+    const absolute_local_cache = try std.Io.Dir.path.join(allocator, &.{ project_root, ".zig-analyzer/compiler-cache" });
+    defer allocator.free(absolute_local_cache);
+    const absolute_global_cache = try std.Io.Dir.path.join(allocator, &.{ project_root, ".zig-analyzer/compiler-global-cache" });
+    defer allocator.free(absolute_global_cache);
+
+    try runChecked(io, allocator, source_directory, &.{
+        "zig",
+        "build",
+        "-Dno-lib",
+        "-Denable-llvm=false",
+        "-Ddebug-extensions=true",
+        "-Doptimize=ReleaseSafe",
+        "-Dversion-string=0.16.0+zig-analyzer.1",
+        "--cache-dir",
+        absolute_local_cache,
+        "--global-cache-dir",
+        absolute_global_cache,
+        "--prefix",
+        absolute_backend_directory,
+    });
+
+    if (!try pathExists(io, backend_binary)) {
+        return printFailure(io, "compiler build completed without producing {s}\n", .{backend_binary});
+    }
+
+    try writeManifest(io, allocator, expected_patch_sha256);
+
+    var buffer: [512]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writer(io, &buffer);
+    try file_writer.interface.print("zig-analyzer backend: built {s}\n", .{backend_binary});
+    try file_writer.interface.flush();
+}
+
+pub fn readManifest(io: std.Io, allocator: std.mem.Allocator) !std.json.Parsed(Manifest) {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(64 * 1024));
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice(Manifest, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+}
+
+pub fn expectedPatchSha256(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    return patchSha256(io, allocator);
+}
+
+fn verifyBootstrapCompiler(io: std.Io, allocator: std.mem.Allocator) !void {
+    const actual_version = try commandOutput(io, allocator, null, &.{ "zig", "version" });
+    defer allocator.free(actual_version);
+    if (!std.mem.eql(u8, actual_version, build_options.zig_version)) {
+        return printFailure(io, "backend bootstrap requires Zig {s}; found {s}\n", .{
+            build_options.zig_version,
+            actual_version,
+        });
+    }
+}
+
+const PatchState = enum { not_applied, applied, conflicted };
+
+fn detectPatchState(io: std.Io, allocator: std.mem.Allocator) !PatchState {
+    if (try commandSucceeds(io, allocator, source_directory, &.{ "git", "apply", "--check", "../../" ++ patch_path })) {
+        return .not_applied;
+    }
+    if (try commandSucceeds(io, allocator, source_directory, &.{ "git", "apply", "--reverse", "--check", "../../" ++ patch_path })) {
+        return .applied;
+    }
+    return .conflicted;
+}
+
+fn writeManifest(io: std.Io, allocator: std.mem.Allocator, patch_sha256: []const u8) !void {
+    var allocating: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+    try std.json.Stringify.value(Manifest{
+        .analyzer_version = build_options.version_string,
+        .zig_version = build_options.zig_version,
+        .zig_commit = build_options.zig_commit,
+        .patch_sha256 = patch_sha256,
+        .compiler_protocol_version = build_options.compiler_protocol_version,
+    }, .{ .whitespace = .indent_2 }, &allocating.writer);
+    try allocating.writer.writeByte('\n');
+    const bytes = try allocating.toOwnedSlice();
+    defer allocator.free(bytes);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = bytes });
+}
+
+fn patchSha256(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, patch_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(digest, .lower)});
+}
+
+fn commandOutput(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    arguments: []const []const u8,
+) ![]u8 {
+    const result = try std.process.run(allocator, io, .{
+        .argv = arguments,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (!exitedSuccessfully(result.term)) {
+        return printFailure(io, "command '{s}' failed: {s}\n", .{ arguments[0], result.stderr });
+    }
+    return try allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+}
+
+fn runChecked(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    arguments: []const []const u8,
+) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = arguments,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(32 * 1024 * 1024),
+        .stderr_limit = .limited(32 * 1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (exitedSuccessfully(result.term)) return;
+    return printFailure(io, "command '{s}' failed:\n{s}\n{s}\n", .{ arguments[0], result.stdout, result.stderr });
+}
+
+fn commandSucceeds(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    arguments: []const []const u8,
+) !bool {
+    const result = try std.process.run(allocator, io, .{
+        .argv = arguments,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return exitedSuccessfully(result.term);
+}
+
+fn exitedSuccessfully(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |exit_code| exit_code == 0,
+        else => false,
+    };
+}
+
+fn pathExists(io: std.Io, path: []const u8) !bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn printFailure(io: std.Io, comptime format: []const u8, arguments: anytype) anyerror {
+    var buffer: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stderr().writer(io, &buffer);
+    file_writer.interface.print(format, arguments) catch |err| return err;
+    file_writer.interface.flush() catch |err| return err;
+    return error.BootstrapFailed;
+}
+
+test "manifest captures the compatibility boundary" {
+    const manifest = Manifest{
+        .analyzer_version = "0.1.0-dev",
+        .zig_version = "0.16.0",
+        .zig_commit = build_options.zig_commit,
+        .patch_sha256 = "abc",
+        .compiler_protocol_version = 1,
+    };
+    try std.testing.expectEqualStrings("0.16.0", manifest.zig_version);
+    try std.testing.expectEqual(@as(u16, 1), manifest.compiler_protocol_version);
+}
