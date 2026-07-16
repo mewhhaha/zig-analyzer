@@ -33,7 +33,21 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator) !void {
         }
     } else |err| switch (err) {
         error.FileNotFound => {},
-        else => return printFailure(io, "failed to read backend manifest {s}: {s}\n", .{ manifest_path, @errorName(err) }),
+        else => {
+            // An unreadable manifest cannot prove which patch the source tree
+            // carries, so rebuild from a fresh checkout instead of wedging
+            // every future bootstrap on the corrupt file.
+            var warning_buffer: [4096]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writer(io, &warning_buffer);
+            try stderr_writer.interface.print(
+                "backend manifest {s} is unreadable ({t}); rebuilding the backend from scratch\n",
+                .{ manifest_path, err },
+            );
+            try stderr_writer.interface.flush();
+            if (try pathExists(io, source_directory)) {
+                try std.Io.Dir.cwd().deleteTree(io, source_directory);
+            }
+        },
     }
 
     if (!try pathExists(io, source_directory ++ "/.git")) {
@@ -156,7 +170,12 @@ fn writeManifest(io: std.Io, allocator: std.mem.Allocator, patch_sha256: []const
     try allocating.writer.writeByte('\n');
     const bytes = try allocating.toOwnedSlice();
     defer allocator.free(bytes);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = bytes });
+    // Write-temp-rename so a crash mid-write cannot leave a truncated
+    // manifest next to a complete backend.
+    var atomic_manifest = try std.Io.Dir.cwd().createFileAtomic(io, manifest_path, .{ .replace = true });
+    defer atomic_manifest.deinit(io);
+    try atomic_manifest.file.writeStreamingAll(io, bytes);
+    try atomic_manifest.replace(io);
 }
 
 fn patchSha256(io: std.Io, allocator: std.mem.Allocator) ![]u8 {

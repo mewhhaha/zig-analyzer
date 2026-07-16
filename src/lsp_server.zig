@@ -2802,31 +2802,6 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
     return diagnostics;
 }
 
-fn unresolvedCallDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![]lsp.types.Diagnostic {
-    const tokens = try tokenize(allocator, document.source);
-    defer allocator.free(tokens);
-    var diagnostics: std.ArrayList(lsp.types.Diagnostic) = .empty;
-    errdefer diagnostics.deinit(allocator);
-
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .identifier or index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
-        if (index > 0 and tokens[index - 1].tag == .period) continue;
-        const name = document.source[token.loc.start..token.loc.end];
-        if (std.zig.isPrimitive(name) or document.declarationNamed(name) != null) continue;
-        if (try document.scopedIdentifierSpans(allocator, token.loc.start)) |spans| {
-            allocator.free(spans);
-            continue;
-        }
-        try diagnostics.append(allocator, .{
-            .range = document.range(token.loc),
-            .severity = .Error,
-            .source = "zig-analyzer semantic",
-            .message = try std.fmt.allocPrint(allocator, "use of undeclared identifier '{s}'", .{name}),
-        });
-    }
-    return try diagnostics.toOwnedSlice(allocator);
-}
-
 pub fn compilerDiagnostics(
     document: *const Document,
     bundle: std.zig.ErrorBundle,
@@ -3613,6 +3588,25 @@ test "style rename preserves type-producing declaration semantics" {
     try std.testing.expectEqualStrings("InferredType", inferred_name);
     try std.testing.expectEqualStrings("ReflectedType", reflected_name);
     try std.testing.expectEqualStrings("ExternalState", external_name);
+}
+
+test "fix-all edits keep same-position insertions in input order and drop overlaps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const survivors = try nonOverlappingEdits(arena, &.{
+        .{ .span = .{ .start = 5, .end = 9 }, .replacement = "replacement" },
+        .{ .span = .{ .start = 3, .end = 3 }, .replacement = "first insertion" },
+        .{ .span = .{ .start = 3, .end = 3 }, .replacement = "first insertion" },
+        .{ .span = .{ .start = 3, .end = 3 }, .replacement = "second insertion" },
+        .{ .span = .{ .start = 7, .end = 12 }, .replacement = "overlaps the replacement" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), survivors.len);
+    try std.testing.expectEqualStrings("first insertion", survivors[0].replacement);
+    try std.testing.expectEqualStrings("second insertion", survivors[1].replacement);
+    try std.testing.expectEqualStrings("replacement", survivors[2].replacement);
 }
 
 test "member resolution finds explicit struct fields" {

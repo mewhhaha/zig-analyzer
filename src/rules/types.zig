@@ -91,6 +91,8 @@ pub const Rule = enum {
     unbraced_multiline_if,
     unconditional_busy_loop,
     banned_identifier,
+    truncating_intcast,
+    padded_byte_compare,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -176,6 +178,8 @@ pub const Rule = enum {
             .unbraced_multiline_if => "unbraced-multiline-if",
             .unconditional_busy_loop => "unconditional-busy-loop",
             .banned_identifier => "banned-identifier",
+            .truncating_intcast => "truncating-intcast",
+            .padded_byte_compare => "padded-byte-compare",
         };
     }
 
@@ -209,6 +213,7 @@ pub const Rule = enum {
             .aliased_memcpy,
             .usize_in_packed_struct,
             .unconditional_busy_loop,
+            .padded_byte_compare,
             => .correctness,
             else => .style,
         };

@@ -198,8 +198,14 @@ pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]
     return null;
 }
 
+/// Cheap pre-check so per-finding suppression lookups can be skipped for the
+/// common case of a file with no directives at all.
+pub fn hasSuppressionDirectives(source: []const u8) bool {
+    return std.mem.indexOf(u8, source, "// zig-analyzer:") != null;
+}
+
 pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
-    if (std.mem.indexOf(u8, source, "// zig-analyzer:") == null) return false;
+    if (!hasSuppressionDirectives(source)) return false;
     const target_offset = @min(offset, source.len);
     const target_line_start = lineStart(source, target_offset);
     var cursor: usize = 0;
