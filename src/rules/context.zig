@@ -27,6 +27,10 @@ pub const RuleRun = struct {
         return index < context.tokens.len and std.mem.eql(u8, context.tokenText(index), expected);
     }
 
+    pub fn refersToBinding(context: RuleRun, index: usize, name: []const u8) bool {
+        return tokenRefersToBinding(context.source, context.tokens, index, name);
+    }
+
     pub fn matchingToken(
         context: RuleRun,
         opening_index: usize,
@@ -87,3 +91,14 @@ pub const RuleRun = struct {
         return context.matchingToken(opening, .l_brace, .r_brace);
     }
 };
+
+pub fn tokenRefersToBinding(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    index: usize,
+    name: []const u8,
+) bool {
+    const token = tokens[index];
+    if (token.tag != .identifier or !std.mem.eql(u8, source[token.loc.start..token.loc.end], name)) return false;
+    return index == 0 or tokens[index - 1].tag != .period;
+}

@@ -8,7 +8,8 @@ pub fn run(context: RuleRun) !void {
 
     for (context.tokens, 0..) |token, expect_index| {
         if (token.tag != .identifier or !context.tokenIs(expect_index, "expect") or
-            expect_index + 8 >= context.tokens.len or context.tokens[expect_index + 1].tag != .l_paren) continue;
+            expect_index + 8 >= context.tokens.len or context.tokens[expect_index + 1].tag != .l_paren or
+            !calleeIsTestingQualified(context, expect_index)) continue;
         const expect_end = context.matchingToken(expect_index + 1, .l_paren, .r_paren) orelse continue;
         const eql_index = expect_index + 6;
         if (context.tokens[expect_index + 2].tag != .identifier or !context.tokenIs(expect_index + 2, "std") or
@@ -63,6 +64,12 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
+fn calleeIsTestingQualified(context: RuleRun, expect_index: usize) bool {
+    if (expect_index == 0 or context.tokens[expect_index - 1].tag != .period) return true;
+    return expect_index >= 2 and context.tokens[expect_index - 2].tag == .identifier and
+        context.tokenIs(expect_index - 2, "testing");
+}
+
 fn topLevelComma(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;
@@ -109,6 +116,24 @@ test "byte equality assertions use string-aware failures" {
         "std.testing.expectEqualStrings(expected(), actual)",
         findings.items[0].fixes[0].edits[0].replacement,
     );
+}
+
+test "a custom expect harness is not rewritten to expectEqualStrings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "try harness.expect(std.mem.eql(u8, expected, actual));";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_strings)] = .information;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = configuration,
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 test "non-byte equality assertions do not use string expectations" {
