@@ -1,0 +1,13 @@
+{
+  "format": {
+    "profile": "analyzer",
+    "organizeImports": true
+  },
+  "lints": {
+    "profile": "idiomatic",
+    "correctness": "warning",
+    "rules": {
+      "discarded-error": "warning"
+    }
+  }
+}

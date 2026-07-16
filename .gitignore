@@ -1,0 +1,5 @@
+/.zig-cache/
+tmp
+/zig-pkg/
+/zig-out/
+/.zig-analyzer/
