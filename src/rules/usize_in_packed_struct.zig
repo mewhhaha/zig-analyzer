@@ -12,8 +12,12 @@ pub fn run(context: RuleRun) !void {
             .keyword_packed => "packed",
             else => continue,
         };
-        if (layout_index + 2 >= context.tokens.len or
-            context.tokens[layout_index + 1].tag != .keyword_struct) continue;
+        if (layout_index + 2 >= context.tokens.len) continue;
+        const container: []const u8 = switch (context.tokens[layout_index + 1].tag) {
+            .keyword_struct => "struct",
+            .keyword_union => "union",
+            else => continue,
+        };
         var opening = layout_index + 2;
         if (context.tokens[opening].tag == .l_paren) {
             opening = (context.matchingToken(opening, .l_paren, .r_paren) orelse continue) + 1;
@@ -42,8 +46,8 @@ pub fn run(context: RuleRun) !void {
                         .span = context.tokens[type_index].loc,
                         .message = try std.fmt.allocPrint(
                             context.allocator,
-                            "field '{s}' of this {s} struct uses pointer-sized '{s}'; its width and the layout vary by target",
-                            .{ context.tokenText(index - 1), layout, context.tokenText(type_index) },
+                            "field '{s}' of this {s} {s} uses pointer-sized '{s}'; its width and the layout vary by target",
+                            .{ context.tokenText(index - 1), layout, container, context.tokenText(type_index) },
                         ),
                     });
                 },
@@ -56,7 +60,8 @@ pub fn run(context: RuleRun) !void {
 fn pointerSizedFieldType(context: RuleRun, colon_index: usize, closing: usize) ?usize {
     if (context.tokens[colon_index - 1].tag != .identifier) return null;
     switch (context.tokens[colon_index - 2].tag) {
-        .l_brace, .comma, .doc_comment => {},
+        // '}' and ';' precede fields that follow a method or nested declaration.
+        .l_brace, .comma, .doc_comment, .r_brace, .semicolon => {},
         else => return null,
     }
     var index = colon_index + 1;
@@ -90,6 +95,26 @@ test "pointer-sized fields in packed and extern structs report the layout hazard
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'base'") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'isize'") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "'tag'") != null);
+}
+
+test "pointer-sized fields in packed unions and after methods report the hazard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Word = packed union { address: usize, halves: u64 };\n" ++
+        "const Frame = extern struct {\n" ++
+        "    fn width() u8 {\n" ++
+        "        return 1;\n" ++
+        "    }\n" ++
+        "    const alignment = 8;\n" ++
+        "    base: usize,\n" ++
+        "};";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'address'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "packed union") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'base'") != null);
 }
 
 test "plain structs fixed-width fields and function pointers stay clean" {

@@ -90,6 +90,7 @@ pub const Rule = enum {
     usize_in_packed_struct,
     unbraced_multiline_if,
     unconditional_busy_loop,
+    banned_identifier,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -174,6 +175,7 @@ pub const Rule = enum {
             .usize_in_packed_struct => "usize-in-packed-struct",
             .unbraced_multiline_if => "unbraced-multiline-if",
             .unconditional_busy_loop => "unconditional-busy-loop",
+            .banned_identifier => "banned-identifier",
         };
     }
 
@@ -272,9 +274,15 @@ pub const Rule = enum {
 
 pub const Tier = enum { semantic, correctness, style };
 
+pub const BannedIdentifier = struct {
+    path: []const u8,
+    hint: ?[]const u8 = null,
+};
+
 pub const Configuration = struct {
     levels: [std.meta.fields(Rule).len]Level,
     lint_profile: LintProfile = .none,
+    banned: []const BannedIdentifier = &.{},
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {

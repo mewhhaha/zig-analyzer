@@ -117,11 +117,12 @@ with stable rule names and editor quick fixes:
 | `@hasField`/`@hasDecl` names absent from a proven type shape | Opt-in `unknown-comptime-member` | No diagnostic |
 | An explicitly comptime `if` whose condition is a literal | Opt-in `constant-comptime-condition` | No diagnostic |
 | An allocation followed by a later `try` with no `errdefer` release | `missing-errdefer` with an insert-`errdefer` fix | No error-path leak diagnostic |
-| `@memcpy` between slices carved from the same buffer | `aliased-memcpy` names the shared base and suggests `std.mem.copyForwards`/`copyBackwards` | No aliasing diagnostic |
-| A `usize` or `isize` field inside an `extern` or `packed` struct | `usize-in-packed-struct` explains the target-dependent layout | No layout diagnostic |
+| `@memcpy` between possibly overlapping slices of one buffer | `aliased-memcpy` names the shared base and suggests `std.mem.copyForwards`/`copyBackwards` | No aliasing diagnostic |
+| A `usize` or `isize` field inside an `extern` or `packed` struct or union | `usize-in-packed-struct` explains the target-dependent layout | No layout diagnostic |
 | `while (true)` whose body provably never exits or calls anything | `unconditional-busy-loop` | No diagnostic |
 | `!comptime` applying the negation before the comptime expression | Opt-in `negated-comptime-expression` with a parenthesizing fix | No precedence diagnostic |
 | A multi-line `if` body without braces | Opt-in `unbraced-multiline-if` with a brace-wrapping fix | No diagnostic |
+| Any use of a project-banned identifier path | `banned-identifier` reports the configured path and hint | No diagnostic |
 
 Both servers still report Zig parser and compiler errors, and both can apply
 the compiler's `var` to `const` fix. zig-analyzer's broader action set includes
@@ -187,10 +188,18 @@ Configure severities in `zig-analyzer.json`:
     "correctness": "warning",
     "rules": {
       "discarded-error": "warning"
-    }
+    },
+    "banned": [
+      { "path": "std.BoundedArray", "hint": "use stdx.BoundedArrayType" }
+    ]
   }
 }
 ```
+
+Each `banned` entry names a complete dotted identifier path to reject, with an
+optional `hint` appended to the diagnostic. Configuring a non-empty list turns
+the `banned-identifier` rule on at warning severity; `lints.rules` can still
+pick another severity.
 
 The profiles are cumulative:
 

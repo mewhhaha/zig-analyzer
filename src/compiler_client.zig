@@ -177,6 +177,9 @@ pub const Client = struct {
             return error.MalformedResponse;
         }
         const list = try client.reader.interface.takeStruct(protocol.DeclarationList, .little);
+        if (list.declaration_count > (header.body_length - @sizeOf(protocol.DeclarationList)) / @sizeOf(u32)) {
+            return error.MalformedResponse;
+        }
         const names = try allocator.alloc([]const u8, list.declaration_count);
         var names_read: usize = 0;
         errdefer {
@@ -337,6 +340,9 @@ pub const Client = struct {
             return error.MalformedResponse;
         }
         const list = try client.reader.interface.takeStruct(protocol.DeclarationList, .little);
+        if (list.declaration_count > (header.body_length - @sizeOf(protocol.DeclarationList)) / @sizeOf(u32)) {
+            return error.MalformedResponse;
+        }
         const names = try allocator.alloc([]const u8, list.declaration_count);
         var names_read: usize = 0;
         errdefer {
