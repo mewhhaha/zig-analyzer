@@ -5,6 +5,8 @@ pub const compiler_protocol = @import("compiler_protocol.zig");
 pub const compiler_client = @import("compiler_client.zig");
 pub const compiler_session = @import("compiler_session.zig");
 pub const document = @import("document.zig");
+pub const hover = @import("hover.zig");
+pub const language_hover = @import("language_hover.zig");
 pub const lsp_server = @import("lsp_server.zig");
 pub const allocation_lifecycle = @import("rules/allocation_lifecycle.zig");
 pub const memory_lint = allocation_lifecycle;
@@ -17,6 +19,8 @@ test {
     _ = compiler_client;
     _ = compiler_session;
     _ = document;
+    _ = hover;
+    _ = language_hover;
     _ = lsp_server;
     _ = allocation_lifecycle;
     _ = memory_lint;

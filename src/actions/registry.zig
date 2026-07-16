@@ -1,12 +1,15 @@
 const std = @import("std");
 const analysis = @import("../analysis.zig");
 const action_context = @import("context.zig");
-const expression = @import("expression.zig");
-const language = @import("language.zig");
-const ownership = @import("ownership.zig");
-const testing = @import("testing.zig");
 
 pub const Candidate = action_context.Candidate;
+
+const action_modules = .{
+    @import("expression.zig"),
+    @import("ownership.zig"),
+    @import("language.zig"),
+    @import("testing.zig"),
+};
 
 pub fn actions(
     allocator: std.mem.Allocator,
@@ -24,16 +27,10 @@ pub fn actions(
         .shapes = shapes,
         .candidates = &candidates,
     };
-    try expression.run(context);
-    try ownership.run(context);
-    try language.run(context);
-    try testing.run(context);
+    inline for (action_modules) |action_module| try action_module.run(context);
     return try candidates.toOwnedSlice(allocator);
 }
 
 test {
-    _ = expression;
-    _ = language;
-    _ = ownership;
-    _ = testing;
+    _ = action_modules;
 }

@@ -7,14 +7,6 @@ pub const Description = struct {
     category: []const u8,
     summary: []const u8,
     reference: []const u8,
-
-    pub fn renderDocumentation(description: Description, allocator: std.mem.Allocator) ![]const u8 {
-        return try std.fmt.allocPrint(
-            allocator,
-            "{s}\n\n[Zig language reference]({s})",
-            .{ description.summary, description.reference },
-        );
-    }
 };
 
 pub fn describe(

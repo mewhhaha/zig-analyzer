@@ -1,89 +1,39 @@
 const RuleRun = @import("context.zig").RuleRun;
 
-const aliased_memcpy = @import("aliased_memcpy.zig");
-const banned_identifier = @import("banned_identifier.zig");
-const cleanup_after_fallible_operation = @import("cleanup_after_fallible_operation.zig");
-const cleanup_lifecycle = @import("cleanup_lifecycle.zig");
-const container_invalidation = @import("container_invalidation.zig");
-const error_idioms = @import("error_idioms.zig");
-const escaping_storage = @import("escaping_storage.zig");
-const invalidated_container_view = @import("invalidated_container_view.zig");
-const inclusive_index_bound = @import("inclusive_index_bound.zig");
-const missing_errdefer = @import("missing_errdefer.zig");
-const needless_defer_block = @import("needless_defer_block.zig");
-const needless_empty_else = @import("needless_empty_else.zig");
-const negated_comptime_expression = @import("negated_comptime_expression.zig");
-const optional_switch_idioms = @import("optional_switch_idioms.zig");
-const prefer_testing_expect_equal_strings = @import("prefer_testing_expect_equal_strings.zig");
-const redundant_boolean_if = @import("redundant_boolean_if.zig");
-const redundant_optional_unwrap = @import("redundant_optional_unwrap.zig");
-const returning_local_slice = @import("returning_local_slice.zig");
-const returning_released_value = @import("returning_released_value.zig");
-const testing_idioms = @import("testing_idioms.zig");
-const unbraced_multiline_if = @import("unbraced_multiline_if.zig");
-const unconditional_busy_loop = @import("unconditional_busy_loop.zig");
-const unsigned_reverse_loop = @import("unsigned_reverse_loop.zig");
-const unsafe_orelse_unreachable = @import("unsafe_orelse_unreachable.zig");
-const usize_in_packed_struct = @import("usize_in_packed_struct.zig");
-const truncating_intcast = @import("truncating_intcast.zig");
-const padded_byte_compare = @import("padded_byte_compare.zig");
+const rule_modules = .{
+    @import("aliased_memcpy.zig"),
+    @import("banned_identifier.zig"),
+    @import("cleanup_after_fallible_operation.zig"),
+    @import("cleanup_lifecycle.zig"),
+    @import("container_invalidation.zig"),
+    @import("escaping_storage.zig"),
+    @import("invalidated_container_view.zig"),
+    @import("inclusive_index_bound.zig"),
+    @import("missing_errdefer.zig"),
+    @import("needless_defer_block.zig"),
+    @import("needless_empty_else.zig"),
+    @import("negated_comptime_expression.zig"),
+    @import("redundant_boolean_if.zig"),
+    @import("returning_local_slice.zig"),
+    @import("returning_released_value.zig"),
+    @import("unbraced_multiline_if.zig"),
+    @import("unconditional_busy_loop.zig"),
+    @import("unsigned_reverse_loop.zig"),
+    @import("unsafe_orelse_unreachable.zig"),
+    @import("usize_in_packed_struct.zig"),
+    @import("redundant_optional_unwrap.zig"),
+    @import("error_idioms.zig"),
+    @import("optional_switch_idioms.zig"),
+    @import("prefer_testing_expect_equal_strings.zig"),
+    @import("testing_idioms.zig"),
+    @import("truncating_intcast.zig"),
+    @import("padded_byte_compare.zig"),
+};
 
 pub fn run(context: RuleRun) !void {
-    try aliased_memcpy.run(context);
-    try banned_identifier.run(context);
-    try cleanup_after_fallible_operation.run(context);
-    try cleanup_lifecycle.run(context);
-    try container_invalidation.run(context);
-    try escaping_storage.run(context);
-    try invalidated_container_view.run(context);
-    try inclusive_index_bound.run(context);
-    try missing_errdefer.run(context);
-    try needless_defer_block.run(context);
-    try needless_empty_else.run(context);
-    try negated_comptime_expression.run(context);
-    try redundant_boolean_if.run(context);
-    try returning_local_slice.run(context);
-    try returning_released_value.run(context);
-    try unbraced_multiline_if.run(context);
-    try unconditional_busy_loop.run(context);
-    try unsigned_reverse_loop.run(context);
-    try unsafe_orelse_unreachable.run(context);
-    try usize_in_packed_struct.run(context);
-    try redundant_optional_unwrap.run(context);
-    try error_idioms.run(context);
-    try optional_switch_idioms.run(context);
-    try prefer_testing_expect_equal_strings.run(context);
-    try testing_idioms.run(context);
-    try truncating_intcast.run(context);
-    try padded_byte_compare.run(context);
+    inline for (rule_modules) |rule_module| try rule_module.run(context);
 }
 
 test {
-    _ = aliased_memcpy;
-    _ = banned_identifier;
-    _ = cleanup_after_fallible_operation;
-    _ = cleanup_lifecycle;
-    _ = container_invalidation;
-    _ = error_idioms;
-    _ = escaping_storage;
-    _ = invalidated_container_view;
-    _ = inclusive_index_bound;
-    _ = missing_errdefer;
-    _ = needless_defer_block;
-    _ = needless_empty_else;
-    _ = negated_comptime_expression;
-    _ = prefer_testing_expect_equal_strings;
-    _ = redundant_boolean_if;
-    _ = redundant_optional_unwrap;
-    _ = returning_local_slice;
-    _ = returning_released_value;
-    _ = optional_switch_idioms;
-    _ = testing_idioms;
-    _ = unbraced_multiline_if;
-    _ = unconditional_busy_loop;
-    _ = unsigned_reverse_loop;
-    _ = unsafe_orelse_unreachable;
-    _ = usize_in_packed_struct;
-    _ = truncating_intcast;
-    _ = padded_byte_compare;
+    _ = rule_modules;
 }
