@@ -111,7 +111,7 @@ compiler nor ZLS will ever mention:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-116 rules, stable codes, five focused profiles, quick fixes wherever the
+120 rules, stable codes, five focused profiles, quick fixes wherever the
 rewrite is provable, plus refactors ZLS doesn't attempt (`toOwnedSlice`
 returns, `defer`→`errdefer` transfer, `inline else` collapses, `orelse
 unreachable` → `.?`). Configure in `zig-analyzer.json`, suppress in source:
@@ -120,6 +120,25 @@ unreachable` → `.?`). Configure in `zig-analyzer.json`, suppress in source:
 `modernize` targets pinned-release migrations, while `disciplined` enables the
 bounded-loop, allocation, recursion, assertion, and function-size policies as
 an independent set.
+
+Project contracts make the strongest proofs extensible without heuristics:
+
+```json
+{
+  "contracts": {
+    "imports": [{ "from": "src/rules", "deny": ["src/lsp_server.zig"] }],
+    "resources": [{ "acquire": "Db.open", "release": "Db.close" }],
+    "must-use": ["Builder.finish"]
+  }
+}
+```
+
+The CLI also builds conservative function summaries across direct calls.
+Borrowing, release, escape, allocator provenance, and owned returns flow across
+files; recursion, function pointers, ambiguous names, and unresolved calls stay
+opaque. Opt-in compiler-backed project rules can compare public type shapes
+across analyzed build roots and report public declarations outside every
+successfully analyzed root's import graph.
 
 ```json
 {

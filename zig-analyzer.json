@@ -2,6 +2,14 @@
   "check": {
     "exclude": [".claude", "tmp"]
   },
+  "contracts": {
+    "imports": [
+      {
+        "from": "src/rules",
+        "deny": ["src/lsp_server.zig"]
+      }
+    ]
+  },
   "lints": {
     "profile": "idiomatic",
     "correctness": "warning",

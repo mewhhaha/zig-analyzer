@@ -57,6 +57,28 @@ pub const Cache = struct {
                 hasher.update(&.{0});
             }
         }
+        hasher.update(std.mem.asBytes(&configuration.import_boundaries.len));
+        for (configuration.import_boundaries) |boundary| {
+            hasher.update(std.mem.asBytes(&boundary.from.len));
+            hasher.update(boundary.from);
+            hasher.update(std.mem.asBytes(&boundary.denied.len));
+            for (boundary.denied) |denied| {
+                hasher.update(std.mem.asBytes(&denied.len));
+                hasher.update(denied);
+            }
+        }
+        hasher.update(std.mem.asBytes(&configuration.resource_contracts.len));
+        for (configuration.resource_contracts) |contract| {
+            hasher.update(std.mem.asBytes(&contract.acquire.len));
+            hasher.update(contract.acquire);
+            hasher.update(std.mem.asBytes(&contract.release.len));
+            hasher.update(contract.release);
+        }
+        hasher.update(std.mem.asBytes(&configuration.must_use_contracts.len));
+        for (configuration.must_use_contracts) |contract| {
+            hasher.update(std.mem.asBytes(&contract.len));
+            hasher.update(contract);
+        }
         for (configuration.check_excludes) |excluded_path| {
             hasher.update(std.mem.asBytes(&excluded_path.len));
             hasher.update(excluded_path);
@@ -177,4 +199,10 @@ test "cache invalidates source path and configuration changes" {
     var settings_cache = Cache.init(io, temporary.dir, settings_configuration);
     defer settings_cache.deinit(io);
     try std.testing.expect(settings_cache.load(io, allocator, "src/main.zig", "fn missing") == null);
+
+    var contract_configuration = analysis.Configuration.defaults();
+    contract_configuration.must_use_contracts = &.{"Builder.finish"};
+    var contract_cache = Cache.init(io, temporary.dir, contract_configuration);
+    defer contract_cache.deinit(io);
+    try std.testing.expect(contract_cache.load(io, allocator, "src/main.zig", "fn missing") == null);
 }

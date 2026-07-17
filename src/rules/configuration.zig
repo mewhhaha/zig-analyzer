@@ -62,6 +62,13 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
         }
     }
 
+    if (root.get("contracts")) |contracts_value| {
+        if (try parseContracts(allocator, contracts_value, &configuration)) |warning| {
+            configuration.warning = warning;
+            return configuration;
+        }
+    }
+
     const lints_value = root.get("lints") orelse {
         if (removed_format) configuration.warning = try removedFormatWarning(allocator);
         return configuration;
@@ -220,6 +227,157 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
     }
     if (removed_format) configuration.warning = try removedFormatWarning(allocator);
     return configuration;
+}
+
+fn parseContracts(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    configuration: *Configuration,
+) !?[]const u8 {
+    const contracts = switch (value) {
+        .object => |object| object,
+        else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts' must contain an object"),
+    };
+    var keys = contracts.iterator();
+    while (keys.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "imports") or std.mem.eql(u8, key, "resources") or
+            std.mem.eql(u8, key, "must-use")) continue;
+        return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts' contains unknown key '{s}'", .{key});
+    }
+
+    if (contracts.get("imports")) |imports_value| {
+        const entries = switch (imports_value) {
+            .array => |array| array.items,
+            else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.imports' must contain an array of objects"),
+        };
+        const boundaries = try allocator.alloc(rule_types.ImportBoundary, entries.len);
+        for (entries, boundaries) |entry_value, *boundary| {
+            const entry = switch (entry_value) {
+                .object => |object| object,
+                else => return try allocator.dupe(u8, "zig-analyzer.json entries in 'contracts.imports' must contain objects with 'from' and 'deny'"),
+            };
+            var entry_keys = entry.iterator();
+            while (entry_keys.next()) |pair| {
+                if (std.mem.eql(u8, pair.key_ptr.*, "from") or std.mem.eql(u8, pair.key_ptr.*, "deny")) continue;
+                return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts.imports' contains unknown key '{s}'", .{pair.key_ptr.*});
+            }
+            const from_result = try contractRelativePath(allocator, entry.get("from") orelse return try allocator.dupe(
+                u8,
+                "zig-analyzer.json entries in 'contracts.imports' require a 'from' path",
+            ), "contracts.imports.from");
+            const from = switch (from_result) {
+                .value => |path| path,
+                .warning => |warning| return warning,
+            };
+            const denied_values = switch (entry.get("deny") orelse return try allocator.dupe(
+                u8,
+                "zig-analyzer.json entries in 'contracts.imports' require a 'deny' array",
+            )) {
+                .array => |array| array.items,
+                else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.imports.deny' must contain an array of relative paths"),
+            };
+            if (denied_values.len == 0) return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.imports.deny' must not be empty");
+            const denied = try allocator.alloc([]const u8, denied_values.len);
+            for (denied_values, denied) |denied_value, *denied_path| {
+                const denied_result = try contractRelativePath(allocator, denied_value, "contracts.imports.deny");
+                denied_path.* = switch (denied_result) {
+                    .value => |path| path,
+                    .warning => |warning| return warning,
+                };
+            }
+            boundary.* = .{ .from = from, .denied = denied };
+        }
+        configuration.import_boundaries = boundaries;
+        if (boundaries.len != 0) configuration.levels[@intFromEnum(Rule.import_boundary)] = .warning;
+    }
+
+    if (contracts.get("resources")) |resources_value| {
+        const entries = switch (resources_value) {
+            .array => |array| array.items,
+            else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.resources' must contain an array of objects"),
+        };
+        const resources = try allocator.alloc(rule_types.ResourceContract, entries.len);
+        for (entries, resources) |entry_value, *resource| {
+            const entry = switch (entry_value) {
+                .object => |object| object,
+                else => return try allocator.dupe(u8, "zig-analyzer.json entries in 'contracts.resources' must contain objects with 'acquire' and 'release'"),
+            };
+            var entry_keys = entry.iterator();
+            while (entry_keys.next()) |pair| {
+                if (std.mem.eql(u8, pair.key_ptr.*, "acquire") or std.mem.eql(u8, pair.key_ptr.*, "release")) continue;
+                return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts.resources' contains unknown key '{s}'", .{pair.key_ptr.*});
+            }
+            const acquire_result = try callableContract(allocator, entry.get("acquire") orelse return try allocator.dupe(
+                u8,
+                "zig-analyzer.json entries in 'contracts.resources' require an 'acquire' callable",
+            ), "contracts.resources.acquire");
+            const acquire = switch (acquire_result) {
+                .value => |callable| callable,
+                .warning => |warning| return warning,
+            };
+            const release_result = try callableContract(allocator, entry.get("release") orelse return try allocator.dupe(
+                u8,
+                "zig-analyzer.json entries in 'contracts.resources' require a 'release' callable",
+            ), "contracts.resources.release");
+            const release = switch (release_result) {
+                .value => |callable| callable,
+                .warning => |warning| return warning,
+            };
+            resource.* = .{ .acquire = acquire, .release = release };
+        }
+        configuration.resource_contracts = resources;
+    }
+
+    if (contracts.get("must-use")) |must_use_value| {
+        const entries = switch (must_use_value) {
+            .array => |array| array.items,
+            else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.must-use' must contain an array of callable strings"),
+        };
+        const callables = try allocator.alloc([]const u8, entries.len);
+        for (entries, callables) |entry, *callable| {
+            const callable_result = try callableContract(allocator, entry, "contracts.must-use");
+            callable.* = switch (callable_result) {
+                .value => |name| name,
+                .warning => |warning| return warning,
+            };
+        }
+        configuration.must_use_contracts = callables;
+        if (callables.len != 0) configuration.levels[@intFromEnum(Rule.discarded_must_use)] = .warning;
+    }
+    return null;
+}
+
+const ParsedString = union(enum) { value: []const u8, warning: []const u8 };
+
+fn contractRelativePath(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    key: []const u8,
+) !ParsedString {
+    const path = switch (value) {
+        .string => |string| string,
+        else => return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' must be a relative path string", .{key}) },
+    };
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or containsParentPathComponent(path)) {
+        return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' path '{s}' must be non-empty, relative, and contain no '..' component", .{ key, path }) };
+    }
+    return .{ .value = try allocator.dupe(u8, std.mem.trimEnd(u8, path, "/\\")) };
+}
+
+fn callableContract(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    key: []const u8,
+) !ParsedString {
+    const callable = switch (value) {
+        .string => |string| string,
+        else => return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' must contain callable strings", .{key}) },
+    };
+    if (!validBannedPath(callable)) {
+        return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' callable '{s}' must be identifiers separated by single dots", .{ key, callable }) };
+    }
+    return .{ .value = try allocator.dupe(u8, callable) };
 }
 
 fn parseRuleSettings(
@@ -702,6 +860,51 @@ test "configuration parses banned identifiers and activates the rule" {
     try std.testing.expectEqualStrings("use stdx.BoundedArrayType", configuration.banned[0].hint.?);
     try std.testing.expectEqual(@as(?[]const u8, null), configuration.banned[1].hint);
     try std.testing.expectEqual(Level.warning, configuration.level(.banned_identifier));
+}
+
+test "configuration parses project contracts and activates contract rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{
+        \\  "contracts": {
+        \\    "imports": [{"from":"src/rules","deny":["src/lsp_server.zig"]}],
+        \\    "resources": [{"acquire":"Db.open","release":"Db.close"}],
+        \\    "must-use": ["Builder.finish"]
+        \\  }
+        \\}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    try std.testing.expectEqualStrings("src/rules", configuration.import_boundaries[0].from);
+    try std.testing.expectEqualStrings("src/lsp_server.zig", configuration.import_boundaries[0].denied[0]);
+    try std.testing.expectEqualStrings("Db.open", configuration.resource_contracts[0].acquire);
+    try std.testing.expectEqualStrings("Db.close", configuration.resource_contracts[0].release);
+    try std.testing.expectEqualStrings("Builder.finish", configuration.must_use_contracts[0]);
+    try std.testing.expectEqual(Level.warning, configuration.level(.import_boundary));
+    try std.testing.expectEqual(Level.warning, configuration.level(.discarded_must_use));
+}
+
+test "malformed project contracts identify the invalid contract field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: []const u8, expected: []const u8 }{
+        .{
+            .source = "{\"contracts\":{\"imports\":[{\"from\":\"../rules\",\"deny\":[\"src/lsp_server.zig\"]}]}}",
+            .expected = "contracts.imports.from",
+        },
+        .{
+            .source = "{\"contracts\":{\"resources\":[{\"acquire\":\"Db..open\",\"release\":\"Db.close\"}]}}",
+            .expected = "Db..open",
+        },
+        .{
+            .source = "{\"contracts\":{\"must-use\":[3]}}",
+            .expected = "contracts.must-use",
+        },
+    };
+    for (cases) |case| {
+        const configuration = try parse(arena.allocator(), case.source);
+        try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, case.expected) != null);
+    }
 }
 
 test "an explicit rule level overrides the banned default" {

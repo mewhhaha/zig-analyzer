@@ -6,6 +6,7 @@ const rule_modules = .{
     @import("cleanup_after_fallible_operation.zig"),
     @import("cleanup_lifecycle.zig"),
     @import("container_invalidation.zig"),
+    @import("discarded_must_use.zig"),
     @import("escaping_storage.zig"),
     @import("invalidated_container_view.zig"),
     @import("inclusive_index_bound.zig"),

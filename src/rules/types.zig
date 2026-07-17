@@ -125,6 +125,10 @@ pub const Rule = enum {
     comptime_parameter_order,
     todo_comment,
     assertion_free_test,
+    import_boundary,
+    discarded_must_use,
+    configuration_divergent_api,
+    unreachable_public_declaration,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -174,6 +178,8 @@ pub const Rule = enum {
             .exposed_private_error_set,
             .deprecated_declaration,
             .mutated_container_copy,
+            .import_boundary,
+            .discarded_must_use,
             => .correctness,
             else => .style,
         };
@@ -263,10 +269,23 @@ pub const BannedIdentifier = struct {
     hint: ?[]const u8 = null,
 };
 
+pub const ImportBoundary = struct {
+    from: []const u8,
+    denied: []const []const u8,
+};
+
+pub const ResourceContract = struct {
+    acquire: []const u8,
+    release: []const u8,
+};
+
 pub const Configuration = struct {
     levels: [std.meta.fields(Rule).len]Level,
     lint_profile: LintProfile = .none,
     banned: []const BannedIdentifier = &.{},
+    import_boundaries: []const ImportBoundary = &.{},
+    resource_contracts: []const ResourceContract = &.{},
+    must_use_contracts: []const []const u8 = &.{},
     check_excludes: []const []const u8 = &.{},
     function_length_limit: usize = 70,
     line_length_limit: usize = 100,
@@ -277,7 +296,10 @@ pub const Configuration = struct {
     pub fn defaults() Configuration {
         var levels: [std.meta.fields(Rule).len]Level = undefined;
         for (std.enums.values(Rule)) |rule| {
-            levels[@intFromEnum(rule)] = switch (rule.tier()) {
+            levels[@intFromEnum(rule)] = if (rule == .import_boundary or rule == .discarded_must_use or
+                rule == .configuration_divergent_api or rule == .unreachable_public_declaration)
+                .off
+            else switch (rule.tier()) {
                 .semantic => .@"error",
                 .correctness => .warning,
                 .style => .off,

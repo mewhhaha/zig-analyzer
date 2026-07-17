@@ -1,12 +1,31 @@
 const std = @import("std");
 
+const syntax_scope = @import("../syntax_scope.zig");
+const allocation_lifecycle = @import("allocation_lifecycle.zig");
 const generated_source = @import("generated_source.zig");
+const summaries = @import("summaries.zig");
 const types = @import("types.zig");
 
 pub const SourceFile = struct {
     path: []const u8,
     source: [:0]const u8,
     tokens: ?[]const std.zig.Token = null,
+};
+
+pub const CompilerShape = struct {
+    name: []const u8,
+    kind: enum { enumeration, tagged_union, structure },
+    fields: []const []const u8,
+};
+
+pub const CompilerUnitFacts = struct {
+    root_path: []const u8,
+    shapes: []const CompilerShape,
+};
+
+pub const CompilerFacts = struct {
+    units: []const CompilerUnitFacts = &.{},
+    roots_complete: bool = false,
 };
 
 const IndexedSourceFile = struct {
@@ -36,6 +55,15 @@ pub fn findings(
     files: []const SourceFile,
     configuration: types.Configuration,
 ) ![]const Finding {
+    return findingsWithCompilerFacts(allocator, files, configuration, .{});
+}
+
+pub fn findingsWithCompilerFacts(
+    allocator: std.mem.Allocator,
+    files: []const SourceFile,
+    configuration: types.Configuration,
+    compiler_facts: CompilerFacts,
+) ![]const Finding {
     if (configuration.level(.duplicate_module_import) == .off and
         configuration.level(.duplicate_c_import) == .off and
         configuration.level(.unreferenced_test_file) == .off and
@@ -45,7 +73,11 @@ pub fn findings(
         configuration.level(.inconsistent_parameter_vocabulary) == .off and
         configuration.level(.inconsistent_error_set_style) == .off and
         configuration.level(.allocation_after_init) == .off and
-        configuration.level(.recursive_call) == .off) return &.{};
+        configuration.level(.recursive_call) == .off and
+        configuration.level(.import_boundary) == .off and
+        configuration.level(.configuration_divergent_api) == .off and
+        configuration.level(.unreachable_public_declaration) == .off and
+        !allocation_lifecycle.enabled(configuration)) return &.{};
     const indexed_files = try allocator.alloc(IndexedSourceFile, files.len);
     for (files, indexed_files) |file, *indexed_file| indexed_file.* = .{
         .path = file.path,
@@ -55,7 +87,9 @@ pub fn findings(
     var found: std.ArrayList(Finding) = .empty;
     const imports = if (configuration.level(.duplicate_module_import) != .off or
         configuration.level(.unreferenced_test_file) != .off or
-        configuration.level(.inconsistent_import_alias) != .off)
+        configuration.level(.inconsistent_import_alias) != .off or
+        configuration.level(.import_boundary) != .off or
+        configuration.level(.unreachable_public_declaration) != .off)
         try collectImports(allocator, indexed_files)
     else
         &.{};
@@ -69,6 +103,10 @@ pub fn findings(
     try findInconsistentErrorSetStyle(allocator, indexed_files, configuration, &found);
     try findAllocationsAfterInit(allocator, indexed_files, configuration, &found);
     try findRecursiveCalls(allocator, indexed_files, configuration, &found);
+    try findImportBoundaryViolations(allocator, indexed_files, imports, configuration, &found);
+    try findSummaryLifecycleDifferences(allocator, indexed_files, configuration, &found);
+    try findConfigurationDivergentApis(allocator, indexed_files, configuration, compiler_facts, &found);
+    try findUnreachablePublicDeclarations(allocator, indexed_files, imports, configuration, compiler_facts, &found);
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
             if (left.file_index != right.file_index) return left.file_index < right.file_index;
@@ -77,6 +115,236 @@ pub fn findings(
         }
     }.lessThan);
     return try found.toOwnedSlice(allocator);
+}
+
+fn findSummaryLifecycleDifferences(
+    allocator: std.mem.Allocator,
+    files: []const IndexedSourceFile,
+    configuration: types.Configuration,
+    found: *std.ArrayList(Finding),
+) !void {
+    if (!allocation_lifecycle.enabled(configuration) or files.len < 2) return;
+    const sources = try allocator.alloc(summaries.Source, files.len);
+    for (files, sources, 0..) |file, *source, file_index| source.* = .{
+        .file_index = file_index,
+        .path = file.path,
+        .source = file.source,
+        .tokens = file.tokens,
+    };
+    var summary_index = try summaries.build(allocator, sources, configuration);
+    defer summary_index.deinit(allocator);
+
+    for (files, 0..) |file, file_index| {
+        var tree = try std.zig.Ast.parse(allocator, file.source, .zig);
+        defer tree.deinit(allocator);
+        var scope_index = try syntax_scope.Index.init(allocator, file.source, file.tokens);
+        defer scope_index.deinit();
+        const project_warnings = try allocation_lifecycle.warningsWithSummaries(
+            allocator,
+            file.source,
+            &tree,
+            file.tokens,
+            &scope_index,
+            summary_index,
+        );
+        const local_warnings = try allocation_lifecycle.warningsWithSyntax(
+            allocator,
+            file.source,
+            &tree,
+            file.tokens,
+            &scope_index,
+            configuration,
+        );
+        for (project_warnings) |warning| {
+            if (containsLifecycleWarning(local_warnings, warning)) continue;
+            try found.append(allocator, .{
+                .file_index = file_index,
+                .rule = warning.rule,
+                .span = warning.span,
+                .message = warning.message,
+            });
+        }
+    }
+}
+
+fn containsLifecycleWarning(
+    warnings: []const allocation_lifecycle.Warning,
+    candidate: allocation_lifecycle.Warning,
+) bool {
+    for (warnings) |warning| {
+        if (warning.rule == candidate.rule and warning.span.start == candidate.span.start and
+            warning.span.end == candidate.span.end) return true;
+    }
+    return false;
+}
+
+fn findConfigurationDivergentApis(
+    allocator: std.mem.Allocator,
+    files: []const IndexedSourceFile,
+    configuration: types.Configuration,
+    compiler_facts: CompilerFacts,
+    found: *std.ArrayList(Finding),
+) !void {
+    if (configuration.level(.configuration_divergent_api) == .off or compiler_facts.units.len < 2) return;
+    var reported: std.StringHashMapUnmanaged(void) = .empty;
+    for (compiler_facts.units, 0..) |left_unit, left_index| {
+        for (left_unit.shapes) |left_shape| {
+            for (compiler_facts.units[left_index + 1 ..]) |right_unit| {
+                const right_shape = shapeNamed(right_unit.shapes, left_shape.name) orelse continue;
+                if (shapesEqual(left_shape, right_shape) or reported.contains(left_shape.name)) continue;
+                const name = declarationBaseName(left_shape.name);
+                const location = publicDeclarationNamed(files, name) orelse continue;
+                try reported.put(allocator, left_shape.name, {});
+                try found.append(allocator, .{
+                    .file_index = location.file_index,
+                    .rule = .configuration_divergent_api,
+                    .span = location.span,
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "public declaration '{s}' has different compiler-resolved shapes in compile units '{s}' and '{s}'",
+                        .{ name, left_unit.root_path, right_unit.root_path },
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn findUnreachablePublicDeclarations(
+    allocator: std.mem.Allocator,
+    files: []const IndexedSourceFile,
+    imports: []const Import,
+    configuration: types.Configuration,
+    compiler_facts: CompilerFacts,
+    found: *std.ArrayList(Finding),
+) !void {
+    if (configuration.level(.unreachable_public_declaration) == .off or
+        compiler_facts.units.len == 0 or !compiler_facts.roots_complete) return;
+    const reachable = try allocator.alloc(bool, files.len);
+    @memset(reachable, false);
+    for (compiler_facts.units) |unit| {
+        for (files, 0..) |file, file_index| {
+            if (std.mem.eql(u8, file.path, unit.root_path)) reachable[file_index] = true;
+        }
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (imports) |import| {
+            if (!reachable[import.file_index]) continue;
+            for (files, 0..) |file, imported_index| {
+                if (reachable[imported_index] or !std.mem.eql(u8, file.path, import.resolved_path)) continue;
+                reachable[imported_index] = true;
+                changed = true;
+            }
+        }
+    }
+    for (imports) |import| {
+        if (!reachable[import.file_index] or std.mem.endsWith(u8, import.spelling, ".zig") or
+            std.mem.eql(u8, import.spelling, "std") or std.mem.eql(u8, import.spelling, "builtin") or
+            std.mem.eql(u8, import.spelling, "root")) continue;
+        return;
+    }
+    for (files, 0..) |file, file_index| {
+        if (reachable[file_index] or std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig")) continue;
+        for (file.tokens, 0..) |token, pub_index| {
+            if (token.tag != .keyword_pub or pub_index + 2 >= file.tokens.len) continue;
+            const name_index = if (file.tokens[pub_index + 1].tag == .keyword_fn or
+                file.tokens[pub_index + 1].tag == .keyword_const or
+                file.tokens[pub_index + 1].tag == .keyword_var)
+                pub_index + 2
+            else
+                continue;
+            if (file.tokens[name_index].tag != .identifier) continue;
+            const name = tokenText(file.source, file.tokens[name_index]);
+            try found.append(allocator, .{
+                .file_index = file_index,
+                .rule = .unreachable_public_declaration,
+                .span = file.tokens[name_index].loc,
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "public declaration '{s}' is reachable from none of the {d} compiler-analyzed compile units",
+                    .{ name, compiler_facts.units.len },
+                ),
+            });
+        }
+    }
+}
+
+const PublicDeclarationLocation = struct { file_index: usize, span: std.zig.Token.Loc };
+
+fn publicDeclarationNamed(files: []const IndexedSourceFile, name: []const u8) ?PublicDeclarationLocation {
+    var selected: ?PublicDeclarationLocation = null;
+    for (files, 0..) |file, file_index| {
+        for (file.tokens, 0..) |token, index| {
+            if (token.tag != .keyword_pub or index + 2 >= file.tokens.len or
+                (file.tokens[index + 1].tag != .keyword_const and file.tokens[index + 1].tag != .keyword_var) or
+                file.tokens[index + 2].tag != .identifier or !tokenIs(file.source, file.tokens[index + 2], name)) continue;
+            if (selected != null) return null;
+            selected = .{ .file_index = file_index, .span = file.tokens[index + 2].loc };
+        }
+    }
+    return selected;
+}
+
+fn shapeNamed(shapes: []const CompilerShape, name: []const u8) ?CompilerShape {
+    var selected: ?CompilerShape = null;
+    for (shapes) |shape| {
+        if (!std.mem.eql(u8, shape.name, name)) continue;
+        if (selected != null) return null;
+        selected = shape;
+    }
+    return selected;
+}
+
+fn shapesEqual(left: CompilerShape, right: CompilerShape) bool {
+    if (left.kind != right.kind or left.fields.len != right.fields.len) return false;
+    for (left.fields, right.fields) |left_field, right_field| {
+        if (!std.mem.eql(u8, left_field, right_field)) return false;
+    }
+    return true;
+}
+
+fn declarationBaseName(declaration: []const u8) []const u8 {
+    const separator = std.mem.lastIndexOfScalar(u8, declaration, '.') orelse return declaration;
+    return declaration[separator + 1 ..];
+}
+
+fn findImportBoundaryViolations(
+    allocator: std.mem.Allocator,
+    files: []const IndexedSourceFile,
+    imports: []const Import,
+    configuration: types.Configuration,
+    found: *std.ArrayList(Finding),
+) !void {
+    if (configuration.level(.import_boundary) == .off) return;
+    for (imports) |import| {
+        const source_path = files[import.file_index].path;
+        for (configuration.import_boundaries) |boundary| {
+            if (!pathMatchesContract(source_path, boundary.from)) continue;
+            for (boundary.denied) |denied| {
+                if (!pathMatchesContract(import.resolved_path, denied)) continue;
+                try found.append(allocator, .{
+                    .file_index = import.file_index,
+                    .rule = .import_boundary,
+                    .span = import.span,
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "source '{s}' may not import '{s}' because contract '{s}' denies '{s}'",
+                        .{ source_path, import.resolved_path, boundary.from, denied },
+                    ),
+                });
+                break;
+            }
+        }
+    }
+}
+
+fn pathMatchesContract(path: []const u8, contract: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, contract)) return false;
+    if (path.len == contract.len) return true;
+    if (contract.len != 0 and std.fs.path.isSep(contract[contract.len - 1])) return true;
+    return std.fs.path.isSep(path[contract.len]);
 }
 
 fn findDuplicateModuleImports(
@@ -840,4 +1108,89 @@ test "disciplined project rules report direct allocation and recursion" {
     };
     try std.testing.expect(saw_allocation);
     try std.testing.expect(saw_recursion);
+}
+
+test "declared import boundaries reject matching project imports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.import_boundaries = &.{.{
+        .from = "src/rules",
+        .denied = &.{"src/lsp_server.zig"},
+    }};
+    configuration.levels[@intFromEnum(types.Rule.import_boundary)] = .warning;
+    const files = [_]SourceFile{.{
+        .path = "src/rules/example.zig",
+        .source = "const lsp = @import(\"../lsp_server.zig\");",
+    }};
+    const found = try findings(arena.allocator(), &files, configuration);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.import_boundary, found[0].rule);
+}
+
+test "project summaries expose leaks hidden by cross-file borrowing calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const files = [_]SourceFile{
+        .{ .path = "src/inspect.zig", .source = "pub fn inspect(bytes: []u8) void { _ = bytes.len; }" },
+        .{ .path = "src/main.zig", .source = "const inspection = @import(\"inspect.zig\"); fn run(allocator: std.mem.Allocator) !void { const bytes = try allocator.alloc(u8, 4); inspection.inspect(bytes); }" },
+    };
+    const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+    try std.testing.expectEqual(@as(usize, 1), found[0].file_index);
+}
+
+test "compiler facts report divergent APIs and unreachable public declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.configuration_divergent_api)] = .warning;
+    configuration.levels[@intFromEnum(types.Rule.unreachable_public_declaration)] = .warning;
+    const files = [_]SourceFile{.{
+        .path = "src/api.zig",
+        .source = "pub const Api = struct {}; pub fn detached() void {}",
+    }};
+    const compiler_facts: CompilerFacts = .{ .roots_complete = true, .units = &.{
+        .{
+            .root_path = "src/linux.zig",
+            .shapes = &.{.{ .name = "shared.Api", .kind = .structure, .fields = &.{"linux"} }},
+        },
+        .{
+            .root_path = "src/windows.zig",
+            .shapes = &.{.{ .name = "shared.Api", .kind = .structure, .fields = &.{"windows"} }},
+        },
+    } };
+    const found = try findingsWithCompilerFacts(arena.allocator(), &files, configuration, compiler_facts);
+    var saw_divergence = false;
+    var saw_unreachable = false;
+    for (found) |finding| switch (finding.rule) {
+        .configuration_divergent_api => saw_divergence = true,
+        .unreachable_public_declaration => saw_unreachable = true,
+        else => {},
+    };
+    try std.testing.expect(saw_divergence);
+    try std.testing.expect(saw_unreachable);
+
+    var incomplete_facts = compiler_facts;
+    incomplete_facts.roots_complete = false;
+    const incomplete = try findingsWithCompilerFacts(arena.allocator(), &files, configuration, incomplete_facts);
+    for (incomplete) |finding| try std.testing.expect(finding.rule != .unreachable_public_declaration);
+}
+
+test "unresolved named modules keep reachability findings opaque" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.unreachable_public_declaration)] = .warning;
+    const files = [_]SourceFile{
+        .{ .path = "src/main.zig", .source = "const custom = @import(\"custom\"); pub fn run() void { _ = custom; }" },
+        .{ .path = "src/detached.zig", .source = "pub fn detached() void {}" },
+    };
+    const compiler_facts: CompilerFacts = .{
+        .roots_complete = true,
+        .units = &.{.{ .root_path = "src/main.zig", .shapes = &.{} }},
+    };
+    const found = try findingsWithCompilerFacts(arena.allocator(), &files, configuration, compiler_facts);
+    for (found) |finding| try std.testing.expect(finding.rule != .unreachable_public_declaration);
 }

@@ -2,6 +2,8 @@ const std = @import("std");
 
 const analysis = @import("analysis.zig");
 const check_cache = @import("check_cache.zig");
+const compile_units = @import("compile_units.zig");
+const compiler_session = @import("compiler_session.zig");
 const generated_source = @import("rules/generated_source.zig");
 const project_rules = @import("rules/project.zig");
 
@@ -106,8 +108,8 @@ fn runWithWriter(
         const display_path = try displayPath(arena, root, loaded_file.relative_path);
         try writer.print("{s}: information[generated-source]: skipped translate-c output\n", .{display_path});
     }
-    if (loaded_files.len > 1) {
-        try reportProjectFindings(arena, root, loaded_files, configuration, writer, &summary);
+    if (loaded_files.len > 1 or configuration.level(.import_boundary) != .off) {
+        try reportProjectFindings(io, arena, root, loaded_files, configuration, writer, &summary);
     }
     const file_results = try arena.alloc(FileCheckResult, loaded_files.len);
     for (file_results) |*result| result.* = .{};
@@ -144,6 +146,7 @@ fn runWithWriter(
 }
 
 fn reportProjectFindings(
+    io: std.Io,
     allocator: std.mem.Allocator,
     root: ScanRoot,
     loaded_files: []const LoadedFile,
@@ -160,7 +163,8 @@ fn reportProjectFindings(
             .tokens = loaded_file.tokens,
         });
     }
-    const findings = try project_rules.findings(allocator, files.items, configuration);
+    const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration);
+    const findings = try project_rules.findingsWithCompilerFacts(allocator, files.items, configuration, compiler_facts);
     for (findings) |finding| {
         const file = files.items[finding.file_index];
         if (analysis.isSuppressed(file.source, finding.rule, finding.span.start)) continue;
@@ -178,6 +182,108 @@ fn reportProjectFindings(
         });
         summary.findings += 1;
     }
+}
+
+fn collectCompilerFacts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    loaded_files: []const LoadedFile,
+    configuration: analysis.Configuration,
+) !project_rules.CompilerFacts {
+    if (configuration.level(.configuration_divergent_api) == .off and
+        configuration.level(.unreachable_public_declaration) == .off) return .{};
+    const public_type_names = try collectPublicTypeNames(allocator, loaded_files);
+    var root_paths: std.ArrayList([]const u8) = .empty;
+    for (loaded_files) |loaded_file| {
+        if (!std.mem.eql(u8, std.fs.path.basename(loaded_file.relative_path), "build.zig")) continue;
+        const build_source = loaded_file.source orelse continue;
+        const build_directory = std.fs.path.dirname(try std.fs.path.join(
+            allocator,
+            &.{ root.absolute_path, loaded_file.relative_path },
+        )) orelse root.absolute_path;
+        const declared_roots = try compile_units.declaredRootSources(allocator, build_source, build_directory);
+        for (declared_roots) |root_path| {
+            if (containsCompilerRoot(root_paths.items, root_path)) continue;
+            if (root_paths.items.len == 16) return .{};
+            try root_paths.append(allocator, root_path);
+        }
+    }
+
+    var units: std.ArrayList(project_rules.CompilerUnitFacts) = .empty;
+    for (root_paths.items) |root_path| {
+        var session = compiler_session.Session.start(io, allocator, .empty, root_path) catch continue;
+        defer session.deinit();
+        const declarations = session.workspaceDeclarations(allocator) catch continue;
+        var shapes: std.ArrayList(project_rules.CompilerShape) = .empty;
+        if (configuration.level(.configuration_divergent_api) != .off) for (declarations) |declaration| {
+            if (!containsPublicTypeName(public_type_names, compilerDeclarationBaseName(declaration))) continue;
+            const resolved = session.typeShape(allocator, declaration) catch |err| switch (err) {
+                error.SemanticsUnavailable => continue,
+                else => continue,
+            };
+            try shapes.append(allocator, .{
+                .name = declaration,
+                .kind = switch (resolved.kind) {
+                    .enumeration => .enumeration,
+                    .tagged_union => .tagged_union,
+                    .structure => .structure,
+                    _ => continue,
+                },
+                .fields = resolved.fields,
+            });
+        };
+        const relative_root = try std.fs.path.relative(
+            allocator,
+            "/",
+            null,
+            root.absolute_path,
+            root_path,
+        );
+        try units.append(allocator, .{
+            .root_path = relative_root,
+            .shapes = try shapes.toOwnedSlice(allocator),
+        });
+    }
+    const roots_complete = units.items.len == root_paths.items.len;
+    return .{
+        .units = try units.toOwnedSlice(allocator),
+        .roots_complete = roots_complete,
+    };
+}
+
+fn collectPublicTypeNames(
+    allocator: std.mem.Allocator,
+    loaded_files: []const LoadedFile,
+) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (loaded_files) |loaded_file| {
+        const source = loaded_file.source orelse continue;
+        for (loaded_file.tokens, 0..) |token, index| {
+            if (token.tag != .keyword_pub or index + 3 >= loaded_file.tokens.len or
+                loaded_file.tokens[index + 1].tag != .keyword_const or
+                loaded_file.tokens[index + 2].tag != .identifier) continue;
+            const name = source[loaded_file.tokens[index + 2].loc.start..loaded_file.tokens[index + 2].loc.end];
+            if (containsPublicTypeName(names.items, name)) continue;
+            try names.append(allocator, name);
+        }
+    }
+    return try names.toOwnedSlice(allocator);
+}
+
+fn containsPublicTypeName(names: []const []const u8, candidate: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+fn compilerDeclarationBaseName(declaration: []const u8) []const u8 {
+    const separator = std.mem.lastIndexOfScalar(u8, declaration, '.') orelse return declaration;
+    return declaration[separator + 1 ..];
+}
+
+fn containsCompilerRoot(roots: []const []const u8, candidate: []const u8) bool {
+    for (roots) |root| if (std.mem.eql(u8, root, candidate)) return true;
+    return false;
 }
 
 fn openScanRoot(io: std.Io, allocator: std.mem.Allocator, requested_path: []const u8) !ScanRoot {
