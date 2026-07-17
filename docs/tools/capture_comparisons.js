@@ -519,6 +519,7 @@ async function captureExample(
         endChar: entry.range.end.character,
         code: String(entry.code ?? ""),
         message: entry.message,
+        severity: { 1: "error", 2: "warning", 3: "info", 4: "hint" }[entry.severity] ?? "info",
       }));
     }
   }
