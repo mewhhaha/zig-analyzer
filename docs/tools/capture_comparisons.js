@@ -443,8 +443,14 @@ async function captureExample(
 
   await Promise.all([analyzer.openFile(uri, text), zls.openFile(uri, text)]);
   if (example.kind === "Diagnostics") {
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline && !analyzer.diagnostics.has(uri)) {
+    // Parser diagnostics publish immediately and may be empty; the
+    // compiler-backed publish follows once the compile unit is analyzed, so
+    // wait for findings rather than for the first publish.
+    const deadline = Date.now() + 120_000;
+    while (
+      Date.now() < deadline &&
+      (analyzer.diagnostics.get(uri) ?? []).length === 0
+    ) {
       await analyzer.drain(1_000);
     }
     await analyzer.drain(3_000);

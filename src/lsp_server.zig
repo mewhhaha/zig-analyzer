@@ -330,10 +330,13 @@ pub const Server = struct {
                 .label = "Zig language reference",
                 .url = language.reference,
             },
-        } else if (token.tag == .identifier)
-            try server.hoverDescription(arena, document, token.loc) orelse return null
-        else
-            return null;
+        } else if (token.tag == .identifier) described: {
+            var description = try server.hoverDescription(arena, document, token.loc) orelse return null;
+            if (description.reference == null) {
+                description.reference = try server.typeDeclarationReference(arena, document, description.type_summary);
+            }
+            break :described description;
+        } else return null;
         return .{
             .contents = .{ .markup_content = .{
                 .kind = .markdown,
@@ -1067,10 +1070,24 @@ pub const Server = struct {
             if (try server.compilerTypeMembers(allocator, document, receiver)) |member_names| {
                 for (member_names) |member_name| {
                     if (!std.mem.eql(u8, member_name, name)) continue;
-                    if (document.declarationNamed(name)) |declaration| {
-                        return try describeBinding(allocator, document.source, declaration.span);
+                    var description = if (document.declarationNamed(name)) |declaration|
+                        try describeBinding(allocator, document.source, declaration.span)
+                    else
+                        try describeTypedMemberNamed(allocator, document.source, name);
+                    if (description) |*resolved| {
+                        if (resolved.type_summary) |summary| {
+                            if (document.declarationNamed(receiver)) |receiver_declaration| {
+                                if (try receiverTypeParameterBindings(
+                                    allocator,
+                                    document.source,
+                                    receiver_declaration.span,
+                                )) |bindings| {
+                                    resolved.type_summary = try substituteTypeParameters(allocator, summary, bindings);
+                                }
+                            }
+                        }
                     }
-                    return try describeTypedMemberNamed(allocator, document.source, name);
+                    return description;
                 }
                 return null;
             }
@@ -1170,6 +1187,40 @@ pub const Server = struct {
             return try describeBinding(allocator, source, member.span);
         }
         return null;
+    }
+
+    fn typeDeclarationReference(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        type_summary: ?[]const u8,
+    ) !?hover.Reference {
+        const summary = type_summary orelse return null;
+        const type_name = primaryTypeName(try allocator.dupeZ(u8, summary)) orelse return null;
+        if (std.mem.indexOfScalar(u8, type_name, '.') == null) {
+            const declaration = document.declarationNamed(type_name) orelse return null;
+            return .{
+                .label = try std.fmt.allocPrint(allocator, "Go to {s}", .{type_name}),
+                .url = try std.fmt.allocPrint(allocator, "{s}#L{d}", .{
+                    document.uri,
+                    lineNumberAt(document.source, declaration.span.start),
+                }),
+            };
+        }
+        const site = try server.resolveImportedTypeSite(allocator, document, type_name) orelse return null;
+        const container_start = if (site.container.start < site.file.tokens.len)
+            site.file.tokens[site.container.start].loc.start
+        else
+            0;
+        const absolute_path = try std.fs.path.resolve(allocator, &.{site.file.path});
+        const last_segment = type_name[(std.mem.lastIndexOfScalar(u8, type_name, '.') orelse 0) + 1 ..];
+        return .{
+            .label = try std.fmt.allocPrint(allocator, "Go to {s}", .{last_segment}),
+            .url = try std.fmt.allocPrint(allocator, "file://{s}#L{d}", .{
+                absolute_path,
+                lineNumberAt(site.file.source, container_start),
+            }),
+        };
     }
 
     fn importDeclarationHover(
@@ -1706,6 +1757,157 @@ const QualifiedReceiver = struct {
     expression: []const u8,
     start: usize,
 };
+
+const TypeParameterBinding = struct {
+    name: []const u8,
+    argument: []const u8,
+};
+
+/// A receiver declared as `const R = TypeFn(Args);` binds TypeFn's comptime
+/// type parameters, so member signatures can show the instantiated types the
+/// compiler analyzed instead of the generic parameter names.
+fn receiverTypeParameterBindings(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    receiver_span: std.zig.Token.Loc,
+) !?[]const TypeParameterBinding {
+    const tokens = try tokenize(allocator, source);
+    const binding_index = for (tokens, 0..) |token, index| {
+        if (token.tag == .identifier and std.meta.eql(token.loc, receiver_span)) break index;
+    } else return null;
+    if (binding_index + 3 >= tokens.len or tokens[binding_index + 1].tag != .equal or
+        tokens[binding_index + 2].tag != .identifier or tokens[binding_index + 3].tag != .l_paren) return null;
+    const callee = source[tokens[binding_index + 2].loc.start..tokens[binding_index + 2].loc.end];
+    const arguments_end = matchingSyntaxToken(tokens, binding_index + 3, .l_paren, .r_paren) orelse return null;
+    var arguments: std.ArrayList([]const u8) = .empty;
+    var argument_start = binding_index + 4;
+    var depth: usize = 0;
+    var cursor = argument_start;
+    while (cursor <= arguments_end) : (cursor += 1) {
+        switch (tokens[cursor].tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => {
+                if (cursor == arguments_end) {
+                    if (argument_start < cursor) {
+                        try arguments.append(allocator, std.mem.trim(
+                            u8,
+                            source[tokens[argument_start].loc.start..tokens[cursor - 1].loc.end],
+                            " \t\r\n",
+                        ));
+                    }
+                    break;
+                }
+                depth -|= 1;
+            },
+            .comma => if (depth == 0) {
+                try arguments.append(allocator, std.mem.trim(
+                    u8,
+                    source[tokens[argument_start].loc.start..tokens[cursor - 1].loc.end],
+                    " \t\r\n",
+                ));
+                argument_start = cursor + 1;
+            },
+            else => {},
+        }
+    }
+    const function_index = for (tokens, 0..) |token, index| {
+        if (token.tag != .keyword_fn or index + 2 >= tokens.len or tokens[index + 1].tag != .identifier or
+            tokens[index + 2].tag != .l_paren) continue;
+        if (std.mem.eql(u8, source[tokens[index + 1].loc.start..tokens[index + 1].loc.end], callee)) break index;
+    } else return null;
+    const parameters_end = matchingSyntaxToken(tokens, function_index + 2, .l_paren, .r_paren) orelse return null;
+    var bindings: std.ArrayList(TypeParameterBinding) = .empty;
+    var parameter_index: usize = 0;
+    var parameter_start = function_index + 3;
+    cursor = parameter_start;
+    depth = 0;
+    while (cursor <= parameters_end) : (cursor += 1) {
+        const at_end = cursor == parameters_end;
+        switch (tokens[cursor].tag) {
+            .l_paren, .l_bracket, .l_brace => if (!at_end) {
+                depth += 1;
+                continue;
+            },
+            .r_paren, .r_bracket, .r_brace => if (!at_end) {
+                depth -|= 1;
+                continue;
+            },
+            .comma => if (depth != 0) continue,
+            else => if (!at_end) continue,
+        }
+        if (parameter_start < cursor and parameter_index < arguments.items.len and
+            tokens[parameter_start].tag == .keyword_comptime and
+            tokens[parameter_start + 1].tag == .identifier and
+            tokens[parameter_start + 2].tag == .colon and
+            tokens[parameter_start + 3].tag == .identifier and
+            std.mem.eql(u8, source[tokens[parameter_start + 3].loc.start..tokens[parameter_start + 3].loc.end], "type"))
+        {
+            try bindings.append(allocator, .{
+                .name = source[tokens[parameter_start + 1].loc.start..tokens[parameter_start + 1].loc.end],
+                .argument = arguments.items[parameter_index],
+            });
+        }
+        parameter_index += 1;
+        parameter_start = cursor + 1;
+    }
+    if (bindings.items.len == 0) return null;
+    return try bindings.toOwnedSlice(allocator);
+}
+
+fn substituteTypeParameters(
+    allocator: std.mem.Allocator,
+    summary: []const u8,
+    bindings: []const TypeParameterBinding,
+) ![]const u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    var index: usize = 0;
+    while (index < summary.len) {
+        const character = summary[index];
+        if (!std.ascii.isAlphabetic(character) and character != '_') {
+            try writer.writer.writeByte(character);
+            index += 1;
+            continue;
+        }
+        var end = index;
+        while (end < summary.len and (std.ascii.isAlphanumeric(summary[end]) or summary[end] == '_')) : (end += 1) {}
+        const word = summary[index..end];
+        const replacement = for (bindings) |binding| {
+            if (std.mem.eql(u8, binding.name, word)) break binding.argument;
+        } else word;
+        try writer.writer.writeAll(replacement);
+        index = end;
+    }
+    return try writer.toOwnedSlice();
+}
+
+fn lineNumberAt(source: []const u8, byte_offset: usize) usize {
+    return std.mem.count(u8, source[0..@min(byte_offset, source.len)], "\n") + 1;
+}
+
+fn primaryTypeName(summary: [:0]const u8) ?[]const u8 {
+    var tokenizer = std.zig.Tokenizer.init(summary);
+    while (true) {
+        const token = tokenizer.next();
+        switch (token.tag) {
+            .eof => return null,
+            .identifier => {
+                const name = summary[token.loc.start..token.loc.end];
+                if (std.zig.isPrimitive(name)) continue;
+                var end = token.loc.end;
+                while (true) {
+                    const period = tokenizer.next();
+                    if (period.tag != .period) break;
+                    const segment = tokenizer.next();
+                    if (segment.tag != .identifier) break;
+                    end = segment.loc.end;
+                }
+                return summary[token.loc.start..end];
+            },
+            else => {},
+        }
+    }
+}
 
 fn bareTypeExpression(type_expression: []const u8) []const u8 {
     var bare = std.mem.trim(u8, type_expression, " \t\r\n");
@@ -4454,6 +4656,8 @@ test "LSP hover follows inferred returns through imported type aliases" {
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const view = make()") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "types.Headers.View") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Go to View") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "fixtures/hover_types.zig#L") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "slice: []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Headers decoded from the used message body") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":null") != null);
