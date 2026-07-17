@@ -47,13 +47,29 @@ This compiles. Ask for completion after `pipeline.`:
 ZLS never followed the loop, so the method the program calls two lines down
 doesn't exist as far as it's concerned. Same story across the corpus: types
 selected through `@field` (ZLS returns nothing), APIs gated behind comptime
-conditions (ZLS offers the branch your build doesn't have). Everything is
-pinned to Zig 0.16.0 and [ZLS 0.16.0 at
+conditions (ZLS offers the branch your build doesn't have).
+
+The comparison gives ZLS every relevant advantage its configuration exposes:
+an explicit Zig 0.16.0 executable, `enable_build_on_save = true`, and
+`warn_style = true`. The harness sends `textDocument/didSave` and waits up to
+60 seconds for build diagnostics. Under those conditions, zig-analyzer also
+reports these valid-but-dangerous programs while ZLS reports no diagnostic:
+
+| Example | zig-analyzer | ZLS 0.16.0 |
+| --- | --- | --- |
+| Overlapping `@memcpy` slices | `aliased-memcpy` | none |
+| Unsigned `while (i >= 0)` countdown | `unsigned-reverse-loop` | none |
+| Byte equality over struct padding | `padded-byte-compare` | none |
+| An empty `catch {}` | `discarded-error` | none |
+
+Everything is pinned to Zig 0.16.0 and [ZLS 0.16.0 at
 `4944862`](https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d),
 kept as a regression corpus including the cases ZLS gets right, with a
 [gallery](https://mewhhaha.github.io/zig-analyzer/) showing every cursor and
-captured response. Reproduce it from
-[`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig).
+captured response. Reproduce the first completion from
+[`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig),
+or run the complete capture described in
+[`examples/README.md`](examples/README.md).
 
 ## Use it
 

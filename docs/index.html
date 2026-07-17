@@ -595,12 +595,14 @@
       Nothing here is mocked, but nothing runs live either: both servers were run over these files
       and their responses were recorded per position on 2026-07-17, against Zig 0.16.0 and
       <a href="https://builds.zigtools.org/zls-x86_64-linux-0.16.0.tar.xz">ZLS 0.16.0</a>
-      with this repository's configuration. ZLS can also surface compiler errors through its
-      optional build-on-save workflow, which is not enabled here.
+      with an explicit Zig executable, build-on-save enabled, and style warnings enabled. The
+      capture sends a save event for every diagnostic fixture and waits up to 60 seconds for
+      ZLS's build diagnostics.
     </p>
     <p>
-      Re-capture with <code>node docs/tools/capture_comparisons.js</code>, or use
-      <code>deno run --allow-read --allow-write --allow-run docs/tools/capture_comparisons.js</code>.
+      Re-capture with <code>node docs/tools/capture_comparisons.js --repo . --zls /path/to/zls
+      --zig /path/to/zig</code>, or use Deno with the same arguments and
+      <code>--allow-read --allow-write --allow-run</code>.
       The fixtures compile under
       <code>zig build examples</code> and live in
       <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,

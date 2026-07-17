@@ -66,6 +66,31 @@ test "compiler session tracks unsaved overlay syntax without changing the file" 
     try std.testing.expectEqualStrings(saved_source, source_after_analysis);
 }
 
+test "compiler session accepts a multi-kilobyte unsaved overlay" {
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "fixtures/comptime/main.zig",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(fixture_path);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    defer std.testing.allocator.free(uri);
+
+    var session = try zig_analyzer.compiler_session.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        .empty,
+        fixture_path,
+    );
+    defer session.deinit();
+
+    const source = "const value = 1;\n// " ++ ("x" ** 2048) ++ "\n";
+    const facts = try session.replaceOverlay(uri, 1, source);
+    try std.testing.expectEqual(@as(i32, 1), facts.document_version);
+    try std.testing.expectEqual(@as(u32, 1), facts.declaration_count);
+    try std.testing.expectEqual(@as(u32, 0), facts.syntax_error_count);
+}
+
 test "compiler diagnostics use the unsaved root overlay" {
     const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
         std.testing.io,

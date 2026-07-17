@@ -6,6 +6,10 @@ test {
     _ = @import("compiler/recursive_wrapper.zig");
     _ = @import("compiler/reflected_strategy.zig");
     _ = @import("diagnostics/memory_management.zig");
+    _ = @import("diagnostics/overlapping_copy.zig");
+    _ = @import("diagnostics/unsigned_reverse_loop.zig");
+    _ = @import("diagnostics/padded_equality.zig");
+    _ = @import("diagnostics/discarded_error.zig");
     _ = @import("diagnostics/idiomatic_style.zig");
     _ = @import("diagnostics/lifetime_mistakes.zig");
     _ = @import("diagnostics/action_results.zig");

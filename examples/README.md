@@ -70,6 +70,16 @@ and mutates a map during iteration. The functions are referenced but not run,
 so the file remains a safe compilation fixture while every diagnostic is
 visible in the editor.
 
+Four smaller diagnostic fixtures each isolate one valid Zig program that the
+compiler and ZLS accept but zig-analyzer warns about:
+
+| File | Diagnostic |
+| --- | --- |
+| `diagnostics/overlapping_copy.zig` | `aliased-memcpy` |
+| `diagnostics/unsigned_reverse_loop.zig` | `unsigned-reverse-loop` |
+| `diagnostics/padded_equality.zig` | `padded-byte-compare` |
+| `diagnostics/discarded_error.zig` | `discarded-error` |
+
 For completion cases, leave the source unchanged and place the cursor directly
 after the listed dot, before the existing member name:
 
@@ -122,3 +132,20 @@ After testing zig-analyzer, temporarily change the `language-servers` entry in
 `.helix/languages.toml` from `zig-analyzer-local` to `zls`, run
 `:lsp-restart`, and repeat the same requests with ZLS 0.16.0. Restore the local
 entry afterward so Helix uses this repository's analyzer again.
+
+The checked-in gallery is captured with an explicit Zig executable and ZLS's
+strongest relevant settings: build-on-save and style warnings are enabled, a
+save event is sent for every diagnostic fixture, and the harness waits up to
+60 seconds for ZLS's build diagnostics. Reproduce that exact comparison with:
+
+```sh
+node docs/tools/capture_comparisons.js \
+  --repo . \
+  --zls /path/to/zls-0.16.0 \
+  --zig /path/to/zig-0.16.0
+```
+
+The compiler-error card is an isolated file that is intentionally not part of
+the repository's build graph. ZLS build-on-save therefore completes the
+project build without compiling that file; the empty ZLS result on that card
+does not claim that ZLS can never relay compiler errors from build targets.

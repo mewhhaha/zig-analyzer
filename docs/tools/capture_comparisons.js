@@ -3,11 +3,11 @@
 // Capture LSP responses from zig-analyzer and ZLS for the docs comparison page.
 //
 // Node:
-//   node docs/tools/capture_comparisons.js --repo . --zls /path/to/zls
+//   node docs/tools/capture_comparisons.js --repo . --zls /path/to/zls --zig /path/to/zig
 //
 // Deno:
 //   deno run --allow-read --allow-write --allow-run \
-//     docs/tools/capture_comparisons.js --repo . --zls /path/to/zls
+//     docs/tools/capture_comparisons.js --repo . --zls /path/to/zls --zig /path/to/zig
 
 const TOKEN =
   /@\w+|"(?:[^"\\]|\\.)*"|\w+|==|!=|<=|>=|=>|\+=|-=|\*=|\|\||&&|[^\sA-Za-z0-9_"]/g;
@@ -26,6 +26,7 @@ const EXAMPLES = [
     displayStart: 30,
     displayEnd: 46,
     completion: { line: 45, after: "pipeline." },
+    requiredAnalyzerCompletions: ["trace"],
   },
   {
     id: "indirect-field",
@@ -38,6 +39,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 22,
     completion: { line: 21, after: "ActiveImplementation." },
+    requiredAnalyzerCompletions: ["verify"],
   },
   {
     id: "active-branch",
@@ -50,6 +52,7 @@ const EXAMPLES = [
     displayStart: 2,
     displayEnd: 21,
     completion: { line: 20, after: "ActiveApi." },
+    requiredAnalyzerCompletions: ["recordMetric"],
   },
   {
     id: "parsed-configuration",
@@ -62,6 +65,7 @@ const EXAMPLES = [
     displayStart: 2,
     displayEnd: 23,
     completion: { line: 18, after: "ResilientClient." },
+    requiredAnalyzerCompletions: ["retryBudget"],
   },
   {
     id: "recursive-wrapper",
@@ -74,6 +78,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 23,
     completion: { line: 22, after: "wrapped." },
+    requiredAnalyzerCompletions: ["unwrap"],
   },
   {
     id: "reflected-strategy",
@@ -86,6 +91,7 @@ const EXAMPLES = [
     displayStart: 2,
     displayEnd: 27,
     completion: { line: 22, after: "ReadingStrategy." },
+    requiredAnalyzerCompletions: ["encode"],
   },
   {
     id: "stdlib-completion",
@@ -97,6 +103,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 8,
     completion: { line: 3, after: "std.mem." },
+    requiredAnalyzerCompletions: ["eql"],
   },
   {
     id: "keyword-hover",
@@ -129,6 +136,7 @@ const EXAMPLES = [
     fixture: "examples/diagnostics/memory_management.zig",
     displayStart: 0,
     displayEnd: 24,
+    requiredAnalyzerDiagnostics: ["cleanup-after-fallible-operation"],
   },
   {
     id: "lifetimes",
@@ -140,6 +148,59 @@ const EXAMPLES = [
     fixture: "examples/diagnostics/lifetime_mistakes.zig",
     displayStart: 0,
     displayEnd: 27,
+    requiredAnalyzerDiagnostics: [
+      "returning-deinitialized-view",
+      "returning-arena-allocation",
+      "invalidated-element-pointer",
+    ],
+  },
+  {
+    id: "overlapping-copy",
+    kind: "Diagnostics",
+    label: "overlap",
+    title: "A copy whose slices may overlap",
+    summary:
+      "Both slices come from the same buffer and are not provably disjoint; @memcpy makes overlap undefined behavior.",
+    fixture: "examples/diagnostics/overlapping_copy.zig",
+    displayStart: 0,
+    displayEnd: 4,
+    requiredAnalyzerDiagnostics: ["aliased-memcpy"],
+  },
+  {
+    id: "unsigned-reverse-loop",
+    kind: "Diagnostics",
+    label: "underflow",
+    title: "An unsigned loop that cannot terminate",
+    summary:
+      "The index is always at least zero, then underflows when the update runs after index zero.",
+    fixture: "examples/diagnostics/unsigned_reverse_loop.zig",
+    displayStart: 0,
+    displayEnd: 6,
+    requiredAnalyzerDiagnostics: ["unsigned-reverse-loop"],
+  },
+  {
+    id: "padded-equality",
+    kind: "Diagnostics",
+    label: "padding",
+    title: "Equality that reads undefined padding",
+    summary:
+      "Byte-wise comparison includes the padding between flag and count, so equal field values can compare unequal.",
+    fixture: "examples/diagnostics/padded_equality.zig",
+    displayStart: 0,
+    displayEnd: 9,
+    requiredAnalyzerDiagnostics: ["padded-byte-compare"],
+  },
+  {
+    id: "discarded-error",
+    kind: "Diagnostics",
+    label: "catch {}",
+    title: "An error silently converted to success",
+    summary:
+      "The empty catch body discards the failure and continues as though the operation succeeded.",
+    fixture: "examples/diagnostics/discarded_error.zig",
+    displayStart: 0,
+    displayEnd: 8,
+    requiredAnalyzerDiagnostics: ["discarded-error"],
   },
   {
     id: "compiler-error",
@@ -151,6 +212,7 @@ const EXAMPLES = [
     fixture: "examples/diagnostics/compiler_error.zig",
     displayStart: 0,
     displayEnd: 2,
+    requiredAnalyzerDiagnostics: ["compiler-error"],
   },
 ];
 
@@ -163,6 +225,7 @@ class LspClient {
     this.rootFileUri = rootFileUri;
     this.nextId = 0;
     this.diagnostics = new Map();
+    this.diagnosticPublications = new Map();
     this.buffer = new Uint8Array();
     this.messages = [];
     this.waiters = [];
@@ -266,6 +329,8 @@ class LspClient {
   async absorb(message) {
     if (message.method === "textDocument/publishDiagnostics") {
       this.diagnostics.set(message.params.uri, message.params.diagnostics);
+      const publications = this.diagnosticPublications.get(message.params.uri) ?? 0;
+      this.diagnosticPublications.set(message.params.uri, publications + 1);
       return;
     }
     if ("id" in message && "method" in message) {
@@ -465,6 +530,9 @@ async function captureExample(
   if (example.kind === "Diagnostics") {
     // Build-on-save diagnostics only fire on a save event, so report one to
     // both servers and give ZLS's build run time to publish.
+    await Promise.all([analyzer.drain(500), zls.drain(500)]);
+    const zlsPublicationsBeforeSave = [...zls.diagnosticPublications.values()]
+      .reduce((total, publications) => total + publications, 0);
     await Promise.all([analyzer.saveFile(uri), zls.saveFile(uri)]);
     const deadline = Date.now() + 60_000;
     let documentVersion = 2;
@@ -487,7 +555,9 @@ async function captureExample(
     const zlsDeadline = Date.now() + 60_000;
     while (
       Date.now() < zlsDeadline &&
-      (zls.diagnostics.get(uri) ?? []).length === 0
+      [...zls.diagnosticPublications.values()]
+        .reduce((total, publications) => total + publications, 0) ===
+        zlsPublicationsBeforeSave
     ) {
       await zls.drain(2_000);
     }
@@ -495,6 +565,50 @@ async function captureExample(
   } else {
     await analyzer.drain(1_000);
     await zls.drain(500);
+  }
+
+  let completion = null;
+  if (example.completion !== undefined) {
+    const { line, after } = example.completion;
+    const afterStart = lines[line].indexOf(after);
+    if (afterStart === -1) {
+      throw new Error(
+        `${example.fixture}:${
+          line + 1
+        }: completion marker '${after}' was not found`,
+      );
+    }
+    const character = afterStart + after.length;
+    const position = { line, character };
+    const required = example.requiredAnalyzerCompletions ?? [];
+    const deadline = Date.now() + 60_000;
+    let analyzerLabels = [];
+    while (Date.now() < deadline) {
+      const result = await analyzer.request("textDocument/completion", {
+        textDocument: { uri },
+        position,
+      });
+      analyzerLabels = completionLabels(result);
+      if (required.every((label) => analyzerLabels.includes(label))) break;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    for (const label of required) {
+      if (!analyzerLabels.includes(label)) {
+        throw new Error(
+          `${example.fixture}:${line + 1}: zig-analyzer completion omitted '${label}'`,
+        );
+      }
+    }
+    const zlsResult = await zls.request("textDocument/completion", {
+      textDocument: { uri },
+      position,
+    });
+    completion = {
+      line,
+      character,
+      analyzer: analyzerLabels,
+      zls: completionLabels(zlsResult),
+    };
   }
 
   const tokens = [];
@@ -528,27 +642,7 @@ async function captureExample(
     tokens,
   };
 
-  if (example.completion !== undefined) {
-    const { line, after } = example.completion;
-    const afterStart = lines[line].indexOf(after);
-    if (afterStart === -1) {
-      throw new Error(
-        `${example.fixture}:${
-          line + 1
-        }: completion marker '${after}' was not found`,
-      );
-    }
-    const character = afterStart + after.length;
-    const labels = {};
-    for (const [client, key] of [[analyzer, "analyzer"], [zls, "zls"]]) {
-      const result = await client.request("textDocument/completion", {
-        textDocument: { uri },
-        position: { line, character },
-      });
-      labels[key] = completionLabels(result);
-    }
-    captured.completion = { line, character, ...labels };
-  }
+  if (completion !== null) captured.completion = completion;
 
   if (example.kind === "Diagnostics") {
     captured.diagnostics = {};
@@ -564,6 +658,14 @@ async function captureExample(
         message: entry.message,
         severity: { 1: "error", 2: "warning", 3: "info", 4: "hint" }[entry.severity] ?? "info",
       }));
+    }
+    const analyzerCodes = captured.diagnostics.analyzer.map((entry) => entry.code);
+    for (const required of example.requiredAnalyzerDiagnostics ?? []) {
+      if (!analyzerCodes.includes(required)) {
+        throw new Error(
+          `${example.fixture}: zig-analyzer diagnostics omitted '${required}'`,
+        );
+      }
     }
   }
 
