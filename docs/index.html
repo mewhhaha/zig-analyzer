@@ -10,19 +10,23 @@
   <style>
     :root {
       --background: #09090b;
-      --card: #18181b;
-      --well: #09090b;
       --line: rgba(255, 255, 255, 0.1);
-      --line-faint: rgba(255, 255, 255, 0.05);
+      --line-faint: rgba(255, 255, 255, 0.06);
       --text: #fafafa;
       --muted: #a1a1aa;
       --faint: #71717a;
       --accent: #fbbf24;
       --analyzer: #34d399;
       --focus-ring: #f59e0b;
-      --radius-card: 16px;
       --font-sans: InterVariable, ui-sans-serif, system-ui, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --gutter: 20px;
+    }
+
+    @media (min-width: 48rem) {
+      :root {
+        --gutter: 28px;
+      }
     }
 
     * {
@@ -35,6 +39,8 @@
     }
 
     body {
+      display: flex;
+      flex-direction: column;
       margin: 0;
       min-height: 100dvh;
       background: var(--background);
@@ -60,37 +66,41 @@
 
     :focus-visible {
       outline: 2px solid var(--focus-ring);
-      outline-offset: 2px;
-    }
-
-    .page {
-      max-width: 68rem;
-      margin: 0 auto;
-      padding: 24px 16px 48px;
-    }
-
-    @media (min-width: 40rem) {
-      .page {
-        padding: 28px 24px 64px;
-      }
+      outline-offset: -2px;
     }
 
     .site-header {
       display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding-bottom: 28px;
+      align-items: baseline;
+      gap: 20px;
+      padding: 14px var(--gutter);
+      border-bottom: 1px solid var(--line-faint);
     }
 
     .wordmark {
       font-family: var(--font-mono);
-      font-size: 0.9375rem;
+      font-size: 0.875rem;
       font-weight: 600;
       text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .tagline {
+      display: none;
+      margin: 0;
+      color: var(--faint);
+      font-size: 0.875rem;
+      font-weight: 400;
+    }
+
+    @media (min-width: 48rem) {
+      .tagline {
+        display: block;
+      }
     }
 
     .site-header nav {
+      margin-left: auto;
       font-size: 0.875rem;
     }
 
@@ -105,130 +115,128 @@
       text-underline-offset: 3px;
     }
 
-    h1 {
-      max-width: 30ch;
-      margin: 0;
-      font-size: clamp(1.5rem, 4vw, 2rem);
-      font-weight: 600;
-      line-height: 1.2;
-      letter-spacing: -0.025em;
-      text-wrap: balance;
-    }
-
-    .lede {
-      max-width: 62ch;
-      margin: 10px 0 0;
-      color: var(--muted);
-      font-size: 1rem;
-      text-wrap: pretty;
-    }
-
-    @media (min-width: 40rem) {
-      .lede {
-        font-size: 0.9375rem;
-      }
-    }
-
-    .carousel {
-      margin-top: 28px;
-    }
-
-    .slide {
-      border-radius: var(--radius-card);
-      background: var(--card);
-      box-shadow: inset 0 0 0 1px var(--line-faint);
-      padding: 20px;
-    }
-
-    @media (min-width: 40rem) {
-      .slide {
-        padding: 28px;
-      }
-    }
-
-    .slide-header {
+    .toolbar {
       display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 16px;
+      align-items: stretch;
+      border-bottom: 1px solid var(--line-faint);
     }
 
-    .slide-kind {
-      margin: 0;
+    .tabs {
+      display: flex;
+      overflow-x: auto;
+      scrollbar-width: none;
+      padding: 0 calc(var(--gutter) - 12px);
+    }
+
+    .tab {
+      flex-shrink: 0;
+      padding: 10px 12px;
+      border: 0;
+      background: transparent;
+      color: var(--faint);
       font-family: var(--font-mono);
       font-size: 0.75rem;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--accent);
+      white-space: nowrap;
+      cursor: pointer;
     }
 
-    .slide-counter {
-      margin: 0;
-      flex-shrink: 0;
-      font-family: var(--font-mono);
-      font-size: 0.8125rem;
-      font-variant-numeric: tabular-nums;
-      color: var(--faint);
-    }
-
-    .slide h2 {
-      max-width: 40ch;
-      margin: 6px 0 0;
-      font-size: 1.25rem;
-      font-weight: 600;
-      line-height: 1.3;
-      letter-spacing: -0.025em;
-      text-wrap: balance;
-    }
-
-    .slide-summary {
-      max-width: 68ch;
-      margin: 8px 0 0;
+    .tab:hover {
       color: var(--muted);
-      font-size: 1rem;
-      text-wrap: pretty;
     }
 
-    @media (min-width: 40rem) {
-      .slide-summary {
-        font-size: 0.9375rem;
-      }
+    .tab[aria-current="true"] {
+      color: var(--text);
+      box-shadow: inset 0 -1px var(--text);
+    }
+
+    .pager {
+      display: flex;
+      align-items: stretch;
+      margin-left: auto;
+      border-left: 1px solid var(--line-faint);
+    }
+
+    .step {
+      width: 44px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 0.875rem;
+    }
+
+    .step + .step {
+      border-left: 1px solid var(--line-faint);
+    }
+
+    .step:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+    }
+
+    .step:disabled {
+      cursor: default;
+      color: var(--faint);
+      opacity: 0.4;
     }
 
     .workbench {
       display: grid;
-      gap: 12px;
-      margin-top: 20px;
+      flex: 1;
+      align-items: stretch;
+      min-height: 0;
     }
 
     @media (min-width: 64rem) {
       .workbench {
-        grid-template-columns: minmax(0, 11fr) minmax(0, 9fr);
-        align-items: start;
+        grid-template-columns: minmax(0, 1fr) minmax(24rem, 30rem);
       }
+    }
+
+    .code-pane {
+      min-width: 0;
+      padding: 20px 0 28px;
+    }
+
+    .example-heading {
+      padding: 0 var(--gutter);
+    }
+
+    .example-heading h2 {
+      margin: 0;
+      font-size: 1.125rem;
+      font-weight: 600;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+      text-wrap: balance;
+    }
+
+    .summary {
+      max-width: 72ch;
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 0.875rem;
+      text-wrap: pretty;
     }
 
     .source {
       overflow-x: auto;
-      margin: 0;
-      padding: 14px 0;
-      border-radius: calc(var(--radius-card) - 8px);
-      background: var(--well);
-      box-shadow: inset 0 0 0 1px var(--line-faint);
-      font: 0.8125rem/1.7 var(--font-mono);
+      margin: 18px 0 0;
+      padding: 2px 0;
+      font: 0.875rem/1.8 var(--font-mono);
       tab-size: 4;
     }
 
     .source-line {
       display: grid;
-      grid-template-columns: 3.5ch minmax(max-content, 1fr);
-      padding: 0 16px 0 8px;
+      grid-template-columns: calc(var(--gutter) + 3.5ch) minmax(max-content, 1fr);
+      padding-right: var(--gutter);
     }
 
     .line-number {
-      padding-right: 1.5ch;
-      color: #52525c;
+      padding-right: 2ch;
+      color: #3f3f47;
       text-align: right;
       user-select: none;
     }
@@ -286,8 +294,41 @@
       }
     }
 
+    .fixture {
+      margin: 14px 0 0;
+      padding: 0 var(--gutter);
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+    }
+
+    .fixture a {
+      color: var(--faint);
+      text-decoration: none;
+    }
+
+    .fixture a:hover {
+      color: var(--text);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
     .inspector {
       min-width: 0;
+      padding: 20px var(--gutter) 28px;
+      border-top: 1px solid var(--line-faint);
+    }
+
+    @media (min-width: 64rem) {
+      .inspector {
+        position: sticky;
+        top: 0;
+        align-self: start;
+        max-height: 100dvh;
+        overflow-y: auto;
+        border-top: 0;
+        border-left: 1px solid var(--line-faint);
+        scrollbar-width: thin;
+      }
     }
 
     .status {
@@ -295,7 +336,7 @@
       flex-wrap: wrap;
       align-items: baseline;
       gap: 4px 12px;
-      margin: 0 0 10px;
+      margin: 0 0 16px;
       font-family: var(--font-mono);
       font-size: 0.8125rem;
       color: var(--faint);
@@ -307,27 +348,19 @@
 
     .results {
       display: grid;
-      gap: 12px;
+      gap: 20px;
     }
 
-    @media (min-width: 40rem) {
+    @media (min-width: 40rem) and (max-width: 64rem) {
       .results {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
 
-    @media (min-width: 64rem) {
-      .results {
-        grid-template-columns: 1fr;
-      }
-    }
-
     .result {
       min-width: 0;
-      padding: 14px 16px;
-      border-radius: calc(var(--radius-card) - 8px);
-      background: var(--well);
-      box-shadow: inset 0 0 0 1px var(--line-faint);
+      padding-top: 14px;
+      border-top: 1px solid var(--line-faint);
     }
 
     .result-label {
@@ -367,7 +400,7 @@
     }
 
     .result-output {
-      height: 148px;
+      height: clamp(148px, 24vh, 240px);
       overflow: auto;
       margin: 10px 0 0;
       color: var(--muted);
@@ -396,7 +429,7 @@
       overflow-x: auto;
       margin: 0;
       padding: 8px 10px;
-      border-radius: 8px;
+      border-radius: 6px;
       background: rgba(255, 255, 255, 0.04);
       font: 0.8125rem/1.6 var(--font-mono);
       white-space: pre-wrap;
@@ -439,138 +472,15 @@
       color: #fdba74;
     }
 
-    .observation {
-      max-width: 76ch;
-      margin: 20px 0 0;
-      padding-top: 16px;
-      border-top: 1px solid var(--line-faint);
-      color: var(--muted);
-      font-size: 1rem;
-      text-wrap: pretty;
-    }
-
-    @media (min-width: 40rem) {
-      .observation {
-        font-size: 0.9375rem;
-      }
-    }
-
-    .observation strong {
-      color: var(--text);
-      font-weight: 600;
-    }
-
-    .fixture {
-      margin: 12px 0 0;
-      font-size: 0.875rem;
-    }
-
-    .fixture a {
-      color: var(--muted);
-    }
-
-    .fixture a:hover {
-      color: var(--text);
-    }
-
-    .controls {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-top: 16px;
-    }
-
-    .step {
-      min-height: 38px;
-      padding: 6px 12px;
-      border: 0;
-      border-radius: 8px;
-      background: transparent;
-      box-shadow: inset 0 0 0 1px var(--line);
-      cursor: pointer;
-      font-size: 0.875rem;
-      font-weight: 500;
-    }
-
-    .step:hover:not(:disabled) {
-      background: rgba(255, 255, 255, 0.05);
-    }
-
-    .step:disabled {
-      cursor: default;
-      opacity: 0.35;
-    }
-
-    .dots {
-      display: none;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-      gap: 4px;
-    }
-
-    @media (min-width: 40rem) {
-      .dots {
-        display: flex;
-      }
-    }
-
-    .dot {
-      position: relative;
-      width: 24px;
-      height: 24px;
-      padding: 0;
-      border: 0;
-      border-radius: 999px;
-      background: transparent;
-      cursor: pointer;
-    }
-
-    .dot::after {
-      content: "";
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: var(--line);
-      transform: translate(-50%, -50%);
-    }
-
-    .dot:hover::after {
-      background: var(--faint);
-    }
-
-    .dot[aria-current="true"]::after {
-      background: var(--text);
-    }
-
-    .dot .touch-target {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: max(100%, 3rem);
-      height: max(100%, 3rem);
-      transform: translate(-50%, -50%);
-    }
-
-    @media (pointer: fine) {
-      .dot .touch-target {
-        display: none;
-      }
-    }
-
     .site-footer {
-      margin-top: 40px;
-      padding-top: 24px;
+      padding: 20px var(--gutter) 32px;
       border-top: 1px solid var(--line-faint);
       color: var(--faint);
       font-size: 0.875rem;
     }
 
     .site-footer p {
+      max-width: 82ch;
       margin: 0;
       text-wrap: pretty;
     }
@@ -591,89 +501,80 @@
       font-family: var(--font-mono);
       font-size: 0.8125rem;
     }
+
+    noscript {
+      display: block;
+      padding: 20px var(--gutter);
+    }
   </style>
 </head>
 <body>
-  <div class="page">
-    <header class="site-header">
-      <a class="wordmark" href="https://github.com/mewhhaha/zig-analyzer">zig-analyzer</a>
-      <nav aria-label="Project links">
-        <a href="https://github.com/mewhhaha/zig-analyzer">GitHub</a>
-      </nav>
-    </header>
+  <header class="site-header">
+    <a class="wordmark" href="https://github.com/mewhhaha/zig-analyzer">zig-analyzer</a>
+    <h1 class="tagline">Hover the code. Both servers answer.</h1>
+    <nav aria-label="Project links">
+      <a href="https://github.com/mewhhaha/zig-analyzer">GitHub</a>
+    </nav>
+  </header>
 
-    <main>
-      <h1>Hover the code. Both servers answer.</h1>
-      <p class="lede">
-        Real Zig files, with the responses zig-analyzer and ZLS 0.16.0 gave at every position,
-        recorded and replayed here. Hover or tap any token; the blinking cursor shows completion.
-      </p>
-
-      <section class="carousel" aria-label="Comparison examples">
-        <article class="slide" id="slide">
-          <div class="slide-header">
-            <p class="slide-kind" id="slide-kind"></p>
-            <p class="slide-counter" id="slide-counter"></p>
-          </div>
-          <h2 id="slide-title"></h2>
-          <p class="slide-summary" id="slide-summary"></p>
-
-          <div class="workbench">
-            <pre class="source" id="slide-source" tabindex="0"
-              aria-label="Zig source. Use the arrow keys to move between tokens; both server responses update as you move."></pre>
-            <div class="inspector">
-              <p class="status" id="status" aria-live="polite"></p>
-              <div class="results">
-                <section class="result analyzer" aria-label="zig-analyzer response">
-                  <div class="result-label">
-                    <h3>zig-analyzer</h3>
-                    <span class="result-caption" id="analyzer-caption"></span>
-                  </div>
-                  <div class="result-output" id="analyzer-output"></div>
-                </section>
-                <section class="result" aria-label="ZLS response">
-                  <div class="result-label">
-                    <h3>ZLS 0.16.0</h3>
-                    <span class="result-caption" id="zls-caption"></span>
-                  </div>
-                  <div class="result-output" id="zls-output"></div>
-                </section>
-              </div>
-            </div>
-          </div>
-
-          <p class="observation" id="slide-observation"></p>
-          <p class="fixture"><a id="fixture-link" href="https://github.com/mewhhaha/zig-analyzer">Open the fixture</a></p>
-        </article>
-
-        <div class="controls">
-          <button class="step" type="button" id="previous">&larr; Previous</button>
-          <ol class="dots" id="dots" role="list" aria-label="Go to example"></ol>
-          <button class="step" type="button" id="next">Next &rarr;</button>
-        </div>
-      </section>
-
-      <noscript>
-        <p>Replaying the captured responses requires JavaScript.</p>
-      </noscript>
-    </main>
-
-    <footer class="site-footer">
-      <p>
-        Nothing here is mocked, but nothing runs live either: both servers were run over these files
-        and their responses were recorded per position on 2026-07-16, against Zig 0.16.0 and
-        <a href="https://builds.zigtools.org/zls-x86_64-linux-0.16.0.tar.xz">ZLS 0.16.0</a>
-        with this repository's configuration. ZLS can also surface compiler errors through its
-        optional build-on-save workflow, which is not enabled here.
-      </p>
-      <p>
-        Re-capture with <code>python docs/tools/capture_comparisons.py</code>. The fixtures compile under
-        <code>zig build examples</code> and live in
-        <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,
-        with a <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">manual reproduction guide</a>.
-      </p>
-    </footer>
+  <div class="toolbar">
+    <nav class="tabs" id="tabs" aria-label="Examples"></nav>
+    <div class="pager">
+      <button class="step" type="button" id="previous" aria-label="Previous example">&larr;</button>
+      <button class="step" type="button" id="next" aria-label="Next example">&rarr;</button>
+    </div>
   </div>
+
+  <main class="workbench">
+    <section class="code-pane" aria-label="Example source">
+      <div class="example-heading">
+        <h2 id="slide-title"></h2>
+        <p class="summary" id="slide-summary"></p>
+      </div>
+      <pre class="source" id="slide-source" tabindex="0"
+        aria-label="Zig source. Use the arrow keys to move between tokens; both server responses update as you move."></pre>
+      <p class="fixture"><a id="fixture-link" href="https://github.com/mewhhaha/zig-analyzer">examples/</a></p>
+    </section>
+    <aside class="inspector">
+      <p class="status" id="status" aria-live="polite"></p>
+      <div class="results">
+        <section class="result analyzer" aria-label="zig-analyzer response">
+          <div class="result-label">
+            <h3>zig-analyzer</h3>
+            <span class="result-caption" id="analyzer-caption"></span>
+          </div>
+          <div class="result-output" id="analyzer-output"></div>
+        </section>
+        <section class="result" aria-label="ZLS response">
+          <div class="result-label">
+            <h3>ZLS 0.16.0</h3>
+            <span class="result-caption" id="zls-caption"></span>
+          </div>
+          <div class="result-output" id="zls-output"></div>
+        </section>
+      </div>
+    </aside>
+  </main>
+
+  <noscript>
+    <p>Replaying the captured responses requires JavaScript.</p>
+  </noscript>
+
+  <footer class="site-footer">
+    <p>
+      Nothing here is mocked, but nothing runs live either: both servers were run over these files
+      and their responses were recorded per position on 2026-07-17, against Zig 0.16.0 and
+      <a href="https://builds.zigtools.org/zls-x86_64-linux-0.16.0.tar.xz">ZLS 0.16.0</a>
+      with this repository's configuration. ZLS can also surface compiler errors through its
+      optional build-on-save workflow, which is not enabled here.
+    </p>
+    <p>
+      Re-capture with <code>python docs/tools/capture_comparisons.py</code>. The fixtures compile under
+      <code>zig build examples</code> and live in
+      <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,
+      with a <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">manual reproduction guide</a>.
+    </p>
+  </footer>
 
   <script src="comparison-data.js"></script>
   <script>
@@ -786,7 +687,7 @@
     const analyzerCaption = document.querySelector("#analyzer-caption");
     const zlsOutput = document.querySelector("#zls-output");
     const zlsCaption = document.querySelector("#zls-caption");
-    const dots = document.querySelector("#dots");
+    const tabs = document.querySelector("#tabs");
     const previousButton = document.querySelector("#previous");
     const nextButton = document.querySelector("#next");
 
@@ -947,28 +848,21 @@
       pinned = null;
       keyboardCursor = -1;
       document.title = `${example.title} · zig-analyzer vs ZLS`;
-      document.querySelector("#slide-kind").textContent = example.kind;
-      document.querySelector("#slide-counter").textContent = `${selectedIndex + 1} / ${examples.length}`;
       document.querySelector("#slide-title").textContent = example.title;
       document.querySelector("#slide-summary").textContent = example.summary;
 
-      const observation = document.querySelector("#slide-observation");
-      observation.replaceChildren();
-      const observationLabel = document.createElement("strong");
-      observationLabel.textContent = "What this demonstrates. ";
-      observation.append(observationLabel, example.observation);
-
       const fixtureLink = document.querySelector("#fixture-link");
       fixtureLink.href = `${repositoryFileUrl}${example.fixture}#L${example.displayStart + 1}`;
-      fixtureLink.textContent = `Open ${example.fixture}`;
+      fixtureLink.textContent = example.fixture;
 
       buildSource(example);
       activate(null);
 
       previousButton.disabled = selectedIndex === 0;
       nextButton.disabled = selectedIndex === examples.length - 1;
-      [...dots.children].forEach((entry, index) => {
-        entry.firstChild.setAttribute("aria-current", String(index === selectedIndex));
+      [...tabs.children].forEach((tab, index) => {
+        tab.setAttribute("aria-current", String(index === selectedIndex));
+        if (index === selectedIndex) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
       });
     }
 
@@ -979,18 +873,14 @@
     }
 
     examples.forEach((example, index) => {
-      const entry = document.createElement("li");
-      const dot = document.createElement("button");
-      dot.type = "button";
-      dot.className = "dot";
-      dot.setAttribute("aria-label", `${example.kind}: ${example.title}`);
-      dot.addEventListener("click", () => selectExample(index));
-      const touchTarget = document.createElement("span");
-      touchTarget.className = "touch-target";
-      touchTarget.setAttribute("aria-hidden", "true");
-      dot.append(touchTarget);
-      entry.append(dot);
-      dots.append(entry);
+      const tab = document.createElement("button");
+      tab.type = "button";
+      tab.className = "tab";
+      tab.textContent = example.label;
+      tab.title = `${example.kind}: ${example.title}`;
+      tab.setAttribute("aria-label", `${example.kind}: ${example.title}`);
+      tab.addEventListener("click", () => selectExample(index));
+      tabs.append(tab);
     });
 
     previousButton.addEventListener("click", () => {
