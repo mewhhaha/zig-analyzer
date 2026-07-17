@@ -177,49 +177,98 @@ fn findMutatedContainerCopies(context: RuleRun) !void {
     const level = context.level(.mutated_container_copy);
     if (level == .off) return;
     for (context.tokens, 0..) |token, var_index| {
-        if (token.tag != .keyword_var or var_index + 5 >= context.tokens.len or
+        if (token.tag != .keyword_var or var_index + 7 >= context.tokens.len or
             context.tokens[var_index + 1].tag != .identifier) continue;
         const equal = nextTagBefore(context.tokens, var_index + 2, .equal, .semicolon) orelse continue;
-        if (equal + 3 >= context.tokens.len or context.tokens[equal + 1].tag != .identifier or
-            context.tokens[equal + 2].tag != .period or context.tokens[equal + 3].tag != .identifier) continue;
+        if (!hasProvenStandardContainerType(context, var_index + 2, equal)) continue;
+        if (equal + 4 >= context.tokens.len or context.tokens[equal + 1].tag != .identifier or
+            context.tokens[equal + 2].tag != .period or context.tokens[equal + 3].tag != .identifier or
+            context.tokens[equal + 4].tag != .semicolon) continue;
         const end = context.enclosingScopeEnd(var_index) orelse continue;
         const copy_name = context.tokenText(var_index + 1);
+        if (identifierDeclarationCount(context, copy_name) != 1) continue;
         const original = context.source[context.tokens[equal + 1].loc.start..context.tokens[equal + 3].loc.end];
-        if (copyIsReturnedOrWrittenBack(context, equal + 4, end, copy_name, original)) continue;
-        const mutation = mutatingCall(context, equal + 4, end, copy_name) orelse continue;
+        if (fieldIsReferenced(context, equal + 5, end, original)) continue;
+        const mutation = exclusivelyMutatedCopy(context, equal + 5, end, copy_name) orelse continue;
         try context.emit(.{
             .rule = .mutated_container_copy,
             .level = level,
             .span = context.tokens[mutation].loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "mutation of container copy '{s}' is not written back; original '{s}' will not observe length or allocation changes",
+                "local copy '{s}' mutates standard container metadata, but field '{s}' is never updated",
                 .{ copy_name, original },
             ),
         });
     }
 }
 
-fn mutatingCall(context: RuleRun, start: usize, end: usize, name: []const u8) ?usize {
-    const methods = [_][]const u8{ "append", "appendSlice", "insert", "addOne", "ensureTotalCapacity", "resize", "clearAndFree", "pop" };
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or index + 3 >= end or
-            context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
-            context.tokens[index + 3].tag != .l_paren) continue;
-        for (methods) |method| if (context.tokenIs(index + 2, method)) return index;
-    }
-    return null;
+fn hasProvenStandardContainerType(context: RuleRun, start: usize, equal: usize) bool {
+    if (start + 4 >= equal or context.tokens[start].tag != .colon or
+        context.tokens[start + 1].tag != .identifier or !context.tokenIs(start + 1, "std") or
+        context.tokens[start + 2].tag != .period or context.tokens[start + 3].tag != .identifier or
+        context.tokens[start + 4].tag != .l_paren) return false;
+    if (identifierDeclarationCount(context, "std") != 1 or !hasCanonicalStdImport(context)) return false;
+    const containers = [_][]const u8{
+        "ArrayList",
+        "ArrayListUnmanaged",
+        "ArrayHashMap",
+        "ArrayHashMapUnmanaged",
+        "AutoArrayHashMap",
+        "AutoArrayHashMapUnmanaged",
+        "AutoHashMap",
+        "AutoHashMapUnmanaged",
+        "MultiArrayList",
+        "PriorityDequeue",
+        "PriorityQueue",
+        "SegmentedList",
+        "StringArrayHashMap",
+        "StringArrayHashMapUnmanaged",
+        "StringHashMap",
+        "StringHashMapUnmanaged",
+    };
+    for (containers) |container| if (context.tokenIs(start + 3, container)) return true;
+    return false;
 }
 
-fn copyIsReturnedOrWrittenBack(context: RuleRun, start: usize, end: usize, name: []const u8, original: []const u8) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .keyword_return and index + 1 < end and context.tokenIs(index + 1, name)) return true;
-        if (token.tag != .identifier or !context.tokenIs(index, name) or index < 4) continue;
-        if (context.tokens[index - 1].tag != .equal) continue;
-        const assignment_start = context.source[context.tokens[index - 4].loc.start..context.tokens[index - 2].loc.end];
-        if (std.mem.eql(u8, assignment_start, original)) return true;
+fn hasCanonicalStdImport(context: RuleRun) bool {
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .keyword_const or index + 6 >= context.tokens.len or
+            context.tokens[index + 1].tag != .identifier or !context.tokenIs(index + 1, "std") or
+            context.tokens[index + 2].tag != .equal or context.tokens[index + 3].tag != .builtin or
+            !context.tokenIs(index + 3, "@import") or context.tokens[index + 4].tag != .l_paren or
+            context.tokens[index + 5].tag != .string_literal or !context.tokenIs(index + 5, "\"std\"") or
+            context.tokens[index + 6].tag != .r_paren) continue;
+        return true;
     }
     return false;
+}
+
+fn fieldIsReferenced(context: RuleRun, start: usize, end: usize, original: []const u8) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or index + 2 >= end or
+            context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier) continue;
+        const expression = context.source[token.loc.start..context.tokens[index + 2].loc.end];
+        if (std.mem.eql(u8, expression, original)) return true;
+    }
+    return false;
+}
+
+fn exclusivelyMutatedCopy(context: RuleRun, start: usize, end: usize, name: []const u8) ?usize {
+    const methods = [_][]const u8{ "append", "appendSlice", "insert", "addOne", "ensureTotalCapacity", "resize", "clearAndFree", "pop" };
+    var first_mutation: ?usize = null;
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, name) or
+            !context.refersToBinding(index, name)) continue;
+        if (index + 3 >= end or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 2].tag != .identifier or context.tokens[index + 3].tag != .l_paren) return null;
+        for (methods) |method| {
+            if (!context.tokenIs(index + 2, method)) continue;
+            if (first_mutation == null) first_mutation = index;
+            break;
+        } else return null;
+    }
+    return first_mutation;
 }
 
 fn isExported(context: RuleRun, fn_index: usize) bool {
@@ -235,10 +284,18 @@ fn isExported(context: RuleRun, fn_index: usize) bool {
 fn identifierDeclarationCount(context: RuleRun, name: []const u8) usize {
     var count: usize = 0;
     for (context.tokens, 0..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or index == 0) continue;
-        switch (context.tokens[index - 1].tag) {
-            .keyword_fn, .keyword_const, .keyword_var => count += 1,
+        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+        if (index > 0) switch (context.tokens[index - 1].tag) {
+            .keyword_fn, .keyword_const, .keyword_var, .pipe, .asterisk => {
+                count += 1;
+                continue;
+            },
             else => {},
+        };
+        if (index + 1 < context.tokens.len and
+            (context.tokens[index + 1].tag == .colon or context.tokens[index + 1].tag == .pipe))
+        {
+            count += 1;
         }
     }
     return count;
@@ -281,6 +338,7 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
         "const Secret = struct {};\n" ++
         "const Failure = error{Bad};\n" ++
         "/// Deprecated: use current instead.\n" ++
@@ -288,7 +346,7 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
         "fn flag() !bool { return true; }\n" ++
         "pub fn secret() Secret { return .{}; }\n" ++
         "pub fn fail() Failure!void { return error.Bad; }\n" ++
-        "fn use(self: *State) void { _ = old; var copy = self.list; copy.append(1); }\n";
+        "fn use(self: *State) void { _ = old; var copy: std.ArrayList(u8) = self.list; _ = copy.pop(); }\n";
     const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
     var seen = [_]bool{false} ** 5;
     for (found) |finding| switch (finding.rule) {
@@ -300,6 +358,54 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
         else => {},
     };
     for (seen) |value| try std.testing.expect(value);
+}
+
+test "mutated container copies reject constructors and type literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "fn run(allocator: std.mem.Allocator) !void {\n" ++
+        "    var list = std.ArrayList(u8).empty;\n" ++
+        "    try list.append(allocator, 1);\n" ++
+        "    var headers = namespace.Headers.ViewChangeArray{ .array = .{} };\n" ++
+        "    headers.append(1);\n" ++
+        "}\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .mutated_container_copy);
+}
+
+test "mutated container copies omit inferred and otherwise observed values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "fn inferred(self: *State) void { var copy = self.list; _ = copy.pop(); }\n" ++
+        "fn observed(self: *State) void {\n" ++
+        "    var copy: std.ArrayList(u8) = self.list;\n" ++
+        "    _ = copy.pop();\n" ++
+        "    consume(copy);\n" ++
+        "}\n" ++
+        "fn owner_used(self: *State) void {\n" ++
+        "    var copy: std.ArrayList(u8) = self.list;\n" ++
+        "    self.list.clearRetainingCapacity();\n" ++
+        "    _ = copy.pop();\n" ++
+        "}\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .mutated_container_copy);
+}
+
+test "mutated container copies reject shadowed standard library aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "fn run(std: anytype, self: *State) void {\n" ++
+        "    var copy: std.ArrayList(u8) = self.list;\n" ++
+        "    _ = copy.pop();\n" ++
+        "}\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .mutated_container_copy);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8, configuration: types.Configuration) ![]const types.Finding {
