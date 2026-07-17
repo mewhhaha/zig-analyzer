@@ -1,6 +1,7 @@
 const std = @import("std");
-const types = @import("types.zig");
+
 const generated_source = @import("generated_source.zig");
+const types = @import("types.zig");
 
 pub const SourceFile = struct {
     path: []const u8,

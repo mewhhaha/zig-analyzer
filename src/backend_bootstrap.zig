@@ -259,8 +259,8 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
 fn printFailure(io: std.Io, comptime format: []const u8, arguments: anytype) anyerror {
     var buffer: [4096]u8 = undefined;
     var file_writer = std.Io.File.stderr().writer(io, &buffer);
-    file_writer.interface.print(format, arguments) catch |err| return err;
-    file_writer.interface.flush() catch |err| return err;
+    try file_writer.interface.print(format, arguments);
+    try file_writer.interface.flush();
     return error.BootstrapFailed;
 }
 

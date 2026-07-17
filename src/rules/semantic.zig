@@ -1,10 +1,11 @@
 const std = @import("std");
+
+const syntax_scope = @import("../syntax_scope.zig");
 const allocation_lifecycle = @import("allocation_lifecycle.zig");
 const configuration_parser = @import("configuration.zig");
-const rule_types = @import("types.zig");
-const rule_registry = @import("registry.zig");
 const generated_source_detection = @import("generated_source.zig");
-const syntax_scope = @import("../syntax_scope.zig");
+const rule_registry = @import("registry.zig");
+const rule_types = @import("types.zig");
 
 pub const Level = rule_types.Level;
 pub const Rule = rule_types.Rule;

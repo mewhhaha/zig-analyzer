@@ -5,6 +5,7 @@ const language_reference = "https://ziglang.org/documentation/master/";
 pub const Description = struct {
     syntax: []const u8,
     category: []const u8,
+    type_summary: ?[]const u8 = null,
     summary: []const u8,
     reference: []const u8,
 };
@@ -305,6 +306,7 @@ fn primitiveDescription(allocator: std.mem.Allocator, spelling: []const u8) !Des
     return .{
         .syntax = spelling,
         .category = category,
+        .type_summary = if (std.mem.eql(u8, spelling, "true") or std.mem.eql(u8, spelling, "false")) "bool" else null,
         .summary = summary,
         .reference = if (primitiveValueSummary(spelling) != null)
             language_reference ++ "#Primitive-Values"
@@ -430,6 +432,16 @@ test "describes keywords and arbitrary-width integer types" {
     try std.testing.expectEqualStrings("A signed integer type with 37 bits.", integer.summary);
 
     try std.testing.expect(try describe(std.testing.allocator, "value", .identifier) == null);
+}
+
+test "boolean primitive values report their concrete type" {
+    const truth = (try describe(std.testing.allocator, "true", .identifier)).?;
+    const falsehood = (try describe(std.testing.allocator, "false", .identifier)).?;
+
+    try std.testing.expectEqualStrings("primitive value", truth.category);
+    try std.testing.expectEqualStrings("bool", truth.type_summary.?);
+    try std.testing.expectEqualStrings("primitive value", falsehood.category);
+    try std.testing.expectEqualStrings("bool", falsehood.type_summary.?);
 }
 
 test "describes builtins operators literals and punctuation" {

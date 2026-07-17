@@ -27,6 +27,7 @@ const EXAMPLES = [
     displayEnd: 46,
     completion: { line: 45, after: "pipeline." },
     requiredAnalyzerCompletions: ["trace"],
+    expectedZlsCompletions: ["value"],
   },
   {
     id: "indirect-field",
@@ -40,19 +41,21 @@ const EXAMPLES = [
     displayEnd: 22,
     completion: { line: 21, after: "ActiveImplementation." },
     requiredAnalyzerCompletions: ["verify"],
+    expectedZlsCompletions: [],
   },
   {
     id: "active-branch",
     kind: "Completion",
     label: "comptime if",
-    title: "The active comptime branch",
+    title: "Filtering an inactive comptime branch",
     summary:
-      "The feature list contains metrics, so only the first branch exists for this call. ZLS offers both possibilities.",
+      "Both servers find recordMetric, but only zig-analyzer filters out disabled from the branch this call cannot produce.",
     fixture: "examples/compiler/conditional_api.zig",
     displayStart: 2,
     displayEnd: 21,
     completion: { line: 20, after: "ActiveApi." },
     requiredAnalyzerCompletions: ["recordMetric"],
+    expectedZlsCompletions: ["disabled", "recordMetric"],
   },
   {
     id: "parsed-configuration",
@@ -60,25 +63,13 @@ const EXAMPLES = [
     label: "parsed spec",
     title: "A type parsed from a string",
     summary:
-      'The retry budget is parsed out of "retries:3" at comptime and selects the resilient client.',
+      'Both servers find retryBudget, but ZLS also offers singleAttempt even though "retries:3" selects the other branch.',
     fixture: "examples/compiler/parsed_configuration.zig",
     displayStart: 2,
     displayEnd: 23,
     completion: { line: 18, after: "ResilientClient." },
     requiredAnalyzerCompletions: ["retryBudget"],
-  },
-  {
-    id: "recursive-wrapper",
-    kind: "Completion",
-    label: "recursion",
-    title: "A recursively built wrapper",
-    summary:
-      "Wrapped(3, Leaf) builds three nested structs; the outermost one answers at the dot.",
-    fixture: "examples/compiler/recursive_wrapper.zig",
-    displayStart: 0,
-    displayEnd: 23,
-    completion: { line: 22, after: "wrapped." },
-    requiredAnalyzerCompletions: ["unwrap"],
+    expectedZlsCompletions: ["retryBudget", "singleAttempt"],
   },
   {
     id: "reflected-strategy",
@@ -86,19 +77,21 @@ const EXAMPLES = [
     label: "@typeInfo",
     title: "A strategy chosen by reflection",
     summary:
-      "Strategy reads Reading's fields through @typeInfo and returns the matching encoder.",
+      "Both servers find encode, but ZLS also offers unsupported from the reflection branch Reading cannot select.",
     fixture: "examples/compiler/reflected_strategy.zig",
     displayStart: 2,
     displayEnd: 27,
     completion: { line: 22, after: "ReadingStrategy." },
     requiredAnalyzerCompletions: ["encode"],
+    expectedZlsCompletions: ["encode", "unsupported"],
   },
   {
     id: "stdlib-completion",
     kind: "Completion",
     label: "std.mem",
     title: "Completing the standard library",
-    summary: "Everyday standard-library completion, where both servers agree.",
+    summary:
+      "Everyday standard-library completion, included as a parity baseline with both candidate sets visible.",
     fixture: "examples/zls/stdlib_completion.zig",
     displayStart: 0,
     displayEnd: 8,
@@ -137,6 +130,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 24,
     requiredAnalyzerDiagnostics: ["cleanup-after-fallible-operation"],
+    expectedZlsDiagnostics: [],
   },
   {
     id: "lifetimes",
@@ -153,6 +147,7 @@ const EXAMPLES = [
       "returning-arena-allocation",
       "invalidated-element-pointer",
     ],
+    expectedZlsDiagnostics: [],
   },
   {
     id: "overlapping-copy",
@@ -165,6 +160,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 4,
     requiredAnalyzerDiagnostics: ["aliased-memcpy"],
+    expectedZlsDiagnostics: [],
   },
   {
     id: "unsigned-reverse-loop",
@@ -177,6 +173,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 6,
     requiredAnalyzerDiagnostics: ["unsigned-reverse-loop"],
+    expectedZlsDiagnostics: [],
   },
   {
     id: "padded-equality",
@@ -189,6 +186,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 9,
     requiredAnalyzerDiagnostics: ["padded-byte-compare"],
+    expectedZlsDiagnostics: [],
   },
   {
     id: "discarded-error",
@@ -201,18 +199,7 @@ const EXAMPLES = [
     displayStart: 0,
     displayEnd: 8,
     requiredAnalyzerDiagnostics: ["discarded-error"],
-  },
-  {
-    id: "compiler-error",
-    kind: "Diagnostics",
-    label: "compile error",
-    title: "A semantic compiler error",
-    summary:
-      "It parses, but a string literal cannot be returned as u32 — a compiler-backed diagnostic.",
-    fixture: "examples/diagnostics/compiler_error.zig",
-    displayStart: 0,
-    displayEnd: 2,
-    requiredAnalyzerDiagnostics: ["compiler-error"],
+    expectedZlsDiagnostics: [],
   },
 ];
 
@@ -603,11 +590,23 @@ async function captureExample(
       textDocument: { uri },
       position,
     });
+    const zlsLabels = completionLabels(zlsResult);
+    if (
+      example.expectedZlsCompletions !== undefined &&
+      JSON.stringify(zlsLabels) !==
+        JSON.stringify(example.expectedZlsCompletions)
+    ) {
+      throw new Error(
+        `${example.fixture}:${line + 1}: expected ZLS completions ${
+          JSON.stringify(example.expectedZlsCompletions)
+        }, received ${JSON.stringify(zlsLabels)}`,
+      );
+    }
     completion = {
       line,
       character,
       analyzer: analyzerLabels,
-      zls: completionLabels(zlsResult),
+      zls: zlsLabels,
     };
   }
 
@@ -666,6 +665,18 @@ async function captureExample(
           `${example.fixture}: zig-analyzer diagnostics omitted '${required}'`,
         );
       }
+    }
+    const zlsCodes = captured.diagnostics.zls.map((entry) => entry.code);
+    if (
+      example.expectedZlsDiagnostics !== undefined &&
+      JSON.stringify(zlsCodes) !==
+        JSON.stringify(example.expectedZlsDiagnostics)
+    ) {
+      throw new Error(
+        `${example.fixture}: expected ZLS diagnostics ${
+          JSON.stringify(example.expectedZlsDiagnostics)
+        }, received ${JSON.stringify(zlsCodes)}`,
+      );
     }
   }
 

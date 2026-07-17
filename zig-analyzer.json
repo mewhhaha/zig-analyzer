@@ -1,4 +1,7 @@
 {
+  "check": {
+    "exclude": [".claude", "tmp"]
+  },
   "lints": {
     "profile": "idiomatic",
     "correctness": "warning",

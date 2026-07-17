@@ -8,8 +8,10 @@ zig build examples
 ```
 
 `diagnostics/compiler_error.zig` is intentionally excluded from that build. It
-is valid Zig syntax with a semantic return-type error, so opening it exercises
-the `zig compiler` diagnostic path rather than the parser diagnostic path.
+is valid Zig syntax with a semantic return-type error and is used by the
+compiler-integration tests. It is not a ZLS comparison: because the isolated
+file is outside the repository build graph, build-on-save does not ask ZLS to
+compile it.
 
 `diagnostics/code_actions.zig` is also intentionally incomplete. Open it in
 Helix and use `space a` on the affected expression to exercise switch-prong and
@@ -80,20 +82,29 @@ compiler and ZLS accept but zig-analyzer warns about:
 | `diagnostics/padded_equality.zig` | `padded-byte-compare` |
 | `diagnostics/discarded_error.zig` | `discarded-error` |
 
-For completion cases, leave the source unchanged and place the cursor directly
-after the listed dot, before the existing member name:
+For compiler-derived completion cases, leave the source unchanged and place the
+cursor directly after the listed dot, before the existing member name. The
+expected sets are pinned in the capture script so a changed ZLS response forces
+this comparison to be reviewed:
 
-| File | Cursor expression | Expected member |
-| --- | --- | --- |
-| `compiler/comptime_pipeline.zig` | `pipeline.` | `trace` |
-| `compiler/indirect_type_lookup.zig` | `ActiveImplementation.` | `verify` |
-| `compiler/conditional_api.zig` | `ActiveApi.` | `recordMetric` |
-| `compiler/reflected_strategy.zig` | `ReadingStrategy.` | `encode` |
-| `compiler/parsed_configuration.zig` | `ResilientClient.` | `retryBudget` |
-| `compiler/recursive_wrapper.zig` | `wrapped.` | `unwrap` |
-| `zls/struct_fields.zig` | `profile.` | `display_name`, `login_count` |
-| `zls/stdlib_completion.zig` | `std.mem.` | `eql` |
-| `zls/imports/main.zig` | `catalog.` | `default_limit`, `clampToLimit` |
+| File | Cursor expression | zig-analyzer | ZLS 0.16.0 |
+| --- | --- | --- | --- |
+| `compiler/comptime_pipeline.zig` | `pipeline.` | `Self`, `inner`, `trace` | `value` |
+| `compiler/indirect_type_lookup.zig` | `ActiveImplementation.` | `verify` | none |
+| `compiler/conditional_api.zig` | `ActiveApi.` | `recordMetric` | `disabled`, `recordMetric` |
+| `compiler/parsed_configuration.zig` | `ResilientClient.` | `retryBudget` | `retryBudget`, `singleAttempt` |
+| `compiler/reflected_strategy.zig` | `ReadingStrategy.` | `encode` | `encode`, `unsupported` |
+
+The last three are precision differences, not missing-completion claims: ZLS
+finds the usable member but also includes an impossible branch. The recursive
+wrapper remains a compiler regression fixture, but it is no longer a gallery
+comparison because both servers provide its useful `inner` and `unwrap`
+members.
+
+The `zls` fixtures cover ordinary parity cases. Struct fields expose
+`display_name` and `login_count`, standard-library completion includes `eql`,
+and the imported catalog exposes `default_limit` and `clampToLimit` in both
+servers.
 
 The remaining rename case is `zls/scoped_rename.zig`. Rename the `value`
 parameter of `increment` to `number`. A scope-aware result changes that
@@ -145,7 +156,6 @@ node docs/tools/capture_comparisons.js \
   --zig /path/to/zig-0.16.0
 ```
 
-The compiler-error card is an isolated file that is intentionally not part of
-the repository's build graph. ZLS build-on-save therefore completes the
-project build without compiling that file; the empty ZLS result on that card
-does not claim that ZLS can never relay compiler errors from build targets.
+The comparison generator also pins the expected empty ZLS diagnostic sets. If
+ZLS starts reporting one of those safety or lifetime problems, regeneration
+fails until the stale card is removed or rewritten.

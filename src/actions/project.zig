@@ -66,6 +66,8 @@ fn buildImportAction(
     const build_directory = std.fs.path.dirname(build_path) orelse return null;
     const relative_path = try std.fs.path.relative(allocator, "/", null, build_directory, module_path);
     const insertion = build_tokens[build_body.end].loc.start;
+    // Ownership is transferred through the returned Candidate.edits slice.
+    // zig-analyzer: disable-next-line unreleased-allocation
     const edits = try allocator.alloc(FileEdit, 1);
     edits[0] = .{
         .uri = build_document.uri,
