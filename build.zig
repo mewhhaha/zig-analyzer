@@ -85,6 +85,61 @@ pub fn build(b: *std.Build) void {
     const examples_step = b.step("examples", "Compile and test the language-server comparison examples");
     examples_step.dependOn(&run_comparison_examples_tests.step);
     test_step.dependOn(&run_comparison_examples_tests.step);
+    const pipeline_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/comptime_pipeline.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const conditional_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/conditional_api.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const indirect_lookup_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/indirect_type_lookup.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const parsed_configuration_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/parsed_configuration.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const recursive_wrapper_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/recursive_wrapper.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const reflected_strategy_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/reflected_strategy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const compiler_example_tests = [_]*std.Build.Step.Compile{
+        pipeline_example_tests,
+        conditional_example_tests,
+        indirect_lookup_example_tests,
+        parsed_configuration_example_tests,
+        recursive_wrapper_example_tests,
+        reflected_strategy_example_tests,
+    };
+    for (compiler_example_tests) |compiler_example_test| {
+        const run_compiler_example_test = b.addRunArtifact(compiler_example_test);
+        examples_step.dependOn(&run_compiler_example_test.step);
+        test_step.dependOn(&run_compiler_example_test.step);
+    }
 
     const compiler_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{

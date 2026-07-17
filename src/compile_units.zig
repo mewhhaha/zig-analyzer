@@ -336,7 +336,7 @@ test "root selection follows actual imports and isolates unrelated documents" {
     try std.testing.expectEqualStrings(unrelated_path, unrelated_root);
 }
 
-test "compiler error example remains outside the examples compile unit" {
+test "comparison root selection isolates standalone examples" {
     const io = std.testing.io;
     const repository = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repository);
@@ -350,6 +350,11 @@ test "compiler error example remains outside the examples compile unit" {
         &.{ repository, "examples/diagnostics/memory_management.zig" },
     );
     defer std.testing.allocator.free(memory_management);
+    const compiler_example = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ repository, "examples/compiler/comptime_pipeline.zig" },
+    );
+    defer std.testing.allocator.free(compiler_example);
 
     const isolated_root = try rootSourceForDocument(io, std.testing.allocator, compiler_error);
     defer std.testing.allocator.free(isolated_root);
@@ -357,6 +362,9 @@ test "compiler error example remains outside the examples compile unit" {
     const examples_root = try rootSourceForDocument(io, std.testing.allocator, memory_management);
     defer std.testing.allocator.free(examples_root);
     try std.testing.expect(std.mem.endsWith(u8, examples_root, "examples/examples.zig"));
+    const compiler_example_root = try rootSourceForDocument(io, std.testing.allocator, compiler_example);
+    defer std.testing.allocator.free(compiler_example_root);
+    try std.testing.expectEqualStrings(compiler_example, compiler_example_root);
 }
 
 test "named modules resolve their declared root source" {

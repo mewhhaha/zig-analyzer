@@ -65,7 +65,7 @@ index 1252d74e..e5c54459 100644
              const actual_err = switch (orig_err) {
                  error.Canceled,
                  error.OutOfMemory,
-@@ -109,6 +129,585 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -109,6 +129,591 @@ fn runServer(ids: *IncrementalDebugServer) void {
      }
  }
  
@@ -94,9 +94,11 @@ index 1252d74e..e5c54459 100644
 +                const expected_body_length: u32 = @sizeOf(AnalysisProtocol.Hello) +
 +                    @as(u32, hello.zig_version_length) + hello.authentication_token_length;
 +                if (header.body_length != expected_body_length) return error.EndOfStream;
-+                const zig_version = try stream_reader.take(hello.zig_version_length);
++                const zig_version = try stream_reader.readAlloc(ids.zcu.gpa, hello.zig_version_length);
++                defer ids.zcu.gpa.free(zig_version);
 +                const zig_version_is_compatible = std.mem.eql(u8, zig_version, "0.16.0");
-+                const authentication_token = try stream_reader.take(hello.authentication_token_length);
++                const authentication_token = try stream_reader.readAlloc(ids.zcu.gpa, hello.authentication_token_length);
++                defer ids.zcu.gpa.free(authentication_token);
 +                const status: AnalysisProtocol.HandshakeStatus = if (hello.protocol_version != AnalysisProtocol.version)
 +                    .incompatible_protocol
 +                else if (!zig_version_is_compatible)
@@ -132,16 +134,16 @@ index 1252d74e..e5c54459 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay request length is invalid");
 +                    continue;
 +                }
-+                const uri = try stream_reader.take(request.uri_length);
-+                const owned_uri = try ids.zcu.gpa.dupe(u8, uri);
-+                defer ids.zcu.gpa.free(owned_uri);
-+                const source = try stream_reader.take(request.source_length);
-+                const file_index = overlayFileIndex(ids, owned_uri) orelse {
++                const uri = try stream_reader.readAlloc(ids.zcu.gpa, request.uri_length);
++                defer ids.zcu.gpa.free(uri);
++                const source = try stream_reader.readAlloc(ids.zcu.gpa, request.source_length);
++                defer ids.zcu.gpa.free(source);
++                const file_index = overlayFileIndex(ids, uri) orelse {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document is outside the active compile unit");
 +                    continue;
 +                };
-+                try ids.replaceOverlay(owned_uri, request.document_version, source, file_index);
-+                const facts = try ids.documentFacts(owned_uri, request.document_version);
++                try ids.replaceOverlay(uri, request.document_version, source, file_index);
++                const facts = try ids.documentFacts(uri, request.document_version);
 +                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .document_facts, AnalysisProtocol.DocumentFacts, facts);
 +            },
 +            .analyze => {
@@ -167,7 +169,8 @@ index 1252d74e..e5c54459 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "analysis request length is invalid");
 +                    continue;
 +                }
-+                const uri = try stream_reader.take(request.uri_length);
++                const uri = try stream_reader.readAlloc(ids.zcu.gpa, request.uri_length);
++                defer ids.zcu.gpa.free(uri);
 +                const overlay = ids.zcu.analysis_overlays.get(uri) orelse {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document overlay is unavailable");
 +                    continue;
@@ -209,7 +212,8 @@ index 1252d74e..e5c54459 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type members request length is invalid");
 +                    continue;
 +                }
-+                const name = try stream_reader.take(request.name_length);
++                const name = try stream_reader.readAlloc(ids.zcu.gpa, request.name_length);
++                defer ids.zcu.gpa.free(name);
 +                if (!try ids.writeTypeMembers(stream_writer, header.request_id, name)) {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "resolved container type is unavailable");
 +                }
@@ -236,7 +240,8 @@ index 1252d74e..e5c54459 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "type shape request length is invalid");
 +                    continue;
 +                }
-+                const name = try stream_reader.take(request.name_length);
++                const name = try stream_reader.readAlloc(ids.zcu.gpa, request.name_length);
++                defer ids.zcu.gpa.free(name);
 +                if (!try ids.writeTypeShape(stream_writer, header.request_id, name)) {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "finite enum, tagged union, or struct shape is unavailable");
 +                }
@@ -264,7 +269,8 @@ index 1252d74e..e5c54459 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "overlay removal length is invalid");
 +                    continue;
 +                }
-+                const uri = try stream_reader.take(request.uri_length);
++                const uri = try stream_reader.readAlloc(ids.zcu.gpa, request.uri_length);
++                defer ids.zcu.gpa.free(uri);
 +                markOverlayRemoved(ids, uri);
 +                if (ids.zcu.analysis_overlays.fetchRemove(uri)) |removed| {
 +                    ids.zcu.gpa.free(removed.key);
@@ -275,7 +281,7 @@ index 1252d74e..e5c54459 100644
 +                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .remove_overlay, AnalysisProtocol.RemoveOverlayRequest, .{ .uri_length = 0 });
 +            },
 +            .workspace_declarations => {
-+                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++                try discardBody(stream_reader, header.body_length);
 +                if (!authenticated) {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
 +                    continue;
@@ -300,7 +306,7 @@ index 1252d74e..e5c54459 100644
 +                );
 +            },
 +            .workspace_declaration_names => {
-+                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++                try discardBody(stream_reader, header.body_length);
 +                if (!authenticated) {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
 +                    continue;
@@ -313,7 +319,7 @@ index 1252d74e..e5c54459 100644
 +            },
 +            .shutdown => return error.EndOfStream,
 +            else => {
-+                if (header.body_length != 0) _ = try stream_reader.take(header.body_length);
++                try discardBody(stream_reader, header.body_length);
 +            },
 +        }
 +    }
@@ -581,7 +587,7 @@ index 1252d74e..e5c54459 100644
 +}
 +
 +fn discardBody(reader: *Io.Reader, body_length: u32) Io.Reader.Error!void {
-+    if (body_length != 0) _ = try reader.take(body_length);
++    try reader.discardAll(body_length);
 +}
 +
 +fn writeHelloResponse(
