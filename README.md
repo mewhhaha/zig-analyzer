@@ -60,7 +60,7 @@ captured response. Reproduce it from
 Requires Zig 0.16.0 exactly:
 
 ```sh
-zig build
+zig build -Doptimize=ReleaseFast
 zig build backend                    # builds the patched compiler
 zig-out/bin/zig-analyzer doctor      # verifies the setup
 ```

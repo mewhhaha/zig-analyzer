@@ -56,7 +56,7 @@ support for the opinionated profile.
 Build the analyzer before opening this repository in Helix:
 
 ```sh
-zig build
+zig build -Doptimize=ReleaseFast
 hx --health zig
 ```
 
@@ -84,7 +84,7 @@ configuration:
 
 ```sh
 zig build backend-test
-zig build
+zig build -Doptimize=ReleaseFast
 hx fixtures/comptime/main.zig
 ```
 

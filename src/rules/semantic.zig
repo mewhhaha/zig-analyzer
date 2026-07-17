@@ -102,18 +102,18 @@ pub fn findingsWithShapes(
     try findCatchDiagnostics(allocator, source, tokens, configuration, &found);
     try findMissingResourceCleanup(allocator, source, tokens, configuration, &found);
     try findUndefinedValueEscapes(allocator, source, tokens, configuration, &found);
-    try findBooleanComparisons(allocator, source, tokens, configuration, &found);
+    try findBooleanComparisons(allocator, source, tokens, &scope_index, configuration, &found);
     try findErrorValueComparisons(allocator, source, tokens, &tree, configuration, &found);
     try findMixedBitwiseArithmetic(allocator, source, tokens, &tree, configuration, &found);
     try findUnusedPrivateDeclarations(allocator, source, tokens, &tree, configuration, &found);
     try findComptimeReflectionIssues(allocator, source, tokens, containers.items, &scope_index, configuration, &found);
     try findConstantComptimeConditions(allocator, source, tokens, configuration, &found);
-    try findSwitches(allocator, source, tokens, containers.items, configuration, &found);
-    try findStructInitializers(allocator, source, tokens, &tree, containers.items, configuration, &found);
+    try findSwitches(allocator, source, tokens, containers.items, &scope_index, configuration, &found);
+    try findStructInitializers(allocator, source, tokens, &tree, containers.items, &scope_index, configuration, &found);
     // defer_cleanup_in_loop is intentionally inert: a defer in a loop body runs at the
     // end of each iteration, not at function exit, so the rule's premise was false.
     // The Rule enum entry remains so existing configurations still parse.
-    try findNeedlessCasts(allocator, source, tokens, configuration, &found);
+    try findNeedlessCasts(allocator, source, tokens, &scope_index, configuration, &found);
     try findNeedlessElse(allocator, source, tokens, configuration, &found);
     try findNonIdiomaticNames(allocator, source, tokens, configuration, &found);
     try findOfficialStyleIssues(allocator, source, tokens, configuration, &found);
@@ -347,7 +347,7 @@ fn containerForReceiver(
     receiver_name: []const u8,
     receiver_index: usize,
 ) ?Container {
-    if (containerNamed(source, tokens, containers, receiver_name, receiver_index)) |container| return container;
+    if (containerNamed(containers, scope_index, receiver_name, receiver_index)) |container| return container;
     for (containers) |container| {
         if (!scopeContains(container.scope, receiver_index)) continue;
         if (indexedBindingHasType(source, tokens, scope_index, receiver_index, container.name) or
@@ -1158,6 +1158,7 @@ fn findBooleanComparisons(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -1180,7 +1181,7 @@ fn findBooleanComparisons(
         const operand = tokens[operand_index];
         const literal_text = tokenText(source, literal);
         const operand_name = tokenText(source, operand);
-        if (!bindingAtHasType(source, tokens, operand_index, "bool")) continue;
+        if (!indexedBindingHasType(source, tokens, scope_index, operand_index, "bool")) continue;
         const equal_to_true = (operator.tag == .equal_equal) == std.mem.eql(u8, literal_text, "true");
         const replacement = if (equal_to_true)
             try allocator.dupe(u8, operand_name)
@@ -1507,19 +1508,6 @@ fn collectReflectedNames(
     return collected;
 }
 
-fn bindingAtHasType(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    receiver_index: usize,
-    type_name: []const u8,
-) bool {
-    const binding = syntax_scope.findBinding(source, tokens, receiver_index) orelse return false;
-    const index = binding.token_index;
-    if (index + 2 >= tokens.len or tokens[index + 1].tag != .colon or
-        !tokenIs(source, tokens[index + 2], type_name)) return false;
-    return index + 3 >= tokens.len or tokens[index + 3].tag != .period;
-}
-
 fn indexedBindingHasType(
     source: []const u8,
     tokens: []const std.zig.Token,
@@ -1753,6 +1741,7 @@ fn findSwitches(
     source: []const u8,
     tokens: []const std.zig.Token,
     containers: []const Container,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -1782,7 +1771,7 @@ fn findSwitches(
             return_types.get(operand_name) orelse continue
         else
             continue;
-        const container = containerNamed(source, tokens, containers, type_name, switch_index) orelse continue;
+        const container = containerNamed(containers, scope_index, type_name, switch_index) orelse continue;
         if (container.kind == .structure) continue;
 
         var missing: std.ArrayList([]const u8) = .empty;
@@ -2014,9 +2003,8 @@ fn enclosingOpeningParenthesis(tokens: []const std.zig.Token, index: usize) ?usi
 }
 
 fn containerNamed(
-    source: []const u8,
-    tokens: []const std.zig.Token,
     containers: []const Container,
+    scope_index: *const syntax_scope.Index,
     requested_name: []const u8,
     use_index: usize,
 ) ?Container {
@@ -2027,43 +2015,14 @@ fn containerNamed(
             if (!std.mem.eql(u8, container.name, name) or !scopeContains(container.scope, use_index)) continue;
             if (selected == null or scopeDepth(container.scope) > scopeDepth(selected.?.scope)) selected = container;
         }
-        const alias = visibleAlias(source, tokens, name, use_index);
+        const visible_binding = scope_index.findBindingNamed(name, use_index);
         if (selected) |container| {
-            if (alias == null or scopeDepth(container.scope) >= scopeDepth(alias.?.scope)) return container;
+            if (visible_binding == null or scopeDepth(container.scope) >= visible_binding.?.scope_rank) return container;
         }
-        const target = (alias orelse return null).target orelse return null;
+        const target = (visible_binding orelse return null).alias_target orelse return null;
         name = target;
     }
     return null;
-}
-
-const VisibleAlias = struct {
-    target: ?[]const u8,
-    scope: TokenScope,
-};
-
-fn visibleAlias(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    alias: []const u8,
-    use_index: usize,
-) ?VisibleAlias {
-    var selected: ?VisibleAlias = null;
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_const or index + 3 >= tokens.len or !tokenIs(source, tokens[index + 1], alias) or
-            tokens[index + 2].tag != .equal) continue;
-        const scope = enclosingTokenScope(tokens, index);
-        if (!scopeContains(scope, use_index)) continue;
-        const target = if (tokens[index + 3].tag == .identifier and index + 4 < tokens.len and
-            tokens[index + 4].tag == .semicolon)
-            tokenText(source, tokens[index + 3])
-        else
-            null;
-        if (selected == null or scopeDepth(scope) > scopeDepth(selected.?.scope)) {
-            selected = .{ .target = target, .scope = scope };
-        }
-    }
-    return selected;
 }
 
 fn containerDeclared(containers: []const Container, name: []const u8) bool {
@@ -2196,6 +2155,7 @@ fn findStructInitializers(
     tokens: []const std.zig.Token,
     tree: *const std.zig.Ast,
     containers: []const Container,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -2216,7 +2176,7 @@ fn findStructInitializers(
         };
         if (type_token_index >= tokens.len or tokens[type_token_index].tag != .identifier) continue;
         const type_name = tokenText(source, tokens[type_token_index]);
-        const container = containerNamed(source, tokens, containers, type_name, type_token_index) orelse continue;
+        const container = containerNamed(containers, scope_index, type_name, type_token_index) orelse continue;
         if (container.kind != .structure) continue;
         const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
         var missing: std.ArrayList([]const u8) = .empty;
@@ -2328,6 +2288,7 @@ fn findNeedlessCasts(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -2349,7 +2310,7 @@ fn findNeedlessCasts(
             replacement = source[tokens[index + 4].loc.start..tokens[inner_close].loc.end];
             message = try std.fmt.allocPrint(allocator, "nested cast to '{s}' repeats the same proven type", .{type_name});
         } else if (tokens[index + 4].tag == .identifier and index + 5 == outer_close and
-            bindingAtHasType(source, tokens, index + 4, type_name))
+            indexedBindingHasType(source, tokens, scope_index, index + 4, type_name))
         {
             replacement = tokenText(source, tokens[index + 4]);
             message = try std.fmt.allocPrint(

@@ -10,6 +10,8 @@ pub const Binding = struct {
     token_index: usize,
     scope: std.zig.Token.Loc,
     kind: BindingKind,
+    alias_target: ?[]const u8 = null,
+    scope_rank: usize = 0,
 };
 
 pub const Index = struct {
@@ -26,9 +28,15 @@ pub const Index = struct {
     ) !Index {
         var index: Index = .{ .allocator = allocator, .source = source, .tokens = tokens };
         errdefer index.deinit();
+        var scope_openings: std.ArrayListUnmanaged(usize) = .empty;
+        defer scope_openings.deinit(allocator);
         for (tokens, 0..) |token, token_index| {
+            if (token.tag == .r_brace and scope_openings.items.len != 0) _ = scope_openings.pop();
             if (token.tag == .identifier) {
-                if (binding(tokens, source, token_index)) |candidate| {
+                if (binding(tokens, source, token_index)) |unindexed_candidate| {
+                    var candidate = unindexed_candidate;
+                    candidate.alias_target = aliasTarget(source, tokens, token_index);
+                    candidate.scope_rank = if (scope_openings.getLastOrNull()) |opening| opening + 1 else 0;
                     const entry = try index.bindings.getOrPut(allocator, tokenText(source, token));
                     if (!entry.found_existing) entry.value_ptr.* = .empty;
                     try entry.value_ptr.append(allocator, candidate);
@@ -38,6 +46,17 @@ pub const Index = struct {
                 const scope = declarationScope(tokens, token_index, true) orelse continue;
                 try index.usingnamespace_scopes.append(allocator, scope);
             }
+            if (token.tag == .l_brace) try scope_openings.append(allocator, token_index);
+        }
+        var binding_lists = index.bindings.valueIterator();
+        while (binding_lists.next()) |bindings| {
+            std.mem.sort(Binding, bindings.items, {}, struct {
+                fn lessThan(_: void, left: Binding, right: Binding) bool {
+                    if (left.scope.start != right.scope.start) return left.scope.start < right.scope.start;
+                    if (left.scope.end != right.scope.end) return left.scope.end > right.scope.end;
+                    return left.token_index < right.token_index;
+                }
+            }.lessThan);
         }
         return index;
     }
@@ -51,18 +70,29 @@ pub const Index = struct {
 
     pub fn findBinding(index: *const Index, use_index: usize) ?Binding {
         if (use_index >= index.tokens.len or index.tokens[use_index].tag != .identifier) return null;
-        const candidates = index.bindings.get(tokenText(index.source, index.tokens[use_index])) orelse return null;
-        var selected: ?Binding = null;
-        for (candidates.items) |candidate| {
-            if (!spanContains(candidate.scope, index.tokens[use_index].loc)) continue;
-            if (selected == null or scopeLength(candidate.scope) < scopeLength(selected.?.scope) or
-                scopeLength(candidate.scope) == scopeLength(selected.?.scope) and
-                    candidate.token_index > selected.?.token_index)
-            {
-                selected = candidate;
-            }
+        return index.findBindingNamed(tokenText(index.source, index.tokens[use_index]), use_index);
+    }
+
+    pub fn findBindingNamed(index: *const Index, name: []const u8, use_index: usize) ?Binding {
+        if (use_index >= index.tokens.len) return null;
+        const candidates = index.bindings.get(name) orelse return null;
+        const occurrence = index.tokens[use_index].loc;
+        var low: usize = 0;
+        var high = candidates.items.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (candidates.items[middle].scope.start <= occurrence.start)
+                low = middle + 1
+            else
+                high = middle;
         }
-        return selected;
+        var cursor = low;
+        while (cursor > 0) {
+            cursor -= 1;
+            const candidate = candidates.items[cursor];
+            if (spanContains(candidate.scope, occurrence)) return candidate;
+        }
+        return null;
     }
 
     pub fn usingnamespaceMayProvideName(index: *const Index, use_index: usize) bool {
@@ -73,6 +103,12 @@ pub const Index = struct {
         return false;
     }
 };
+
+fn aliasTarget(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) ?[]const u8 {
+    if (identifier_index + 3 >= tokens.len or tokens[identifier_index + 1].tag != .equal or
+        tokens[identifier_index + 2].tag != .identifier or tokens[identifier_index + 3].tag != .semicolon) return null;
+    return tokenText(source, tokens[identifier_index + 2]);
+}
 
 pub fn findBinding(
     source: []const u8,
@@ -494,6 +530,30 @@ test "bindings respect lexical scopes and local declaration order" {
     }
     try std.testing.expect(findBinding(source, tokens, later_use.?) == null);
     try std.testing.expect(findBinding(source, tokens, foreign_use.?) == null);
+}
+
+test "indexed bindings select the innermost alias" {
+    const source: [:0]const u8 =
+        "const Alias = Global;\n" ++
+        "fn run() void { const Alias = Local; _ = Alias; }\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+
+    const use_start = std.mem.indexOf(u8, source, "_ = Alias").?;
+    var use_index: ?usize = null;
+    for (tokens, 0..) |token, token_index| {
+        if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "Alias")) {
+            use_index = token_index;
+            break;
+        }
+    }
+    try std.testing.expect(use_index != null);
+    const selected = index.findBinding(use_index.?);
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("Local", selected.?.alias_target.?);
+    try std.testing.expect(selected.?.scope_rank != 0);
 }
 
 test "usingnamespace uncertainty is limited to its container" {
