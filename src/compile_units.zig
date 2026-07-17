@@ -46,6 +46,32 @@ pub fn rootSourceForDocument(
     return try allocator.dupe(u8, if (ambiguous) document_path else selected orelse document_path);
 }
 
+pub fn namedModuleSourceForDocument(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    document_path: []const u8,
+    module_name: []const u8,
+) !?[]const u8 {
+    const build_path = try nearestBuildFile(io, allocator, document_path) orelse return null;
+    defer allocator.free(build_path);
+    const source_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        build_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(source_bytes);
+    const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
+    defer allocator.free(source);
+    @memcpy(source, source_bytes);
+    return try declaredNamedModuleSource(
+        allocator,
+        source,
+        std.fs.path.dirname(build_path) orelse ".",
+        module_name,
+    );
+}
+
 pub fn declaredRootSources(
     allocator: std.mem.Allocator,
     build_source: [:0]const u8,
@@ -80,6 +106,54 @@ pub fn declaredRootSources(
         try roots.append(allocator, resolved);
     }
     return try roots.toOwnedSlice(allocator);
+}
+
+fn declaredNamedModuleSource(
+    allocator: std.mem.Allocator,
+    build_source: [:0]const u8,
+    build_directory: []const u8,
+    module_name: []const u8,
+) !?[]const u8 {
+    const tokens = try tokenize(allocator, build_source);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(build_source, token, "addModule") or
+            index + 2 >= tokens.len or tokens[index + 1].tag != .l_paren or
+            tokens[index + 2].tag != .string_literal) continue;
+        const name_literal = tokenText(build_source, tokens[index + 2]);
+        if (name_literal.len < 2 or !std.mem.eql(u8, name_literal[1 .. name_literal.len - 1], module_name)) continue;
+
+        var parenthesis_depth: usize = 1;
+        var cursor = index + 2;
+        while (cursor + 1 < tokens.len and parenthesis_depth != 0) {
+            cursor += 1;
+            switch (tokens[cursor].tag) {
+                .l_paren => parenthesis_depth += 1,
+                .r_paren => parenthesis_depth -= 1,
+                else => {},
+            }
+            if (parenthesis_depth == 0) break;
+            if (tokens[cursor].tag != .identifier or
+                !tokenIs(build_source, tokens[cursor], "root_source_file")) continue;
+            var path_call = cursor + 1;
+            while (path_call + 1 < tokens.len and path_call - cursor < 12 and
+                tokens[path_call].tag != .l_paren) : (path_call += 1)
+            {}
+            if (path_call + 1 >= tokens.len or path_call - cursor >= 12 or path_call < 1 or
+                tokens[path_call - 1].tag != .identifier or
+                (!tokenIs(build_source, tokens[path_call - 1], "path") and
+                    !tokenIs(build_source, tokens[path_call - 1], "pathFromRoot")) or
+                tokens[path_call + 1].tag != .string_literal) continue;
+            const path_literal = tokenText(build_source, tokens[path_call + 1]);
+            if (path_literal.len < 2) return null;
+            return try std.fs.path.resolve(
+                allocator,
+                &.{ build_directory, path_literal[1 .. path_literal.len - 1] },
+            );
+        }
+        return null;
+    }
+    return null;
 }
 
 fn nearestBuildFile(io: std.Io, allocator: std.mem.Allocator, document_path: []const u8) !?[]const u8 {
@@ -147,4 +221,20 @@ test "build roots are deduplicated and resolved from the build directory" {
     try std.testing.expectEqual(@as(usize, 2), roots.len);
     try std.testing.expectEqualStrings("/workspace/src/main.zig", roots[0]);
     try std.testing.expectEqualStrings("/workspace/tools/tool.zig", roots[1]);
+}
+
+test "named modules resolve their declared root source" {
+    const source: [:0]const u8 =
+        "const stdx_module = b.addModule(\"stdx\", .{\n" ++
+        "    .root_source_file = b.path(\"src/stdx/stdx.zig\"),\n" ++
+        "});\n" ++
+        "const other = b.addModule(\"other\", .{ .root_source_file = b.path(\"src/other.zig\") });\n";
+    const path = (try declaredNamedModuleSource(
+        std.testing.allocator,
+        source,
+        "/workspace",
+        "stdx",
+    )).?;
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings("/workspace/src/stdx/stdx.zig", path);
 }

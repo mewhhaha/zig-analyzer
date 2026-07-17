@@ -349,11 +349,30 @@ pub const Server = struct {
         params: lsp.ParamsType("textDocument/definition"),
     ) !lsp.ResultType("textDocument/definition") {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
-        const identifier_span = document.identifierAt(document.byteOffset(params.position)) orelse return null;
+        const byte_offset = document.byteOffset(params.position);
+        if (try server.importedFileDefinition(arena, document, byte_offset)) |location| {
+            return .{ .definition = .{ .location = location } };
+        }
+        const identifier_span = document.identifierAt(byte_offset) orelse return null;
+        if (identifier_span.start > 0 and document.source[identifier_span.start - 1] == '.') {
+            if (try server.importExpressionMemberDefinition(arena, document, identifier_span)) |location| {
+                return .{ .definition = .{ .location = location } };
+            }
+        }
         if (memberReceiver(document.source, identifier_span.start)) |receiver| {
             if (try server.importedDefinition(arena, document, receiver, document.source[identifier_span.start..identifier_span.end])) |location| {
                 return .{ .definition = .{ .location = location } };
             }
+        }
+        if (try server.aliasTargetDefinition(arena, document, identifier_span)) |location| {
+            return .{ .definition = .{ .location = location } };
+        }
+        if (try server.importAliasDefinition(
+            arena,
+            document,
+            document.source[identifier_span.start..identifier_span.end],
+        )) |location| {
+            return .{ .definition = .{ .location = location } };
         }
         const declaration = declarationAtPosition(document, params.position) orelse return null;
         return .{ .definition = .{ .location = .{
@@ -1003,6 +1022,186 @@ pub const Server = struct {
         return null;
     }
 
+    fn importedFileDefinition(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        byte_offset: usize,
+    ) !?lsp.types.Location {
+        const import_path = try importPathAt(allocator, document.source, byte_offset) orelse return null;
+        const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
+        const path = try server.importedNeighborPath(allocator, document_path, import_path) orelse return null;
+        const source = try server.importedSource(allocator, path) orelse return null;
+        return try sourceStartLocation(allocator, source);
+    }
+
+    fn importAliasDefinition(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        alias: []const u8,
+    ) !?lsp.types.Location {
+        const import_path = try importName(allocator, document.source, alias) orelse return null;
+        const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
+        const path = try server.importedNeighborPath(allocator, document_path, import_path) orelse return null;
+        const source = try server.importedSource(allocator, path) orelse return null;
+        return try sourceStartLocation(allocator, source);
+    }
+
+    fn aliasTargetDefinition(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        identifier_span: std.zig.Token.Loc,
+    ) !?lsp.types.Location {
+        const binding_spans = try document.scopedIdentifierSpans(allocator, identifier_span.start) orelse return null;
+        if (binding_spans.len == 0 or std.meta.eql(binding_spans[0], identifier_span)) return null;
+        const tokens = try tokenize(allocator, document.source);
+        const binding_index = for (tokens, 0..) |token, index| {
+            if (std.meta.eql(token.loc, binding_spans[0])) break index;
+        } else return null;
+        if (binding_index == 0 or tokens[binding_index - 1].tag != .keyword_const) return null;
+
+        const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
+        var file = ImportedSource{
+            .path = document_path,
+            .source = document.source,
+            .tokens = tokens,
+        };
+        var container = TokenRange{ .start = 0, .end = tokens.len };
+        var pending: std.ArrayList([]const u8) = .empty;
+        const initial_target = try constantTarget(
+            allocator,
+            document.source,
+            tokens,
+            binding_index,
+        ) orelse return null;
+        switch (initial_target) {
+            .container => return null,
+            .alias_path => |path_text| {
+                const segments = try dottedPathSegments(allocator, path_text) orelse return null;
+                try pending.appendSlice(allocator, segments);
+            },
+            .imported_file => |imported| {
+                const path = try server.importedNeighborPath(allocator, file.path, imported.file) orelse return null;
+                file = try server.importedSource(allocator, path) orelse return null;
+                container = .{ .start = 0, .end = file.tokens.len };
+                if (imported.members.len == 0) return try sourceStartLocation(allocator, file);
+                try pending.appendSlice(allocator, imported.members);
+            },
+        }
+
+        var last_location: ?lsp.types.Location = null;
+        var hops: usize = 0;
+        while (pending.items.len != 0) : (hops += 1) {
+            if (hops == 32) return last_location;
+            const target_name = pending.orderedRemove(0);
+            const declaration = containerDeclarationNamed(
+                file.source,
+                file.tokens,
+                container,
+                target_name,
+            ) orelse return last_location;
+            last_location = try sourceLocation(allocator, file, file.tokens[declaration.name_index].loc);
+            const descent = switch (declaration.kind) {
+                .field => return last_location,
+                .function => if (pending.items.len == 0)
+                    return last_location
+                else
+                    typeFunctionResult(file.source, file.tokens, declaration.name_index) orelse return last_location,
+                .constant => try constantTarget(
+                    allocator,
+                    file.source,
+                    file.tokens,
+                    declaration.name_index,
+                ) orelse return last_location,
+            };
+            switch (descent) {
+                .container => |range| {
+                    if (pending.items.len == 0) return last_location;
+                    container = range;
+                },
+                .alias_path => |path_text| {
+                    const segments = try dottedPathSegments(allocator, path_text) orelse return last_location;
+                    try pending.insertSlice(allocator, 0, segments);
+                    container = .{ .start = 0, .end = file.tokens.len };
+                },
+                .imported_file => |imported| {
+                    try pending.insertSlice(allocator, 0, imported.members);
+                    const path = try server.importedNeighborPath(allocator, file.path, imported.file) orelse return last_location;
+                    file = try server.importedSource(allocator, path) orelse return last_location;
+                    container = .{ .start = 0, .end = file.tokens.len };
+                    if (pending.items.len == 0) return try sourceStartLocation(allocator, file);
+                },
+            }
+        }
+        return last_location;
+    }
+
+    fn importExpressionMemberDefinition(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        identifier_span: std.zig.Token.Loc,
+    ) !?lsp.types.Location {
+        const tokens = try tokenize(allocator, document.source);
+        const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
+        for (tokens, 0..) |token, import_index| {
+            if (token.tag != .builtin or import_index + 5 >= tokens.len or
+                !std.mem.eql(u8, document.source[token.loc.start..token.loc.end], "@import") or
+                tokens[import_index + 1].tag != .l_paren or
+                tokens[import_index + 2].tag != .string_literal or
+                tokens[import_index + 3].tag != .r_paren)
+            {
+                continue;
+            }
+            var preceding_members: std.ArrayList([]const u8) = .empty;
+            var member_index = import_index + 4;
+            while (member_index + 1 < tokens.len and
+                tokens[member_index].tag == .period and
+                tokens[member_index + 1].tag == .identifier) : (member_index += 2)
+            {
+                const member_token = tokens[member_index + 1];
+                if (std.meta.eql(member_token.loc, identifier_span)) {
+                    const literal = document.source[tokens[import_index + 2].loc.start..tokens[import_index + 2].loc.end];
+                    if (literal.len < 2) return null;
+                    const path = try server.importedNeighborPath(
+                        allocator,
+                        document_path,
+                        literal[1 .. literal.len - 1],
+                    ) orelse return null;
+                    const imported = try server.importedSource(allocator, path) orelse return null;
+                    var site = ResolvedTypeSite{
+                        .file = imported,
+                        .container = .{ .start = 0, .end = imported.tokens.len },
+                    };
+                    if (preceding_members.items.len != 0) {
+                        var pending: std.ArrayList([]const u8) = .empty;
+                        try pending.appendSlice(allocator, preceding_members.items);
+                        site = try server.descendPendingSegments(allocator, imported, &pending) orelse return null;
+                    }
+                    const member_name = document.source[member_token.loc.start..member_token.loc.end];
+                    const declaration = containerDeclarationNamed(
+                        site.file.source,
+                        site.file.tokens,
+                        site.container,
+                        member_name,
+                    ) orelse return null;
+                    return try sourceLocation(
+                        allocator,
+                        site.file,
+                        site.file.tokens[declaration.name_index].loc,
+                    );
+                }
+                try preceding_members.append(
+                    allocator,
+                    document.source[member_token.loc.start..member_token.loc.end],
+                );
+            }
+        }
+        return null;
+    }
+
     fn hoverDescription(
         server: *Server,
         allocator: std.mem.Allocator,
@@ -1221,6 +1420,25 @@ pub const Server = struct {
         return try server.descendPendingSegments(allocator, file, &pending);
     }
 
+    fn resolveDocumentSite(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        expression: []const u8,
+    ) !?ResolvedTypeSite {
+        const segments = try dottedPathSegments(allocator, bareTypeExpression(expression)) orelse return null;
+        if (segments.len == 0) return null;
+        const path = try filePathFromUri(allocator, document.uri) orelse return null;
+        const file = ImportedSource{
+            .path = path,
+            .source = document.source,
+            .tokens = try tokenize(allocator, document.source),
+        };
+        var pending: std.ArrayList([]const u8) = .empty;
+        try pending.appendSlice(allocator, segments);
+        return try server.descendPendingSegments(allocator, file, &pending);
+    }
+
     fn resolveTypeSiteWithin(
         server: *Server,
         allocator: std.mem.Allocator,
@@ -1341,7 +1559,14 @@ pub const Server = struct {
         if (std.mem.eql(u8, import_string, "std")) {
             return try std.fmt.allocPrint(allocator, "{s}/std/std.zig", .{try server.zigLibDirectory()});
         }
-        if (!std.mem.endsWith(u8, import_string, ".zig")) return null;
+        if (!std.mem.endsWith(u8, import_string, ".zig")) {
+            return try compile_units.namedModuleSourceForDocument(
+                server.io,
+                allocator,
+                current_path,
+                import_string,
+            );
+        }
         const directory = std.fs.path.dirname(current_path) orelse return null;
         return try std.fs.path.resolve(allocator, &.{ directory, import_string });
     }
@@ -1452,12 +1677,24 @@ pub const Server = struct {
         const level = configuration.level(.unresolved_member);
         if (level == .off) return &.{};
         const tokens = try tokenize(allocator, document.source);
+        var candidate_receivers: std.StringHashMapUnmanaged(void) = .empty;
+        for (document.declarations) |declaration| {
+            if (declaration.brace_depth != 0 or declaration.kind != .constant) continue;
+            try candidate_receivers.put(allocator, declaration.name, {});
+        }
+        var resolved_views: std.StringHashMapUnmanaged(?ModuleView) = .empty;
         var findings: std.ArrayList(analysis.Finding) = .empty;
         for (tokens, 0..) |member_token, member_index| {
             if (member_token.tag != .identifier or member_index < 2 or
                 tokens[member_index - 1].tag != .period or tokens[member_index - 2].tag != .identifier) continue;
+            if (member_index >= 3 and tokens[member_index - 3].tag == .period) continue;
             const receiver = document.source[tokens[member_index - 2].loc.start..tokens[member_index - 2].loc.end];
-            const view = try server.moduleView(allocator, document, receiver) orelse continue;
+            if (!candidate_receivers.contains(receiver)) continue;
+            const view_entry = try resolved_views.getOrPut(allocator, receiver);
+            if (!view_entry.found_existing) {
+                view_entry.value_ptr.* = try server.moduleView(allocator, document, receiver);
+            }
+            const view = view_entry.value_ptr.* orelse continue;
             const member_name = document.source[member_token.loc.start..member_token.loc.end];
             var exists = false;
             for (view.members) |member| {
@@ -1548,20 +1785,16 @@ pub const Server = struct {
         document: *const Document,
         receiver: []const u8,
     ) !?ModuleView {
-        const path = try server.modulePath(allocator, document, receiver) orelse return null;
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            server.io,
-            path,
-            allocator,
-            .limited(16 * 1024 * 1024),
-        ) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
+        const site = try server.resolveDocumentSite(allocator, document, receiver) orelse return null;
+        const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
         return .{
-            .path = path,
-            .source = source,
-            .members = try publicModuleMembers(allocator, source),
+            .path = site.file.path,
+            .source = site.file.source,
+            .members = try siteMembers(
+                allocator,
+                site,
+                std.mem.eql(u8, document_path, site.file.path),
+            ),
         };
     }
 
@@ -1728,6 +1961,89 @@ fn siteMemberDescription(
         member_name,
     ) orelse return null;
     return try describeBinding(allocator, site.file.source, site.file.tokens[declaration.name_index].loc);
+}
+
+fn siteMembers(
+    allocator: std.mem.Allocator,
+    site: ResolvedTypeSite,
+    include_private: bool,
+) ![]SyntaxMember {
+    var members: std.ArrayList(SyntaxMember) = .empty;
+    var brace_depth: usize = 0;
+    var parenthesis_depth: usize = 0;
+    var public_pending = false;
+    for (site.file.tokens[site.container.start..site.container.end], site.container.start..) |token, index| {
+        switch (token.tag) {
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .keyword_pub => if (brace_depth == 0 and parenthesis_depth == 0) {
+                public_pending = true;
+            },
+            .keyword_fn, .keyword_const, .keyword_var => {
+                if (brace_depth != 0 or parenthesis_depth != 0 or
+                    (!include_private and !public_pending) or index + 1 >= site.container.end) continue;
+                const name_token = site.file.tokens[index + 1];
+                if (name_token.tag != .identifier) continue;
+                try members.append(allocator, .{
+                    .name = site.file.source[name_token.loc.start..name_token.loc.end],
+                    .kind = switch (token.tag) {
+                        .keyword_fn => .Function,
+                        .keyword_const => .Constant,
+                        .keyword_var => .Variable,
+                        else => unreachable,
+                    },
+                    .detail = switch (token.tag) {
+                        .keyword_fn => if (public_pending) "pub fn" else "fn",
+                        .keyword_const => if (public_pending) "pub const" else "const",
+                        .keyword_var => if (public_pending) "pub var" else "var",
+                        else => unreachable,
+                    },
+                    .span = name_token.loc,
+                });
+                public_pending = false;
+            },
+            .identifier => {
+                if (brace_depth != 0 or parenthesis_depth != 0) continue;
+                const next_tag = if (index + 1 < site.container.end)
+                    site.file.tokens[index + 1].tag
+                else
+                    null;
+                const starts_tag = index == site.container.start or
+                    site.file.tokens[index - 1].tag == .comma;
+                const is_field_or_tag = next_tag == .colon or
+                    (starts_tag and (next_tag == null or next_tag == .comma or next_tag == .equal));
+                if (!is_field_or_tag) continue;
+                try members.append(allocator, .{
+                    .name = site.file.source[token.loc.start..token.loc.end],
+                    .kind = .Field,
+                    .detail = "field",
+                    .span = token.loc,
+                });
+            },
+            .semicolon => if (brace_depth == 0 and parenthesis_depth == 0) {
+                public_pending = false;
+            },
+            else => {},
+        }
+    }
+    return try members.toOwnedSlice(allocator);
+}
+
+fn sourceStartLocation(allocator: std.mem.Allocator, source: ImportedSource) !lsp.types.Location {
+    return sourceLocation(allocator, source, .{ .start = 0, .end = 0 });
+}
+
+fn sourceLocation(
+    allocator: std.mem.Allocator,
+    source: ImportedSource,
+    span: std.zig.Token.Loc,
+) !lsp.types.Location {
+    return .{
+        .uri = try std.fmt.allocPrint(allocator, "file://{s}", .{source.path}),
+        .range = lsp.offsets.locToRange(source.source, span, .@"utf-16"),
+    };
 }
 
 fn qualifiedCallReceiver(source: []const u8, member_start: usize) ?QualifiedReceiver {
@@ -2453,6 +2769,29 @@ fn importStringPrefix(source: [:0]const u8, byte_offset: usize) ?[]const u8 {
     }
 }
 
+fn importPathAt(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    byte_offset: usize,
+) !?[]const u8 {
+    const tokens = try tokenize(allocator, source);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .builtin or index + 3 >= tokens.len or
+            !std.mem.eql(u8, source[token.loc.start..token.loc.end], "@import") or
+            tokens[index + 1].tag != .l_paren or
+            tokens[index + 2].tag != .string_literal or
+            tokens[index + 3].tag != .r_paren)
+        {
+            continue;
+        }
+        if (byte_offset < token.loc.start or byte_offset > tokens[index + 3].loc.end) continue;
+        const literal = source[tokens[index + 2].loc.start..tokens[index + 2].loc.end];
+        if (literal.len < 2) return null;
+        return literal[1 .. literal.len - 1];
+    }
+    return null;
+}
+
 fn memberReceiver(source: []const u8, byte_offset: usize) ?[]const u8 {
     if (byte_offset == 0 or byte_offset > source.len or source[byte_offset - 1] != '.') return null;
     var start = byte_offset - 1;
@@ -2550,7 +2889,7 @@ fn importName(
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
     for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_const or index + 5 >= tokens.len) continue;
+        if (token.tag != .keyword_const or index + 7 >= tokens.len) continue;
         const alias_token = tokens[index + 1];
         const equal_token = tokens[index + 2];
         const import_token = tokens[index + 3];
@@ -2558,7 +2897,8 @@ fn importName(
         const path_token = tokens[index + 5];
         if (alias_token.tag != .identifier or equal_token.tag != .equal or
             import_token.tag != .builtin or opening_parenthesis.tag != .l_paren or
-            path_token.tag != .string_literal)
+            path_token.tag != .string_literal or tokens[index + 6].tag != .r_paren or
+            tokens[index + 7].tag != .semicolon)
         {
             continue;
         }
@@ -4203,6 +4543,90 @@ test "module diagnostics report only missing public members" {
     try std.testing.expectEqual(@as(usize, 1), missing_member_count);
 }
 
+test "module diagnostics resolve nested imported aliases once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source: [:0]const u8 =
+        "const Message = @import(\"catalog.zig\").MessagePool.Message;\n" ++
+        "fn use(_: *Message.Ping, _: *Message.Missing) void {}\n";
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+    try server.documents.open("file://examples/zls/imports/nested.zig", 1, source);
+    const document = server.documents.getConst("file://examples/zls/imports/nested.zig").?;
+
+    const view = (try server.moduleView(arena, document, "Message")).?;
+    var ping_member_count: usize = 0;
+    for (view.members) |member| {
+        if (std.mem.eql(u8, member.name, "Ping")) ping_member_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ping_member_count);
+
+    const found = try server.documentFindings(arena, document, analysis.Configuration.defaults());
+    var missing_member_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .unresolved_member) continue;
+        missing_member_count += 1;
+        try std.testing.expectEqualStrings("Missing", source[finding.span.start..finding.span.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_member_count);
+}
+
+test "module diagnostics respect same-file visibility and nested receivers" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source: [:0]const u8 =
+        "const namespace = struct { const log = struct { fn scoped() void {} }; };\n" ++
+        "const log = struct {};\n" ++
+        "const Status = enum { normal };\n" ++
+        "const Private = struct { fn run() void {} const Nested = u8; };\n" ++
+        "fn use() void { namespace.log.scoped(); _ = Status.normal; Private.run(); _ = Private.Nested; Private.missing(); }\n";
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+    try server.documents.open("file:///same_file_visibility.zig", 1, source);
+    const document = server.documents.getConst("file:///same_file_visibility.zig").?;
+
+    const found = try server.moduleMemberFindings(arena, document, analysis.Configuration.defaults());
+    var missing_member_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .unresolved_member) continue;
+        missing_member_count += 1;
+        try std.testing.expectEqualStrings("missing", source[finding.span.start..finding.span.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_member_count);
+}
+
+test "definition follows a constant alias into an imported declaration" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source: [:0]const u8 =
+        "const catalog = @import(\"catalog.zig\");\n" ++
+        "const Alias = catalog.MessagePool;\n" ++
+        "fn use() void { _ = Alias; }\n";
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+    try server.documents.open("file://examples/zls/imports/alias.zig", 1, source);
+    const document = server.documents.getConst("file://examples/zls/imports/alias.zig").?;
+    const usage_start = std.mem.lastIndexOf(u8, source, "Alias").?;
+    const identifier_span = document.identifierAt(usage_start).?;
+
+    const location = (try server.aliasTargetDefinition(arena, document, identifier_span)).?;
+    try std.testing.expect(std.mem.endsWith(u8, location.uri, "/examples/zls/imports/catalog.zig"));
+    try std.testing.expectEqual(@as(u32, 2), location.range.start.line);
+    try std.testing.expectEqual(@as(u32, 10), location.range.start.character);
+}
+
 test "import resolution identifies aliases" {
     const source: [:0]const u8 =
         "const std = @import(\"std\");\n" ++
@@ -4295,6 +4719,53 @@ test "LSP import completion and definition resolve another file" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "catalog.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "fn clampToLimit(value: u32) u32") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"result\":null") != null);
+}
+
+test "LSP resolves import paths and nested imported definitions" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig","languageId":"zig","version":1,"text":"const Message = @import(\"catalog.zig\").MessagePool.Message;\nfn use(_: *Message.Ping) void {}\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":1,"character":19}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":26}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":40}}}
+        ,
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":52}}}
+        ,
+        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":1,"character":20}}}
+        ,
+        \\{"jsonrpc":"2.0","id":7,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 8), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "unresolved-member") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"Ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "catalog.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"line\":0,\"character\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"line\":2,\"character\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"line\":3,\"character\":14") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"line\":4,\"character\":18") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
 }
 
 test "LSP hover describes parameters locals functions and bounded constants" {

@@ -1,7 +1,7 @@
 # `mutated-container-copy`
 
-Reports mutation of a local `var` copied from a container field when the copy is neither returned nor written back.
+Reports metadata mutation of an explicitly typed standard-library container copied from a field when neither value is otherwise observed.
 
 **Why it matters.** A reallocating method can move the copy's buffer while the original retains stale length and capacity, losing the mutation or leaking storage.
 
-**When it matters.** Only known length- or allocation-changing methods on a direct field copy are recognized. Copies returned or assigned back are silent.
+**When it matters.** The initializer must be exactly `owner.field`, the local type must name a known container through an unshadowed `const std = @import("std")`, and every later use of the local must be a known length- or allocation-changing method. If the field is referenced again, the copy is consumed, the type is inferred, or any expression is ambiguous, the rule stays silent.
