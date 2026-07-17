@@ -287,12 +287,13 @@ class LspClient {
     }
   }
 
-  async initialize() {
+  async initialize(initializationOptions) {
     await this.request(
       "initialize",
       {
         processId: null,
         rootUri: this.rootFileUri,
+        initializationOptions: initializationOptions ?? null,
         capabilities: {
           textDocument: {
             hover: { contentFormat: ["markdown", "plaintext"] },
@@ -304,6 +305,14 @@ class LspClient {
       120_000,
     );
     await this.send({ jsonrpc: "2.0", method: "initialized", params: {} });
+  }
+
+  async saveFile(uri) {
+    await this.send({
+      jsonrpc: "2.0",
+      method: "textDocument/didSave",
+      params: { textDocument: { uri } },
+    });
   }
 
   async openFile(uri, text) {
@@ -443,11 +452,21 @@ async function captureExample(
 
   await Promise.all([analyzer.openFile(uri, text), zls.openFile(uri, text)]);
   if (example.kind === "Diagnostics") {
+    // Build-on-save diagnostics only fire on a save event, so report one to
+    // both servers and give ZLS's build run time to publish.
+    await Promise.all([analyzer.saveFile(uri), zls.saveFile(uri)]);
     const deadline = Date.now() + 30_000;
     while (Date.now() < deadline && !analyzer.diagnostics.has(uri)) {
       await analyzer.drain(1_000);
     }
     await analyzer.drain(3_000);
+    const zlsDeadline = Date.now() + 60_000;
+    while (
+      Date.now() < zlsDeadline &&
+      (zls.diagnostics.get(uri) ?? []).length === 0
+    ) {
+      await zls.drain(2_000);
+    }
     await zls.drain(3_000);
   } else {
     await analyzer.drain(1_000);
@@ -529,14 +548,17 @@ async function captureExample(
 }
 
 function parseArguments(args) {
-  const parsed = { repository: null, zls: null, out: null, help: false };
+  const parsed = { repository: null, zls: null, zig: null, out: null, help: false };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--help" || argument === "-h") {
       parsed.help = true;
       continue;
     }
-    if (argument !== "--repo" && argument !== "--zls" && argument !== "--out") {
+    if (
+      argument !== "--repo" && argument !== "--zls" && argument !== "--zig" &&
+      argument !== "--out"
+    ) {
       throw new Error(`unknown argument '${argument}'`);
     }
     if (index + 1 === args.length) {
@@ -546,9 +568,22 @@ function parseArguments(args) {
     index += 1;
     if (argument === "--repo") parsed.repository = value;
     if (argument === "--zls") parsed.zls = value;
+    if (argument === "--zig") parsed.zig = value;
     if (argument === "--out") parsed.out = value;
   }
   return parsed;
+}
+
+// ZLS reads its configuration from `initializationOptions`. The comparison
+// hands it every setting that could strengthen its answers: an explicit zig
+// executable (instead of PATH luck), build-on-save diagnostics (they only
+// publish when the client reports saves), and its opt-in style warnings.
+function zlsInitializationOptions(zigPath) {
+  return {
+    zig_exe_path: zigPath,
+    enable_build_on_save: true,
+    warn_style: true,
+  };
 }
 
 function usage() {
@@ -556,8 +591,8 @@ function usage() {
     "Capture zig-analyzer and ZLS responses for the documentation.",
     "",
     "Usage:",
-    "  node docs/tools/capture_comparisons.js --repo . --zls /path/to/zls [--out path]",
-    "  deno run --allow-read --allow-write --allow-run docs/tools/capture_comparisons.js --repo . --zls /path/to/zls [--out path]",
+    "  node docs/tools/capture_comparisons.js --repo . --zls /path/to/zls [--zig /path/to/zig] [--out path]",
+    "  deno run --allow-read --allow-write --allow-run docs/tools/capture_comparisons.js --repo . --zls /path/to/zls [--zig /path/to/zig] [--out path]",
   ].join("\n");
 }
 
@@ -681,7 +716,10 @@ async function main() {
     );
     const zls = new LspClient(zlsProcess, "zls", runtime.toFileUrl(repository));
     try {
-      await Promise.all([analyzer.initialize(), zls.initialize()]);
+      await Promise.all([
+        analyzer.initialize(),
+        zls.initialize(zlsInitializationOptions(arguments_.zig)),
+      ]);
       captured.push(
         await captureExample(
           example,
