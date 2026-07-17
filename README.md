@@ -77,6 +77,7 @@ Or skip the editor and lint in CI:
 ```sh
 zig-analyzer check .        # lint the project
 zig-analyzer check --fix .  # apply only provably safe rewrites
+zig-analyzer check --no-cache . # bypass cached unchanged-file findings
 ```
 
 The linter catches valid Zig that is still wrong — things neither the

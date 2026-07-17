@@ -1,5 +1,6 @@
 const std = @import("std");
 const analysis = @import("analysis.zig");
+const check_cache = @import("check_cache.zig");
 const project_rules = @import("rules/project.zig");
 
 const max_source_size = 64 * 1024 * 1024;
@@ -8,6 +9,7 @@ const max_configuration_size = 1024 * 1024;
 pub const Options = struct {
     path: []const u8 = ".",
     fix: bool = false,
+    cache: bool = true,
 };
 
 const Summary = struct {
@@ -17,11 +19,24 @@ const Summary = struct {
     findings: usize = 0,
 };
 
+const FileCheckResult = struct {
+    output: ?[]u8 = null,
+    summary: Summary = .{},
+    failure: ?anyerror = null,
+};
+
 const ReportedFinding = struct {
     rule: analysis.Rule,
     level: analysis.Level,
     span: std.zig.Token.Loc,
     message: []const u8,
+};
+
+const LoadedFile = struct {
+    relative_path: []const u8,
+    source: ?[:0]const u8,
+    tokens: []const std.zig.Token,
+    read_error: ?anyerror,
 };
 
 const ScanRoot = struct {
@@ -70,6 +85,8 @@ fn runWithWriter(
     defer root.deinit(io);
 
     const configuration = try loadConfiguration(io, arena, root.absolute_path);
+    var cache = if (options.cache) check_cache.Cache.init(io, root.dir, configuration) else check_cache.Cache{};
+    defer cache.deinit(io);
     var summary: Summary = .{};
     if (configuration.warning) |warning| {
         try writer.print("{s}: warning[configuration]: {s}\n", .{ options.path, warning });
@@ -80,11 +97,35 @@ fn runWithWriter(
         try writer.print("zig-analyzer check: could not scan '{s}': {t}\n", .{ options.path, err });
         return 2;
     };
-    if (relative_paths.len > 1) {
-        try reportProjectFindings(io, arena, root, relative_paths, configuration, writer, &summary);
+    const loaded_files = try loadFiles(io, arena, root, relative_paths);
+    if (loaded_files.len > 1) {
+        try reportProjectFindings(arena, root, loaded_files, configuration, writer, &summary);
     }
-    for (relative_paths) |relative_path| {
-        try checkFile(io, allocator, root, relative_path, configuration, options.fix, writer, &summary);
+    const file_results = try arena.alloc(FileCheckResult, loaded_files.len);
+    for (file_results) |*result| result.* = .{};
+    defer for (file_results) |result| if (result.output) |output| allocator.free(output);
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var concurrency_available = true;
+    for (loaded_files, file_results) |loaded_file, *result| {
+        if (concurrency_available) {
+            group.concurrent(io, checkFileTask, .{ io, allocator, root, loaded_file, configuration, options.fix, cache, result }) catch {
+                concurrency_available = false;
+                checkFileTask(io, allocator, root, loaded_file, configuration, options.fix, cache, result);
+            };
+        } else {
+            checkFileTask(io, allocator, root, loaded_file, configuration, options.fix, cache, result);
+        }
+    }
+    try group.await(io);
+    for (file_results) |result| {
+        if (result.failure) |failure| return failure;
+        if (result.output) |output| try writer.writeAll(output);
+        summary.files_checked += result.summary.files_checked;
+        summary.files_changed += result.summary.files_changed;
+        summary.edits_applied += result.summary.edits_applied;
+        summary.findings += result.summary.findings;
     }
 
     if (options.fix) {
@@ -95,25 +136,21 @@ fn runWithWriter(
 }
 
 fn reportProjectFindings(
-    io: std.Io,
     allocator: std.mem.Allocator,
     root: ScanRoot,
-    relative_paths: []const []const u8,
+    loaded_files: []const LoadedFile,
     configuration: analysis.Configuration,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
     var files: std.ArrayList(project_rules.SourceFile) = .empty;
-    for (relative_paths) |relative_path| {
-        const source = root.dir.readFileAllocOptions(
-            io,
-            relative_path,
-            allocator,
-            .limited(max_source_size),
-            .of(u8),
-            0,
-        ) catch continue;
-        try files.append(allocator, .{ .path = relative_path, .source = source });
+    for (loaded_files) |loaded_file| {
+        const source = loaded_file.source orelse continue;
+        try files.append(allocator, .{
+            .path = loaded_file.relative_path,
+            .source = source,
+            .tokens = loaded_file.tokens,
+        });
     }
     const findings = try project_rules.findings(allocator, files.items, configuration);
     for (findings) |finding| {
@@ -224,6 +261,40 @@ fn collectZigPaths(
     return try paths.toOwnedSlice(allocator);
 }
 
+fn loadFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    relative_paths: []const []const u8,
+) ![]const LoadedFile {
+    const loaded_files = try allocator.alloc(LoadedFile, relative_paths.len);
+    for (relative_paths, loaded_files) |relative_path, *loaded_file| {
+        const source = root.dir.readFileAllocOptions(
+            io,
+            relative_path,
+            allocator,
+            .limited(max_source_size),
+            .of(u8),
+            0,
+        ) catch |err| {
+            loaded_file.* = .{
+                .relative_path = relative_path,
+                .source = null,
+                .tokens = &.{},
+                .read_error = err,
+            };
+            continue;
+        };
+        loaded_file.* = .{
+            .relative_path = relative_path,
+            .source = source,
+            .tokens = try tokenize(allocator, source),
+            .read_error = null,
+        };
+    }
+    return loaded_files;
+}
+
 fn pathIsExcluded(path: []const u8, exclusions: []const []const u8) bool {
     for (exclusions) |exclusion| {
         if (!pathHasPrefix(path, exclusion)) continue;
@@ -266,9 +337,10 @@ fn checkFile(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: ScanRoot,
-    relative_path: []const u8,
+    loaded_file: LoadedFile,
     configuration: analysis.Configuration,
     fix: bool,
+    cache: check_cache.Cache,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
@@ -276,30 +348,24 @@ fn checkFile(
     defer file_arena_state.deinit();
     const file_arena = file_arena_state.allocator();
 
-    const display_path = try displayPath(file_arena, root, relative_path);
-    const source = root.dir.readFileAllocOptions(
-        io,
-        relative_path,
-        file_arena,
-        .limited(max_source_size),
-        .of(u8),
-        0,
-    ) catch |err| {
-        try writer.print("{s}: error[io]: could not read file: {t}\n", .{ display_path, err });
+    const display_path = try displayPath(file_arena, root, loaded_file.relative_path);
+    const source = loaded_file.source orelse {
+        try writer.print("{s}: error[io]: could not read file: {t}\n", .{ display_path, loaded_file.read_error.? });
         summary.findings += 1;
         return;
     };
+    var checked_tokens = loaded_file.tokens;
     summary.files_checked += 1;
 
     var checked_source: [:0]const u8 = source;
     if (fix) {
-        const findings = try analysis.findings(file_arena, source, configuration);
+        const findings = try analysis.findingsWithTokens(file_arena, source, loaded_file.tokens, configuration);
         const edits = try safeFixAllEdits(file_arena, findings);
         if (edits.len != 0) {
             const fixed_source = try applyEdits(file_arena, source, edits);
             if (!std.mem.eql(u8, source, fixed_source)) {
                 var replaced = true;
-                replaceFile(io, root.dir, relative_path, fixed_source) catch |err| {
+                replaceFile(io, root.dir, loaded_file.relative_path, fixed_source) catch |err| {
                     try writer.print("{s}: error[io]: could not apply fixes: {t}\n", .{ display_path, err });
                     summary.findings += 1;
                     replaced = false;
@@ -308,6 +374,7 @@ fn checkFile(
                     summary.files_changed += 1;
                     summary.edits_applied += edits.len;
                     checked_source = fixed_source;
+                    checked_tokens = try tokenize(file_arena, fixed_source);
                 }
             }
         }
@@ -318,7 +385,15 @@ fn checkFile(
         summary.findings += 1;
     }
 
-    const reported = try reportedFindings(file_arena, checked_source, relative_path, configuration);
+    const reported = try reportedFindings(
+        io,
+        file_arena,
+        checked_source,
+        checked_tokens,
+        loaded_file.relative_path,
+        configuration,
+        cache,
+    );
     for (reported) |finding| {
         const location = sourceLocation(checked_source, finding.span.start);
         try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
@@ -333,14 +408,50 @@ fn checkFile(
     summary.findings += reported.len;
 }
 
+fn checkFileTask(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    loaded_file: LoadedFile,
+    configuration: analysis.Configuration,
+    fix: bool,
+    cache: check_cache.Cache,
+    result: *FileCheckResult,
+) void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    checkFile(io, allocator, root, loaded_file, configuration, fix, cache, &output.writer, &result.summary) catch |err| {
+        output.deinit();
+        result.failure = err;
+        return;
+    };
+    result.output = output.toOwnedSlice() catch |err| {
+        output.deinit();
+        result.failure = err;
+        return;
+    };
+}
+
 fn reportedFindings(
+    io: std.Io,
     allocator: std.mem.Allocator,
     source: [:0]const u8,
+    tokens: []const std.zig.Token,
     path: []const u8,
     configuration: analysis.Configuration,
+    cache: check_cache.Cache,
 ) ![]const ReportedFinding {
+    if (cache.load(io, allocator, path, source)) |cached| {
+        const reported = try allocator.alloc(ReportedFinding, cached.len);
+        for (cached, reported) |finding, *reported_finding| reported_finding.* = .{
+            .rule = finding.rule,
+            .level = finding.level,
+            .span = .{ .start = finding.start, .end = finding.end },
+            .message = finding.message,
+        };
+        return reported;
+    }
     var reported: std.ArrayList(ReportedFinding) = .empty;
-    const native_findings = try analysis.findings(allocator, source, configuration);
+    const native_findings = try analysis.findingsWithTokens(allocator, source, tokens, configuration);
     for (native_findings) |finding| try reported.append(allocator, .{
         .rule = finding.rule,
         .level = finding.level,
@@ -362,7 +473,17 @@ fn reportedFindings(
             return @intFromEnum(left.rule) < @intFromEnum(right.rule);
         }
     }.lessThan);
-    return try reported.toOwnedSlice(allocator);
+    const sorted = try reported.toOwnedSlice(allocator);
+    const records = try allocator.alloc(check_cache.Record, sorted.len);
+    for (sorted, records) |finding, *record| record.* = .{
+        .rule = finding.rule,
+        .level = finding.level,
+        .start = finding.span.start,
+        .end = finding.span.end,
+        .message = finding.message,
+    };
+    cache.store(io, allocator, path, source, records);
+    return sorted;
 }
 
 fn safeFixAllEdits(allocator: std.mem.Allocator, findings: []const analysis.Finding) ![]const analysis.Edit {
@@ -438,6 +559,16 @@ fn sourceLocation(source: []const u8, offset: usize) SourceLocation {
     };
 }
 
+fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
+    var tokens: std.ArrayList(std.zig.Token) = .empty;
+    var tokenizer = std.zig.Tokenizer.init(source);
+    while (true) {
+        const token = tokenizer.next();
+        try tokens.append(allocator, token);
+        if (token.tag == .eof) return try tokens.toOwnedSlice(allocator);
+    }
+}
+
 test "check fixes safe findings recursively and skips dependency directories" {
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{ .iterate = true });
@@ -479,6 +610,28 @@ test "check fixes safe findings recursively and skips dependency directories" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "unresolved-call") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "fixtureCall") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "checked 1 Zig files") != null);
+}
+
+test "concurrent checks preserve sorted deterministic output" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "fn b() void { missingB(); }\n" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "fn a() void { missingA(); }\n" });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first.deinit();
+    _ = try runWithWriter(io, std.testing.allocator, .{ .path = path, .cache = false }, &first.writer);
+    var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second.deinit();
+    _ = try runWithWriter(io, std.testing.allocator, .{ .path = path, .cache = false }, &second.writer);
+
+    try std.testing.expectEqualStrings(first.writer.buffered(), second.writer.buffered());
+    const first_a = std.mem.indexOf(u8, first.writer.buffered(), "a.zig") orelse return error.TestUnexpectedResult;
+    const first_b = std.mem.indexOf(u8, first.writer.buffered(), "b.zig") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first_a < first_b);
 }
 
 test "check exclusions reject parent paths" {

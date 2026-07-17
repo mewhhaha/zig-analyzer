@@ -56,16 +56,35 @@ pub fn findings(
     return try findingsWithShapes(allocator, source, configuration, &.{});
 }
 
+pub fn findingsWithTokens(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    configuration: Configuration,
+) ![]Finding {
+    return try findingsWithShapesAndTokens(allocator, source, tokens, configuration, &.{});
+}
+
 pub fn findingsWithShapes(
     allocator: std.mem.Allocator,
     source: [:0]const u8,
     configuration: Configuration,
     resolved_shapes: []const ResolvedShape,
 ) ![]Finding {
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
-    defer tree.deinit(allocator);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    return try findingsWithShapesAndTokens(allocator, source, tokens, configuration, resolved_shapes);
+}
+
+fn findingsWithShapesAndTokens(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    configuration: Configuration,
+    resolved_shapes: []const ResolvedShape,
+) ![]Finding {
+    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    defer tree.deinit(allocator);
     var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
     defer scope_index.deinit();
     var containers: std.ArrayList(Container) = .empty;

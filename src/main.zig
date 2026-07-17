@@ -6,7 +6,7 @@ const usage =
     \\
     \\Usage:
     \\  zig-analyzer lsp
-    \\  zig-analyzer check [--fix] [path]
+    \\  zig-analyzer check [--fix] [--no-cache] [path]
     \\  zig-analyzer doctor
     \\  zig-analyzer backend bootstrap
     \\  zig-analyzer version
@@ -43,10 +43,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, command, "check")) {
         var fix = false;
+        var cache = true;
         var path: ?[]const u8 = null;
         while (arguments.next()) |argument| {
             if (std.mem.eql(u8, argument, "--fix")) {
                 fix = true;
+                continue;
+            }
+            if (std.mem.eql(u8, argument, "--no-cache")) {
+                cache = false;
                 continue;
             }
             if (std.mem.eql(u8, argument, "--help") or std.mem.eql(u8, argument, "-h")) {
@@ -69,6 +74,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return try zig_analyzer.project_check.run(io, allocator, .{
             .path = path orelse ".",
             .fix = fix,
+            .cache = cache,
         });
     }
     if (std.mem.eql(u8, command, "backend")) {
