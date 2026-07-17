@@ -77,7 +77,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
         const profile_name = switch (profile_value) {
             .string => |string| string,
             else => {
-                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, or strict");
+                configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, strict, modernize, or disciplined");
                 return configuration;
             },
         };
@@ -87,8 +87,12 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             .idiomatic
         else if (std.mem.eql(u8, profile_name, "strict"))
             .strict
+        else if (std.mem.eql(u8, profile_name, "modernize"))
+            .modernize
+        else if (std.mem.eql(u8, profile_name, "disciplined"))
+            .disciplined
         else {
-            configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, or strict");
+            configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, strict, modernize, or disciplined");
             return configuration;
         };
         applyLintProfile(&configuration, configuration.lint_profile);
@@ -195,15 +199,122 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                 );
                 return configuration;
             }
-            const level = parseLevel(entry.value_ptr.*) orelse {
-                configuration.warning = try invalidLevelMessage(allocator, entry.key_ptr.*);
-                return configuration;
-            };
-            configuration.levels[@intFromEnum(rule)] = level;
+            switch (entry.value_ptr.*) {
+                .string => {
+                    const level = parseLevel(entry.value_ptr.*) orelse {
+                        configuration.warning = try invalidLevelMessage(allocator, entry.key_ptr.*);
+                        return configuration;
+                    };
+                    configuration.levels[@intFromEnum(rule)] = level;
+                },
+                .object => if (try parseRuleSettings(allocator, rule, entry.value_ptr.*, &configuration)) |warning| {
+                    configuration.warning = warning;
+                    return configuration;
+                },
+                else => {
+                    configuration.warning = try invalidLevelMessage(allocator, entry.key_ptr.*);
+                    return configuration;
+                },
+            }
         }
     }
     if (removed_format) configuration.warning = try removedFormatWarning(allocator);
     return configuration;
+}
+
+fn parseRuleSettings(
+    allocator: std.mem.Allocator,
+    rule: Rule,
+    value: std.json.Value,
+    configuration: *Configuration,
+) !?[]const u8 {
+    if (rule != .function_length and rule != .line_length and rule != .todo_comment) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "zig-analyzer.json rule '{s}' accepts a severity string, not an options object",
+            .{rule.code()},
+        );
+    }
+    const settings = switch (value) {
+        .object => |object| object,
+        else => unreachable,
+    };
+    var iterator = settings.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "level")) {
+            const level = parseLevel(entry.value_ptr.*) orelse return try invalidLevelMessage(allocator, rule.code());
+            configuration.levels[@intFromEnum(rule)] = level;
+            continue;
+        }
+        switch (rule) {
+            .function_length => if (std.mem.eql(u8, key, "max-lines")) {
+                configuration.function_length_limit = positiveInteger(entry.value_ptr.*) orelse return try settingTypeWarning(
+                    allocator,
+                    rule,
+                    key,
+                    "a positive integer",
+                );
+                continue;
+            },
+            .line_length => {
+                if (std.mem.eql(u8, key, "max-columns")) {
+                    configuration.line_length_limit = positiveInteger(entry.value_ptr.*) orelse return try settingTypeWarning(
+                        allocator,
+                        rule,
+                        key,
+                        "a positive integer",
+                    );
+                    continue;
+                }
+                if (std.mem.eql(u8, key, "allow-unsplittable")) {
+                    configuration.line_length_allow_unsplittable = switch (entry.value_ptr.*) {
+                        .bool => |enabled| enabled,
+                        else => return try settingTypeWarning(allocator, rule, key, "a boolean"),
+                    };
+                    continue;
+                }
+            },
+            .todo_comment => if (std.mem.eql(u8, key, "markers")) {
+                const values = switch (entry.value_ptr.*) {
+                    .array => |array| array.items,
+                    else => return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
+                };
+                if (values.len == 0) return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings");
+                const markers = try allocator.alloc([]const u8, values.len);
+                for (values, markers) |marker_value, *marker| marker.* = switch (marker_value) {
+                    .string => |text| if (text.len != 0) try allocator.dupe(u8, text) else return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
+                    else => return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
+                };
+                configuration.todo_markers = markers;
+                continue;
+            },
+            else => unreachable,
+        }
+        return try std.fmt.allocPrint(
+            allocator,
+            "zig-analyzer.json rule '{s}' contains unknown setting '{s}'",
+            .{ rule.code(), key },
+        );
+    }
+    return null;
+}
+
+fn positiveInteger(value: std.json.Value) ?usize {
+    const integer = switch (value) {
+        .integer => |number| number,
+        else => return null,
+    };
+    if (integer <= 0) return null;
+    return std.math.cast(usize, integer);
+}
+
+fn settingTypeWarning(allocator: std.mem.Allocator, rule: Rule, key: []const u8, expected: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "zig-analyzer.json rule '{s}' setting '{s}' must be {s}",
+        .{ rule.code(), key, expected },
+    );
 }
 
 fn containsParentPathComponent(path: []const u8) bool {
@@ -475,10 +586,21 @@ fn setTier(configuration: *Configuration, tier: Tier, level: Level) void {
 fn applyLintProfile(configuration: *Configuration, profile: LintProfile) void {
     for (std.enums.values(Rule)) |rule| {
         const minimum_profile = rule.profile() orelse continue;
-        if (@intFromEnum(profile) >= @intFromEnum(minimum_profile)) {
+        if (profileIncludes(profile, minimum_profile)) {
             configuration.levels[@intFromEnum(rule)] = .information;
         }
     }
+}
+
+fn profileIncludes(selected: LintProfile, required: LintProfile) bool {
+    return switch (selected) {
+        .none => false,
+        .official => required == .official,
+        .idiomatic => required == .official or required == .idiomatic,
+        .strict => required == .official or required == .idiomatic or required == .strict,
+        .modernize => required == .modernize,
+        .disciplined => required == .disciplined,
+    };
 }
 
 fn validBannedPath(path: []const u8) bool {
@@ -503,6 +625,64 @@ test "configuration reports an unknown rule" {
     defer if (configuration.warning) |warning| std.testing.allocator.free(warning);
     try std.testing.expectEqualStrings(
         "zig-analyzer.json contains unknown lint rule 'not-a-rule'",
+        configuration.warning.?,
+    );
+}
+
+test "modernize and disciplined profiles enable only their rule families" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const modernize = try parse(arena.allocator(),
+        \\{"lints":{"profile":"modernize"}}
+    );
+    try std.testing.expectEqual(Level.information, modernize.level(.modernize_managed_container));
+    try std.testing.expectEqual(Level.off, modernize.level(.function_length));
+    try std.testing.expectEqual(Level.off, modernize.level(.prefer_range_for));
+
+    const disciplined = try parse(arena.allocator(),
+        \\{"lints":{"profile":"disciplined"}}
+    );
+    try std.testing.expectEqual(Level.information, disciplined.level(.function_length));
+    try std.testing.expectEqual(Level.off, disciplined.level(.modernize_deprecated_io));
+    try std.testing.expectEqual(Level.off, disciplined.level(.line_length));
+    try std.testing.expectEqual(Level.off, disciplined.level(.todo_comment));
+
+    const idiomatic = try parse(arena.allocator(),
+        \\{"lints":{"profile":"idiomatic"}}
+    );
+    try std.testing.expectEqual(Level.information, idiomatic.level(.prefer_range_for));
+    try std.testing.expectEqual(Level.off, idiomatic.level(.allocator_first_parameter));
+    try std.testing.expectEqual(Level.off, idiomatic.level(.minority_naming_style));
+}
+
+test "threshold and marker rules parse typed settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"rules":{
+        \\  "function-length":{"level":"warning","max-lines":90},
+        \\  "line-length":{"level":"information","max-columns":120,"allow-unsplittable":false},
+        \\  "todo-comment":{"level":"hint","markers":["DEBT","LATER"]}
+        \\}}}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    try std.testing.expectEqual(@as(usize, 90), configuration.function_length_limit);
+    try std.testing.expectEqual(@as(usize, 120), configuration.line_length_limit);
+    try std.testing.expect(!configuration.line_length_allow_unsplittable);
+    try std.testing.expectEqualStrings("DEBT", configuration.todo_markers[0]);
+    try std.testing.expectEqual(Level.warning, configuration.level(.function_length));
+    try std.testing.expectEqual(Level.information, configuration.level(.line_length));
+    try std.testing.expectEqual(Level.hint, configuration.level(.todo_comment));
+}
+
+test "rule setting errors name the offending rule and setting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"rules":{"line-length":{"max-columns":0}}}}
+    );
+    try std.testing.expectEqualStrings(
+        "zig-analyzer.json rule 'line-length' setting 'max-columns' must be a positive integer",
         configuration.warning.?,
     );
 }

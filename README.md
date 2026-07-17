@@ -94,16 +94,25 @@ compiler nor ZLS will ever mention:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-Around 80 rules, stable codes, three profiles, quick fixes wherever the
+116 rules, stable codes, five focused profiles, quick fixes wherever the
 rewrite is provable, plus refactors ZLS doesn't attempt (`toOwnedSlice`
 returns, `defer`→`errdefer` transfer, `inline else` collapses, `orelse
 unreachable` → `.?`). Configure in `zig-analyzer.json`, suppress in source:
+
+`official`, `idiomatic`, and `strict` progressively add style guidance;
+`modernize` targets pinned-release migrations, while `disciplined` enables the
+bounded-loop, allocation, recursion, assertion, and function-size policies as
+an independent set.
 
 ```json
 {
   "lints": {
     "profile": "idiomatic",
-    "rules": { "discarded-error": "warning" },
+    "rules": {
+      "discarded-error": "warning",
+      "line-length": { "level": "warning", "max-columns": 100 },
+      "todo-comment": { "level": "hint", "markers": ["TODO", "FIXME"] }
+    },
     "banned": [{ "path": "std.BoundedArray", "hint": "use stdx.BoundedArrayType" }]
   }
 }

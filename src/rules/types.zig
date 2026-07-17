@@ -96,6 +96,35 @@ pub const Rule = enum {
     banned_identifier,
     truncating_intcast,
     padded_byte_compare,
+    useless_error_return,
+    exposed_private_type,
+    exposed_private_error_set,
+    deprecated_declaration,
+    mutated_container_copy,
+    prefer_range_for,
+    prefer_index_of,
+    prefer_memset,
+    prefer_memcpy,
+    prefer_string_switch,
+    prefer_log_over_print,
+    prefer_buffered_writer,
+    prefer_arena,
+    inconsistent_import_alias,
+    minority_naming_style,
+    inconsistent_parameter_vocabulary,
+    inconsistent_error_set_style,
+    modernize_managed_container,
+    modernize_deprecated_io,
+    function_length,
+    assertion_free_branching,
+    unbounded_loop,
+    allocation_after_init,
+    recursive_call,
+    line_length,
+    allocator_first_parameter,
+    comptime_parameter_order,
+    todo_comment,
+    assertion_free_test,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -140,6 +169,11 @@ pub const Rule = enum {
             .usize_in_packed_struct,
             .unconditional_busy_loop,
             .padded_byte_compare,
+            .useless_error_return,
+            .exposed_private_type,
+            .exposed_private_error_set,
+            .deprecated_declaration,
+            .mutated_container_copy,
             => .correctness,
             else => .style,
         };
@@ -192,7 +226,24 @@ pub const Rule = enum {
             .inclusive_index_bound,
             .negated_comptime_expression,
             .unbraced_multiline_if,
+            .prefer_range_for,
+            .prefer_index_of,
+            .prefer_memset,
+            .prefer_memcpy,
+            .prefer_string_switch,
+            .prefer_log_over_print,
+            .prefer_buffered_writer,
+            .prefer_arena,
             => .idiomatic,
+            .modernize_managed_container,
+            .modernize_deprecated_io,
+            => .modernize,
+            .function_length,
+            .assertion_free_branching,
+            .unbounded_loop,
+            .allocation_after_init,
+            .recursive_call,
+            => .disciplined,
             .vague_type_name,
             .unsafe_catch_unreachable,
             .lost_error_context,
@@ -217,6 +268,10 @@ pub const Configuration = struct {
     lint_profile: LintProfile = .none,
     banned: []const BannedIdentifier = &.{},
     check_excludes: []const []const u8 = &.{},
+    function_length_limit: usize = 70,
+    line_length_limit: usize = 100,
+    line_length_allow_unsplittable: bool = true,
+    todo_markers: []const []const u8 = &.{ "TODO", "FIXME", "XXX" },
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {
@@ -236,7 +291,7 @@ pub const Configuration = struct {
     }
 };
 
-pub const LintProfile = enum { none, official, idiomatic, strict };
+pub const LintProfile = enum { none, official, idiomatic, strict, modernize, disciplined };
 
 pub const Edit = struct {
     span: std.zig.Token.Loc,

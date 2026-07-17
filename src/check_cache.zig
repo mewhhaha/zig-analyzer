@@ -39,6 +39,13 @@ pub const Cache = struct {
         hasher.update(std.mem.asBytes(&executable_stat.ctime.nanoseconds));
         hasher.update(std.mem.asBytes(&configuration.levels));
         hasher.update(std.mem.asBytes(&configuration.lint_profile));
+        hasher.update(std.mem.asBytes(&configuration.function_length_limit));
+        hasher.update(std.mem.asBytes(&configuration.line_length_limit));
+        hasher.update(std.mem.asBytes(&configuration.line_length_allow_unsplittable));
+        for (configuration.todo_markers) |marker| {
+            hasher.update(std.mem.asBytes(&marker.len));
+            hasher.update(marker);
+        }
         for (configuration.banned) |banned| {
             hasher.update(std.mem.asBytes(&banned.path.len));
             hasher.update(banned.path);
@@ -164,4 +171,10 @@ test "cache invalidates source path and configuration changes" {
     var changed_cache = Cache.init(io, temporary.dir, configuration);
     defer changed_cache.deinit(io);
     try std.testing.expect(changed_cache.load(io, allocator, "src/main.zig", "fn missing") == null);
+
+    var settings_configuration = analysis.Configuration.defaults();
+    settings_configuration.line_length_limit = 120;
+    var settings_cache = Cache.init(io, temporary.dir, settings_configuration);
+    defer settings_cache.deinit(io);
+    try std.testing.expect(settings_cache.load(io, allocator, "src/main.zig", "fn missing") == null);
 }

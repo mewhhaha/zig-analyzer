@@ -3,6 +3,7 @@ const allocation_lifecycle = @import("allocation_lifecycle.zig");
 const configuration_parser = @import("configuration.zig");
 const rule_types = @import("types.zig");
 const rule_registry = @import("registry.zig");
+const generated_source_detection = @import("generated_source.zig");
 const syntax_scope = @import("../syntax_scope.zig");
 
 pub const Level = rule_types.Level;
@@ -83,6 +84,7 @@ fn findingsWithShapesAndTokens(
     configuration: Configuration,
     resolved_shapes: []const ResolvedShape,
 ) ![]Finding {
+    if (generated_source_detection.isTranslateCOutput(source)) return &.{};
     var tree = try std.zig.Ast.parse(allocator, source, .zig);
     defer tree.deinit(allocator);
     var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
@@ -2453,6 +2455,7 @@ fn findNonIdiomaticNames(
 ) !void {
     const level = configuration.level(.non_idiomatic_name);
     if (level == .off) return;
+    const foreign_binding_dominated = fileIsDominatedByForeignBindings(source, tokens);
     // Aliases like 'const Alias = Target;' inherit Target's convention, so one
     // pass collects every name declared as a type or type-returning function.
     var type_declaring_names: std.StringHashMapUnmanaged(void) = .empty;
@@ -2474,6 +2477,8 @@ fn findNonIdiomaticNames(
         if (index >= 2 and (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export)) continue;
         // 'extern "lib" fn name(...)' binds an ABI symbol whose name is fixed.
         if (index >= 3 and tokens[index - 2].tag == .string_literal and tokens[index - 3].tag == .keyword_extern) continue;
+        if (declaration_tag == .keyword_const and declarationInitializedByExternBuiltin(source, tokens, index)) continue;
+        if (foreign_binding_dominated and declaration_tag == .keyword_const and declarationHasLiteralInitializer(tokens, index)) continue;
         if (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index)) continue;
         const name = tokenText(source, token);
         if (std.mem.startsWith(u8, name, "@\"")) continue;
@@ -2505,6 +2510,44 @@ fn findNonIdiomaticNames(
             .message = try std.fmt.allocPrint(allocator, "declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention }),
         });
     }
+}
+
+fn declarationInitializedByExternBuiltin(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
+    return identifier_index + 3 < tokens.len and tokens[identifier_index + 1].tag == .equal and
+        tokens[identifier_index + 2].tag == .builtin and std.mem.eql(u8, tokenText(source, tokens[identifier_index + 2]), "@extern") and
+        tokens[identifier_index + 3].tag == .l_paren;
+}
+
+fn declarationHasLiteralInitializer(tokens: []const std.zig.Token, identifier_index: usize) bool {
+    if (identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
+    return switch (tokens[identifier_index + 2].tag) {
+        .number_literal, .string_literal, .char_literal => true,
+        else => false,
+    };
+}
+
+fn fileIsDominatedByForeignBindings(source: []const u8, tokens: []const std.zig.Token) bool {
+    var declarations: usize = 0;
+    var foreign_bindings: usize = 0;
+    var brace_depth: usize = 0;
+    for (tokens, 0..) |token, index| {
+        switch (token.tag) {
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            .keyword_fn, .keyword_const => if (brace_depth == 0 and index + 1 < tokens.len and
+                tokens[index + 1].tag == .identifier and
+                (token.tag != .keyword_const or (index + 2 < tokens.len and tokens[index + 2].tag == .equal)))
+            {
+                declarations += 1;
+                const externally_named = (index > 0 and (tokens[index - 1].tag == .keyword_extern or tokens[index - 1].tag == .keyword_export)) or
+                    (index > 1 and tokens[index - 1].tag == .string_literal and tokens[index - 2].tag == .keyword_extern) or
+                    (token.tag == .keyword_const and index + 3 < tokens.len and tokens[index + 1].tag == .identifier and declarationInitializedByExternBuiltin(source, tokens, index + 1));
+                if (externally_named) foreign_bindings += 1;
+            },
+            else => {},
+        }
+    }
+    return declarations >= 10 and foreign_bindings * 5 >= declarations * 4;
 }
 
 fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: usize) bool {
@@ -4348,6 +4391,35 @@ test "error-set types foreign symbols and re-exports keep their names" {
     };
     try std.testing.expectEqual(@as(usize, 1), naming_count);
     try std.testing.expectEqual(@as(usize, 0), underscore_count);
+}
+
+test "foreign-binding files preserve literal constants and extern builtin names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "extern fn One() void; extern fn Two() void; extern fn Three() void; extern fn Four() void;\n" ++
+        "extern fn Five() void; extern fn Six() void; extern fn Seven() void; extern fn Eight() void;\n" ++
+        "const GENERIC_READ = 1; const FILE_SHARE_WRITE = 2;\n" ++
+        "const CreateIoCompletionPort = @extern(*const fn () callconv(.c) void, .{ .name = \"CreateIoCompletionPort\" });\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| {
+        if (finding.rule == .non_idiomatic_name) std.debug.print("unexpected foreign naming finding: {s}\n", .{finding.message});
+        try std.testing.expect(finding.rule != .non_idiomatic_name);
+    }
+}
+
+test "translate-c output skips file-local diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub const __builtin_bswap16 = @import(\"std\").zig.c_builtins.__builtin_bswap16;\n" ++
+        "pub const __builtin_bswap32 = @import(\"std\").zig.c_builtins.__builtin_bswap32;\n" ++
+        "pub const __builtin_bswap64 = @import(\"std\").zig.c_builtins.__builtin_bswap64;\n" ++
+        "fn generated() void { var value = 1; missing(value); }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "a catch body that records the captured error keeps its context" {

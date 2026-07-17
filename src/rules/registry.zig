@@ -28,6 +28,10 @@ const rule_modules = .{
     @import("testing_idioms.zig"),
     @import("truncating_intcast.zig"),
     @import("padded_byte_compare.zig"),
+    @import("compiler_hygiene.zig"),
+    @import("helping_hand.zig"),
+    @import("modernize.zig"),
+    @import("discipline_policy.zig"),
 };
 
 pub fn run(context: RuleRun) !void {
