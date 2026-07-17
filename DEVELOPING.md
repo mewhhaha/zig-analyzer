@@ -17,6 +17,7 @@ zig build test
 zig build backend-test
 zig build fixtures
 zig build examples
+zig build fuzz-rules
 zig build run -- doctor
 zig build run -- version
 ```
@@ -70,6 +71,14 @@ The comparison sources are valid Zig programs. `zig build examples` compiles
 and runs their tests. `examples/diagnostics/compiler_error.zig` and
 `examples/diagnostics/code_actions.zig` are intentionally invalid and excluded
 from that build so they can exercise diagnostics and actions.
+
+`zig build fuzz-rules` runs the rule fuzz harness in `tests/rule_fuzz.zig`: it
+generates clean-by-construction programs that must produce no default
+findings, checks that formatting, comments, and consistent renames leave
+findings unchanged, and feeds byte mutations and generated token soup through
+every rule. The same tests run under `zig build test`; the continuous
+`--fuzz` mode is blocked by a `test_runner.zig` compile error in the shipped
+Zig 0.16.0.
 
 See [examples/README.md](examples/README.md) for exact completion, hover,
 navigation, rename, diagnostic, and code-action cases. To reproduce the ZLS
