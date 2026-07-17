@@ -6,6 +6,12 @@ pub const SourceFile = struct {
     source: [:0]const u8,
 };
 
+const IndexedSourceFile = struct {
+    path: []const u8,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+};
+
 pub const Finding = struct {
     file_index: usize,
     rule: types.Rule,
@@ -25,11 +31,26 @@ pub fn findings(
     files: []const SourceFile,
     configuration: types.Configuration,
 ) ![]const Finding {
+    if (configuration.level(.duplicate_module_import) == .off and
+        configuration.level(.duplicate_c_import) == .off and
+        configuration.level(.unreferenced_test_file) == .off and
+        configuration.level(.conflicting_build_options) == .off) return &.{};
+    const indexed_files = try allocator.alloc(IndexedSourceFile, files.len);
+    for (files, indexed_files) |file, *indexed_file| indexed_file.* = .{
+        .path = file.path,
+        .source = file.source,
+        .tokens = try tokenize(allocator, file.source),
+    };
     var found: std.ArrayList(Finding) = .empty;
-    try findDuplicateModuleImports(allocator, files, configuration, &found);
-    try findDuplicateCImports(allocator, files, configuration, &found);
-    try findUnreferencedTests(allocator, files, configuration, &found);
-    try findConflictingBuildOptions(allocator, files, configuration, &found);
+    const imports = if (configuration.level(.duplicate_module_import) != .off or
+        configuration.level(.unreferenced_test_file) != .off)
+        try collectImports(allocator, indexed_files)
+    else
+        &.{};
+    try findDuplicateModuleImports(allocator, imports, configuration, &found);
+    try findDuplicateCImports(allocator, indexed_files, configuration, &found);
+    try findUnreferencedTests(allocator, indexed_files, imports, configuration, &found);
+    try findConflictingBuildOptions(allocator, indexed_files, configuration, &found);
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
             if (left.file_index != right.file_index) return left.file_index < right.file_index;
@@ -42,12 +63,11 @@ pub fn findings(
 
 fn findDuplicateModuleImports(
     allocator: std.mem.Allocator,
-    files: []const SourceFile,
+    imports: []const Import,
     configuration: types.Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
     if (configuration.level(.duplicate_module_import) == .off) return;
-    const imports = try collectImports(allocator, files);
     for (imports, 0..) |current, index| {
         for (imports[0..index]) |previous| {
             if (previous.file_index != current.file_index or
@@ -70,20 +90,19 @@ fn findDuplicateModuleImports(
 
 fn findDuplicateCImports(
     allocator: std.mem.Allocator,
-    files: []const SourceFile,
+    files: []const IndexedSourceFile,
     configuration: types.Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
     if (configuration.level(.duplicate_c_import) == .off) return;
     var signatures: std.StringHashMapUnmanaged(struct { file_index: usize, span: std.zig.Token.Loc }) = .empty;
     for (files, 0..) |file, file_index| {
-        const tokens = try tokenize(allocator, file.source);
-        for (tokens, 0..) |token, index| {
+        for (file.tokens, 0..) |token, index| {
             if (token.tag != .builtin or !tokenIs(file.source, token, "@cImport") or
-                index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
-            const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
+                index + 1 >= file.tokens.len or file.tokens[index + 1].tag != .l_paren) continue;
+            const closing = matchingToken(file.tokens, index + 1, .l_paren, .r_paren) orelse continue;
             var signature_writer: std.Io.Writer.Allocating = .init(allocator);
-            for (file.source[tokens[index + 1].loc.end..tokens[closing].loc.start]) |character| {
+            for (file.source[file.tokens[index + 1].loc.end..file.tokens[closing].loc.start]) |character| {
                 if (!std.ascii.isWhitespace(character)) try signature_writer.writer.writeByte(character);
             }
             const signature = try signature_writer.toOwnedSlice();
@@ -106,14 +125,14 @@ fn findDuplicateCImports(
 
 fn findUnreferencedTests(
     allocator: std.mem.Allocator,
-    files: []const SourceFile,
+    files: []const IndexedSourceFile,
+    imports: []const Import,
     configuration: types.Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
     if (configuration.level(.unreferenced_test_file) == .off) return;
-    const imports = try collectImports(allocator, files);
     for (files, 0..) |file, file_index| {
-        if (!looksLikeTestPath(file.path) or !containsTestDeclaration(allocator, file.source)) continue;
+        if (!looksLikeTestPath(file.path) or !containsTestDeclaration(file.tokens)) continue;
         var referenced = false;
         for (imports) |import| {
             if (import.file_index != file_index and std.mem.eql(u8, import.resolved_path, file.path)) {
@@ -144,7 +163,7 @@ fn findUnreferencedTests(
 
 fn findConflictingBuildOptions(
     allocator: std.mem.Allocator,
-    files: []const SourceFile,
+    files: []const IndexedSourceFile,
     configuration: types.Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -153,17 +172,16 @@ fn findConflictingBuildOptions(
     var reported: std.StringHashMapUnmanaged(void) = .empty;
     for (files, 0..) |file, file_index| {
         if (!std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig")) continue;
-        const tokens = try tokenize(allocator, file.source);
-        for (tokens, 0..) |token, index| {
-            if (token.tag != .identifier or !tokenIs(file.source, token, "root_source_file") or index + 6 >= tokens.len) continue;
+        for (file.tokens, 0..) |token, index| {
+            if (token.tag != .identifier or !tokenIs(file.source, token, "root_source_file") or index + 6 >= file.tokens.len) continue;
             var string_index = index + 1;
-            while (string_index < tokens.len and string_index - index < 12 and tokens[string_index].tag != .string_literal) : (string_index += 1) {}
-            if (string_index >= tokens.len or string_index - index >= 12) continue;
-            const root_spelling = stringValue(file.source, tokens[string_index]) orelse continue;
+            while (string_index < file.tokens.len and string_index - index < 12 and file.tokens[string_index].tag != .string_literal) : (string_index += 1) {}
+            if (string_index >= file.tokens.len or string_index - index >= 12) continue;
+            const root_spelling = stringValue(file.source, file.tokens[string_index]) orelse continue;
             if (!std.mem.endsWith(u8, root_spelling, ".zig")) continue;
             const root_path = try resolveImportPath(allocator, file.path, root_spelling);
-            const block = enclosingInitializer(tokens, index) orelse continue;
-            const signature = try optionSignature(allocator, file.source, tokens, block.opening + 1, block.closing);
+            const block = enclosingInitializer(file.tokens, index) orelse continue;
+            const signature = try optionSignature(allocator, file.source, file.tokens, block.opening + 1, block.closing);
             if (std.mem.eql(u8, signature, "target=<default>;optimize=<default>")) continue;
             if (roots.get(root_path)) |first| {
                 if (std.mem.eql(u8, first.signature, signature)) continue;
@@ -173,7 +191,7 @@ fn findConflictingBuildOptions(
                 try found.append(allocator, .{
                     .file_index = file_index,
                     .rule = .conflicting_build_options,
-                    .span = tokens[string_index].loc,
+                    .span = file.tokens[string_index].loc,
                     .message = try std.fmt.allocPrint(
                         allocator,
                         "root source '{s}' is configured with both '{s}' and '{s}'; semantic results may differ between compile units",
@@ -185,18 +203,17 @@ fn findConflictingBuildOptions(
     }
 }
 
-fn collectImports(allocator: std.mem.Allocator, files: []const SourceFile) ![]const Import {
+fn collectImports(allocator: std.mem.Allocator, files: []const IndexedSourceFile) ![]const Import {
     var imports: std.ArrayList(Import) = .empty;
     for (files, 0..) |file, file_index| {
-        const tokens = try tokenize(allocator, file.source);
-        for (tokens, 0..) |token, index| {
-            if (token.tag != .builtin or !tokenIs(file.source, token, "@import") or index + 2 >= tokens.len or
-                tokens[index + 1].tag != .l_paren or tokens[index + 2].tag != .string_literal) continue;
-            const spelling = stringValue(file.source, tokens[index + 2]) orelse continue;
+        for (file.tokens, 0..) |token, index| {
+            if (token.tag != .builtin or !tokenIs(file.source, token, "@import") or index + 2 >= file.tokens.len or
+                file.tokens[index + 1].tag != .l_paren or file.tokens[index + 2].tag != .string_literal) continue;
+            const spelling = stringValue(file.source, file.tokens[index + 2]) orelse continue;
             if (!std.mem.endsWith(u8, spelling, ".zig")) continue;
             try imports.append(allocator, .{
                 .file_index = file_index,
-                .span = tokens[index + 2].loc,
+                .span = file.tokens[index + 2].loc,
                 .spelling = spelling,
                 .resolved_path = try resolveImportPath(allocator, file.path, spelling),
             });
@@ -219,8 +236,7 @@ fn looksLikeTestPath(path: []const u8) bool {
     return false;
 }
 
-fn containsTestDeclaration(allocator: std.mem.Allocator, source: [:0]const u8) bool {
-    const tokens = tokenize(allocator, source) catch return false;
+fn containsTestDeclaration(tokens: []const std.zig.Token) bool {
     for (tokens) |token| if (token.tag == .keyword_test) return true;
     return false;
 }

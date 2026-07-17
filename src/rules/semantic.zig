@@ -126,7 +126,7 @@ pub fn findingsWithShapes(
     try findImportIssues(allocator, source, tokens, configuration, &found);
     try findUnsortedImports(allocator, source, tokens, configuration, &found);
     if (allocation_lifecycle.enabled(configuration)) {
-        const allocation_findings = try allocation_lifecycle.warnings(allocator, source);
+        const allocation_findings = try allocation_lifecycle.warningsWithSyntax(allocator, source, &tree, tokens, &scope_index);
         for (allocation_findings) |finding| try addFinding(allocator, source, configuration, &found, .{
             .rule = finding.rule,
             .level = configuration.level(finding.rule),
@@ -348,27 +348,23 @@ fn containerForReceiver(
     receiver_index: usize,
 ) ?Container {
     if (containerNamed(containers, scope_index, receiver_name, receiver_index)) |container| return container;
-    for (containers) |container| {
-        if (!scopeContains(container.scope, receiver_index)) continue;
-        if (indexedBindingHasType(source, tokens, scope_index, receiver_index, container.name) or
-            bindingInitializesType(source, tokens, scope_index, receiver_name, container.name, receiver_index)) return container;
-    }
-    return null;
+    const type_name = indexedBindingTypeName(source, tokens, scope_index, receiver_index) orelse return null;
+    return containerNamed(containers, scope_index, type_name, receiver_index);
 }
 
-fn bindingInitializesType(
+fn indexedBindingTypeName(
     source: []const u8,
     tokens: []const std.zig.Token,
     scope_index: *const syntax_scope.Index,
-    binding_name: []const u8,
-    type_name: []const u8,
     receiver_index: usize,
-) bool {
-    const visible_binding = scope_index.findBinding(receiver_index) orelse return false;
+) ?[]const u8 {
+    const visible_binding = scope_index.findBinding(receiver_index) orelse return null;
     const index = visible_binding.token_index;
-    return tokenIs(source, tokens[index], binding_name) and index + 3 < tokens.len and
-        tokens[index + 1].tag == .equal and tokenIs(source, tokens[index + 2], type_name) and
-        tokens[index + 3].tag == .l_brace;
+    if (index + 2 < tokens.len and tokens[index + 1].tag == .colon and tokens[index + 2].tag == .identifier and
+        (index + 3 >= tokens.len or tokens[index + 3].tag != .period)) return tokenText(source, tokens[index + 2]);
+    if (index + 3 < tokens.len and tokens[index + 1].tag == .equal and tokens[index + 2].tag == .identifier and
+        tokens[index + 3].tag == .l_brace) return tokenText(source, tokens[index + 2]);
+    return null;
 }
 
 fn findUnresolvedLabels(

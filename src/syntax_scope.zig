@@ -14,6 +14,11 @@ pub const Binding = struct {
     scope_rank: usize = 0,
 };
 
+const LexicalScope = struct {
+    opening: ?usize,
+    closing: usize,
+};
+
 pub const Index = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -30,10 +35,25 @@ pub const Index = struct {
         errdefer index.deinit();
         var scope_openings: std.ArrayListUnmanaged(usize) = .empty;
         defer scope_openings.deinit(allocator);
+        const brace_closings = try allocator.alloc(?usize, tokens.len);
+        defer allocator.free(brace_closings);
+        @memset(brace_closings, null);
+        for (tokens, 0..) |token, token_index| switch (token.tag) {
+            .l_brace => try scope_openings.append(allocator, token_index),
+            .r_brace => if (scope_openings.pop()) |opening| {
+                brace_closings[opening] = token_index;
+            },
+            else => {},
+        };
+        scope_openings.clearRetainingCapacity();
         for (tokens, 0..) |token, token_index| {
             if (token.tag == .r_brace and scope_openings.items.len != 0) _ = scope_openings.pop();
             if (token.tag == .identifier) {
-                if (binding(tokens, source, token_index)) |unindexed_candidate| {
+                const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
+                    .{ .opening = opening, .closing = brace_closings[opening] orelse tokens.len - 1 }
+                else
+                    .{ .opening = null, .closing = tokens.len - 1 };
+                if (binding(tokens, source, token_index, lexical_scope)) |unindexed_candidate| {
                     var candidate = unindexed_candidate;
                     candidate.alias_target = aliasTarget(source, tokens, token_index);
                     candidate.scope_rank = if (scope_openings.getLastOrNull()) |opening| opening + 1 else 0;
@@ -43,7 +63,11 @@ pub const Index = struct {
                 }
             }
             if (std.mem.eql(u8, tokenText(source, token), "usingnamespace")) {
-                const scope = declarationScope(tokens, token_index, true) orelse continue;
+                const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
+                    .{ .opening = opening, .closing = brace_closings[opening] orelse tokens.len - 1 }
+                else
+                    .{ .opening = null, .closing = tokens.len - 1 };
+                const scope = declarationScope(tokens, token_index, true, lexical_scope) orelse continue;
                 try index.usingnamespace_scopes.append(allocator, scope);
             }
             if (token.tag == .l_brace) try scope_openings.append(allocator, token_index);
@@ -120,7 +144,7 @@ pub fn findBinding(
     var selected: ?Binding = null;
     for (tokens, 0..) |token, candidate_index| {
         if (token.tag != .identifier or !std.mem.eql(u8, tokenText(source, token), name)) continue;
-        const candidate = binding(tokens, source, candidate_index) orelse continue;
+        const candidate = binding(tokens, source, candidate_index, null) orelse continue;
         if (!spanContains(candidate.scope, tokens[use_index].loc)) continue;
         if (selected == null or scopeLength(candidate.scope) < scopeLength(selected.?.scope) or
             scopeLength(candidate.scope) == scopeLength(selected.?.scope) and
@@ -138,7 +162,7 @@ pub fn declarationAt(
     identifier_index: usize,
 ) ?Binding {
     if (identifier_index >= tokens.len or tokens[identifier_index].tag != .identifier) return null;
-    return binding(tokens, source, identifier_index);
+    return binding(tokens, source, identifier_index, null);
 }
 
 pub fn isContainerFieldDeclaration(tokens: []const std.zig.Token, identifier_index: usize) bool {
@@ -160,7 +184,7 @@ pub fn usingnamespaceMayProvideName(source: []const u8, tokens: []const std.zig.
     if (use_index >= tokens.len) return false;
     for (tokens, 0..) |token, index| {
         if (!std.mem.eql(u8, tokenText(source, token), "usingnamespace")) continue;
-        const scope = declarationScope(tokens, index, true) orelse continue;
+        const scope = declarationScope(tokens, index, true, null) orelse continue;
         if (spanContains(scope, tokens[use_index].loc)) return true;
     }
     return false;
@@ -170,13 +194,17 @@ fn binding(
     tokens: []const std.zig.Token,
     source: []const u8,
     identifier_index: usize,
+    lexical_scope: ?LexicalScope,
 ) ?Binding {
     if (identifierIsNamedDeclaration(tokens, identifier_index)) {
         const declaration_tag = tokens[identifier_index - 1].tag;
-        const container_member = declarationIsContainerMember(tokens, identifier_index - 1);
+        const container_member = if (lexical_scope) |scope|
+            if (scope.opening) |opening| braceStartsContainer(tokens, opening) else true
+        else
+            declarationIsContainerMember(tokens, identifier_index - 1);
         return .{
             .token_index = identifier_index,
-            .scope = declarationScope(tokens, identifier_index - 1, container_member) orelse return null,
+            .scope = declarationScope(tokens, identifier_index - 1, container_member, lexical_scope) orelse return null,
             .kind = if (declaration_tag == .keyword_fn)
                 .callable
             else
@@ -198,7 +226,7 @@ fn binding(
     }
     if (identifierIsDestructureBinding(tokens, identifier_index)) {
         const declaration_index = destructureDeclarationIndex(tokens, identifier_index) orelse return null;
-        var scope = declarationScope(tokens, declaration_index, false) orelse return null;
+        var scope = declarationScope(tokens, declaration_index, false, null) orelse return null;
         scope.start = tokens[identifier_index].loc.end;
         return .{
             .token_index = identifier_index,
@@ -266,7 +294,15 @@ fn declarationScope(
     tokens: []const std.zig.Token,
     declaration_index: usize,
     order_independent: bool,
+    lexical_scope: ?LexicalScope,
 ) ?std.zig.Token.Loc {
+    if (lexical_scope) |scope| return .{
+        .start = if (order_independent)
+            if (scope.opening) |opening| tokens[opening].loc.end else 0
+        else
+            tokens[declaration_index].loc.end,
+        .end = tokens[scope.closing].loc.end,
+    };
     const opening = enclosingOpeningBrace(tokens, declaration_index);
     const closing = if (opening) |brace|
         matchingToken(tokens, brace, .l_brace, .r_brace) orelse return null

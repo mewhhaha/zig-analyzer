@@ -1,4 +1,5 @@
 const std = @import("std");
+const syntax_scope = @import("../syntax_scope.zig");
 const types = @import("types.zig");
 const tokenRefersToBinding = @import("context.zig").tokenRefersToBinding;
 
@@ -31,6 +32,18 @@ pub fn warnings(
     defer tree.deinit(allocator);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
+    defer scope_index.deinit();
+    return warningsWithSyntax(allocator, source, &tree, tokens, &scope_index);
+}
+
+pub fn warningsWithSyntax(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+) ![]Warning {
     var found: std.ArrayList(Warning) = .empty;
     errdefer {
         for (found.items) |warning| freeWarning(allocator, warning);
@@ -48,7 +61,7 @@ pub fn warnings(
         const binding_name = source[tokens[binding_index].loc.start..tokens[binding_index].loc.end];
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = findStatementEnd(tokens, declaration_index) orelse continue;
-        const allocation = allocationFromValue(&tree, initializer) orelse continue;
+        const allocation = allocationFromValue(tree, initializer) orelse continue;
         if (allocation.allocator_source) |allocator_name| {
             if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
         }
@@ -58,6 +71,7 @@ pub fn warnings(
             allocator,
             source,
             tokens,
+            scope_index,
             binding_name,
             binding_index,
             statement_end + 1,
@@ -69,6 +83,7 @@ pub fn warnings(
             allocator,
             source,
             tokens,
+            scope_index,
             binding_name,
             binding_index,
             declaration_index,
@@ -80,6 +95,7 @@ pub fn warnings(
         const cleanup = ownershipLeavesScope(
             source,
             tokens,
+            scope_index,
             binding_name,
             binding_index,
             statement_end + 1,
@@ -279,6 +295,7 @@ fn findMismatchedRelease(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -290,11 +307,11 @@ fn findMismatchedRelease(
     for (tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or
             (!tokenIsIdentifier(source, token, "free") and !tokenIsIdentifier(source, token, "destroy"))) continue;
-        if (!releaseCallContainsBinding(source, tokens, binding_name, binding_index, method_index, end)) continue;
+        if (!releaseCallContainsBinding(source, tokens, scope_index, binding_name, binding_index, method_index, end)) continue;
         const actual_release = source[token.loc.start..token.loc.end];
         const receiver_is_binding = method_index >= 2 and
             tokenIsIdentifier(source, tokens[method_index - 2], binding_name) and
-            identifierRefersToBinding(source, tokens, binding_name, binding_index, method_index - 2);
+            identifierRefersToBinding(scope_index, binding_index, method_index - 2);
         const receiver_name = if (method_index >= 2 and tokens[method_index - 2].tag == .identifier)
             source[tokens[method_index - 2].loc.start..tokens[method_index - 2].loc.end]
         else
@@ -329,6 +346,7 @@ fn findReleaseOrderingIssues(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     declaration_index: usize,
@@ -342,10 +360,10 @@ fn findReleaseOrderingIssues(
     defer releases.deinit(allocator);
     for (tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |token, method_index| {
         if (!tokenIsIdentifier(source, token, allocation.release) or
-            !releaseCallContainsBinding(source, tokens, binding_name, binding_index, method_index, scope_end)) continue;
+            !releaseCallContainsBinding(source, tokens, scope_index, binding_name, binding_index, method_index, scope_end)) continue;
         const release_scope = enclosingScope(tokens, method_index) orelse continue;
         if (release_scope.opening != declaration_scope.opening) continue;
-        if (!releaseUsesAllocationReceiver(source, tokens, binding_name, binding_index, method_index, allocation.receiver)) continue;
+        if (!releaseUsesAllocationReceiver(source, tokens, scope_index, binding_name, binding_index, method_index, allocation.receiver)) continue;
         try releases.append(allocator, method_index);
     }
 
@@ -380,7 +398,7 @@ fn findReleaseOrderingIssues(
             !statementStartsWith(tokens, first_release, .keyword_errdefer))
         {
             const release_end = findStatementEnd(tokens, first_release) orelse first_release;
-            if (firstUseAfterRelease(source, tokens, binding_name, binding_index, release_end + 1, scope_end, releases.items)) |use_index| {
+            if (firstUseAfterRelease(source, tokens, scope_index, binding_name, binding_index, release_end + 1, scope_end, releases.items)) |use_index| {
                 try found.append(allocator, .{
                     .rule = .use_after_release,
                     .span = tokens[use_index].loc,
@@ -395,7 +413,7 @@ fn findReleaseOrderingIssues(
     }
 
     const before_release = if (releases.items.len == 0) scope_end else releases.items[0];
-    if (owningAssignment(source, tokens, binding_name, binding_index, declaration_end + 1, before_release)) |assignment_index| {
+    if (owningAssignment(source, tokens, scope_index, binding_name, binding_index, declaration_end + 1, before_release)) |assignment_index| {
         try found.append(allocator, .{
             .rule = .overwritten_owning_value,
             .span = tokens[assignment_index].loc,
@@ -435,6 +453,7 @@ fn releaseDeletionFix(
 fn releaseCallContainsBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     method_index: usize,
@@ -446,10 +465,11 @@ fn releaseCallContainsBinding(
     if (closing >= end) return false;
     const receiver_is_binding = method_index >= 2 and
         tokenIsIdentifier(source, tokens[method_index - 2], binding_name) and
-        identifierRefersToBinding(source, tokens, binding_name, binding_index, method_index - 2);
+        identifierRefersToBinding(scope_index, binding_index, method_index - 2);
     return receiver_is_binding or releaseArgumentContainsBinding(
         source,
         tokens,
+        scope_index,
         binding_name,
         binding_index,
         method_index + 2,
@@ -460,6 +480,7 @@ fn releaseCallContainsBinding(
 fn releaseArgumentContainsBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -467,7 +488,7 @@ fn releaseArgumentContainsBinding(
 ) bool {
     for (start..end) |index| {
         if (!tokenRefersToBinding(source, tokens, index, binding_name) or
-            !identifierRefersToBinding(source, tokens, binding_name, binding_index, index)) continue;
+            !identifierRefersToBinding(scope_index, binding_index, index)) continue;
         if (index + 1 < end and (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket)) continue;
         return true;
     }
@@ -477,6 +498,7 @@ fn releaseArgumentContainsBinding(
 fn releaseUsesAllocationReceiver(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     method_index: usize,
@@ -484,7 +506,7 @@ fn releaseUsesAllocationReceiver(
 ) bool {
     if (method_index < 2 or tokens[method_index - 2].tag != .identifier) return allocation_receiver == null;
     if (tokenIsIdentifier(source, tokens[method_index - 2], binding_name) and
-        identifierRefersToBinding(source, tokens, binding_name, binding_index, method_index - 2)) return true;
+        identifierRefersToBinding(scope_index, binding_index, method_index - 2)) return true;
     const expected_receiver = allocation_receiver orelse return true;
     return tokenIsIdentifier(source, tokens[method_index - 2], expected_receiver);
 }
@@ -518,6 +540,7 @@ fn fallibleOperationBetween(
 fn firstUseAfterRelease(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -527,7 +550,7 @@ fn firstUseAfterRelease(
     const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
     for (start..end) |index| {
         if (!tokenRefersToBinding(source, tokens, index, binding_name) or
-            !identifierRefersToBinding(source, tokens, binding_name, binding_index, index)) continue;
+            !identifierRefersToBinding(scope_index, binding_index, index)) continue;
         const use_scope = enclosingScope(tokens, index) orelse continue;
         if (use_scope.opening != declaration_scope.opening) continue;
         var belongs_to_release = false;
@@ -551,6 +574,7 @@ fn firstUseAfterRelease(
 fn owningAssignment(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -560,7 +584,7 @@ fn owningAssignment(
     var index = start;
     while (index + 2 < end) : (index += 1) {
         if (!tokenIsIdentifier(source, tokens[index], binding_name) or
-            !identifierRefersToBinding(source, tokens, binding_name, binding_index, index) or
+            !identifierRefersToBinding(scope_index, binding_index, index) or
             tokens[index + 1].tag != .equal) continue;
         const assignment_scope = enclosingScope(tokens, index) orelse continue;
         if (assignment_scope.opening != declaration_scope.opening) continue;
@@ -576,7 +600,7 @@ fn owningAssignment(
             if (!std.mem.eql(u8, method, "realloc") or rhs_index + 1 >= tokens.len or
                 tokens[rhs_index + 1].tag != .l_paren) continue;
             const closing = matchingToken(tokens, rhs_index + 1, .l_paren, .r_paren) orelse continue;
-            if (containsBinding(source, tokens, binding_name, binding_index, rhs_index + 2, @min(closing, value_end))) {
+            if (containsBinding(source, tokens, scope_index, binding_name, binding_index, rhs_index + 2, @min(closing, value_end))) {
                 realloc_consumes_original = true;
             }
         }
@@ -590,6 +614,7 @@ const Cleanup = enum { released, errdefer_only, missing };
 fn ownershipLeavesScope(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -599,7 +624,7 @@ fn ownershipLeavesScope(
     var found_errdefer = false;
     for (tokens[start..end], start..) |token, index| {
         if ((token.tag == .keyword_return or token.tag == .keyword_break) and
-            controlFlowValueContainsBinding(source, tokens, binding_name, binding_index, index + 1, end)) return .released;
+            controlFlowValueContainsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, end)) return .released;
         if (token.tag != .identifier or !std.mem.eql(u8, source[token.loc.start..token.loc.end], release_method)) continue;
         if (index == 0 or index + 2 >= end or tokens[index - 1].tag != .period or tokens[index + 1].tag != .l_paren) {
             continue;
@@ -607,10 +632,11 @@ fn ownershipLeavesScope(
         const closing_parenthesis = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
         if (closing_parenthesis >= end) continue;
         const receiver_is_binding = index >= 2 and tokenIsIdentifier(source, tokens[index - 2], binding_name) and
-            identifierRefersToBinding(source, tokens, binding_name, binding_index, index - 2);
+            identifierRefersToBinding(scope_index, binding_index, index - 2);
         const argument_contains_binding = releaseArgumentContainsBinding(
             source,
             tokens,
+            scope_index,
             binding_name,
             binding_index,
             index + 2,
@@ -620,13 +646,14 @@ fn ownershipLeavesScope(
         if (!statementStartsWithErrdefer(tokens, index)) return .released;
         found_errdefer = true;
     }
-    if (bindingEscapes(source, tokens, binding_name, binding_index, start, end, release_method)) return .released;
+    if (bindingEscapes(source, tokens, scope_index, binding_name, binding_index, start, end, release_method)) return .released;
     return if (found_errdefer) .errdefer_only else .missing;
 }
 
 fn controlFlowValueContainsBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -634,12 +661,13 @@ fn controlFlowValueContainsBinding(
 ) bool {
     var end = start;
     while (end < scope_end and tokens[end].tag != .semicolon and tokens[end].tag != .r_brace) : (end += 1) {}
-    return containsBinding(source, tokens, binding_name, binding_index, start, end);
+    return containsBinding(source, tokens, scope_index, binding_name, binding_index, start, end);
 }
 
 fn containsBinding(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -647,7 +675,7 @@ fn containsBinding(
 ) bool {
     for (tokens[start..end], start..) |token, index| {
         if (tokenIsIdentifier(source, token, binding_name) and
-            identifierRefersToBinding(source, tokens, binding_name, binding_index, index)) return true;
+            identifierRefersToBinding(scope_index, binding_index, index)) return true;
     }
     return false;
 }
@@ -655,6 +683,7 @@ fn containsBinding(
 fn bindingEscapes(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     binding_name: []const u8,
     binding_index: usize,
     start: usize,
@@ -666,14 +695,14 @@ fn bindingEscapes(
             (tokens[index - 1].tag == .identifier or tokens[index - 1].tag == .builtin))
         {
             const closing = matchingToken(tokens, index, .l_paren, .r_paren) orelse continue;
-            if (closing >= end or !containsBinding(source, tokens, binding_name, binding_index, index + 1, closing)) continue;
+            if (closing >= end or !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, closing)) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
             if (!std.mem.eql(u8, method, release_method)) return true;
         }
         if (token.tag != .equal) continue;
         const statement_end = findStatementEnd(tokens, index) orelse continue;
         if (statement_end >= end or
-            !containsBinding(source, tokens, binding_name, binding_index, index + 1, statement_end) or
+            !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, statement_end) or
             assignmentDiscards(source, tokens, start, index)) continue;
         return true;
     }
@@ -696,28 +725,12 @@ fn assignmentDiscards(
 }
 
 fn identifierRefersToBinding(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    binding_name: []const u8,
+    scope_index: *const syntax_scope.Index,
     binding_index: usize,
     use_index: usize,
 ) bool {
-    var selected_index = binding_index;
-    var selected_depth = scopeDepth(enclosingScope(tokens, binding_index) orelse return false);
-    for (tokens, 0..) |token, declaration_index| {
-        if (token.tag != .keyword_const and token.tag != .keyword_var) continue;
-        if (declaration_index + 1 >= tokens.len or
-            !tokenIsIdentifier(source, tokens[declaration_index + 1], binding_name)) continue;
-        const candidate_index = declaration_index + 1;
-        const scope = enclosingScope(tokens, candidate_index) orelse continue;
-        if (!scopeContains(scope, use_index)) continue;
-        const depth = scopeDepth(scope);
-        if (depth > selected_depth or depth == selected_depth and candidate_index > selected_index) {
-            selected_index = candidate_index;
-            selected_depth = depth;
-        }
-    }
-    return selected_index == binding_index;
+    const binding = scope_index.findBinding(use_index) orelse return false;
+    return binding.token_index == binding_index;
 }
 
 fn statementStartsWithErrdefer(tokens: []const std.zig.Token, index: usize) bool {
@@ -833,14 +846,6 @@ fn enclosingScope(tokens: []const std.zig.Token, index: usize) ?Scope {
         if (depth == 0) return .{ .opening = opening_index, .closing = closing_index };
     }
     return null;
-}
-
-fn scopeContains(scope: Scope, index: usize) bool {
-    return index > scope.opening and index < scope.closing;
-}
-
-fn scopeDepth(scope: Scope) usize {
-    return scope.opening + 1;
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
