@@ -72,7 +72,7 @@ and mutates a map during iteration. The functions are referenced but not run,
 so the file remains a safe compilation fixture while every diagnostic is
 visible in the editor.
 
-Four smaller diagnostic fixtures each isolate one valid Zig program that the
+Seven smaller diagnostic fixtures each isolate one valid Zig program that the
 compiler and ZLS accept but zig-analyzer warns about:
 
 | File | Diagnostic |
@@ -81,6 +81,9 @@ compiler and ZLS accept but zig-analyzer warns about:
 | `diagnostics/unsigned_reverse_loop.zig` | `unsigned-reverse-loop` |
 | `diagnostics/padded_equality.zig` | `padded-byte-compare` |
 | `diagnostics/discarded_error.zig` | `discarded-error` |
+| `diagnostics/use_after_release.zig` | `use-after-release`, `double-release` |
+| `diagnostics/dangling_slice.zig` | `returning-local-slice` |
+| `diagnostics/helper_release.zig` | `unreleased-allocation` |
 
 For compiler-derived completion cases, leave the source unchanged and place the
 cursor directly after the listed dot, before the existing member name. The
@@ -94,9 +97,12 @@ this comparison to be reviewed:
 | `compiler/conditional_api.zig` | `ActiveApi.` | `recordMetric` | `disabled`, `recordMetric` |
 | `compiler/parsed_configuration.zig` | `ResilientClient.` | `retryBudget` | `retryBudget`, `singleAttempt` |
 | `compiler/reflected_strategy.zig` | `ReadingStrategy.` | `encode` | `encode`, `unsupported` |
+| `compiler/reified_flags.zig` | `flags.` | `verbose`, `cache`, `trace` | none |
 
-The last three are precision differences, not missing-completion claims: ZLS
-finds the usable member but also includes an impossible branch. The recursive
+The comptime-branch rows are precision differences, not missing-completion
+claims: ZLS finds the usable member but also includes an impossible branch. The
+reified `@Struct` row is a full miss: ZLS 0.16.0 offers no candidates for
+fields that exist only after reification. The recursive
 wrapper remains a compiler regression fixture, but it is no longer a gallery
 comparison because both servers provide its useful `inner` and `unwrap`
 members.

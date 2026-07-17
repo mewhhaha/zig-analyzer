@@ -185,6 +185,7 @@
 
     .workbench {
       display: grid;
+      grid-template-rows: 1fr auto;
       flex: 1;
       align-items: stretch;
       min-height: 0;
@@ -197,6 +198,8 @@
     }
 
     .code-pane {
+      display: flex;
+      flex-direction: column;
       min-width: 0;
       padding: 20px 0 28px;
     }
@@ -223,6 +226,7 @@
     }
 
     .source {
+      flex: 1;
       overflow-x: auto;
       margin: 18px 0 0;
       padding: 2px 0;
