@@ -569,7 +569,9 @@
       optional build-on-save workflow, which is not enabled here.
     </p>
     <p>
-      Re-capture with <code>python docs/tools/capture_comparisons.py</code>. The fixtures compile under
+      Re-capture with <code>node docs/tools/capture_comparisons.js</code>, or use
+      <code>deno run --allow-read --allow-write --allow-run docs/tools/capture_comparisons.js</code>.
+      The fixtures compile under
       <code>zig build examples</code> and live in
       <a href="https://github.com/mewhhaha/zig-analyzer/tree/main/examples">examples/</a>,
       with a <a href="https://github.com/mewhhaha/zig-analyzer/blob/main/examples/README.md">manual reproduction guide</a>.
