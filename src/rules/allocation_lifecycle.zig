@@ -218,8 +218,7 @@ const arena_backed_types = [_][]const u8{ "ArenaAllocator", "FixedBufferAllocato
 
 fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, allocator_name: []const u8) bool {
     var name = allocator_name;
-    var hops: usize = 0;
-    while (hops < 4) : (hops += 1) {
+    for (0..4) |_| {
         const declaration = bindingDeclarationValue(source, tokens, name) orelse return false;
         for (tokens[declaration.start..declaration.end]) |token| {
             if (token.tag != .identifier) continue;
@@ -248,7 +247,9 @@ fn allocatorCallReceiver(source: []const u8, tokens: []const std.zig.Token, rang
     while (index + 3 < range.end) : (index += 1) {
         if (tokens[index].tag == .identifier and tokens[index + 1].tag == .period and
             tokenIsIdentifier(source, tokens[index + 2], "allocator") and tokens[index + 3].tag == .l_paren)
+        {
             return source[tokens[index].loc.start..tokens[index].loc.end];
+        }
     }
     return null;
 }

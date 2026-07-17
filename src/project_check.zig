@@ -1,8 +1,9 @@
 const std = @import("std");
+
 const analysis = @import("analysis.zig");
 const check_cache = @import("check_cache.zig");
-const project_rules = @import("rules/project.zig");
 const generated_source = @import("rules/generated_source.zig");
+const project_rules = @import("rules/project.zig");
 
 const max_source_size = 64 * 1024 * 1024;
 const max_configuration_size = 1024 * 1024;

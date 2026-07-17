@@ -251,9 +251,9 @@ test "extern and packed structs with defined layout are left alone" {
         "fn bits(a: Bits, b: Bits) bool {\n" ++
         "    return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));\n" ++
         "}\n";
-    const findingsList = try findingsFor(arena.allocator(), source);
+    const findings = try findingsFor(arena.allocator(), source);
 
-    try std.testing.expectEqual(@as(usize, 0), findingsList.len);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "unresolvable operand types stay silent" {

@@ -1,17 +1,18 @@
 const std = @import("std");
-const lsp = @import("lsp");
 const build_options = @import("build_options");
-const analysis = @import("analysis.zig");
-const backend_bootstrap = @import("backend_bootstrap.zig");
-const compiler_session = @import("compiler_session.zig");
-const compile_units = @import("compile_units.zig");
-const document_module = @import("document.zig");
-const language_hover = @import("language_hover.zig");
-const hover = @import("hover.zig");
-const syntax_types = @import("syntax_types.zig");
+const lsp = @import("lsp");
+
 const action_lsp = @import("actions/lsp_adapter.zig");
 const project_actions = @import("actions/project.zig");
 const zig_actions = @import("actions/registry.zig");
+const analysis = @import("analysis.zig");
+const backend_bootstrap = @import("backend_bootstrap.zig");
+const compile_units = @import("compile_units.zig");
+const compiler_session = @import("compiler_session.zig");
+const document_module = @import("document.zig");
+const hover = @import("hover.zig");
+const language_hover = @import("language_hover.zig");
+const syntax_types = @import("syntax_types.zig");
 
 const Document = document_module.Document;
 const Declaration = document_module.Declaration;
@@ -324,7 +325,7 @@ pub const Server = struct {
         const spelling = document.source[token.loc.start..token.loc.end];
         const description = if (try language_hover.describe(arena, spelling, token.tag)) |language| hover.Content{
             .declaration = language.syntax,
-            .type_summary = language.category,
+            .type_summary = language.type_summary orelse language.category,
             .documentation = language.summary,
             .reference = .{
                 .label = "Zig language reference",
@@ -895,7 +896,7 @@ pub const Server = struct {
         try server.publishDiagnosticSlice(arena, document, diagnostics.items[0..diagnostic_count]);
     }
 
-    fn loadConfiguration(server: *Server, allocator: std.mem.Allocator) !analysis.Configuration {
+    fn loadConfiguration(server: *const Server, allocator: std.mem.Allocator) !analysis.Configuration {
         const source = std.Io.Dir.cwd().readFileAlloc(
             server.io,
             "zig-analyzer.json",
@@ -1536,7 +1537,7 @@ pub const Server = struct {
         return binding.type_summary;
     }
 
-    fn importedSource(server: *Server, allocator: std.mem.Allocator, path: []const u8) !?ImportedSource {
+    fn importedSource(server: *const Server, allocator: std.mem.Allocator, path: []const u8) !?ImportedSource {
         const bytes = std.Io.Dir.cwd().readFileAlloc(
             server.io,
             path,
@@ -1825,7 +1826,7 @@ pub const Server = struct {
     }
 
     fn importPathCompletions(
-        server: *Server,
+        server: *const Server,
         allocator: std.mem.Allocator,
         document: *const Document,
         prefix: []const u8,
@@ -4848,7 +4849,7 @@ test "LSP hover documents Zig keywords primitive types and values" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "An unsigned integer type with 8 bits") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "mutable binding") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "boolean type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "primitive value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "```zig\\ntrue\\n```\\n```zig\\n(bool)\\n```") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "#Primitive-Values") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
 }
