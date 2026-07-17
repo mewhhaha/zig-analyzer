@@ -2,14 +2,13 @@ diff --git a/src/IncrementalDebugServer.zig b/src/IncrementalDebugServer.zig
 index 1252d74e..e5c54459 100644
 --- a/src/IncrementalDebugServer.zig
 +++ b/src/IncrementalDebugServer.zig
-@@ -18,31 +18,49 @@ future: ?Io.Future(void),
+@@ -18,31 +18,47 @@ future: ?Io.Future(void),
  /// Held by our owner when an update is in-progress, and held by us when responding to a command.
  /// So, essentially guards all access to `Compilation`, including `Zcu`.
  mutex: std.Io.Mutex,
 +protocol_port: u16,
 +authentication_token: []const u8,
 +analysis_generation: u32,
-+overlays: std.StringHashMapUnmanaged(Overlay),
  
  pub fn init(zcu: *Zcu) IncrementalDebugServer {
 +    const protocol_port = if (zcu.comp.environ_map.get("ZIG_ANALYZER_PORT")) |port_text|
@@ -23,19 +22,18 @@ index 1252d74e..e5c54459 100644
 +        .protocol_port = protocol_port,
 +        .authentication_token = zcu.comp.environ_map.get("ZIG_ANALYZER_TOKEN") orelse "",
 +        .analysis_generation = 1,
-+        .overlays = .empty,
      };
  }
  
  pub fn deinit(ids: *IncrementalDebugServer) void {
      const io = ids.zcu.comp.io;
      if (ids.future) |*f| f.cancel(io);
-+    var iterator = ids.overlays.iterator();
++    var iterator = ids.zcu.analysis_overlays.iterator();
 +    while (iterator.next()) |entry| {
 +        ids.zcu.gpa.free(entry.key_ptr.*);
 +        ids.zcu.gpa.free(entry.value_ptr.source);
 +    }
-+    ids.overlays.deinit(ids.zcu.gpa);
++    ids.zcu.analysis_overlays.deinit(ids.zcu.gpa);
  }
  
  const port = 7623;
@@ -54,7 +52,7 @@ index 1252d74e..e5c54459 100644
      var server = addr.listen(io, .{}) catch |err| switch (err) {
          error.Canceled => return,
          else => |e| {
-@@ -69,7 +87,11 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -69,7 +85,11 @@ fn runServer(ids: *IncrementalDebugServer) void {
          var cmd_buf: [1024]u8 = undefined;
          var reader = stream.reader(io, &cmd_buf);
          var writer = stream.writer(io, &.{});
@@ -67,7 +65,7 @@ index 1252d74e..e5c54459 100644
              const actual_err = switch (orig_err) {
                  error.Canceled,
                  error.OutOfMemory,
-@@ -109,6 +131,547 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -109,6 +129,585 @@ fn runServer(ids: *IncrementalDebugServer) void {
      }
  }
  
@@ -138,7 +136,11 @@ index 1252d74e..e5c54459 100644
 +                const owned_uri = try ids.zcu.gpa.dupe(u8, uri);
 +                defer ids.zcu.gpa.free(owned_uri);
 +                const source = try stream_reader.take(request.source_length);
-+                try ids.replaceOverlay(owned_uri, request.document_version, source);
++                const file_index = overlayFileIndex(ids, owned_uri) orelse {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document is outside the active compile unit");
++                    continue;
++                };
++                try ids.replaceOverlay(owned_uri, request.document_version, source, file_index);
 +                const facts = try ids.documentFacts(owned_uri, request.document_version);
 +                try writeStructResponse(stream_writer, header.request_id, ids.analysis_generation, .document_facts, AnalysisProtocol.DocumentFacts, facts);
 +            },
@@ -166,7 +168,7 @@ index 1252d74e..e5c54459 100644
 +                    continue;
 +                }
 +                const uri = try stream_reader.take(request.uri_length);
-+                const overlay = ids.overlays.get(uri) orelse {
++                const overlay = ids.zcu.analysis_overlays.get(uri) orelse {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document overlay is unavailable");
 +                    continue;
 +                };
@@ -263,7 +265,8 @@ index 1252d74e..e5c54459 100644
 +                    continue;
 +                }
 +                const uri = try stream_reader.take(request.uri_length);
-+                if (ids.overlays.fetchRemove(uri)) |removed| {
++                markOverlayRemoved(ids, uri);
++                if (ids.zcu.analysis_overlays.fetchRemove(uri)) |removed| {
 +                    ids.zcu.gpa.free(removed.key);
 +                    ids.zcu.gpa.free(removed.value.source);
 +                    ids.analysis_generation +%= 1;
@@ -316,27 +319,60 @@ index 1252d74e..e5c54459 100644
 +    }
 +}
 +
-+const Overlay = struct {
-+    document_version: i32,
-+    source: [:0]u8,
-+};
++const Overlay = Zcu.AnalysisOverlay;
 +
-+fn replaceOverlay(ids: *IncrementalDebugServer, uri: []const u8, document_version: i32, source: []const u8) !void {
++fn replaceOverlay(ids: *IncrementalDebugServer, uri: []const u8, document_version: i32, source: []const u8, file_index: Zcu.File.Index) !void {
 +    const owned_source = try ids.zcu.gpa.allocSentinel(u8, source.len, 0);
 +    errdefer ids.zcu.gpa.free(owned_source);
 +    @memcpy(owned_source, source);
-+    const result = try ids.overlays.getOrPut(ids.zcu.gpa, uri);
++    const result = try ids.zcu.analysis_overlays.getOrPut(ids.zcu.gpa, uri);
 +    errdefer if (!result.found_existing) {
-+        _ = ids.overlays.remove(uri);
++        _ = ids.zcu.analysis_overlays.remove(uri);
 +    };
 +    if (result.found_existing) {
 +        ids.zcu.gpa.free(result.value_ptr.source);
 +    } else {
 +        result.key_ptr.* = try ids.zcu.gpa.dupe(u8, uri);
 +    }
-+    result.value_ptr.* = .{ .document_version = document_version, .source = owned_source };
++    result.value_ptr.* = .{
++        .document_version = document_version,
++        .source = owned_source,
++        .pending = true,
++        .file_index = file_index,
++    };
 +    ids.analysis_generation +%= 1;
 +    if (ids.analysis_generation == 0) ids.analysis_generation = 1;
++}
++
++fn overlayFileIndex(ids: *IncrementalDebugServer, uri: []const u8) ?Zcu.File.Index {
++    const prefix = "file://";
++    if (!std.mem.startsWith(u8, uri, prefix)) return null;
++    const uri_path = uri[prefix.len..];
++    for (ids.zcu.module_roots.values()) |optional_file_index| {
++        const file_index = optional_file_index.unwrap() orelse continue;
++        const file = ids.zcu.fileByIndex(file_index);
++        if (overlayPathMatches(uri_path, file.path.sub_path)) return file_index;
++    }
++    for (ids.zcu.import_table.keys()) |file_index| {
++        const file = ids.zcu.fileByIndex(file_index);
++        if (overlayPathMatches(uri_path, file.path.sub_path)) return file_index;
++    }
++    return null;
++}
++
++fn markOverlayRemoved(ids: *IncrementalDebugServer, uri: []const u8) void {
++    const file_index = overlayFileIndex(ids, uri) orelse return;
++    const file = ids.zcu.fileByIndex(file_index);
++    switch (file.status) {
++        .astgen_failure, .success => file.stat.size +%= 1,
++        .never_loaded, .retryable_failure => {},
++    }
++}
++
++fn overlayPathMatches(uri_path: []const u8, file_path: []const u8) bool {
++    if (std.mem.eql(u8, uri_path, file_path)) return true;
++    if (uri_path.len <= file_path.len or !std.mem.endsWith(u8, uri_path, file_path)) return false;
++    return std.fs.path.isSep(uri_path[uri_path.len - file_path.len - 1]);
 +}
 +
 +fn writeWorkspaceDeclarationNames(
@@ -533,7 +569,7 @@ index 1252d74e..e5c54459 100644
 +}
 +
 +fn documentFacts(ids: *IncrementalDebugServer, uri: []const u8, document_version: i32) !AnalysisProtocol.DocumentFacts {
-+    const overlay = ids.overlays.get(uri) orelse return error.EndOfStream;
++    const overlay = ids.zcu.analysis_overlays.get(uri) orelse return error.EndOfStream;
 +    var tree = try std.zig.Ast.parse(ids.zcu.gpa, overlay.source, .zig);
 +    defer tree.deinit(ids.zcu.gpa);
 +    return .{
@@ -615,7 +651,7 @@ index 1252d74e..e5c54459 100644
  fn serveStream(
      ids: *IncrementalDebugServer,
      stream_reader: *Io.Reader,
-@@ -454,5 +1017,6 @@ const Zcu = @import("Zcu.zig");
+@@ -454,5 +1053,6 @@ const Zcu = @import("Zcu.zig");
  const InternPool = @import("InternPool.zig");
  const Type = @import("Type.zig");
  const AnalUnit = InternPool.AnalUnit;
@@ -797,3 +833,129 @@ index 00000000..894aedb0
 +    std.debug.assert(@sizeOf(DeclarationList) == 8);
 +    std.debug.assert(@sizeOf(DiagnosticBundle) == 8);
 +}
+diff --git a/src/Zcu.zig b/src/Zcu.zig
+index 88258b23..3451e467 100644
+--- a/src/Zcu.zig
++++ b/src/Zcu.zig
+@@ -338,6 +338,11 @@ builtin_decl_values: BuiltinDecl.Memoized = .initFill(.none),
+ incremental_debug_state: if (build_options.enable_debug_extensions) IncrementalDebugState else void =
+     if (build_options.enable_debug_extensions) .init else {},
+ 
++analysis_overlays: if (build_options.enable_debug_extensions)
++    std.StringHashMapUnmanaged(AnalysisOverlay)
++else
++    void = if (build_options.enable_debug_extensions) .empty else {},
++
+ /// Times semantic analysis of the current `AnalUnit`. When we pause to analyze a different unit,
+ /// this timer must be temporarily paused and resumed later.
+ cur_analysis_timer: ?Compilation.Timer = null,
+@@ -350,5 +355,12 @@ codegen_task_pool: CodegenTaskPool,
+ 
+ generation: u32 = 0,
+ 
++pub const AnalysisOverlay = struct {
++    document_version: i32,
++    source: [:0]u8,
++    pending: bool,
++    file_index: File.Index,
++};
++
+ pub const DependencyReason = struct {
+     src: LazySrcLoc,
+diff --git a/src/Zcu/PerThread.zig b/src/Zcu/PerThread.zig
+index 7d7e0290..1b2f2133 100644
+--- a/src/Zcu/PerThread.zig
++++ b/src/Zcu/PerThread.zig
+@@ -494,6 +494,7 @@ pub fn updateFile(
+     const comp = zcu.comp;
+     const gpa = zcu.gpa;
+     const io = comp.io;
++    const analysis_overlay = analysisOverlayForFile(zcu, file_index, file);
+ 
+     // In any case we need to examine the stat of the file to determine the course of action.
+     var source_file = f: {
+@@ -537,7 +538,9 @@ pub fn updateFile(
+                 stat.mtime.nanoseconds == file.stat.mtime.nanoseconds and
+                 stat.inode == file.stat.inode;
+ 
+-            if (unchanged_metadata) {
++            if (analysis_overlay != null and !analysis_overlay.?.pending or
++                analysis_overlay == null and unchanged_metadata)
++            {
+                 log.debug("unmodified metadata of file: {f}", .{file.path.fmt(comp)});
+                 return;
+             }
+@@ -624,7 +627,7 @@ pub fn updateFile(
+     // Under `--time-report`, ignore cache hits; do the work anyway for those juicy numbers.
+     const ignore_hit = comp.time_report != null;
+ 
+-    const need_update = while (true) {
++    const need_update = if (analysis_overlay != null) true else while (true) {
+         const result = switch (file.getMode()) {
+             inline else => |mode| try loadZirZoirCache(zcu, cache_file, stat, file, mode),
+         };
+@@ -650,17 +653,22 @@ pub fn updateFile(
+     if (need_update) {
+         var cache_file_writer: Io.File.Writer = .init(cache_file, io, &.{});
+ 
+-        if (stat.size > std.math.maxInt(u32))
++        const source_size = if (analysis_overlay) |overlay| overlay.source.len else stat.size;
++        if (source_size > std.math.maxInt(u32))
+             return error.FileTooBig;
+ 
+-        const source = try gpa.allocSentinel(u8, @intCast(stat.size), 0);
++        const source = try gpa.allocSentinel(u8, @intCast(source_size), 0);
+         defer if (file.source == null) gpa.free(source);
+-        var source_fr = source_file.reader(io, &.{});
+-        source_fr.size = stat.size;
+-        source_fr.interface.readSliceAll(source) catch |err| switch (err) {
+-            error.ReadFailed => return source_fr.err.?,
+-            error.EndOfStream => return error.UnexpectedEndOfFile,
+-        };
++        if (analysis_overlay) |overlay| {
++            @memcpy(source, overlay.source);
++        } else {
++            var source_fr = source_file.reader(io, &.{});
++            source_fr.size = stat.size;
++            source_fr.interface.readSliceAll(source) catch |err| switch (err) {
++                error.ReadFailed => return source_fr.err.?,
++                error.EndOfStream => return error.UnexpectedEndOfFile,
++            };
++        }
+ 
+         file.source = source;
+ 
+@@ -679,3 +687,3 @@ pub fn updateFile(
+                 file.zir = try AstGen.generate(gpa, file.tree.?);
+-                Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?) catch |err| switch (err) {
++                if (analysis_overlay == null) Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?) catch |err| switch (err) {
+                     error.OutOfMemory => |e| return e,
+@@ -688,3 +696,3 @@ pub fn updateFile(
+                 file.zoir = try ZonGen.generate(gpa, file.tree.?, .{});
+-                Zcu.saveZoirCache(&cache_file_writer, stat, file.zoir.?) catch |err| {
++                if (analysis_overlay == null) Zcu.saveZoirCache(&cache_file_writer, stat, file.zoir.?) catch |err| {
+                     log.warn("unable to write cached ZOIR code for {f} to {f}{s}: {t}", .{
+@@ -713,6 +721,7 @@ pub fn updateFile(
+         .inode = stat.inode,
+         .mtime = stat.mtime,
+     };
++    if (analysis_overlay) |overlay| overlay.pending = false;
+ 
+     // Now, `zir` or `zoir` is definitely populated and up-to-date.
+     // Mark file successes/failures as needed.
+@@ -749,6 +758,15 @@ pub fn updateFile(
+     }
+ }
+ 
++fn analysisOverlayForFile(zcu: *Zcu, file_index: Zcu.File.Index, _: *const Zcu.File) ?*Zcu.AnalysisOverlay {
++    if (!build_options.enable_debug_extensions or !zcu.comp.debugIncremental()) return null;
++    var iterator = zcu.analysis_overlays.iterator();
++    while (iterator.next()) |entry| {
++        if (entry.value_ptr.file_index == file_index) return entry.value_ptr;
++    }
++    return null;
++}
++
+ fn loadZirZoirCache(
+     zcu: *Zcu,
+     cache_file: Io.File,

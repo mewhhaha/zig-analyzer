@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 const analysis = @import("analysis.zig");
 const backend_bootstrap = @import("backend_bootstrap.zig");
 const compiler_session = @import("compiler_session.zig");
+const compile_units = @import("compile_units.zig");
 const document_module = @import("document.zig");
 const language_hover = @import("language_hover.zig");
 const hover = @import("hover.zig");
@@ -163,6 +164,7 @@ pub const Server = struct {
             params.textDocument.text,
         );
         try server.ensureCompiler(arena, params.textDocument.uri);
+        try server.syncCompilerOverlay(params.textDocument.uri);
         try server.publishDiagnostics(arena, params.textDocument.uri);
     }
 
@@ -181,6 +183,7 @@ pub const Server = struct {
             server.compiler_start_attempted = false;
             try server.ensureCompiler(arena, params.textDocument.uri);
         }
+        try server.syncCompilerOverlay(params.textDocument.uri);
         try server.publishDiagnostics(arena, params.textDocument.uri);
     }
 
@@ -189,10 +192,11 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didClose"),
     ) !void {
+        if (server.compiler) |*compiler| {
+            compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err);
+        }
         if (server.compiler_root_uri) |root_uri| {
             if (std.mem.eql(u8, root_uri, params.textDocument.uri)) {
-                if (server.compiler) |*compiler| compiler.deinit();
-                server.compiler = null;
                 server.allocator.free(root_uri);
                 server.compiler_root_uri = null;
             }
@@ -220,6 +224,7 @@ pub const Server = struct {
         server.compiler_start_attempted = false;
         server.compiler_restart_available = true;
         try server.ensureCompiler(arena, params.textDocument.uri);
+        try server.syncCompilerOverlay(params.textDocument.uri);
         try server.publishDiagnostics(arena, params.textDocument.uri);
     }
 
@@ -915,10 +920,11 @@ pub const Server = struct {
     fn ensureCompiler(server: *Server, allocator: std.mem.Allocator, uri: []const u8) !void {
         if (server.compiler != null or server.compiler_start_attempted) return;
         server.compiler_start_attempted = true;
-        const document = server.documents.getConst(uri) orelse return;
+        if (server.documents.getConst(uri) == null) return;
         if (!try pathExists(server.io, backend_bootstrap.backend_binary)) return;
-        const root_source_path = try filePathFromUri(allocator, uri) orelse return;
-        if (!try pathExists(server.io, root_source_path)) return;
+        const document_path = try filePathFromUri(allocator, uri) orelse return;
+        if (!try pathExists(server.io, document_path)) return;
+        const root_source_path = try compile_units.rootSourceForDocument(server.io, allocator, document_path);
         server.compiler = compiler_session.Session.start(
             server.io,
             server.allocator,
@@ -927,6 +933,26 @@ pub const Server = struct {
         ) catch |err| {
             std.log.err("compiler backend failed to start for '{s}': {t}", .{ root_source_path, err });
             return;
+        };
+    }
+
+    fn syncCompilerOverlay(server: *Server, uri: []const u8) !void {
+        const document = server.documents.getConst(uri) orelse return;
+        const compiler = if (server.compiler) |*active| active else return;
+        _ = compiler.replaceOverlay(uri, document.version, document.source) catch |err| switch (err) {
+            error.SemanticsUnavailable => {
+                if (server.compiler_root_uri) |previous_uri| {
+                    if (std.mem.eql(u8, previous_uri, uri)) {
+                        server.allocator.free(previous_uri);
+                        server.compiler_root_uri = null;
+                    }
+                }
+                return;
+            },
+            else => {
+                server.recordCompilerFailure(err);
+                return;
+            },
         };
         if (server.compiler_root_uri) |previous_uri| server.allocator.free(previous_uri);
         server.compiler_root_uri = try server.allocator.dupe(u8, uri);
@@ -1216,10 +1242,51 @@ pub const Server = struct {
             allocator,
             try analysis.findingsWithShapes(allocator, document.source, lint_configuration, resolved_shapes),
         );
+        try document_findings.appendSlice(
+            allocator,
+            try server.moduleMemberFindings(allocator, document, lint_configuration),
+        );
         if (try analysis.fileNameFinding(allocator, document.source, document.uri, lint_configuration)) |finding| {
             try document_findings.append(allocator, finding);
         }
         return try document_findings.toOwnedSlice(allocator);
+    }
+
+    fn moduleMemberFindings(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        configuration: analysis.Configuration,
+    ) ![]const analysis.Finding {
+        const level = configuration.level(.unresolved_member);
+        if (level == .off) return &.{};
+        const tokens = try tokenize(allocator, document.source);
+        var findings: std.ArrayList(analysis.Finding) = .empty;
+        for (tokens, 0..) |member_token, member_index| {
+            if (member_token.tag != .identifier or member_index < 2 or
+                tokens[member_index - 1].tag != .period or tokens[member_index - 2].tag != .identifier) continue;
+            const receiver = document.source[tokens[member_index - 2].loc.start..tokens[member_index - 2].loc.end];
+            const view = try server.moduleView(allocator, document, receiver) orelse continue;
+            const member_name = document.source[member_token.loc.start..member_token.loc.end];
+            var exists = false;
+            for (view.members) |member| {
+                if (!std.mem.eql(u8, member.name, member_name)) continue;
+                exists = true;
+                break;
+            }
+            if (exists or analysis.isSuppressed(document.source, .unresolved_member, member_token.loc.start)) continue;
+            try findings.append(allocator, .{
+                .rule = .unresolved_member,
+                .level = level,
+                .span = member_token.loc,
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "module '{s}' has no public member named '{s}'",
+                    .{ receiver, member_name },
+                ),
+            });
+        }
+        return try findings.toOwnedSlice(allocator);
     }
 
     fn compilerTypeShapes(
@@ -3625,6 +3692,30 @@ test "module resolution returns only public declarations" {
     try std.testing.expectEqualStrings("clampToLimit", members[1].name);
 }
 
+test "module diagnostics report only missing public members" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source: [:0]const u8 =
+        "const catalog = @import(\"catalog.zig\");\n" ++
+        "fn result() u32 { _ = catalog.default_limit; return catalog.missingLimit; }\n";
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+    try server.documents.open("file://examples/zls/imports/main.zig", 1, source);
+    const document = server.documents.getConst("file://examples/zls/imports/main.zig").?;
+    const found = try server.documentFindings(arena, document, analysis.Configuration.defaults());
+    var missing_member_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .unresolved_member) continue;
+        missing_member_count += 1;
+        try std.testing.expectEqualStrings("missingLimit", source[finding.span.start..finding.span.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_member_count);
+}
+
 test "import resolution identifies aliases" {
     const source: [:0]const u8 =
         "const std = @import(\"std\");\n" ++
@@ -3945,6 +4036,38 @@ test "LSP publishes unresolved calls before the document is saved" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"diagnostics\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved-call") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved function 'compute'") != null);
+}
+
+test "LSP publishes unresolved type references after an unsaved rename" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///unsaved_type.zig","languageId":"zig","version":1,"text":"const pool = @import(\"pool\");\nconst Message = pool.Message;\nfn use(message: *Message.Prepare) void { _ = message; }\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///unsaved_type.zig","version":2},"contentChanges":[{"text":"const pool = @import(\"pool\");\nconst Mssage = pool.Message;\nfn use(message: *Message.Prepare) void { _ = message; }\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"diagnostics\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved-identifier") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved identifier 'Message'") != null);
 }
 
 test "LSP advertises and returns complete filtered code actions" {

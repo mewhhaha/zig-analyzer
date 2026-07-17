@@ -55,6 +55,8 @@ are discovered and kept alive for incremental analysis.
 
 Acceptance:
 
+- [x] A source file starts from the nearest build-declared root source when one
+  unambiguously contains it, rather than becoming an isolated compile unit.
 - [ ] `check` compile units are preferred, with `install` as the fallback.
 - [ ] Required generation steps run without executing produced applications.
 - [ ] Saved build-script changes reconfigure the affected compiler units.

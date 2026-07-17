@@ -3,6 +3,7 @@ const allocation_lifecycle = @import("allocation_lifecycle.zig");
 const configuration_parser = @import("configuration.zig");
 const rule_types = @import("types.zig");
 const rule_registry = @import("registry.zig");
+const syntax_scope = @import("../syntax_scope.zig");
 
 pub const Level = rule_types.Level;
 pub const Rule = rule_types.Rule;
@@ -65,6 +66,8 @@ pub fn findingsWithShapes(
     defer tree.deinit(allocator);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
+    defer scope_index.deinit();
     var containers: std.ArrayList(Container) = .empty;
     try containers.appendSlice(allocator, try collectContainers(allocator, source, tokens));
     for (resolved_shapes) |shape| {
@@ -90,7 +93,10 @@ pub fn findingsWithShapes(
     var found: std.ArrayList(Finding) = .empty;
     const suppression_directives_present = configuration_parser.hasSuppressionDirectives(source);
 
-    try findUnresolvedCalls(allocator, source, tokens, configuration, &found);
+    try findUnresolvedCalls(allocator, source, tokens, &scope_index, configuration, &found);
+    try findUnresolvedIdentifiers(allocator, source, tokens, &tree, &scope_index, configuration, &found);
+    try findUnresolvedMembers(allocator, source, tokens, containers.items, &scope_index, configuration, &found);
+    try findUnresolvedLabels(allocator, source, tokens, configuration, &found);
     try findNeverMutatedVariables(allocator, source, tokens, configuration, &found);
     try findDiscardedErrors(allocator, source, tokens, configuration, &found);
     try findCatchDiagnostics(allocator, source, tokens, configuration, &found);
@@ -100,7 +106,7 @@ pub fn findingsWithShapes(
     try findErrorValueComparisons(allocator, source, tokens, &tree, configuration, &found);
     try findMixedBitwiseArithmetic(allocator, source, tokens, &tree, configuration, &found);
     try findUnusedPrivateDeclarations(allocator, source, tokens, &tree, configuration, &found);
-    try findComptimeReflectionIssues(allocator, source, tokens, containers.items, configuration, &found);
+    try findComptimeReflectionIssues(allocator, source, tokens, containers.items, &scope_index, configuration, &found);
     try findConstantComptimeConditions(allocator, source, tokens, configuration, &found);
     try findSwitches(allocator, source, tokens, containers.items, configuration, &found);
     try findStructInitializers(allocator, source, tokens, &tree, containers.items, configuration, &found);
@@ -229,30 +235,30 @@ fn findUnresolvedCalls(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
     const level = configuration.level(.unresolved_call);
     if (level == .off) return;
-    // usingnamespace brings names into scope that this file-local scan cannot see.
-    for (tokens) |token| if (tokenIs(source, token, "usingnamespace")) return;
-    var declared_names: std.StringHashMapUnmanaged(void) = .empty;
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .identifier) continue;
-        const is_declaration = index > 0 and switch (tokens[index - 1].tag) {
-            .keyword_fn, .keyword_const, .keyword_var => true,
-            else => false,
-        };
-        const is_typed_binding = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
-        if (is_declaration or is_typed_binding or identifierIsCaptureBinding(tokens, index)) {
-            try declared_names.put(allocator, tokenText(source, token), {});
-        }
-    }
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
         if (index > 0 and tokens[index - 1].tag == .period) continue;
+        if (index >= 2 and tokens[index - 1].tag == .colon and
+            (tokens[index - 2].tag == .keyword_break or tokens[index - 2].tag == .keyword_continue)) continue;
         const name = tokenText(source, token);
-        if (std.zig.isPrimitive(name) or declared_names.contains(name)) continue;
+        if (std.zig.isPrimitive(name)) continue;
+        if (scope_index.findBinding(index)) |binding| {
+            if (binding.kind != .non_callable) continue;
+            try addFinding(allocator, source, configuration, found, .{
+                .rule = .unresolved_call,
+                .level = level,
+                .span = token.loc,
+                .message = try std.fmt.allocPrint(allocator, "binding '{s}' is not callable", .{name}),
+            });
+            continue;
+        }
+        if (scope_index.usingnamespaceMayProvideName(index)) continue;
         try addFinding(allocator, source, configuration, found, .{
             .rule = .unresolved_call,
             .level = level,
@@ -260,6 +266,168 @@ fn findUnresolvedCalls(
             .message = try std.fmt.allocPrint(allocator, "call to unresolved function '{s}'", .{name}),
         });
     }
+}
+
+fn findUnresolvedIdentifiers(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
+    scope_index: *const syntax_scope.Index,
+    configuration: Configuration,
+    found: *std.ArrayList(Finding),
+) !void {
+    const level = configuration.level(.unresolved_identifier);
+    if (level == .off) return;
+
+    for (0..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        if (tree.nodeTag(node) != .identifier) continue;
+        const token_index: usize = tree.nodeMainToken(node);
+        if (token_index >= tokens.len) continue;
+        const token = tokens[token_index];
+        const name = tokenText(source, token);
+        if (std.mem.eql(u8, name, "_") or std.zig.isPrimitive(name) or
+            scope_index.findBinding(token_index) != null or
+            syntax_scope.isContainerFieldDeclaration(tokens, token_index)) continue;
+        // Field names and enum literals are resolved through their receiver or
+        // result type. Calls retain the more specific unresolved-call finding.
+        if (token_index > 0 and tokens[token_index - 1].tag == .period) continue;
+        if (token_index + 1 < tokens.len and tokens[token_index + 1].tag == .l_paren) continue;
+        if (scope_index.usingnamespaceMayProvideName(token_index)) continue;
+
+        try addFinding(allocator, source, configuration, found, .{
+            .rule = .unresolved_identifier,
+            .level = level,
+            .span = token.loc,
+            .message = try std.fmt.allocPrint(allocator, "use of unresolved identifier '{s}'", .{name}),
+        });
+    }
+}
+
+fn findUnresolvedMembers(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    containers: []const Container,
+    scope_index: *const syntax_scope.Index,
+    configuration: Configuration,
+    found: *std.ArrayList(Finding),
+) !void {
+    const level = configuration.level(.unresolved_member);
+    if (level == .off) return;
+    for (tokens, 0..) |member_token, member_index| {
+        if (member_token.tag != .identifier or member_index < 2 or tokens[member_index - 1].tag != .period or
+            tokens[member_index - 2].tag != .identifier) continue;
+        if (member_index >= 3 and tokens[member_index - 3].tag == .period) continue;
+        const receiver_name = tokenText(source, tokens[member_index - 2]);
+        const container = containerForReceiver(source, tokens, containers, scope_index, receiver_name, member_index - 2) orelse continue;
+        if (container.has_usingnamespace or container.resolved) continue;
+        const member_name = tokenText(source, member_token);
+        if (containerHasField(container, member_name) or
+            containerHasDeclaration(source, tokens, container.name, member_name)) continue;
+        try addFinding(allocator, source, configuration, found, .{
+            .rule = .unresolved_member,
+            .level = level,
+            .span = member_token.loc,
+            .message = try std.fmt.allocPrint(
+                allocator,
+                "type '{s}' has no member named '{s}'",
+                .{ container.name, member_name },
+            ),
+        });
+    }
+}
+
+fn containerForReceiver(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    containers: []const Container,
+    scope_index: *const syntax_scope.Index,
+    receiver_name: []const u8,
+    receiver_index: usize,
+) ?Container {
+    if (containerNamed(source, tokens, containers, receiver_name, receiver_index)) |container| return container;
+    for (containers) |container| {
+        if (!scopeContains(container.scope, receiver_index)) continue;
+        if (indexedBindingHasType(source, tokens, scope_index, receiver_index, container.name) or
+            bindingInitializesType(source, tokens, scope_index, receiver_name, container.name, receiver_index)) return container;
+    }
+    return null;
+}
+
+fn bindingInitializesType(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    type_name: []const u8,
+    receiver_index: usize,
+) bool {
+    const visible_binding = scope_index.findBinding(receiver_index) orelse return false;
+    const index = visible_binding.token_index;
+    return tokenIs(source, tokens[index], binding_name) and index + 3 < tokens.len and
+        tokens[index + 1].tag == .equal and tokenIs(source, tokens[index + 2], type_name) and
+        tokens[index + 3].tag == .l_brace;
+}
+
+fn findUnresolvedLabels(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    configuration: Configuration,
+    found: *std.ArrayList(Finding),
+) !void {
+    const level = configuration.level(.unresolved_label);
+    if (level == .off) return;
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or index < 2 or tokens[index - 1].tag != .colon or
+            (tokens[index - 2].tag != .keyword_break and tokens[index - 2].tag != .keyword_continue)) continue;
+        const name = tokenText(source, token);
+        if (labelIsVisible(source, tokens, name, index)) continue;
+        try addFinding(allocator, source, configuration, found, .{
+            .rule = .unresolved_label,
+            .level = level,
+            .span = token.loc,
+            .message = try std.fmt.allocPrint(allocator, "branch targets unresolved label '{s}'", .{name}),
+        });
+    }
+}
+
+fn labelIsVisible(source: []const u8, tokens: []const std.zig.Token, name: []const u8, use_index: usize) bool {
+    for (tokens[0..use_index], 0..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(source, token, name) or index + 2 >= tokens.len or
+            tokens[index + 1].tag != .colon) continue;
+        const construct = index + 2;
+        const valid_construct = tokens[construct].tag == .l_brace or switch (tokens[construct].tag) {
+            .keyword_while, .keyword_for, .keyword_switch, .keyword_inline => true,
+            else => false,
+        };
+        if (!valid_construct) continue;
+        const end = labeledConstructEnd(tokens, construct) orelse continue;
+        if (use_index > construct and use_index < end) return true;
+    }
+    return false;
+}
+
+fn labeledConstructEnd(tokens: []const std.zig.Token, construct: usize) ?usize {
+    if (tokens[construct].tag == .l_brace) return matchingToken(tokens, construct, .l_brace, .r_brace);
+    var cursor = construct + 1;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    while (cursor < tokens.len) : (cursor += 1) {
+        switch (tokens[cursor].tag) {
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0)
+                return matchingToken(tokens, cursor, .l_brace, .r_brace),
+            .semicolon => if (parenthesis_depth == 0 and bracket_depth == 0) return cursor,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn identifierIsCaptureBinding(tokens: []const std.zig.Token, index: usize) bool {
@@ -1003,15 +1171,16 @@ fn findBooleanComparisons(
         if (left.tag != .identifier or right.tag != .identifier) continue;
         const left_text = tokenText(source, left);
         const right_text = tokenText(source, right);
-        const operand, const literal = if (isBooleanLiteral(right_text))
-            .{ left, right }
+        const operand_index, const literal = if (isBooleanLiteral(right_text))
+            .{ index - 1, right }
         else if (isBooleanLiteral(left_text))
-            .{ right, left }
+            .{ index + 1, left }
         else
             continue;
+        const operand = tokens[operand_index];
         const literal_text = tokenText(source, literal);
         const operand_name = tokenText(source, operand);
-        if (!bindingHasType(source, tokens, operand_name, "bool", index)) continue;
+        if (!bindingAtHasType(source, tokens, operand_index, "bool")) continue;
         const equal_to_true = (operator.tag == .equal_equal) == std.mem.eql(u8, literal_text, "true");
         const replacement = if (equal_to_true)
             try allocator.dupe(u8, operand_name)
@@ -1338,24 +1507,31 @@ fn collectReflectedNames(
     return collected;
 }
 
-fn bindingHasType(
+fn bindingAtHasType(
     source: []const u8,
     tokens: []const std.zig.Token,
-    binding_name: []const u8,
+    receiver_index: usize,
     type_name: []const u8,
-    before: usize,
 ) bool {
-    var index = before;
-    var proven = false;
-    while (index > 0) {
-        index -= 1;
-        if (tokens[index].tag == .keyword_fn) break;
-        if (!tokenIs(source, tokens[index], binding_name)) continue;
-        if (index + 2 >= tokens.len or tokens[index + 1].tag != .colon) continue;
-        if (!tokenIs(source, tokens[index + 2], type_name)) return false;
-        proven = true;
-    }
-    return proven;
+    const binding = syntax_scope.findBinding(source, tokens, receiver_index) orelse return false;
+    const index = binding.token_index;
+    if (index + 2 >= tokens.len or tokens[index + 1].tag != .colon or
+        !tokenIs(source, tokens[index + 2], type_name)) return false;
+    return index + 3 >= tokens.len or tokens[index + 3].tag != .period;
+}
+
+fn indexedBindingHasType(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    receiver_index: usize,
+    type_name: []const u8,
+) bool {
+    const visible_binding = scope_index.findBinding(receiver_index) orelse return false;
+    const index = visible_binding.token_index;
+    if (index + 2 >= tokens.len or tokens[index + 1].tag != .colon or
+        !tokenIs(source, tokens[index + 2], type_name)) return false;
+    return index + 3 >= tokens.len or tokens[index + 3].tag != .period;
 }
 
 fn collectContainers(
@@ -1426,14 +1602,13 @@ fn collectContainerFields(
             .identifier => {
                 if (brace_depth != 1 or parenthesis_depth != 0 or bracket_depth != 0 or
                     index > opening + 1 and switch (tokens[index - 1].tag) {
-                        .comma, .doc_comment, .container_doc_comment => false,
+                        .r_brace, .comma, .semicolon, .doc_comment, .container_doc_comment => false,
                         else => true,
                     }) continue;
-                if (kind != .enumeration and kind != .error_set and
-                    (index + 1 >= closing or tokens[index + 1].tag != .colon)) continue;
+                if (kind == .structure and (index + 1 >= closing or tokens[index + 1].tag != .colon)) continue;
                 try fields.append(allocator, .{
                     .name = tokenText(source, tokens[index]),
-                    .required = if (kind == .enumeration or kind == .error_set) true else fieldIsRequired(tokens, index + 1, closing),
+                    .required = if (kind != .structure) true else fieldIsRequired(tokens, index + 1, closing),
                 });
             },
             else => {},
@@ -1461,6 +1636,7 @@ fn findComptimeReflectionIssues(
     source: []const u8,
     tokens: []const std.zig.Token,
     containers: []const Container,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -1468,33 +1644,44 @@ fn findComptimeReflectionIssues(
     if (level == .off) return;
     for (tokens, 0..) |token, builtin_index| {
         if (token.tag != .builtin or
-            (!tokenIs(source, token, "@hasField") and !tokenIs(source, token, "@hasDecl"))) continue;
+            (!tokenIs(source, token, "@field") and !tokenIs(source, token, "@hasField") and
+                !tokenIs(source, token, "@hasDecl"))) continue;
         if (builtin_index + 5 >= tokens.len or tokens[builtin_index + 1].tag != .l_paren or
             tokens[builtin_index + 2].tag != .identifier or tokens[builtin_index + 3].tag != .comma or
             tokens[builtin_index + 4].tag != .string_literal or tokens[builtin_index + 5].tag != .r_paren) continue;
         const type_name = tokenText(source, tokens[builtin_index + 2]);
-        const container = containerNamed(source, tokens, containers, type_name, builtin_index) orelse continue;
+        const container = containerForReceiver(source, tokens, containers, scope_index, type_name, builtin_index + 2) orelse continue;
         const literal = tokenText(source, tokens[builtin_index + 4]);
         if (literal.len < 2) continue;
         const member_name = literal[1 .. literal.len - 1];
-        const has_field = tokenIs(source, token, "@hasField");
+        const field_lookup = tokenIs(source, token, "@field");
+        const has_field = tokenIs(source, token, "@hasField") or field_lookup;
         // usingnamespace mixes in members this analysis cannot see.
         if (container.has_usingnamespace) continue;
         if (has_field and container.kind == .enumeration or !has_field and container.resolved) continue;
         const exists = if (has_field)
-            containerHasField(container, member_name)
+            containerHasField(container, member_name) or
+                field_lookup and containerHasDeclaration(source, tokens, container.name, member_name)
         else
             containerHasDeclaration(source, tokens, container.name, member_name);
         if (exists) continue;
+        const message = if (field_lookup)
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} cannot resolve member '{s}' on type '{s}' in this analyzed shape",
+                .{ tokenText(source, token), member_name, container.name },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} is always false: type '{s}' has no member named '{s}' in this analyzed shape",
+                .{ tokenText(source, token), container.name, member_name },
+            );
         try addFinding(allocator, source, configuration, found, .{
             .rule = .unknown_comptime_member,
             .level = level,
             .span = tokens[builtin_index + 4].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
-                "{s} is always false: type '{s}' has no member named '{s}' in this analyzed shape",
-                .{ tokenText(source, token), type_name, member_name },
-            ),
+            .message = message,
         });
     }
 }
@@ -2162,7 +2349,7 @@ fn findNeedlessCasts(
             replacement = source[tokens[index + 4].loc.start..tokens[inner_close].loc.end];
             message = try std.fmt.allocPrint(allocator, "nested cast to '{s}' repeats the same proven type", .{type_name});
         } else if (tokens[index + 4].tag == .identifier and index + 5 == outer_close and
-            bindingHasType(source, tokens, tokenText(source, tokens[index + 4]), type_name, index))
+            bindingAtHasType(source, tokens, index + 4, type_name))
         {
             replacement = tokenText(source, tokens[index + 4]);
             message = try std.fmt.allocPrint(
@@ -4643,7 +4830,7 @@ test "lost error context ignores conditional remaps" {
     try std.testing.expectEqual(@as(usize, 1), context_count);
 }
 
-test "usingnamespace suppresses member and call resolution" {
+test "usingnamespace uncertainty stays within its container" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
@@ -4662,14 +4849,16 @@ test "usingnamespace suppresses member and call resolution" {
     configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .hint;
     const found = try findings(arena.allocator(), source, configuration);
     var member_count: usize = 0;
+    var call_count: usize = 0;
     for (found) |finding| {
-        try std.testing.expect(finding.rule != .unresolved_call);
+        if (finding.rule == .unresolved_call) call_count += 1;
         if (finding.rule == .unknown_comptime_member) {
             member_count += 1;
             try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Plain'") != null);
         }
     }
     try std.testing.expectEqual(@as(usize, 1), member_count);
+    try std.testing.expectEqual(@as(usize, 1), call_count);
 
     const control: [:0]const u8 = "fn run() void { borrowed(); }\n";
     const control_findings = try findings(arena.allocator(), control, configuration);
@@ -4954,4 +5143,151 @@ test "compound Context and State names describe their role" {
         try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Context'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), vague_count);
+}
+
+test "renamed declarations report their unresolved type references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const MessagePool = @import(\"message_pool\");\n" ++
+        "const Mssage = MessagePool.Message;\n" ++
+        "fn toMessage(target: *Message.Prepare) void { _ = target; }\n" ++
+        "const Pending = struct { message: ?*Message.Request = null };\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var unresolved_count: usize = 0;
+    for (found) |finding| if (finding.rule == .unresolved_identifier) {
+        unresolved_count += 1;
+        try std.testing.expectEqualStrings("Message", source[finding.span.start..finding.span.end]);
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "unresolved identifier 'Message'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 2), unresolved_count);
+}
+
+test "resolved bindings and qualified members do not report unresolved identifiers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const Entry = struct { value: u8 };\n" ++
+        "fn read(entry: Entry, maybe: ?u8, pair: struct { u8, u8 }) !u8 {\n" ++
+        "    const .{ first, second } = pair;\n" ++
+        "    const third, const fourth = pair;\n" ++
+        "    if (maybe) |value| return entry.value + value + first + second + third + fourth;\n" ++
+        "    return error.Missing;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_identifier);
+}
+
+test "unresolved calls keep their specific diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn run() void { missing(); }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var call_count: usize = 0;
+    for (found) |finding| switch (finding.rule) {
+        .unresolved_call => call_count += 1,
+        .unresolved_identifier => return error.TestUnexpectedResult,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), call_count);
+}
+
+test "unresolved identifier diagnostics honor source suppression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "// zig-analyzer: disable-next-line unresolved-identifier\n" ++
+        "const value: Missing = undefined;\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_identifier);
+}
+
+test "unresolved names respect lexical scopes and declaration order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn first() void { _ = later; _ = foreign; const later = 1; }\n" ++
+        "fn second() void { const foreign = 1; _ = foreign; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var unresolved_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .unresolved_identifier) unresolved_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), unresolved_count);
+}
+
+test "obvious value bindings cannot be called" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "const run = 1; fn main() void { run(); }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var non_callable_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .unresolved_call and
+            std.mem.indexOf(u8, finding.message, "not callable") != null) non_callable_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), non_callable_count);
+}
+
+test "missing members are reported only for proven local receiver shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Message = struct { value: u8, fn read(_: Message) void {} };\n" ++
+        "fn use(message: Message, unknown: anytype) void { message.read(); _ = message.mssage; _ = Message.missing; unknown.missing(); }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var member_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .unresolved_member) member_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), member_count);
+}
+
+test "member inference follows the visible shadowing binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Kind = enum { child };\n" ++
+        "const Entry = struct { kind: Kind, child: u8 };\n" ++
+        "fn use(maybe: ?Entry) void { if (maybe) |*kind| _ = kind.child; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
+test "void tagged union cases are resolved as members" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Operation = union(enum) { read: u8, checkpoint }; fn use() void { _ = Operation.checkpoint; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
+test "named branches require an enclosing label" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() void { outer: for ([_]u8{ 1, 2 }) |_| { break :outer; } break :missing; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var label_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .unresolved_label) label_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), label_count);
+}
+
+test "field reflection reports missing members on typed values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Message = struct { value: u8 }; fn use(message: Message) void { _ = @field(message, \"value\"); _ = @field(message, \"missing\"); }\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var reflection_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .unknown_comptime_member) reflection_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reflection_count);
 }

@@ -11,6 +11,12 @@ are off until enabled by a profile, the style tier, or a per-rule setting.
 
 - [`unresolved-call`](unresolved-call.md) — Reports an unqualified call whose
   function cannot be found in the analyzed scope.
+- [`unresolved-identifier`](unresolved-identifier.md) — Reports an unqualified
+  non-call identifier that cannot be found in the analyzed scope.
+- [`unresolved-member`](unresolved-member.md) — Reports a field, declaration,
+  or method missing from a receiver whose complete local shape is known.
+- [`unresolved-label`](unresolved-label.md) — Reports a `break` or `continue`
+  targeting a label that is not visible from the branch.
 - [`missing-switch-prong`](missing-switch-prong.md) — Reports a switch over a
   proven finite enum or tagged union that omits cases and has no `else` prong.
 - [`missing-struct-field`](missing-struct-field.md) — Reports a struct

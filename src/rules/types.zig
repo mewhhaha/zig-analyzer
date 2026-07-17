@@ -10,6 +10,9 @@ pub const Level = enum {
 
 pub const Rule = enum {
     unresolved_call,
+    unresolved_identifier,
+    unresolved_member,
+    unresolved_label,
     missing_switch_prong,
     missing_struct_field,
     never_mutated_var,
@@ -102,7 +105,14 @@ pub const Rule = enum {
 
     pub fn tier(rule: Rule) Tier {
         return switch (rule) {
-            .unresolved_call, .missing_switch_prong, .missing_struct_field, .never_mutated_var => .semantic,
+            .unresolved_call,
+            .unresolved_identifier,
+            .unresolved_member,
+            .unresolved_label,
+            .missing_switch_prong,
+            .missing_struct_field,
+            .never_mutated_var,
+            => .semantic,
             .unreleased_allocation,
             .defer_cleanup_in_loop,
             .error_value_comparison,

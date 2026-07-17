@@ -8,5 +8,6 @@ scope.
 **Why it matters.** A misspelled or deleted function name otherwise produces
 cascading type errors and broken navigation.
 
-**When it matters.** It is useful for ordinary file-local calls; the rule stays
-silent when `usingnamespace` makes the visible scope uncertain.
+**When it matters.** It checks lexical declarations, parameters, and captures,
+and also reports bindings proven to hold literal values rather than functions.
+Only references inside a scope extended by `usingnamespace` remain silent.
