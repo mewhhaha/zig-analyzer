@@ -216,26 +216,47 @@ fn allocationFromCall(
     if (tree.nodeTag(call.ast.fn_expr) == .identifier) {
         const function_name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
         const owned = summary_index.ownedReturnCall(source, null, function_name) orelse return null;
+        const allocator_argument = if (owned.allocator_parameter) |parameter|
+            if (parameter < call.ast.params.len) call.ast.params[parameter] else null
+        else
+            null;
         return .{
             .method = function_name,
             .release = owned.release,
-            .receiver = null,
-            .allocator_source = null,
+            .receiver = if (allocator_argument) |argument|
+                if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+            else
+                null,
+            .allocator_source = if (allocator_argument) |argument| allocatorSourceName(tree, argument) else null,
         };
     }
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
     const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
     const method = tree.tokenSlice(method_token);
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
-    const release = allocationRelease(method) orelse
-        if (summary_index.ownedReturnCall(source, receiver_name, method)) |owned| owned.release else return null;
-    if (expressionReferencesField(tree, receiver, "arena")) return null;
-    if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(tree, receiver)) return null;
+    if (allocationRelease(method)) |release| {
+        if (expressionReferencesField(tree, receiver, "arena")) return null;
+        if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(tree, receiver)) return null;
+        return .{
+            .method = method,
+            .release = release,
+            .receiver = receiver_name,
+            .allocator_source = allocatorSourceName(tree, receiver),
+        };
+    }
+    const owned = summary_index.ownedReturnCall(source, receiver_name, method) orelse return null;
+    const allocator_argument = if (owned.allocator_parameter) |parameter|
+        if (parameter < call.ast.params.len) call.ast.params[parameter] else null
+    else
+        null;
     return .{
         .method = method,
-        .release = release,
-        .receiver = receiver_name,
-        .allocator_source = allocatorSourceName(tree, receiver),
+        .release = owned.release,
+        .receiver = if (allocator_argument) |argument|
+            if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+        else
+            receiver_name,
+        .allocator_source = if (allocator_argument) |argument| allocatorSourceName(tree, argument) else null,
     };
 }
 
@@ -261,6 +282,13 @@ fn expressionLooksLikeAllocator(tree: *const std.zig.Ast, expression: std.zig.As
 fn allocatorSourceName(tree: *const std.zig.Ast, receiver: std.zig.Ast.Node.Index) ?[]const u8 {
     switch (tree.nodeTag(receiver)) {
         .identifier => return tree.tokenSlice(tree.nodeMainToken(receiver)),
+        .field_access => {
+            const base, const field_token = tree.nodeData(receiver).node_and_token;
+            if (!std.mem.eql(u8, tree.tokenSlice(field_token), "allocator") and
+                !std.mem.eql(u8, tree.tokenSlice(field_token), "gpa")) return null;
+            if (tree.nodeTag(base) != .identifier) return null;
+            return tree.tokenSlice(tree.nodeMainToken(base));
+        },
         .call, .call_comma, .call_one, .call_one_comma => {
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, receiver) orelse return null;
@@ -424,6 +452,7 @@ fn findReleaseOrderingIssues(
         if (token.tag != .identifier or method_index + 1 >= scope_end or tokens[method_index + 1].tag != .l_paren) continue;
         const release_scope = enclosingScope(tokens, method_index) orelse continue;
         if (release_scope.opening != declaration_scope.opening) continue;
+        if (statementStartsWithErrdefer(tokens, method_index)) continue;
         const direct_release = tokenIsIdentifier(source, token, allocation.release) and
             releaseCallContainsBinding(source, tokens, scope_index, binding_name, binding_index, method_index, scope_end) and
             releaseUsesAllocationReceiver(source, tokens, scope_index, binding_name, binding_index, method_index, allocation.receiver);
@@ -744,8 +773,7 @@ fn controlFlowValueContainsBinding(
     start: usize,
     scope_end: usize,
 ) bool {
-    var end = start;
-    while (end < scope_end and tokens[end].tag != .semicolon and tokens[end].tag != .r_brace) : (end += 1) {}
+    const end = @min(scope_index.statementEnd(start) orelse scope_end, scope_end);
     return containsBinding(source, tokens, scope_index, binding_name, binding_index, start, end);
 }
 
@@ -1215,6 +1243,18 @@ test "summary-backed releases participate in double release and use-after proof"
     try std.testing.expect(saw_use_after_release);
 }
 
+test "errdefer and success cleanup are not a double release" {
+    const source =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "errdefer allocator.free(bytes);" ++
+        "allocator.free(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "an indirect helper transfer remains conservative" {
     const source =
         "fn register(bytes: []u8) void { store(bytes); }" ++
@@ -1484,6 +1524,20 @@ test "declared resource pairs participate in allocation lifecycle proof" {
     const released = try warningsWithConfiguration(std.testing.allocator, released_source, configuration);
     defer freeWarnings(std.testing.allocator, released);
     try std.testing.expectEqual(@as(usize, 0), released.len);
+}
+
+test "nested aggregate returns transfer every contained allocation" {
+    const source =
+        "fn init(allocator: std.mem.Allocator) !Owner {" ++
+        "const first = try allocator.alloc(u8, 4);" ++
+        "errdefer allocator.free(first);" ++
+        "const second = try allocator.alloc(u8, 8);" ++
+        "errdefer allocator.free(second);" ++
+        "return .{ .first = .{ .bytes = first }, .second = .{ .bytes = second } };" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "inferred owned returns participate in allocation lifecycle proof" {

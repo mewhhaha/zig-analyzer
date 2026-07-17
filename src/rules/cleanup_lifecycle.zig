@@ -30,7 +30,8 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
         const cleanup_binding = cleanupBinding(context, defer_index + 1, defer_end) orelse continue;
         for (context.tokens[defer_end + 1 .. scope_end], defer_end + 1..) |candidate, index| {
             if (candidate.tag != .identifier or !context.tokenIs(index, cleanup_binding) or index + 1 >= scope_end or
-                context.tokens[index + 1].tag != .equal or context.enclosingOpeningBrace(index) != scope_opening) continue;
+                !context.refersToBinding(index, cleanup_binding) or context.tokens[index + 1].tag != .equal or
+                context.enclosingOpeningBrace(index) != scope_opening) continue;
             if (index > 0 and (context.tokens[index - 1].tag == .keyword_const or
                 context.tokens[index - 1].tag == .keyword_var)) continue;
             const assignment_end = context.statementEnd(index) orelse continue;
@@ -416,6 +417,18 @@ test "clearing a deferred binding without transferring it still warns" {
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.defer_uses_reassigned_binding, findings.items[0].rule);
+}
+
+test "assigning a same-named field does not reassign the deferred binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn run(owner: anytype, allocator: anytype) !void { var syntax = try parse(); defer syntax.deinit(allocator); owner.syntax = syntax; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
 }
 
 test "constant allocation products are not runtime overflow risks" {

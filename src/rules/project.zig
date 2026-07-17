@@ -1141,6 +1141,17 @@ test "project summaries expose leaks hidden by cross-file borrowing calls" {
     try std.testing.expectEqual(@as(usize, 1), found[0].file_index);
 }
 
+test "cross-file owned returns retain allocator provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const files = [_]SourceFile{
+        .{ .path = "src/config.zig", .source = "pub fn optionValueAlloc(allocator: std.mem.Allocator) ![]u8 { return allocator.dupe(u8, \"value\"); }" },
+        .{ .path = "src/main.zig", .source = "const config = @import(\"config.zig\"); const App = struct { allocator: std.mem.Allocator, fn run(self: *App) !void { const value = try config.optionValueAlloc(self.allocator); defer self.allocator.free(value); } };" },
+    };
+    const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .mismatched_allocation_release);
+}
+
 test "compiler facts report divergent APIs and unreachable public declarations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
