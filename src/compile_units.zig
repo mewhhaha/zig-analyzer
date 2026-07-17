@@ -43,7 +43,60 @@ pub fn rootSourceForDocument(
         selected_prefix_length = root_directory.len;
         ambiguous = false;
     }
-    return try allocator.dupe(u8, if (ambiguous) document_path else selected orelse document_path);
+    const chosen = if (ambiguous) document_path else selected orelse document_path;
+    if (!std.mem.eql(u8, chosen, document_path) and
+        !try documentReachableFromRoot(io, allocator, chosen, document_path))
+    {
+        // A root whose directory contains the document but whose import graph
+        // never reaches it would analyze a unit the document is not part of,
+        // producing no diagnostics for it; the document stays its own unit.
+        return try allocator.dupe(u8, document_path);
+    }
+    return try allocator.dupe(u8, chosen);
+}
+
+fn documentReachableFromRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    document_path: []const u8,
+) !bool {
+    const normalized_document = try std.fs.path.resolve(allocator, &.{document_path});
+    defer allocator.free(normalized_document);
+    var visited: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer {
+        for (visited.keys()) |key| allocator.free(key);
+        visited.deinit(allocator);
+    }
+    try visited.put(allocator, try std.fs.path.resolve(allocator, &.{root_path}), {});
+    var scan_index: usize = 0;
+    while (scan_index < visited.count() and visited.count() <= 512) : (scan_index += 1) {
+        const current = visited.keys()[scan_index];
+        const source = std.Io.Dir.cwd().readFileAlloc(io, current, allocator, .limited(4 * 1024 * 1024)) catch |err|
+            switch (err) {
+                error.FileNotFound, error.NotDir => continue,
+                else => return err,
+            };
+        defer allocator.free(source);
+        const current_directory = std.fs.path.dirname(current) orelse continue;
+        const marker = "@import(\"";
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, source, cursor, marker)) |match| {
+            cursor = match + marker.len;
+            const literal_end = std.mem.indexOfScalarPos(u8, source, cursor, '"') orelse break;
+            const import_path = source[cursor..literal_end];
+            cursor = literal_end + 1;
+            if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
+            const resolved = try std.fs.path.resolve(allocator, &.{ current_directory, import_path });
+            if (std.mem.eql(u8, resolved, normalized_document)) {
+                allocator.free(resolved);
+                return true;
+            }
+            const entry = try visited.getOrPut(allocator, resolved);
+            if (entry.found_existing) allocator.free(resolved);
+        }
+    }
+    return false;
 }
 
 pub fn declaredRootSources(
@@ -132,6 +185,24 @@ fn tokenText(source: []const u8, token: std.zig.Token) []const u8 {
 
 fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool {
     return std.mem.eql(u8, tokenText(source, token), expected);
+}
+
+test "documents outside a root's import graph stay isolated units" {
+    const io = std.testing.io;
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+
+    const broken_fixture = try std.fs.path.join(std.testing.allocator, &.{ cwd, "examples/diagnostics/compiler_error.zig" });
+    defer std.testing.allocator.free(broken_fixture);
+    const isolated = try rootSourceForDocument(io, std.testing.allocator, broken_fixture);
+    defer std.testing.allocator.free(isolated);
+    try std.testing.expectEqualStrings(broken_fixture, isolated);
+
+    const imported_fixture = try std.fs.path.join(std.testing.allocator, &.{ cwd, "examples/diagnostics/memory_management.zig" });
+    defer std.testing.allocator.free(imported_fixture);
+    const contained = try rootSourceForDocument(io, std.testing.allocator, imported_fixture);
+    defer std.testing.allocator.free(contained);
+    try std.testing.expect(std.mem.endsWith(u8, contained, "examples/examples.zig"));
 }
 
 test "build roots are deduplicated and resolved from the build directory" {

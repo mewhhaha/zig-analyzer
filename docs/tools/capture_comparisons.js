@@ -316,6 +316,17 @@ class LspClient {
     });
   }
 
+  async changeFile(uri, version, text) {
+    await this.send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version },
+        contentChanges: [{ text }],
+      },
+    });
+  }
+
   async closeFile(uri) {
     await this.send({
       jsonrpc: "2.0",
@@ -443,15 +454,21 @@ async function captureExample(
 
   await Promise.all([analyzer.openFile(uri, text), zls.openFile(uri, text)]);
   if (example.kind === "Diagnostics") {
-    // Parser diagnostics publish immediately and may be empty; the
-    // compiler-backed publish follows once the compile unit is analyzed, so
-    // wait for findings rather than for the first publish.
-    const deadline = Date.now() + 120_000;
+    // Parser diagnostics publish immediately and may be empty, and the server
+    // only attaches compiler findings when a document event arrives after the
+    // compile unit is analyzed. Re-send the text until findings appear so the
+    // capture does not race the backend's first analysis.
+    const deadline = Date.now() + 300_000;
+    let nudge_version = 2;
     while (
       Date.now() < deadline &&
       (analyzer.diagnostics.get(uri) ?? []).length === 0
     ) {
-      await analyzer.drain(1_000);
+      await analyzer.drain(3_000);
+      if ((analyzer.diagnostics.get(uri) ?? []).length === 0) {
+        await analyzer.changeFile(uri, nudge_version, text);
+        nudge_version += 1;
+      }
     }
     await analyzer.drain(3_000);
     await zls.drain(3_000);

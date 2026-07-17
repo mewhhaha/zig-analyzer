@@ -332,6 +332,15 @@ pub const Server = struct {
             },
         } else if (token.tag == .identifier) described: {
             var description = try server.hoverDescription(arena, document, token.loc) orelse return null;
+            if (description.type_summary) |summary| {
+                if (memberReceiver(document.source, token.loc.start)) |receiver| {
+                    if (document.declarationNamed(receiver)) |receiver_declaration| {
+                        if (try receiverTypeParameterBindings(arena, document.source, receiver_declaration.span)) |bindings| {
+                            description.type_summary = try substituteTypeParameters(arena, summary, bindings);
+                        }
+                    }
+                }
+            }
             if (description.reference == null) {
                 description.reference = try server.typeDeclarationReference(arena, document, description.type_summary);
             }
@@ -1070,24 +1079,10 @@ pub const Server = struct {
             if (try server.compilerTypeMembers(allocator, document, receiver)) |member_names| {
                 for (member_names) |member_name| {
                     if (!std.mem.eql(u8, member_name, name)) continue;
-                    var description = if (document.declarationNamed(name)) |declaration|
-                        try describeBinding(allocator, document.source, declaration.span)
-                    else
-                        try describeTypedMemberNamed(allocator, document.source, name);
-                    if (description) |*resolved| {
-                        if (resolved.type_summary) |summary| {
-                            if (document.declarationNamed(receiver)) |receiver_declaration| {
-                                if (try receiverTypeParameterBindings(
-                                    allocator,
-                                    document.source,
-                                    receiver_declaration.span,
-                                )) |bindings| {
-                                    resolved.type_summary = try substituteTypeParameters(allocator, summary, bindings);
-                                }
-                            }
-                        }
+                    if (document.declarationNamed(name)) |declaration| {
+                        return try describeBinding(allocator, document.source, declaration.span);
                     }
-                    return description;
+                    return try describeTypedMemberNamed(allocator, document.source, name);
                 }
                 return null;
             }
@@ -4351,6 +4346,33 @@ test "fix-all edits keep same-position insertions in input order and drop overla
     try std.testing.expectEqualStrings("first insertion", survivors[0].replacement);
     try std.testing.expectEqualStrings("second insertion", survivors[1].replacement);
     try std.testing.expectEqualStrings("replacement", survivors[2].replacement);
+}
+
+test "receiver type parameters substitute into member signatures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn Strategy(comptime Model: type) type {\n" ++
+        "    return struct {\n" ++
+        "        fn encode(model: Model) u32 {\n" ++
+        "            return model.sequence;\n" ++
+        "        }\n" ++
+        "    };\n" ++
+        "}\n" ++
+        "const ReadingStrategy = Strategy(Reading);\n";
+    const receiver_start = std.mem.indexOf(u8, source, "ReadingStrategy").?;
+    const bindings = (try receiverTypeParameterBindings(
+        arena.allocator(),
+        source,
+        .{ .start = receiver_start, .end = receiver_start + "ReadingStrategy".len },
+    )).?;
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    try std.testing.expectEqualStrings("Model", bindings[0].name);
+    try std.testing.expectEqualStrings("Reading", bindings[0].argument);
+    try std.testing.expectEqualStrings(
+        "fn (Reading) u32",
+        try substituteTypeParameters(arena.allocator(), "fn (Model) u32", bindings),
+    );
 }
 
 test "member resolution finds explicit struct fields" {
