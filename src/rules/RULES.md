@@ -7,6 +7,9 @@ appropriate.
 Semantic diagnostics are errors, correctness rules are warnings, and style rules
 are off until enabled by a profile, the style tier, or a per-rule setting.
 
+Rules that are proposed but not yet implemented are described in
+[PROPOSED_RULES.md](../../PROPOSED_RULES.md).
+
 ## Always-on semantic diagnostics
 
 - [`unresolved-call`](unresolved-call.md) — Reports an unqualified call whose
