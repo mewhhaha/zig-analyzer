@@ -2,6 +2,7 @@ const std = @import("std");
 const analysis = @import("analysis.zig");
 const check_cache = @import("check_cache.zig");
 const project_rules = @import("rules/project.zig");
+const generated_source = @import("rules/generated_source.zig");
 
 const max_source_size = 64 * 1024 * 1024;
 const max_configuration_size = 1024 * 1024;
@@ -98,6 +99,12 @@ fn runWithWriter(
         return 2;
     };
     const loaded_files = try loadFiles(io, arena, root, relative_paths);
+    for (loaded_files) |loaded_file| {
+        const source = loaded_file.source orelse continue;
+        if (!generated_source.isTranslateCOutput(source)) continue;
+        const display_path = try displayPath(arena, root, loaded_file.relative_path);
+        try writer.print("{s}: information[generated-source]: skipped translate-c output\n", .{display_path});
+    }
     if (loaded_files.len > 1) {
         try reportProjectFindings(arena, root, loaded_files, configuration, writer, &summary);
     }
@@ -356,10 +363,11 @@ fn checkFile(
     };
     var checked_tokens = loaded_file.tokens;
     summary.files_checked += 1;
+    const file_configuration = configurationForPath(configuration, loaded_file.relative_path);
 
     var checked_source: [:0]const u8 = source;
     if (fix) {
-        const findings = try analysis.findingsWithTokens(file_arena, source, loaded_file.tokens, configuration);
+        const findings = try analysis.findingsWithTokens(file_arena, source, loaded_file.tokens, file_configuration);
         const edits = try safeFixAllEdits(file_arena, findings);
         if (edits.len != 0) {
             const fixed_source = try applyEdits(file_arena, source, edits);
@@ -391,7 +399,7 @@ fn checkFile(
         checked_source,
         checked_tokens,
         loaded_file.relative_path,
-        configuration,
+        file_configuration,
         cache,
     );
     for (reported) |finding| {
@@ -406,6 +414,34 @@ fn checkFile(
         });
     }
     summary.findings += reported.len;
+}
+
+fn configurationForPath(configuration: analysis.Configuration, path: []const u8) analysis.Configuration {
+    var file_configuration = configuration;
+    if (isTestOnlyPath(path) or std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) {
+        file_configuration.levels[@intFromEnum(analysis.Rule.prefer_log_over_print)] = .off;
+    }
+    return file_configuration;
+}
+
+fn isTestOnlyPath(path: []const u8) bool {
+    const basename = std.fs.path.basename(path);
+    if (std.mem.endsWith(u8, basename, "_test.zig") or std.mem.endsWith(u8, basename, "_tests.zig")) return true;
+    var components = std.mem.splitAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "test") or std.mem.eql(u8, component, "tests") or
+            std.mem.eql(u8, component, "testing")) return true;
+    }
+    return false;
+}
+
+test "test and build paths keep debug printing out of production logging guidance" {
+    var configuration = analysis.Configuration.defaults();
+    configuration.levels[@intFromEnum(analysis.Rule.prefer_log_over_print)] = .information;
+    try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "build.zig").level(.prefer_log_over_print));
+    try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "src/testing/snapshot.zig").level(.prefer_log_over_print));
+    try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "src/parser_tests.zig").level(.prefer_log_over_print));
+    try std.testing.expectEqual(analysis.Level.information, configurationForPath(configuration, "src/main.zig").level(.prefer_log_over_print));
 }
 
 fn checkFileTask(

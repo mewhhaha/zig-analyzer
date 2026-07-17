@@ -7,9 +7,6 @@ appropriate.
 Semantic diagnostics are errors, correctness rules are warnings, and style rules
 are off until enabled by a profile, the style tier, or a per-rule setting.
 
-Rules that are proposed but not yet implemented are described in
-[PROPOSED_RULES.md](../../PROPOSED_RULES.md).
-
 ## Always-on semantic diagnostics
 
 - [`unresolved-call`](unresolved-call.md) — Reports an unqualified call whose
@@ -93,6 +90,16 @@ Rules that are proposed but not yet implemented are described in
   `while (true)` bodies with no visible break, return, or call.
 - [`padded-byte-compare`](padded-byte-compare.md) — Reports byte-wise comparison
   of values whose struct layout contains padding.
+- [`useless-error-return`](useless-error-return.md) — Reports an error-returning
+  function whose fully visible body cannot fail.
+- [`exposed-private-type`](exposed-private-type.md) — Reports a public signature
+  that names a private local type.
+- [`exposed-private-error-set`](exposed-private-error-set.md) — Reports a public
+  signature that names a private local error set.
+- [`deprecated-declaration`](deprecated-declaration.md) — Reports use of a
+  declaration marked `Deprecated:` in its doc comment.
+- [`mutated-container-copy`](mutated-container-copy.md) — Reports mutation of a
+  by-value container field copy that is not written back.
 
 ## Opt-in style and policy rules
 
@@ -211,3 +218,57 @@ Rules that are proposed but not yet implemented are described in
   project-configured identifier or dotted path.
 - [`truncating-intcast`](truncating-intcast.md) — Reports `@intCast` from a
   wider integer binding to a narrower target without a visible range guard.
+- [`prefer-range-for`](prefer-range-for.md) — Reports exact counter loops that a
+  range `for` expresses directly.
+- [`prefer-index-of`](prefer-index-of.md) — Reports simple manual linear-search
+  loops.
+- [`prefer-memset`](prefer-memset.md) — Reports element loops that only fill a
+  slice with one value.
+- [`prefer-memcpy`](prefer-memcpy.md) — Reports element loops that only copy
+  corresponding elements between distinct slices.
+- [`prefer-string-switch`](prefer-string-switch.md) — Reports repeated string
+  equality dispatch over one subject.
+- [`prefer-log-over-print`](prefer-log-over-print.md) — Reports production
+  `std.debug.print` calls that should use configurable logging.
+- [`prefer-buffered-writer`](prefer-buffered-writer.md) — Reports unbuffered
+  small writes inside a loop.
+- [`prefer-arena`](prefer-arena.md) — Reports scopes whose allocations and
+  scope-exit releases already have arena-shaped lifetimes.
+- [`inconsistent-import-alias`](inconsistent-import-alias.md) — Reports a module
+  alias that differs from the project majority.
+- [`minority-naming-style`](minority-naming-style.md) — Reports declaration
+  casing that differs from the project majority for its kind.
+- [`inconsistent-parameter-vocabulary`](inconsistent-parameter-vocabulary.md) —
+  Reports an outlier name for a frequently repeated parameter type.
+- [`inconsistent-error-set-style`](inconsistent-error-set-style.md) — Reports an
+  explicit or inferred public error set that differs from project convention.
+- [`allocator-first-parameter`](allocator-first-parameter.md) — Reports an
+  allocator parameter that is not first after optional `self`.
+- [`comptime-parameter-order`](comptime-parameter-order.md) — Reports a comptime
+  parameter following a runtime parameter.
+- [`todo-comment`](todo-comment.md) — Reports configured task markers in line
+  comments.
+- [`assertion-free-test`](assertion-free-test.md) — Reports tests with no visible
+  assertion or fallible expectation.
+- [`line-length`](line-length.md) — Reports source lines over the configured
+  display-column limit.
+
+## Modernization profile
+
+- [`modernize-managed-container`](modernize-managed-container.md) — Reports
+  allocator-storing managed containers that should use current unmanaged APIs.
+- [`modernize-deprecated-io`](modernize-deprecated-io.md) — Reports known
+  pre-`std.Io` adapters and names their current replacement.
+
+## Disciplined profile
+
+- [`function-length`](function-length.md) — Reports functions longer than the
+  disciplined source-line limit.
+- [`assertion-free-branching`](assertion-free-branching.md) — Reports computed
+  indexing without a visible statement of its invariant.
+- [`unbounded-loop`](unbounded-loop.md) — Reports loops with no visible bound or
+  exhaustion condition.
+- [`allocation-after-init`](allocation-after-init.md) — Reports direct dynamic
+  allocation outside recognized initialization paths.
+- [`recursive-call`](recursive-call.md) — Reports direct and proven mutual
+  recursion.
