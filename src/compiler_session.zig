@@ -14,6 +14,7 @@ pub const Session = struct {
     /// which the backend only does when it exits. Lets deinit wait for a
     /// graceful exit with a deadline instead of blocking forever.
     stdout_closed: *std.Io.Event,
+    update_finished: *std.Io.Event,
     client: compiler_client.Client,
     exit_deadline_ms: i64 = compiler_client.default_response_deadline_ms,
 
@@ -61,7 +62,10 @@ pub const Session = struct {
         const stdout_closed = try allocator.create(std.Io.Event);
         errdefer allocator.destroy(stdout_closed);
         stdout_closed.* = .unset;
-        var stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed });
+        const update_finished = try allocator.create(std.Io.Event);
+        errdefer allocator.destroy(update_finished);
+        update_finished.* = .unset;
+        var stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed, update_finished });
         errdefer stdout_future.cancel(io) catch |err| std.log.warn("failed to cancel compiler output reader: {t}", .{err});
 
         var stdin_writer = child.stdin.?.writer(io, &.{});
@@ -115,6 +119,8 @@ pub const Session = struct {
             std.log.err("compiler protocol handshake failed: {t}", .{err});
             return err;
         };
+        try waitForCompilerUpdate(io, update_finished, compiler_client.default_response_deadline_ms);
+        update_finished.reset();
 
         return .{
             .io = io,
@@ -122,6 +128,7 @@ pub const Session = struct {
             .child = child,
             .stdout_future = stdout_future,
             .stdout_closed = stdout_closed,
+            .update_finished = update_finished,
             .client = client,
         };
     }
@@ -178,6 +185,7 @@ pub const Session = struct {
             session.child.kill(session.io);
         }
         session.allocator.destroy(session.stdout_closed);
+        session.allocator.destroy(session.update_finished);
         if (session.child.id != null) {
             const term = session.child.wait(session.io) catch |err| {
                 std.log.warn("failed to wait for compiler shutdown: {t}", .{err});
@@ -199,7 +207,9 @@ pub const Session = struct {
         document_version: i32,
         source: []const u8,
     ) !protocol.DocumentFacts {
-        return try session.client.replaceOverlay(uri, document_version, source);
+        const facts = try session.client.replaceOverlay(uri, document_version, source);
+        try session.requestCompilerUpdate();
+        return facts;
     }
 
     pub fn analyzeOverlay(session: *Session, uri: []const u8, document_version: i32) !protocol.DocumentFacts {
@@ -208,6 +218,7 @@ pub const Session = struct {
 
     pub fn removeOverlay(session: *Session, uri: []const u8) !void {
         try session.client.removeOverlay(uri);
+        try session.requestCompilerUpdate();
     }
 
     pub fn workspaceDeclarations(
@@ -215,6 +226,10 @@ pub const Session = struct {
         allocator: std.mem.Allocator,
     ) ![]const []const u8 {
         return try session.client.workspaceDeclarations(allocator);
+    }
+
+    pub fn workspaceSummary(session: *Session) !protocol.WorkspaceSummary {
+        return try session.client.workspaceSummary();
     }
 
     pub fn diagnostics(session: *Session, allocator: std.mem.Allocator) !std.zig.ErrorBundle {
@@ -236,6 +251,18 @@ pub const Session = struct {
     ) !compiler_client.TypeShape {
         return try session.client.typeShape(allocator, name);
     }
+
+    fn requestCompilerUpdate(session: *Session) !void {
+        const stdin = session.child.stdin orelse return error.CompilerExited;
+        session.update_finished.reset();
+        var writer = stdin.writer(session.io, &.{});
+        try writer.interface.writeStruct(std.zig.Client.Message.Header{
+            .tag = .update,
+            .bytes_len = 0,
+        }, .little);
+        try writer.interface.flush();
+        try waitForCompilerUpdate(session.io, session.update_finished, session.client.response_deadline_ms);
+    }
 };
 
 fn connectCompilerClient(io: std.Io, allocator: std.mem.Allocator, port: u16) !compiler_client.Client {
@@ -248,7 +275,12 @@ fn connectCompilerClient(io: std.Io, allocator: std.mem.Allocator, port: u16) !c
     return error.CompilerProtocolUnavailable;
 }
 
-fn drainCompilerStdout(io: std.Io, file: std.Io.File, stdout_closed: *std.Io.Event) !void {
+fn drainCompilerStdout(
+    io: std.Io,
+    file: std.Io.File,
+    stdout_closed: *std.Io.Event,
+    update_finished: *std.Io.Event,
+) !void {
     defer stdout_closed.set(io);
     var reader = file.readerStreaming(io, &.{});
     while (true) {
@@ -257,7 +289,19 @@ fn drainCompilerStdout(io: std.Io, file: std.Io.File, stdout_closed: *std.Io.Eve
             error.ReadFailed => return reader.err.?,
         };
         try reader.interface.discardAll(header.bytes_len);
+        if (header.tag == .error_bundle) update_finished.set(io);
     }
+}
+
+fn waitForCompilerUpdate(io: std.Io, event: *std.Io.Event, deadline_ms: i64) !void {
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromMilliseconds(deadline_ms),
+        .clock = .awake,
+    } };
+    event.waitTimeout(io, timeout) catch |err| switch (err) {
+        error.Timeout => return error.CompilerUpdateTimeout,
+        error.Canceled => return error.Canceled,
+    };
 }
 
 test "deinit kills a backend that never exits instead of blocking forever" {
@@ -287,7 +331,10 @@ test "deinit kills a backend that never exits instead of blocking forever" {
     const stdout_closed = try allocator.create(std.Io.Event);
     errdefer allocator.destroy(stdout_closed);
     stdout_closed.* = .unset;
-    const stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed });
+    const update_finished = try allocator.create(std.Io.Event);
+    errdefer allocator.destroy(update_finished);
+    update_finished.* = .unset;
+    const stdout_future = try io.concurrent(drainCompilerStdout, .{ io, child.stdout.?, stdout_closed, update_finished });
 
     var session: Session = .{
         .io = io,
@@ -295,6 +342,7 @@ test "deinit kills a backend that never exits instead of blocking forever" {
         .child = child,
         .stdout_future = stdout_future,
         .stdout_closed = stdout_closed,
+        .update_finished = update_finished,
         .client = client,
         .exit_deadline_ms = 100,
     };

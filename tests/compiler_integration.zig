@@ -1,8 +1,13 @@
 const std = @import("std");
 const zig_analyzer = @import("zig_analyzer");
 
-test "compiler session analyzes unsaved overlays without changing the file" {
-    const fixture_path = "fixtures/comptime/main.zig";
+test "compiler session tracks unsaved overlay syntax without changing the file" {
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "fixtures/comptime/main.zig",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(fixture_path);
     const saved_source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
         fixture_path,
@@ -19,14 +24,6 @@ test "compiler session analyzes unsaved overlays without changing the file" {
     );
     defer session.deinit();
 
-    const uri = "file:///workspace/fixture.zig";
-    try std.testing.expectError(error.SemanticsUnavailable, session.analyzeOverlay(uri, 1));
-    const first_source = "const first = 1;\nconst second = 2;\n";
-    const first = try session.replaceOverlay(uri, 1, first_source);
-    try std.testing.expectEqual(@as(i32, 1), first.document_version);
-    try std.testing.expectEqual(@as(u32, 2), first.declaration_count);
-    try std.testing.expectEqual(@as(u32, 0), first.syntax_error_count);
-
     const compiler_declarations = try session.workspaceDeclarations(std.testing.allocator);
     defer {
         for (compiler_declarations) |name| std.testing.allocator.free(name);
@@ -37,6 +34,19 @@ test "compiler session analyzes unsaved overlays without changing the file" {
         if (std.mem.endsWith(u8, name, ".diagonal")) found_generated_method = true;
     }
     try std.testing.expect(found_generated_method);
+
+    try std.testing.expectError(
+        error.SemanticsUnavailable,
+        session.replaceOverlay("file:///workspace/outside-compile-unit.zig", 1, "const value = 1;\n"),
+    );
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    defer std.testing.allocator.free(uri);
+    try std.testing.expectError(error.SemanticsUnavailable, session.analyzeOverlay(uri, 1));
+    const first_source = "const first = 1;\nconst second = 2;\n";
+    const first = try session.replaceOverlay(uri, 1, first_source);
+    try std.testing.expectEqual(@as(i32, 1), first.document_version);
+    try std.testing.expectEqual(@as(u32, 2), first.declaration_count);
+    try std.testing.expectEqual(@as(u32, 0), first.syntax_error_count);
 
     try std.testing.expectError(error.StaleGeneration, session.analyzeOverlay(uri, 0));
 
@@ -56,10 +66,61 @@ test "compiler session analyzes unsaved overlays without changing the file" {
     try std.testing.expectEqualStrings(saved_source, source_after_analysis);
 }
 
-test "compiler session returns structured semantic errors" {
-    const fixture_path = try std.fs.path.resolve(
+test "compiler diagnostics use the unsaved root overlay" {
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "examples/diagnostics/compiler_error.zig",
         std.testing.allocator,
-        &.{"examples/diagnostics/compiler_error.zig"},
+    );
+    defer std.testing.allocator.free(fixture_path);
+    const saved_source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture_path,
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(saved_source);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    defer std.testing.allocator.free(uri);
+
+    var session = try zig_analyzer.compiler_session.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        .empty,
+        fixture_path,
+    );
+    defer session.deinit();
+
+    const generation_before = (try session.workspaceSummary()).last_generation;
+    const changed_source = "pub const OverlayOnly = enum { ready }; export fn invalidResult() u32 { return true; }\n";
+    _ = try session.replaceOverlay(uri, 1, changed_source);
+    const generation_after = (try session.workspaceSummary()).last_generation;
+    try std.testing.expect(generation_after > generation_before);
+    var changed_diagnostics = try session.diagnostics(std.testing.allocator);
+    defer changed_diagnostics.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), changed_diagnostics.errorMessageCount());
+    const changed_message = changed_diagnostics.getErrorMessage(changed_diagnostics.getMessages()[0]);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        changed_diagnostics.nullTerminatedString(changed_message.msg),
+        "found 'bool'",
+    ) != null);
+
+    const source_after_analysis = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture_path,
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(source_after_analysis);
+    try std.testing.expectEqualStrings(saved_source, source_after_analysis);
+}
+
+test "compiler session returns structured semantic errors" {
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "examples/diagnostics/compiler_error.zig",
+        std.testing.allocator,
     );
     defer std.testing.allocator.free(fixture_path);
     var session = try zig_analyzer.compiler_session.Session.start(

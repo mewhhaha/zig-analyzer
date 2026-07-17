@@ -2,8 +2,8 @@
 
 [Rule index](RULES.md)
 
-Reports `@hasField` or `@hasDecl` checks that are always false for a resolved
-analyzed type shape.
+Reports `@hasField` or `@hasDecl` checks that are always false, and `@field`
+lookups that cannot succeed, for a resolved analyzed type shape.
 
 **Why it matters.** Dead comptime branches often indicate a misspelled member or
 stale compatibility check.
