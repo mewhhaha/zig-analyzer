@@ -127,6 +127,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const reified_flags_example_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/compiler/reified_flags.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
     const compiler_example_tests = [_]*std.Build.Step.Compile{
         pipeline_example_tests,
         conditional_example_tests,
@@ -134,6 +141,7 @@ pub fn build(b: *std.Build) void {
         parsed_configuration_example_tests,
         recursive_wrapper_example_tests,
         reflected_strategy_example_tests,
+        reified_flags_example_tests,
     };
     for (compiler_example_tests) |compiler_example_test| {
         const run_compiler_example_test = b.addRunArtifact(compiler_example_test);
