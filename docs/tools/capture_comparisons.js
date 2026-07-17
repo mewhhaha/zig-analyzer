@@ -325,6 +325,17 @@ class LspClient {
     });
   }
 
+  async changeFile(uri, version, text) {
+    await this.send({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version },
+        contentChanges: [{ text }],
+      },
+    });
+  }
+
   async closeFile(uri) {
     await this.send({
       jsonrpc: "2.0",
@@ -455,9 +466,22 @@ async function captureExample(
     // Build-on-save diagnostics only fire on a save event, so report one to
     // both servers and give ZLS's build run time to publish.
     await Promise.all([analyzer.saveFile(uri), zls.saveFile(uri)]);
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline && !analyzer.diagnostics.has(uri)) {
-      await analyzer.drain(1_000);
+    const deadline = Date.now() + 60_000;
+    let documentVersion = 2;
+    while (
+      Date.now() < deadline &&
+      (analyzer.diagnostics.get(uri) ?? []).length === 0
+    ) {
+      await analyzer.drain(2_000);
+      if ((analyzer.diagnostics.get(uri) ?? []).length === 0) {
+        await analyzer.changeFile(uri, documentVersion, text);
+        documentVersion += 1;
+      }
+    }
+    if ((analyzer.diagnostics.get(uri) ?? []).length === 0) {
+      throw new Error(
+        `${example.fixture}: zig-analyzer published no diagnostics within 60 seconds`,
+      );
     }
     await analyzer.drain(3_000);
     const zlsDeadline = Date.now() + 60_000;
