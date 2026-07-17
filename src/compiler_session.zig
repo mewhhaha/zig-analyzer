@@ -252,6 +252,14 @@ pub const Session = struct {
         return try session.client.typeShape(allocator, name);
     }
 
+    pub fn resolvedValue(
+        session: *Session,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+    ) !compiler_client.ResolvedValue {
+        return try session.client.resolvedValue(allocator, name);
+    }
+
     fn requestCompilerUpdate(session: *Session) !void {
         const stdin = session.child.stdin orelse return error.CompilerExited;
         session.update_finished.reset();

@@ -11,7 +11,8 @@ Their docs call comptime analysis a work in progress; it's been one for years.
 
 This project cheats instead: it builds a patched compiler, asks it what
 everything resolved to, and falls back to syntax only when the file is too
-broken to compile.
+broken to compile. Hover includes compiler-evaluated values for top-level
+constants, not just the initializer text.
 
 ## Proof
 

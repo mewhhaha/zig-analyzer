@@ -325,6 +325,44 @@ pub const Client = struct {
         return .{ .kind = shape_header.kind, .fields = fields };
     }
 
+    pub fn resolvedValue(
+        client: *Client,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+    ) !ResolvedValue {
+        if (name.len > std.math.maxInt(u32)) return error.NameTooLong;
+        var watchdog = try client.armWatchdog();
+        defer client.disarmWatchdog(&watchdog);
+        const request_id = client.takeRequestId();
+        try client.writer.interface.writeStruct(protocol.Header{
+            .body_length = @intCast(@sizeOf(protocol.TypeMembersRequest) + name.len),
+            .request_id = request_id,
+            .generation = client.generation,
+            .tag = .resolved_value,
+        }, .little);
+        try client.writer.interface.writeStruct(protocol.TypeMembersRequest{
+            .name_length = @intCast(name.len),
+        }, .little);
+        try client.writer.interface.writeAll(name);
+        try client.writer.interface.flush();
+
+        const header = try client.reader.interface.takeStruct(protocol.Header, .little);
+        if (header.request_id != request_id) return error.UnexpectedRequestId;
+        client.generation = header.generation;
+        if (header.tag == .response_error) return try client.readProtocolError(header);
+        if (header.tag != .resolved_value or header.body_length < @sizeOf(protocol.ResolvedValue)) {
+            return error.MalformedResponse;
+        }
+        const value_header = try client.reader.interface.takeStruct(protocol.ResolvedValue, .little);
+        const expected_length: u64 = @sizeOf(protocol.ResolvedValue) +
+            @as(u64, value_header.type_length) + value_header.value_length;
+        if (header.body_length != expected_length) return error.MalformedResponse;
+        const type_name = try client.reader.interface.readAlloc(allocator, value_header.type_length);
+        errdefer allocator.free(type_name);
+        const value = try client.reader.interface.readAlloc(allocator, value_header.value_length);
+        return .{ .type_name = type_name, .value = value };
+    }
+
     pub fn shutdown(client: *Client) !void {
         var watchdog = try client.armWatchdog();
         defer client.disarmWatchdog(&watchdog);
@@ -454,6 +492,17 @@ pub const TypeShape = struct {
         for (shape.fields) |field| allocator.free(field);
         allocator.free(shape.fields);
         shape.* = undefined;
+    }
+};
+
+pub const ResolvedValue = struct {
+    type_name: []const u8,
+    value: []const u8,
+
+    pub fn deinit(resolved: *ResolvedValue, allocator: std.mem.Allocator) void {
+        allocator.free(resolved.type_name);
+        allocator.free(resolved.value);
+        resolved.* = undefined;
     }
 };
 

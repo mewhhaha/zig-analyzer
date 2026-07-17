@@ -648,6 +648,16 @@ fn ownershipLeavesScope(
         if (!statementStartsWithErrdefer(tokens, index)) return .released;
         found_errdefer = true;
     }
+    if (localHelperReleasesBinding(
+        source,
+        tokens,
+        scope_index,
+        binding_name,
+        binding_index,
+        start,
+        end,
+        release_method,
+    )) return .released;
     if (bindingEscapes(source, tokens, scope_index, binding_name, binding_index, start, end, release_method)) return .released;
     return if (found_errdefer) .errdefer_only else .missing;
 }
@@ -699,7 +709,22 @@ fn bindingEscapes(
             const closing = scope_index.matchingToken(index) orelse continue;
             if (closing >= end or !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, closing)) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
-            if (!std.mem.eql(u8, method, release_method)) return true;
+            if (std.mem.eql(u8, method, release_method)) continue;
+            if (tokens[index - 1].tag == .identifier) {
+                switch (localCallOwnership(
+                    source,
+                    tokens,
+                    scope_index,
+                    binding_name,
+                    binding_index,
+                    index,
+                    release_method,
+                )) {
+                    .borrowed, .released => continue,
+                    .unknown => {},
+                }
+            }
+            return true;
         }
         if (token.tag != .equal) continue;
         const statement_end = scope_index.statementEnd(index) orelse continue;
@@ -707,6 +732,220 @@ fn bindingEscapes(
             !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, statement_end) or
             assignmentDiscards(source, tokens, start, index)) continue;
         return true;
+    }
+    return false;
+}
+
+const CallOwnership = enum { borrowed, released, unknown };
+
+fn localHelperReleasesBinding(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+    release_method: []const u8,
+) bool {
+    for (tokens[start..end], start..) |token, call_open| {
+        if (token.tag != .l_paren or call_open == 0 or tokens[call_open - 1].tag != .identifier) continue;
+        const closing = scope_index.matchingToken(call_open) orelse continue;
+        if (closing >= end or !containsBinding(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            call_open + 1,
+            closing,
+        )) continue;
+        if (localCallOwnership(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            call_open,
+            release_method,
+        ) == .released) return true;
+    }
+    return false;
+}
+
+fn localCallOwnership(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    call_open: usize,
+    release_method: []const u8,
+) CallOwnership {
+    if (call_open == 0 or tokens[call_open - 1].tag != .identifier or
+        (call_open >= 2 and tokens[call_open - 2].tag == .period)) return .unknown;
+    const call_close = scope_index.matchingToken(call_open) orelse return .unknown;
+    const argument_index = bareBindingArgumentIndex(
+        source,
+        tokens,
+        scope_index,
+        binding_name,
+        binding_index,
+        call_open + 1,
+        call_close,
+    ) orelse return .unknown;
+    const function_name = source[tokens[call_open - 1].loc.start..tokens[call_open - 1].loc.end];
+
+    var matching_function_count: usize = 0;
+    var parameter_index: ?usize = null;
+    var body_open: ?usize = null;
+    var body_close: ?usize = null;
+    for (tokens, 0..) |token, fn_index| {
+        if (token.tag != .keyword_fn or fn_index + 2 >= tokens.len or
+            !tokenIsIdentifier(source, tokens[fn_index + 1], function_name) or
+            tokens[fn_index + 2].tag != .l_paren) continue;
+        const parameters_close = scope_index.matchingToken(fn_index + 2) orelse continue;
+        const candidate_parameter = parameterAt(tokens, fn_index + 3, parameters_close, argument_index) orelse continue;
+        var candidate_body = parameters_close + 1;
+        while (candidate_body < tokens.len and tokens[candidate_body].tag != .l_brace and
+            tokens[candidate_body].tag != .semicolon) : (candidate_body += 1)
+        {}
+        if (candidate_body == tokens.len or tokens[candidate_body].tag != .l_brace) continue;
+        const candidate_close = scope_index.matchingToken(candidate_body) orelse continue;
+        matching_function_count += 1;
+        parameter_index = candidate_parameter;
+        body_open = candidate_body;
+        body_close = candidate_close;
+    }
+    if (matching_function_count != 1) return .unknown;
+
+    const parameter = parameter_index.?;
+    const parameter_name = source[tokens[parameter].loc.start..tokens[parameter].loc.end];
+    var released = false;
+    for (tokens[body_open.? + 1 .. body_close.?], body_open.? + 1..) |token, use_index| {
+        if (!tokenIsIdentifier(source, token, parameter_name) or
+            !identifierRefersToBinding(scope_index, parameter, use_index)) continue;
+        if (parameterUseIsRelease(
+            source,
+            tokens,
+            scope_index,
+            parameter_name,
+            parameter,
+            use_index,
+            body_open.?,
+            release_method,
+        )) {
+            released = true;
+            continue;
+        }
+        if (statementStartsWith(tokens, use_index, .keyword_return) or
+            parameterUseEscapes(source, tokens, use_index, body_open.? + 1)) return .unknown;
+    }
+    return if (released) .released else .borrowed;
+}
+
+fn bareBindingArgumentIndex(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    var argument_index: usize = 0;
+    var segment_start = start;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    for (tokens[start..end], start..) |token, index| {
+        const segment_end = token.tag == .comma and parenthesis_depth == 0 and
+            bracket_depth == 0 and brace_depth == 0;
+        if (segment_end) {
+            if (index == segment_start + 1 and tokenRefersToBinding(source, tokens, segment_start, binding_name) and
+                identifierRefersToBinding(scope_index, binding_index, segment_start)) return argument_index;
+            argument_index += 1;
+            segment_start = index + 1;
+            continue;
+        }
+        switch (token.tag) {
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            else => {},
+        }
+    }
+    if (end == segment_start + 1 and tokenRefersToBinding(source, tokens, segment_start, binding_name) and
+        identifierRefersToBinding(scope_index, binding_index, segment_start)) return argument_index;
+    return null;
+}
+
+fn parameterAt(tokens: []const std.zig.Token, start: usize, end: usize, target: usize) ?usize {
+    var parameter_number: usize = 0;
+    var segment_start = start;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    for (tokens[start..end], start..) |token, index| {
+        if (token.tag == .comma and parenthesis_depth == 0 and bracket_depth == 0) {
+            if (parameter_number == target) return namedParameter(tokens, segment_start, index);
+            parameter_number += 1;
+            segment_start = index + 1;
+            continue;
+        }
+        switch (token.tag) {
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            else => {},
+        }
+    }
+    return if (parameter_number == target) namedParameter(tokens, segment_start, end) else null;
+}
+
+fn namedParameter(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
+    for (tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and index + 1 < end and tokens[index + 1].tag == .colon) return index;
+    }
+    return null;
+}
+
+fn parameterUseIsRelease(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    parameter_name: []const u8,
+    parameter_index: usize,
+    use_index: usize,
+    body_open: usize,
+    release_method: []const u8,
+) bool {
+    const direct_argument = use_index >= 3 and tokens[use_index - 1].tag == .l_paren and
+        tokens[use_index - 2].tag == .identifier and tokens[use_index - 3].tag == .period and
+        tokenIsIdentifier(source, tokens[use_index - 2], release_method);
+    const direct_receiver = use_index + 3 < tokens.len and tokens[use_index + 1].tag == .period and
+        tokenIsIdentifier(source, tokens[use_index + 2], release_method) and tokens[use_index + 3].tag == .l_paren;
+    if (!direct_argument and !direct_receiver) return false;
+    if (!identifierRefersToBinding(scope_index, parameter_index, use_index) or
+        statementStartsWithErrdefer(tokens, use_index)) return false;
+    const scope = enclosingScope(tokens, use_index) orelse return false;
+    return scope.opening == body_open and tokenIsIdentifier(source, tokens[use_index], parameter_name);
+}
+
+fn parameterUseEscapes(source: []const u8, tokens: []const std.zig.Token, use_index: usize, body_start: usize) bool {
+    if (use_index > body_start and
+        (tokens[use_index - 1].tag == .l_paren or tokens[use_index - 1].tag == .comma)) return true;
+    var index = use_index;
+    while (index > body_start) {
+        index -= 1;
+        switch (tokens[index].tag) {
+            .equal => return !assignmentDiscards(source, tokens, body_start, index),
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
     }
     return false;
 }
@@ -954,6 +1193,43 @@ test "passing an allocation to an unknown call is treated as an escape" {
         "fn attach(allocator: std.mem.Allocator) !void {" ++
         "const client = try allocator.create(Client);" ++
         "register(client);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "passing an allocation to a proven borrowing helper does not transfer ownership" {
+    const source =
+        "fn inspect(bytes: []u8) void { _ = bytes.len; }" ++
+        "fn leak(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "inspect(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "a proven releasing helper discharges caller ownership" {
+    const source =
+        "fn release(allocator: std.mem.Allocator, bytes: []u8) void { allocator.free(bytes); }" ++
+        "fn clean(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "release(allocator, bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "an indirect helper transfer remains conservative" {
+    const source =
+        "fn register(bytes: []u8) void { store(bytes); }" ++
+        "fn attach(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "register(bytes);" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);

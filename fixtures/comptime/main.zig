@@ -26,9 +26,15 @@ fn Matrix(comptime Element: type, comptime rows: usize, comptime columns: usize)
 }
 
 const Mat3 = Matrix(u32, 3, 3);
+const computed_answer: u8 = blk: {
+    var answer: u8 = 40;
+    answer += 2;
+    break :blk answer;
+};
 
 export fn analyzerFixture() u32 {
     comptime {
+        _ = computed_answer;
         _ = type_shapes.Color;
         _ = type_shapes.Message;
         _ = type_shapes.Point;
