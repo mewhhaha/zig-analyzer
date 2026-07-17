@@ -149,6 +149,19 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_compiler_example_test.step);
     }
 
+    const rule_fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rule_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zig_analyzer", .module = analyzer_module }},
+        }),
+    });
+    const run_rule_fuzz_tests = b.addRunArtifact(rule_fuzz_tests);
+    test_step.dependOn(&run_rule_fuzz_tests.step);
+    const fuzz_rules_step = b.step("fuzz-rules", "Generate clean programs and mutations to hunt rule false positives and crashes");
+    fuzz_rules_step.dependOn(&run_rule_fuzz_tests.step);
+
     const compiler_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/compiler_integration.zig"),
