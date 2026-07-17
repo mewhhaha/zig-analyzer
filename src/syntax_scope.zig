@@ -25,6 +25,8 @@ pub const Index = struct {
     tokens: []const std.zig.Token,
     bindings: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Binding)) = .empty,
     usingnamespace_scopes: std.ArrayListUnmanaged(std.zig.Token.Loc) = .empty,
+    matching_tokens: []?usize = &.{},
+    enclosing_braces: []?usize = &.{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -35,22 +37,39 @@ pub const Index = struct {
         errdefer index.deinit();
         var scope_openings: std.ArrayListUnmanaged(usize) = .empty;
         defer scope_openings.deinit(allocator);
-        const brace_closings = try allocator.alloc(?usize, tokens.len);
-        defer allocator.free(brace_closings);
-        @memset(brace_closings, null);
+        var parenthesis_openings: std.ArrayListUnmanaged(usize) = .empty;
+        defer parenthesis_openings.deinit(allocator);
+        var bracket_openings: std.ArrayListUnmanaged(usize) = .empty;
+        defer bracket_openings.deinit(allocator);
+        index.matching_tokens = try allocator.alloc(?usize, tokens.len);
+        @memset(index.matching_tokens, null);
+        index.enclosing_braces = try allocator.alloc(?usize, tokens.len);
+        @memset(index.enclosing_braces, null);
         for (tokens, 0..) |token, token_index| switch (token.tag) {
             .l_brace => try scope_openings.append(allocator, token_index),
             .r_brace => if (scope_openings.pop()) |opening| {
-                brace_closings[opening] = token_index;
+                index.matching_tokens[opening] = token_index;
+                index.matching_tokens[token_index] = opening;
+            },
+            .l_paren => try parenthesis_openings.append(allocator, token_index),
+            .r_paren => if (parenthesis_openings.pop()) |opening| {
+                index.matching_tokens[opening] = token_index;
+                index.matching_tokens[token_index] = opening;
+            },
+            .l_bracket => try bracket_openings.append(allocator, token_index),
+            .r_bracket => if (bracket_openings.pop()) |opening| {
+                index.matching_tokens[opening] = token_index;
+                index.matching_tokens[token_index] = opening;
             },
             else => {},
         };
         scope_openings.clearRetainingCapacity();
         for (tokens, 0..) |token, token_index| {
             if (token.tag == .r_brace and scope_openings.items.len != 0) _ = scope_openings.pop();
+            index.enclosing_braces[token_index] = scope_openings.getLastOrNull();
             if (token.tag == .identifier) {
                 const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
-                    .{ .opening = opening, .closing = brace_closings[opening] orelse tokens.len - 1 }
+                    .{ .opening = opening, .closing = index.matching_tokens[opening] orelse tokens.len - 1 }
                 else
                     .{ .opening = null, .closing = tokens.len - 1 };
                 if (binding(tokens, source, token_index, lexical_scope)) |unindexed_candidate| {
@@ -64,7 +83,7 @@ pub const Index = struct {
             }
             if (std.mem.eql(u8, tokenText(source, token), "usingnamespace")) {
                 const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
-                    .{ .opening = opening, .closing = brace_closings[opening] orelse tokens.len - 1 }
+                    .{ .opening = opening, .closing = index.matching_tokens[opening] orelse tokens.len - 1 }
                 else
                     .{ .opening = null, .closing = tokens.len - 1 };
                 const scope = declarationScope(tokens, token_index, true, lexical_scope) orelse continue;
@@ -90,6 +109,8 @@ pub const Index = struct {
         while (iterator.next()) |bindings| bindings.deinit(index.allocator);
         index.bindings.deinit(index.allocator);
         index.usingnamespace_scopes.deinit(index.allocator);
+        index.allocator.free(index.matching_tokens);
+        index.allocator.free(index.enclosing_braces);
     }
 
     pub fn findBinding(index: *const Index, use_index: usize) ?Binding {
@@ -125,6 +146,31 @@ pub const Index = struct {
             if (spanContains(scope, index.tokens[use_index].loc)) return true;
         }
         return false;
+    }
+
+    pub fn matchingToken(index: *const Index, opening_index: usize) ?usize {
+        if (opening_index >= index.matching_tokens.len) return null;
+        return index.matching_tokens[opening_index];
+    }
+
+    pub fn enclosingScopeEnd(index: *const Index, token_index: usize) ?usize {
+        if (token_index >= index.enclosing_braces.len) return null;
+        const opening = index.enclosing_braces[token_index] orelse return null;
+        return index.matchingToken(opening);
+    }
+
+    pub fn statementEnd(index: *const Index, start: usize) ?usize {
+        var cursor = start;
+        while (cursor < index.tokens.len) {
+            switch (index.tokens[cursor].tag) {
+                .l_paren, .l_bracket, .l_brace => cursor = index.matchingToken(cursor) orelse return null,
+                .r_brace => return null,
+                .semicolon => return cursor,
+                else => {},
+            }
+            cursor += 1;
+        }
+        return null;
     }
 };
 
@@ -590,6 +636,34 @@ test "indexed bindings select the innermost alias" {
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("Local", selected.?.alias_target.?);
     try std.testing.expect(selected.?.scope_rank != 0);
+}
+
+test "structural index resolves delimiters statements and enclosing scopes" {
+    const source: [:0]const u8 = "fn run(values: []u8) void { const value = call(values[0]); _ = value; }\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+
+    var declaration_index: ?usize = null;
+    var call_opening: ?usize = null;
+    for (tokens, 0..) |token, token_index| {
+        if (token.tag == .keyword_const) declaration_index = token_index;
+        if (token.tag == .l_paren and token_index > 0 and std.mem.eql(u8, tokenText(source, tokens[token_index - 1]), "call")) {
+            call_opening = token_index;
+        }
+    }
+    try std.testing.expect(declaration_index != null);
+    try std.testing.expect(call_opening != null);
+    const call_closing = index.matchingToken(call_opening.?);
+    try std.testing.expect(call_closing != null);
+    try std.testing.expectEqual(std.zig.Token.Tag.r_paren, tokens[call_closing.?].tag);
+    const statement_end = index.statementEnd(declaration_index.?);
+    try std.testing.expect(statement_end != null);
+    try std.testing.expectEqual(std.zig.Token.Tag.semicolon, tokens[statement_end.?].tag);
+    const scope_end = index.enclosingScopeEnd(declaration_index.?);
+    try std.testing.expect(scope_end != null);
+    try std.testing.expectEqual(std.zig.Token.Tag.r_brace, tokens[scope_end.?].tag);
 }
 
 test "usingnamespace uncertainty is limited to its container" {

@@ -111,11 +111,17 @@ shutdown; the walkthrough is the editor-facing smoke test.
 
 ```text
 zig-analyzer lsp
-zig-analyzer check [--fix] <path>
+zig-analyzer check [--fix] [--no-cache] <path>
 zig-analyzer doctor
 zig-analyzer backend bootstrap
 zig-analyzer version
 ```
+
+Project checks analyze files concurrently but buffer their output in sorted
+path order. Unchanged-file findings are cached under
+`.zig-cache/zig-analyzer/check-v1`; file contents, relative path, lint
+configuration, and executable identity all participate in invalidation. Use
+`--no-cache` for uncached profiling or cache troubleshooting.
 
 `doctor` checks the host Zig version and every compatibility field in the
 compiler-backend manifest. If the patch or protocol changes, rerun

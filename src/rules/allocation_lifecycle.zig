@@ -60,12 +60,12 @@ pub fn warningsWithSyntax(
         if (tokens[binding_index].tag != .identifier) continue;
         const binding_name = source[tokens[binding_index].loc.start..tokens[binding_index].loc.end];
         if (std.mem.eql(u8, binding_name, "_")) continue;
-        const statement_end = findStatementEnd(tokens, declaration_index) orelse continue;
+        const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
         const allocation = allocationFromValue(tree, initializer) orelse continue;
         if (allocation.allocator_source) |allocator_name| {
             if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
         }
-        const scope_end = enclosingScopeEnd(tokens, declaration_index) orelse continue;
+        const scope_end = scope_index.enclosingScopeEnd(declaration_index) orelse continue;
         if (statement_end >= scope_end) continue;
         const mismatched_release = try findMismatchedRelease(
             allocator,
@@ -105,7 +105,7 @@ pub fn warningsWithSyntax(
         if (cleanup == .released or mismatched_release) continue;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out.
         if (allocation.receiver) |receiver_name| {
-            if (deferDeinitializesReceiver(source, tokens, receiver_name, declaration_index, scope_end)) continue;
+            if (deferDeinitializesReceiver(source, tokens, scope_index, receiver_name, declaration_index, scope_end)) continue;
         }
 
         const message = switch (cleanup) {
@@ -391,13 +391,13 @@ fn findReleaseOrderingIssues(
                     "allocation '{s}' has more than one visible {s} in the same control-flow scope",
                     .{ binding_name, allocation.release },
                 ),
-                .fixes = try releaseDeletionFix(allocator, tokens, release_index),
+                .fixes = try releaseDeletionFix(allocator, tokens, scope_index, release_index),
             });
         }
         if (!statementStartsWith(tokens, first_release, .keyword_defer) and
             !statementStartsWith(tokens, first_release, .keyword_errdefer))
         {
-            const release_end = findStatementEnd(tokens, first_release) orelse first_release;
+            const release_end = scope_index.statementEnd(first_release) orelse first_release;
             if (firstUseAfterRelease(source, tokens, scope_index, binding_name, binding_index, release_end + 1, scope_end, releases.items)) |use_index| {
                 try found.append(allocator, .{
                     .rule = .use_after_release,
@@ -429,6 +429,7 @@ fn findReleaseOrderingIssues(
 fn releaseDeletionFix(
     allocator: std.mem.Allocator,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     release_index: usize,
 ) ![]const types.Fix {
     var statement_start = release_index;
@@ -438,7 +439,7 @@ fn releaseDeletionFix(
             else => statement_start -= 1,
         }
     }
-    const statement_end = findStatementEnd(tokens, release_index) orelse release_index;
+    const statement_end = scope_index.statementEnd(release_index) orelse release_index;
     const edits = try allocator.alloc(types.Edit, 1);
     errdefer allocator.free(edits);
     edits[0] = .{
@@ -461,7 +462,7 @@ fn releaseCallContainsBinding(
 ) bool {
     if (method_index == 0 or method_index + 1 >= end or tokens[method_index - 1].tag != .period or
         tokens[method_index + 1].tag != .l_paren) return false;
-    const closing = matchingToken(tokens, method_index + 1, .l_paren, .r_paren) orelse return false;
+    const closing = scope_index.matchingToken(method_index + 1) orelse return false;
     if (closing >= end) return false;
     const receiver_is_binding = method_index >= 2 and
         tokenIsIdentifier(source, tokens[method_index - 2], binding_name) and
@@ -556,7 +557,7 @@ fn firstUseAfterRelease(
         var belongs_to_release = false;
         for (release_indices) |release_index| {
             const closing = if (release_index + 1 < tokens.len and tokens[release_index + 1].tag == .l_paren)
-                matchingToken(tokens, release_index + 1, .l_paren, .r_paren)
+                scope_index.matchingToken(release_index + 1)
             else
                 null;
             if (closing) |closing_index| if (index >= release_index -| 2 and index <= closing_index) {
@@ -588,7 +589,7 @@ fn owningAssignment(
             tokens[index + 1].tag != .equal) continue;
         const assignment_scope = enclosingScope(tokens, index) orelse continue;
         if (assignment_scope.opening != declaration_scope.opening) continue;
-        const statement_end = findStatementEnd(tokens, index) orelse continue;
+        const statement_end = scope_index.statementEnd(index) orelse continue;
         const value_end = @min(statement_end, end);
         var replaces_with_allocation = false;
         var realloc_consumes_original = false;
@@ -599,7 +600,7 @@ fn owningAssignment(
             replaces_with_allocation = true;
             if (!std.mem.eql(u8, method, "realloc") or rhs_index + 1 >= tokens.len or
                 tokens[rhs_index + 1].tag != .l_paren) continue;
-            const closing = matchingToken(tokens, rhs_index + 1, .l_paren, .r_paren) orelse continue;
+            const closing = scope_index.matchingToken(rhs_index + 1) orelse continue;
             if (containsBinding(source, tokens, scope_index, binding_name, binding_index, rhs_index + 2, @min(closing, value_end))) {
                 realloc_consumes_original = true;
             }
@@ -629,7 +630,7 @@ fn ownershipLeavesScope(
         if (index == 0 or index + 2 >= end or tokens[index - 1].tag != .period or tokens[index + 1].tag != .l_paren) {
             continue;
         }
-        const closing_parenthesis = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
+        const closing_parenthesis = scope_index.matchingToken(index + 1) orelse continue;
         if (closing_parenthesis >= end) continue;
         const receiver_is_binding = index >= 2 and tokenIsIdentifier(source, tokens[index - 2], binding_name) and
             identifierRefersToBinding(scope_index, binding_index, index - 2);
@@ -694,13 +695,13 @@ fn bindingEscapes(
         if (token.tag == .l_paren and index > 0 and
             (tokens[index - 1].tag == .identifier or tokens[index - 1].tag == .builtin))
         {
-            const closing = matchingToken(tokens, index, .l_paren, .r_paren) orelse continue;
+            const closing = scope_index.matchingToken(index) orelse continue;
             if (closing >= end or !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, closing)) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
             if (!std.mem.eql(u8, method, release_method)) return true;
         }
         if (token.tag != .equal) continue;
-        const statement_end = findStatementEnd(tokens, index) orelse continue;
+        const statement_end = scope_index.statementEnd(index) orelse continue;
         if (statement_end >= end or
             !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, statement_end) or
             assignmentDiscards(source, tokens, start, index)) continue;
@@ -749,6 +750,7 @@ fn statementStartsWithErrdefer(tokens: []const std.zig.Token, index: usize) bool
 fn deferDeinitializesReceiver(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     receiver_name: []const u8,
     declaration_index: usize,
     scope_end: usize,
@@ -760,9 +762,9 @@ fn deferDeinitializesReceiver(
         // leaks when the function succeeds.
         if (tokens[index].tag != .keyword_defer) continue;
         const body_end = if (tokens[index + 1].tag == .l_brace)
-            matchingToken(tokens, index + 1, .l_brace, .r_brace) orelse scope_end
+            scope_index.matchingToken(index + 1) orelse scope_end
         else
-            findStatementEnd(tokens, index + 1) orelse scope_end;
+            scope_index.statementEnd(index + 1) orelse scope_end;
         var body_index = index + 1;
         while (body_index + 2 < @min(body_end, scope_end)) : (body_index += 1) {
             if (tokens[body_index].tag == .identifier and

@@ -14,6 +14,7 @@ pub const ResolvedShape = semantic.ResolvedShape;
 pub const parseConfiguration = semantic.parseConfiguration;
 pub const suppressionWarning = semantic.suppressionWarning;
 pub const findings = semantic.findings;
+pub const findingsWithTokens = semantic.findingsWithTokens;
 pub const findingsWithShapes = semantic.findingsWithShapes;
 pub const fileNameFinding = semantic.fileNameFinding;
 pub const isSuppressed = semantic.isSuppressed;

@@ -4,6 +4,7 @@ const types = @import("types.zig");
 pub const SourceFile = struct {
     path: []const u8,
     source: [:0]const u8,
+    tokens: ?[]const std.zig.Token = null,
 };
 
 const IndexedSourceFile = struct {
@@ -39,7 +40,7 @@ pub fn findings(
     for (files, indexed_files) |file, *indexed_file| indexed_file.* = .{
         .path = file.path,
         .source = file.source,
-        .tokens = try tokenize(allocator, file.source),
+        .tokens = file.tokens orelse try tokenize(allocator, file.source),
     };
     var found: std.ArrayList(Finding) = .empty;
     const imports = if (configuration.level(.duplicate_module_import) != .off or
