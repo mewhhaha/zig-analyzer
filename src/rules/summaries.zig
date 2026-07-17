@@ -28,6 +28,7 @@ pub const FunctionSummary = struct {
 
 pub const OwnedReturn = struct {
     release: []const u8,
+    allocator_parameter: ?usize = null,
 };
 
 const ImportAlias = struct {
@@ -90,8 +91,7 @@ pub const Index = struct {
     pub fn ownedReturn(index: Index, callable: []const u8) ?OwnedReturn {
         if (index.acquireContract(callable)) |contract| return .{ .release = callableBaseName(contract.release) };
         const function = index.uniqueFunction(callable) orelse return null;
-        if (function.unresolved or !function.returns_owned) return null;
-        return .{ .release = function.return_release orelse "free" };
+        return ownedReturnFromFunction(function);
     }
 
     pub fn ownedReturnCall(
@@ -112,13 +112,11 @@ pub const Index = struct {
         if (receiver) |alias| {
             const target_file = index.importedFile(source, alias) orelse return null;
             const function = index.uniqueFunctionInFile(target_file, name) orelse return null;
-            if (function.unresolved or !function.returns_owned) return null;
-            return .{ .release = function.return_release orelse "free" };
+            return ownedReturnFromFunction(function);
         } else if (index.sourceHasLocalBinding(source, name)) return null;
         const file_index = index.fileIndexForSource(source) orelse return null;
         const function = index.uniqueFunctionInFile(file_index, name) orelse return null;
-        if (function.unresolved or !function.returns_owned) return null;
-        return .{ .release = function.return_release orelse "free" };
+        return ownedReturnFromFunction(function);
     }
 
     fn ownedReturnForCall(index: Index, source: []const u8, callable: []const u8) ?OwnedReturn {
@@ -129,14 +127,12 @@ pub const Index = struct {
             if (index.sourceHasLocalBinding(source, callable)) return null;
             const file_index = index.fileIndexForSource(source) orelse return null;
             const function = index.uniqueFunctionInFile(file_index, callable) orelse return null;
-            if (function.unresolved or !function.returns_owned) return null;
-            return .{ .release = function.return_release orelse "free" };
+            return ownedReturnFromFunction(function);
         };
         if (std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') != null) return null;
         const target_file = index.importedFile(source, callable[0..separator]) orelse return null;
         const function = index.uniqueFunctionInFile(target_file, callable[separator + 1 ..]) orelse return null;
-        if (function.unresolved or !function.returns_owned) return null;
-        return .{ .release = function.return_release orelse "free" };
+        return ownedReturnFromFunction(function);
     }
 
     fn uniqueFunction(index: Index, callable: []const u8) ?FunctionSummary {
@@ -449,10 +445,33 @@ fn propagateCallEffects(index: Index) bool {
             const owned = index.ownedReturnForCall(caller.source, callable) orelse continue;
             caller.returns_owned = true;
             caller.return_release = owned.release;
+            if (owned.allocator_parameter) |callee_allocator_parameter| {
+                for (caller.parameter_names, 0..) |parameter_name, caller_parameter| {
+                    const argument = exactArgumentIndex(
+                        caller.source,
+                        caller.tokens,
+                        parameter_name,
+                        call_open + 1,
+                        call_end,
+                    ) orelse continue;
+                    if (argument == callee_allocator_parameter) {
+                        caller.allocator_parameter = caller_parameter;
+                        break;
+                    }
+                }
+            }
             changed = true;
         }
     }
     return changed;
+}
+
+fn ownedReturnFromFunction(function: FunctionSummary) ?OwnedReturn {
+    if (function.unresolved or !function.returns_owned) return null;
+    return .{
+        .release = function.return_release orelse "free",
+        .allocator_parameter = function.allocator_parameter,
+    };
 }
 
 fn mergeEffect(current: *ParameterEffect, incoming: ParameterEffect) void {
@@ -654,11 +673,13 @@ test "summaries propagate releases and owned returns through direct calls" {
     defer arena.deinit();
     const sources = [_]Source{
         .{ .file_index = 0, .path = "src/release.zig", .source = "pub fn release(allocator: anytype, bytes: []u8) void { allocator.free(bytes); }" },
-        .{ .file_index = 1, .path = "src/operations.zig", .source = "const releasing = @import(\"release.zig\"); fn forward(allocator: anytype, bytes: []u8) void { releasing.release(allocator, bytes); } fn make(allocator: anytype) ![]u8 { return allocator.alloc(u8, 4); }" },
+        .{ .file_index = 1, .path = "src/operations.zig", .source = "const releasing = @import(\"release.zig\"); fn forward(allocator: anytype, bytes: []u8) void { releasing.release(allocator, bytes); } fn make(allocator: anytype) ![]u8 { return allocator.alloc(u8, 4); } fn forwardMake(allocator: anytype) ![]u8 { return make(allocator); }" },
     };
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     try std.testing.expectEqual(ParameterEffect.released, index.parameterEffect("forward", 1));
     try std.testing.expectEqualStrings("free", index.ownedReturn("make").?.release);
+    try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("make").?.allocator_parameter);
+    try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("forwardMake").?.allocator_parameter);
 }
 
 test "recursive and ambiguous calls remain opaque" {
