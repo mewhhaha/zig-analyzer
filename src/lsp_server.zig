@@ -8,6 +8,7 @@ const zig_actions = @import("actions/registry.zig");
 const analysis = @import("analysis.zig");
 const backend_bootstrap = @import("backend_bootstrap.zig");
 const compile_units = @import("compile_units.zig");
+const compiler_client = @import("compiler_client.zig");
 const compiler_session = @import("compiler_session.zig");
 const document_module = @import("document.zig");
 const hover = @import("hover.zig");
@@ -1231,6 +1232,21 @@ pub const Server = struct {
                 .type_summary = "compiler-resolved comptime type",
             };
         }
+        if (try server.resolvedValueForName(allocator, document, name)) |resolved| {
+            const type_summary = try std.fmt.allocPrint(
+                allocator,
+                "{s} = {s}",
+                .{ resolved.type_name, resolved.value },
+            );
+            if (document.declarationNamed(name)) |declaration| {
+                if (try describeBinding(allocator, document.source, declaration.span)) |binding| {
+                    var description = binding;
+                    description.type_summary = type_summary;
+                    return description;
+                }
+            }
+            return .{ .declaration = name, .type_summary = type_summary };
+        }
         if (try server.standardLibraryMemberHover(allocator, document, identifier_span.start, name)) |description| {
             return description;
         }
@@ -1644,6 +1660,32 @@ pub const Server = struct {
                 _ => return null,
             },
             .fields = shape.fields,
+        };
+    }
+
+    fn resolvedValueForName(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        name: []const u8,
+    ) !?compiler_client.ResolvedValue {
+        if (!server.compilerAnalysisCurrent(document)) return null;
+        const compiler = if (server.compiler) |*active| active else return null;
+        const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
+            server.recordCompilerFailure(err);
+            return null;
+        };
+        const qualified_name = for (declarations) |declaration| {
+            if (std.mem.eql(u8, declaration, name)) break declaration;
+            if (declaration.len <= name.len or !std.mem.endsWith(u8, declaration, name)) continue;
+            if (declaration[declaration.len - name.len - 1] == '.') break declaration;
+        } else return null;
+        return compiler.resolvedValue(allocator, qualified_name) catch |err| switch (err) {
+            error.SemanticsUnavailable => null,
+            else => {
+                server.recordCompilerFailure(err);
+                return null;
+            },
         };
     }
 

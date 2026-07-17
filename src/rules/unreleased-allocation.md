@@ -9,4 +9,7 @@ ownership return before scope exit.
 still leaks on successful returns.
 
 **When it matters.** It targets simple allocator bindings whose allocation and
-release methods can be paired without path-sensitive speculation.
+release methods can be paired without path-sensitive speculation. Direct calls
+to same-file helpers are followed when the matching parameter is provably only
+borrowed or directly released; indirect and ambiguous calls remain ownership
+transfers.

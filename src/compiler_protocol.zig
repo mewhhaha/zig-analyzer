@@ -27,6 +27,7 @@ pub const Tag = enum(u16) {
     response_error,
     workspace_declaration_names,
     type_shape,
+    resolved_value,
     _,
 };
 
@@ -84,6 +85,11 @@ pub const TypeShape = extern struct {
     reserved: u16 = 0,
     field_count: u32,
     names_length: u32,
+};
+
+pub const ResolvedValue = extern struct {
+    type_length: u32,
+    value_length: u32,
 };
 
 pub const TypeShapeKind = enum(u16) {
@@ -146,6 +152,7 @@ comptime {
     std.debug.assert(@sizeOf(RemoveOverlayRequest) == 4);
     std.debug.assert(@sizeOf(TypeMembersRequest) == 4);
     std.debug.assert(@sizeOf(TypeShape) == 12);
+    std.debug.assert(@sizeOf(ResolvedValue) == 8);
     std.debug.assert(@sizeOf(DocumentFacts) == 24);
     std.debug.assert(@sizeOf(ErrorResponse) == 12);
     std.debug.assert(@sizeOf(DeclarationList) == 8);
@@ -163,6 +170,7 @@ test "protocol structures have stable wire sizes" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(DeclarationList));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(DiagnosticBundle));
     try std.testing.expectEqual(@as(usize, 12), @sizeOf(TypeShape));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ResolvedValue));
 }
 
 test "unknown protocol tags remain representable" {

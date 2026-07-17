@@ -34,8 +34,9 @@ the repository does not make an unchecked acceptance criterion complete.
 
 zig-analyzer is an LSP server backed by an authenticated, versioned analysis
 protocol added to the pinned Zig compiler. Syntax-backed answers remain
-available while a document is incomplete; compiler-resolved shapes and members
-augment them when the saved program can be analyzed.
+available while a document is incomplete; compiler-resolved shapes, members,
+and top-level constant values augment them when the saved program can be
+analyzed.
 
 The project separates thin transport/composition modules from thick proof and
 policy modules. Core rules and actions return byte-span domain values and do

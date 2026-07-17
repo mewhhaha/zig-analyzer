@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version_string", @import("build.zig.zon").version);
     build_options.addOption([]const u8, "zig_version", "0.16.0");
     build_options.addOption([]const u8, "zig_commit", "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8");
-    build_options.addOption(u16, "compiler_protocol_version", 4);
+    build_options.addOption(u16, "compiler_protocol_version", 5);
 
     const lsp_module = b.dependency("lsp_kit", .{
         .target = target,

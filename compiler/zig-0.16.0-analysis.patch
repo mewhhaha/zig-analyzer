@@ -65,7 +65,7 @@ index 1252d74e..e5c54459 100644
              const actual_err = switch (orig_err) {
                  error.Canceled,
                  error.OutOfMemory,
-@@ -109,6 +129,591 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -109,6 +129,673 @@ fn runServer(ids: *IncrementalDebugServer) void {
      }
  }
  
@@ -244,6 +244,34 @@ index 1252d74e..e5c54459 100644
 +                defer ids.zcu.gpa.free(name);
 +                if (!try ids.writeTypeShape(stream_writer, header.request_id, name)) {
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "finite enum, tagged union, or struct shape is unavailable");
++                }
++            },
++            .resolved_value => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.TypeMembersRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "resolved value request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.TypeMembersRequest, .little);
++                if (header.body_length != @sizeOf(AnalysisProtocol.TypeMembersRequest) + request.name_length) {
++                    try discardBody(stream_reader, header.body_length - @sizeOf(AnalysisProtocol.TypeMembersRequest));
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "resolved value request length is invalid");
++                    continue;
++                }
++                const name = try stream_reader.readAlloc(ids.zcu.gpa, request.name_length);
++                defer ids.zcu.gpa.free(name);
++                if (!try ids.writeResolvedValue(stream_writer, header.request_id, name)) {
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "resolved comptime value is unavailable");
 +                }
 +            },
 +            .remove_overlay => {
@@ -569,6 +597,60 @@ index 1252d74e..e5c54459 100644
 +    return true;
 +}
 +
++fn writeResolvedValue(ids: *IncrementalDebugServer, writer: *Io.Writer, request_id: u32, requested_name: []const u8) !bool {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const zcu = ids.zcu;
++    const ip = &zcu.intern_pool;
++    const pt: Zcu.PerThread = .activate(zcu, .main);
++    defer pt.deactivate();
++    const resolved = for (zcu.incremental_debug_state.navs.keys()) |nav_index| {
++        var nav = ip.getNav(nav_index);
++        if (!std.mem.eql(u8, nav.name.toSlice(ip), requested_name) and
++            !std.mem.eql(u8, nav.fqn.toSlice(ip), requested_name)) continue;
++        if (nav.resolved == null or nav.resolved.?.value == .none) {
++            pt.ensureNavValUpToDate(nav_index, null) catch |err| switch (err) {
++                error.AnalysisFail => continue,
++                error.OutOfMemory => return error.OutOfMemory,
++                error.Canceled => return error.Canceled,
++            };
++            nav = ip.getNav(nav_index);
++        }
++        if (!nav.resolved.?.@"const") continue;
++        const candidate = nav.resolved.?;
++        const type_tag = Type.fromInterned(candidate.type).zigTypeTag(zcu);
++        if (type_tag == .type or type_tag == .@"fn") continue;
++        break candidate;
++    } else return false;
++
++    var type_buffer: [1024]u8 = undefined;
++    var type_writer = Io.Writer.fixed(&type_buffer);
++    type_writer.print("{f}", .{Type.fromInterned(resolved.type).fmt(pt)}) catch return false;
++    const type_text = type_buffer[0..type_writer.end];
++
++    var value_buffer: [4096]u8 = undefined;
++    var value_writer = Io.Writer.fixed(&value_buffer);
++    value_writer.print("{f}", .{Value.fromInterned(resolved.value).fmtValue(pt)}) catch return false;
++    const value_text = value_buffer[0..value_writer.end];
++
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(@sizeOf(AnalysisProtocol.ResolvedValue) + type_text.len + value_text.len),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .resolved_value,
++    }, .little);
++    try writer.writeStruct(AnalysisProtocol.ResolvedValue{
++        .type_length = @intCast(type_text.len),
++        .value_length = @intCast(value_text.len),
++    }, .little);
++    try writer.writeAll(type_text);
++    try writer.writeAll(value_text);
++    try writer.flush();
++    return true;
++}
++
 +fn writeName(writer: *Io.Writer, name: []const u8) !void {
 +    try writer.writeInt(u32, @intCast(name.len), .little);
 +    try writer.writeAll(name);
@@ -657,9 +739,11 @@ index 1252d74e..e5c54459 100644
  fn serveStream(
      ids: *IncrementalDebugServer,
      stream_reader: *Io.Reader,
-@@ -454,5 +1053,6 @@ const Zcu = @import("Zcu.zig");
+@@ -453,6 +1140,8 @@ const Compilation = @import("Compilation.zig");
+ const Zcu = @import("Zcu.zig");
  const InternPool = @import("InternPool.zig");
  const Type = @import("Type.zig");
++const Value = @import("Value.zig");
  const AnalUnit = InternPool.AnalUnit;
 +const AnalysisProtocol = @import("AnalysisProtocol.zig");
  
@@ -685,10 +769,10 @@ new file mode 100644
 index 00000000..894aedb0
 --- /dev/null
 +++ b/src/AnalysisProtocol.zig
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,160 @@
 +const std = @import("std");
 +
-+pub const version: u16 = 4;
++pub const version: u16 = 5;
 +
 +pub const Header = extern struct {
 +    body_length: u32,
@@ -754,6 +838,11 @@ index 00000000..894aedb0
 +    names_length: u32,
 +};
 +
++pub const ResolvedValue = extern struct {
++    type_length: u32,
++    value_length: u32,
++};
++
 +pub const TypeShapeKind = enum(u16) {
 +    enumeration,
 +    tagged_union,
@@ -815,6 +904,7 @@ index 00000000..894aedb0
 +    response_error,
 +    workspace_declaration_names,
 +    type_shape,
++    resolved_value,
 +    _,
 +};
 +
@@ -834,6 +924,7 @@ index 00000000..894aedb0
 +    std.debug.assert(@sizeOf(RemoveOverlayRequest) == 4);
 +    std.debug.assert(@sizeOf(TypeMembersRequest) == 4);
 +    std.debug.assert(@sizeOf(TypeShape) == 12);
++    std.debug.assert(@sizeOf(ResolvedValue) == 8);
 +    std.debug.assert(@sizeOf(DocumentFacts) == 24);
 +    std.debug.assert(@sizeOf(ErrorResponse) == 12);
 +    std.debug.assert(@sizeOf(DeclarationList) == 8);

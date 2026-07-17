@@ -324,6 +324,28 @@ test "compiler protocol returns ordinary and comptime-generated type shapes" {
     }
 }
 
+test "compiler protocol returns resolved comptime values" {
+    var session = try zig_analyzer.compiler_session.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        .empty,
+        "fixtures/comptime/main.zig",
+    );
+    defer session.deinit();
+
+    const declarations = try session.workspaceDeclarations(std.testing.allocator);
+    defer {
+        for (declarations) |name| std.testing.allocator.free(name);
+        std.testing.allocator.free(declarations);
+    }
+    const qualified_name = declarationWithSuffix(declarations, ".computed_answer") orelse
+        return error.ValueNotAnalyzed;
+    var resolved = try session.resolvedValue(std.testing.allocator, qualified_name);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("u8", resolved.type_name);
+    try std.testing.expectEqualStrings("42", resolved.value);
+}
+
 fn declarationWithSuffix(declarations: []const []const u8, suffix: []const u8) ?[]const u8 {
     for (declarations) |declaration| {
         if (std.mem.endsWith(u8, declaration, suffix)) return declaration;
