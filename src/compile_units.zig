@@ -43,7 +43,77 @@ pub fn rootSourceForDocument(
         selected_prefix_length = root_directory.len;
         ambiguous = false;
     }
-    return try allocator.dupe(u8, if (ambiguous) document_path else selected orelse document_path);
+    const chosen = if (ambiguous) document_path else selected orelse document_path;
+    if (!std.mem.eql(u8, chosen, document_path) and
+        !try documentReachableFromRoot(io, allocator, chosen, document_path))
+    {
+        return try allocator.dupe(u8, document_path);
+    }
+    return try allocator.dupe(u8, chosen);
+}
+
+fn documentReachableFromRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    document_path: []const u8,
+) !bool {
+    const normalized_document = try std.fs.path.resolve(allocator, &.{document_path});
+    defer allocator.free(normalized_document);
+    var visited: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer {
+        for (visited.keys()) |path| allocator.free(path);
+        visited.deinit(allocator);
+    }
+    try visited.put(allocator, try std.fs.path.resolve(allocator, &.{root_path}), {});
+
+    const maximum_imported_files = 512;
+    var scan_index: usize = 0;
+    while (scan_index < visited.count()) : (scan_index += 1) {
+        const current_path = visited.keys()[scan_index];
+        const source_bytes = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            current_path,
+            allocator,
+            .limited(4 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return err,
+        };
+        defer allocator.free(source_bytes);
+        const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
+        defer allocator.free(source);
+        @memcpy(source, source_bytes);
+        const tokens = try tokenize(allocator, source);
+        defer allocator.free(tokens);
+        const current_directory = std.fs.path.dirname(current_path) orelse continue;
+
+        for (tokens, 0..) |token, index| {
+            if (token.tag != .builtin or !tokenIs(source, token, "@import") or
+                index + 3 >= tokens.len or tokens[index + 1].tag != .l_paren or
+                tokens[index + 2].tag != .string_literal or tokens[index + 3].tag != .r_paren) continue;
+            const literal = tokenText(source, tokens[index + 2]);
+            const import_path = std.zig.string_literal.parseAlloc(allocator, literal) catch |err| switch (err) {
+                error.InvalidLiteral => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            defer allocator.free(import_path);
+            if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
+
+            const resolved = try std.fs.path.resolve(allocator, &.{ current_directory, import_path });
+            if (std.mem.eql(u8, resolved, normalized_document)) {
+                allocator.free(resolved);
+                return true;
+            }
+            if (visited.count() == maximum_imported_files) {
+                allocator.free(resolved);
+                continue;
+            }
+            const entry = try visited.getOrPut(allocator, resolved);
+            if (entry.found_existing) allocator.free(resolved);
+        }
+    }
+    return false;
 }
 
 pub fn namedModuleSourceForDocument(
@@ -221,6 +291,72 @@ test "build roots are deduplicated and resolved from the build directory" {
     try std.testing.expectEqual(@as(usize, 2), roots.len);
     try std.testing.expectEqualStrings("/workspace/src/main.zig", roots[0]);
     try std.testing.expectEqualStrings("/workspace/tools/tool.zig", roots[1]);
+}
+
+test "root selection follows actual imports and isolates unrelated documents" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(io, "src");
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "build.zig",
+        .data =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/root.zig") }) });
+        \\}
+        ,
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "src/root.zig",
+        .data =
+        \\const real = @import ("real.zig");
+        \\// const commented = @import("unrelated.zig");
+        \\const text = "@import(\"unrelated.zig\")";
+        \\comptime { _ = real; _ = text; }
+        ,
+    });
+    try temporary.dir.writeFile(io, .{ .sub_path = "src/real.zig", .data = "pub const value = 1;\n" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "src/unrelated.zig", .data = "pub const value = 2;\n" });
+
+    const temporary_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(temporary_path);
+    const root_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/root.zig" });
+    defer std.testing.allocator.free(root_path);
+    const real_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/real.zig" });
+    defer std.testing.allocator.free(real_path);
+    const unrelated_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/unrelated.zig" });
+    defer std.testing.allocator.free(unrelated_path);
+
+    const real_root = try rootSourceForDocument(io, std.testing.allocator, real_path);
+    defer std.testing.allocator.free(real_root);
+    try std.testing.expectEqualStrings(root_path, real_root);
+    const unrelated_root = try rootSourceForDocument(io, std.testing.allocator, unrelated_path);
+    defer std.testing.allocator.free(unrelated_root);
+    try std.testing.expectEqualStrings(unrelated_path, unrelated_root);
+}
+
+test "compiler error example remains outside the examples compile unit" {
+    const io = std.testing.io;
+    const repository = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repository);
+    const compiler_error = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ repository, "examples/diagnostics/compiler_error.zig" },
+    );
+    defer std.testing.allocator.free(compiler_error);
+    const memory_management = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ repository, "examples/diagnostics/memory_management.zig" },
+    );
+    defer std.testing.allocator.free(memory_management);
+
+    const isolated_root = try rootSourceForDocument(io, std.testing.allocator, compiler_error);
+    defer std.testing.allocator.free(isolated_root);
+    try std.testing.expectEqualStrings(compiler_error, isolated_root);
+    const examples_root = try rootSourceForDocument(io, std.testing.allocator, memory_management);
+    defer std.testing.allocator.free(examples_root);
+    try std.testing.expect(std.mem.endsWith(u8, examples_root, "examples/examples.zig"));
 }
 
 test "named modules resolve their declared root source" {
