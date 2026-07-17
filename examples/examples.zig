@@ -5,6 +5,7 @@ test {
     _ = @import("compiler/parsed_configuration.zig");
     _ = @import("compiler/recursive_wrapper.zig");
     _ = @import("compiler/reflected_strategy.zig");
+    _ = @import("compiler/reified_flags.zig");
     _ = @import("diagnostics/memory_management.zig");
     _ = @import("diagnostics/overlapping_copy.zig");
     _ = @import("diagnostics/unsigned_reverse_loop.zig");
@@ -13,6 +14,9 @@ test {
     _ = @import("diagnostics/idiomatic_style.zig");
     _ = @import("diagnostics/lifetime_mistakes.zig");
     _ = @import("diagnostics/action_results.zig");
+    _ = @import("diagnostics/use_after_release.zig");
+    _ = @import("diagnostics/dangling_slice.zig");
+    _ = @import("diagnostics/helper_release.zig");
     _ = @import("zls/imports/main.zig");
     _ = @import("zls/hover.zig");
     _ = @import("zls/language_hover.zig");
