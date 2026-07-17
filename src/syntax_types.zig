@@ -42,6 +42,50 @@ pub fn inferredBindingType(
     return try functionReturnType(allocator, source, tokens, callee_name);
 }
 
+/// The construction conventions `T.init(...)` and `T.empty` produce a value
+/// of type `T`, so a binding initialized that way has the dotted path before
+/// the final member as its type expression.
+pub fn initializerTypeExpression(
+    allocator: std.mem.Allocator,
+    source_bytes: []const u8,
+    binding_span: std.zig.Token.Loc,
+) !?[]const u8 {
+    const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
+    defer allocator.free(source);
+    @memcpy(source, source_bytes);
+    const tokens = try tokenize(allocator, source);
+    defer allocator.free(tokens);
+    const binding_index = for (tokens, 0..) |token, index| {
+        if (token.tag == .identifier and std.meta.eql(token.loc, binding_span)) break index;
+    } else return null;
+    if (binding_index == 0 or
+        (tokens[binding_index - 1].tag != .keyword_const and tokens[binding_index - 1].tag != .keyword_var)) return null;
+    const declaration_end = statementEnd(tokens, binding_index - 1) orelse return null;
+    const equal_index = for (tokens[binding_index + 1 .. declaration_end], binding_index + 1..) |token, index| {
+        if (token.tag == .equal) break index;
+    } else return null;
+    var value_start = equal_index + 1;
+    while (value_start < declaration_end and tokens[value_start].tag == .keyword_try) : (value_start += 1) {}
+    if (value_start >= declaration_end or tokens[value_start].tag != .identifier) return null;
+    var last_period: ?usize = null;
+    var cursor = value_start + 1;
+    while (cursor < declaration_end) {
+        switch (tokens[cursor].tag) {
+            .period => {
+                if (cursor + 1 >= declaration_end or tokens[cursor + 1].tag != .identifier) return null;
+                last_period = cursor;
+                cursor += 2;
+            },
+            .l_paren => cursor = (matchingToken(tokens, cursor, .l_paren, .r_paren) orelse return null) + 1,
+            else => return null,
+        }
+    }
+    const period = last_period orelse return null;
+    const constructor = source[tokens[period + 1].loc.start..tokens[period + 1].loc.end];
+    if (!std.mem.eql(u8, constructor, "init") and !std.mem.eql(u8, constructor, "empty")) return null;
+    return try allocator.dupe(u8, source[tokens[value_start].loc.start..tokens[period - 1].loc.end]);
+}
+
 pub fn memberSpan(
     allocator: std.mem.Allocator,
     source_bytes: []const u8,
@@ -266,6 +310,36 @@ test "inferred locals use the called function return type" {
         .{ .start = binding_start, .end = binding_start + "value".len },
     )).?;
     try std.testing.expectEqualStrings("types.Headers.View", type_name);
+}
+
+test "initializer conventions name the constructed type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source =
+        "fn build(parent: std.mem.Allocator) void {\n" ++
+        "    var values = std.ArrayList(u8).empty;\n" ++
+        "    var arena_state = std.heap.ArenaAllocator.init(parent);\n" ++
+        "    const bytes = try parent.alloc(u8, 1);\n" ++
+        "    _ = .{ &values, &arena_state, bytes };\n" ++
+        "}";
+    const values_start = std.mem.indexOf(u8, source, "values =") orelse unreachable;
+    try std.testing.expectEqualStrings("std.ArrayList(u8)", (try initializerTypeExpression(
+        arena.allocator(),
+        source,
+        .{ .start = values_start, .end = values_start + "values".len },
+    )).?);
+    const arena_start = std.mem.indexOf(u8, source, "arena_state =") orelse unreachable;
+    try std.testing.expectEqualStrings("std.heap.ArenaAllocator", (try initializerTypeExpression(
+        arena.allocator(),
+        source,
+        .{ .start = arena_start, .end = arena_start + "arena_state".len },
+    )).?);
+    const bytes_start = std.mem.indexOf(u8, source, "bytes =") orelse unreachable;
+    try std.testing.expectEqual(null, try initializerTypeExpression(
+        arena.allocator(),
+        source,
+        .{ .start = bytes_start, .end = bytes_start + "bytes".len },
+    ));
 }
 
 test "member lookup follows nested and private aliases" {

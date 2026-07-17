@@ -17,6 +17,8 @@
       --faint: #71717a;
       --accent: #fbbf24;
       --analyzer: #34d399;
+      --severity-error: #f87171;
+      --severity-info: #7dd3fc;
       --focus-ring: #f59e0b;
       --font-sans: InterVariable, ui-sans-serif, system-ui, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -260,6 +262,15 @@
       text-underline-offset: 4px;
     }
 
+    .token.diagnostic.severity-error {
+      text-decoration-color: var(--severity-error);
+    }
+
+    .token.diagnostic.severity-info,
+    .token.diagnostic.severity-hint {
+      text-decoration-color: var(--severity-info);
+    }
+
     .caret {
       display: inline-block;
       width: 3px;
@@ -450,6 +461,25 @@
       font-family: var(--font-mono);
       font-size: 0.8125rem;
       color: var(--accent);
+    }
+
+    .result-output .diagnostic-severity {
+      display: inline-block;
+      margin-right: 6px;
+      font-family: var(--font-mono);
+      font-size: 0.6875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--accent);
+    }
+
+    .result-output .severity-error .diagnostic-severity {
+      color: var(--severity-error);
+    }
+
+    .result-output .severity-info .diagnostic-severity,
+    .result-output .severity-hint .diagnostic-severity {
+      color: var(--severity-info);
     }
 
     .token-keyword {
@@ -670,17 +700,25 @@
       target.append(block);
     }
 
-    function renderDiagnostics(target, entries) {
-      target.replaceChildren();
-      if (!entries.length) return renderEmpty(target, "[]");
+    function appendDiagnostics(target, entries) {
       for (const entry of entries) {
         const paragraph = document.createElement("p");
+        paragraph.className = `severity-${entry.severity || "warning"}`;
+        const severity = document.createElement("span");
+        severity.className = "diagnostic-severity";
+        severity.textContent = entry.severity || "warning";
         const code = document.createElement("span");
         code.className = "diagnostic-code";
-        code.textContent = entry.code;
+        code.append(severity, entry.code);
         paragraph.append(code, entry.message);
         target.append(paragraph);
       }
+    }
+
+    function renderDiagnostics(target, entries) {
+      target.replaceChildren();
+      if (!entries.length) return renderEmpty(target, "[]");
+      appendDiagnostics(target, entries);
     }
 
     const sourceElement = document.querySelector("#slide-source");
@@ -717,15 +755,22 @@
       const example = currentExample();
       const line = Number(element.dataset.line);
       const column = Number(element.dataset.column);
+      const length = Number(element.dataset.length);
       setStatus("textDocument/hover", `${fileName(example)}:${line + 1}:${column + 1}`);
-      const analyzerIndex = Number(element.dataset.analyzer);
-      const zlsIndex = Number(element.dataset.zls);
-      analyzerCaption.textContent = analyzerIndex === -1 ? "no hover" : "markdown hover";
-      if (analyzerIndex === -1) renderEmpty(analyzerOutput, "null");
-      else renderMarkdown(strings[analyzerIndex], analyzerOutput);
-      zlsCaption.textContent = zlsIndex === -1 ? "no hover" : "markdown hover";
-      if (zlsIndex === -1) renderEmpty(zlsOutput, "null");
-      else renderMarkdown(strings[zlsIndex], zlsOutput);
+      const sides = [
+        [Number(element.dataset.analyzer), analyzerOutput, analyzerCaption, "analyzer"],
+        [Number(element.dataset.zls), zlsOutput, zlsCaption, "zls"],
+      ];
+      for (const [stringIndex, output, caption, key] of sides) {
+        const touching = diagnosticsAt(example, key, line, column, length);
+        const hoverCaption = stringIndex === -1 ? "no hover" : "markdown hover";
+        caption.textContent = touching.length
+          ? `${hoverCaption} · ${touching.length === 1 ? "1 diagnostic" : `${touching.length} diagnostics`}`
+          : hoverCaption;
+        if (stringIndex === -1) renderEmpty(output, "null");
+        else renderMarkdown(strings[stringIndex], output);
+        appendDiagnostics(output, touching);
+      }
     }
 
     function showCompletion() {
@@ -778,9 +823,9 @@
       activate(element);
     }
 
-    function intersectsDiagnostic(example, line, start, length) {
-      const entries = example.diagnostics ? example.diagnostics.analyzer : [];
-      return entries.some((entry) => {
+    function diagnosticsAt(example, side, line, start, length) {
+      const entries = example.diagnostics ? example.diagnostics[side] : [];
+      return entries.filter((entry) => {
         if (line < entry.startLine || line > entry.endLine) return false;
         const from = line === entry.startLine ? entry.startChar : 0;
         const to = line === entry.endLine ? entry.endChar : Infinity;
@@ -828,7 +873,17 @@
           token.dataset.column = start;
           token.dataset.analyzer = analyzerIndex;
           token.dataset.zls = zlsIndex;
-          if (intersectsDiagnostic(example, fileLine, start, length)) token.classList.add("diagnostic");
+          token.dataset.length = length;
+          const touching = diagnosticsAt(example, "analyzer", fileLine, start, length);
+          if (touching.length) {
+            token.classList.add("diagnostic");
+            const ranking = { error: 3, warning: 2, info: 1, hint: 0 };
+            const severity = touching.reduce(
+              (worst, entry) => (ranking[entry.severity] > ranking[worst] ? entry.severity : worst),
+              touching[0].severity || "warning",
+            );
+            token.classList.add(`severity-${severity}`);
+          }
           highlightZig(line.slice(start, start + length), token);
           token.addEventListener("mouseenter", () => activate(token));
           token.addEventListener("mouseleave", () => activate(pinned));

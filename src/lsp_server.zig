@@ -1011,12 +1011,30 @@ pub const Server = struct {
     ) !?hover.Content {
         const name = document.source[identifier_span.start..identifier_span.end];
         if (try server.resolvedShapeForName(allocator, document, name)) |shape| {
+            if (try server.importDeclarationHover(allocator, document, identifier_span, name)) |origin| {
+                if (shape.fields.len == 0) return .{
+                    .declaration = origin.declaration,
+                    .type_summary = "compiler-resolved comptime type",
+                    .documentation = origin.documentation,
+                };
+                return .{
+                    .declaration = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{
+                        origin.declaration,
+                        try renderResolvedShape(allocator, name, shape),
+                    }),
+                    .type_summary = "compiler-resolved comptime type",
+                    .documentation = origin.documentation,
+                };
+            }
             return .{
                 .declaration = try renderResolvedShape(allocator, name, shape),
                 .type_summary = "compiler-resolved comptime type",
             };
         }
         if (try server.standardLibraryMemberHover(allocator, document, identifier_span.start, name)) |description| {
+            return description;
+        }
+        if (try server.memberChainHover(allocator, document, identifier_span, name)) |description| {
             return description;
         }
         if (memberReceiver(document.source, identifier_span.start)) |receiver| {
@@ -1089,11 +1107,10 @@ pub const Server = struct {
         const receiver_span = receiverIdentifierSpan(document.source, member_span.start) orelse return null;
         const receiver_bindings = try document.scopedIdentifierSpans(allocator, receiver_span.start) orelse return null;
         if (receiver_bindings.len == 0) return null;
-        const inferred_type = try syntax_types.inferredBindingType(
-            allocator,
-            document.source,
-            receiver_bindings[0],
-        ) orelse return null;
+        const inferred_type = try bindingTypeExpression(allocator, document, receiver_bindings[0]) orelse return null;
+        if (try server.importedTypeMemberHover(allocator, document, inferred_type, member_name)) |description| {
+            return description;
+        }
         const type_name = namedTypeExpression(inferred_type) orelse return null;
         if (std.mem.indexOfScalar(u8, type_name, '.')) |separator| {
             const import_alias = type_name[0..separator];
@@ -1153,6 +1170,180 @@ pub const Server = struct {
             return try describeBinding(allocator, source, member.span);
         }
         return null;
+    }
+
+    fn importDeclarationHover(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        identifier_span: std.zig.Token.Loc,
+        name: []const u8,
+    ) !?hover.Content {
+        if (document.declarationNamed(name)) |declaration| {
+            if (try describeBinding(allocator, document.source, declaration.span)) |description| {
+                if (std.mem.indexOf(u8, description.declaration, "@import") != null) return description;
+            }
+        }
+        const receiver = memberReceiver(document.source, identifier_span.start) orelse return null;
+        const view = try server.moduleView(allocator, document, receiver) orelse return null;
+        for (view.members) |member| {
+            if (!std.mem.eql(u8, member.name, name)) continue;
+            const description = try describeBinding(allocator, view.source, member.span) orelse return null;
+            if (std.mem.indexOf(u8, description.declaration, "@import") == null) return null;
+            return description;
+        }
+        return null;
+    }
+
+    fn importedTypeMemberHover(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        type_expression: []const u8,
+        member_name: []const u8,
+    ) !?hover.Content {
+        const site = try server.resolveImportedTypeSite(allocator, document, type_expression) orelse return null;
+        return try siteMemberDescription(allocator, site, member_name);
+    }
+
+    fn resolveImportedTypeSite(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        type_expression: []const u8,
+    ) !?ResolvedTypeSite {
+        const segments = try dottedPathSegments(allocator, bareTypeExpression(type_expression)) orelse return null;
+        if (segments.len < 2) return null;
+        const initial_path = try server.modulePath(allocator, document, segments[0]) orelse return null;
+        const file = try server.importedSource(allocator, initial_path) orelse return null;
+        var pending: std.ArrayList([]const u8) = .empty;
+        try pending.appendSlice(allocator, segments[1..]);
+        return try server.descendPendingSegments(allocator, file, &pending);
+    }
+
+    fn resolveTypeSiteWithin(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        file: ImportedSource,
+        type_expression: []const u8,
+    ) !?ResolvedTypeSite {
+        const segments = try dottedPathSegments(allocator, bareTypeExpression(type_expression)) orelse return null;
+        var pending: std.ArrayList([]const u8) = .empty;
+        try pending.appendSlice(allocator, segments);
+        return try server.descendPendingSegments(allocator, file, &pending);
+    }
+
+    fn descendPendingSegments(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        start_file: ImportedSource,
+        pending: *std.ArrayList([]const u8),
+    ) !?ResolvedTypeSite {
+        var file = start_file;
+        var container = TokenRange{ .start = 0, .end = file.tokens.len };
+        var hops: usize = 0;
+        while (pending.items.len != 0) : (hops += 1) {
+            if (hops == 32) return null;
+            const target_name = pending.orderedRemove(0);
+            const declaration = containerDeclarationNamed(file.source, file.tokens, container, target_name) orelse return null;
+            const descent = switch (declaration.kind) {
+                .field => return null,
+                .function => typeFunctionResult(file.source, file.tokens, declaration.name_index) orelse return null,
+                .constant => try constantTarget(allocator, file.source, file.tokens, declaration.name_index) orelse return null,
+            };
+            switch (descent) {
+                .container => |range| container = range,
+                .alias_path => |path_text| {
+                    const alias_segments = try dottedPathSegments(allocator, path_text) orelse return null;
+                    try pending.insertSlice(allocator, 0, alias_segments);
+                    container = .{ .start = 0, .end = file.tokens.len };
+                },
+                .imported_file => |imported| {
+                    try pending.insertSlice(allocator, 0, imported.members);
+                    const path = try server.importedNeighborPath(allocator, file.path, imported.file) orelse return null;
+                    file = try server.importedSource(allocator, path) orelse return null;
+                    container = .{ .start = 0, .end = file.tokens.len };
+                },
+            }
+        }
+        return .{ .file = file, .container = container };
+    }
+
+    fn memberChainHover(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        member_span: std.zig.Token.Loc,
+        member_name: []const u8,
+    ) !?hover.Content {
+        const receiver = qualifiedCallReceiver(document.source, member_span.start) orelse return null;
+        const links = try dottedPathSegments(allocator, receiver.expression) orelse return null;
+        if (links.len == 0) return null;
+        if (try importName(allocator, document.source, links[0]) != null) {
+            // The receiver spells a constructed type, as in `std.ArrayList(u8).empty`.
+            return try server.importedTypeMemberHover(allocator, document, receiver.expression, member_name);
+        }
+        // The receiver is a value chain, as in `arena.allocator().dupe`; follow
+        // each link's declared result type to the container that owns the member.
+        const bindings = try document.scopedIdentifierSpans(allocator, receiver.start) orelse return null;
+        if (bindings.len == 0) return null;
+        const base_type = try bindingTypeExpression(allocator, document, bindings[0]) orelse return null;
+        var site = try server.resolveImportedTypeSite(allocator, document, base_type) orelse return null;
+        for (links[1..]) |link| {
+            const declaration = containerDeclarationNamed(site.file.source, site.file.tokens, site.container, link) orelse return null;
+            const result_type = switch (declaration.kind) {
+                .function => functionReturnTypeText(site.file.source, site.file.tokens, declaration.name_index),
+                .field, .constant => typed: {
+                    const binding = try describeBinding(
+                        allocator,
+                        site.file.source,
+                        site.file.tokens[declaration.name_index].loc,
+                    ) orelse break :typed null;
+                    break :typed binding.type_summary;
+                },
+            } orelse return null;
+            site = try server.resolveTypeSiteWithin(allocator, site.file, result_type) orelse return null;
+        }
+        return try siteMemberDescription(allocator, site, member_name);
+    }
+
+    fn bindingTypeExpression(
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        binding_span: std.zig.Token.Loc,
+    ) !?[]const u8 {
+        if (try syntax_types.inferredBindingType(allocator, document.source, binding_span)) |inferred| return inferred;
+        if (try syntax_types.initializerTypeExpression(allocator, document.source, binding_span)) |constructed| return constructed;
+        const binding = try describeBinding(allocator, document.source, binding_span) orelse return null;
+        return binding.type_summary;
+    }
+
+    fn importedSource(server: *Server, allocator: std.mem.Allocator, path: []const u8) !?ImportedSource {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            server.io,
+            path,
+            allocator,
+            .limited(16 * 1024 * 1024),
+        ) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const source = try allocator.dupeZ(u8, bytes);
+        return .{ .path = path, .source = source, .tokens = try tokenize(allocator, source) };
+    }
+
+    fn importedNeighborPath(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        current_path: []const u8,
+        import_string: []const u8,
+    ) !?[]const u8 {
+        if (std.mem.eql(u8, import_string, "std")) {
+            return try std.fmt.allocPrint(allocator, "{s}/std/std.zig", .{try server.zigLibDirectory()});
+        }
+        if (!std.mem.endsWith(u8, import_string, ".zig")) return null;
+        const directory = std.fs.path.dirname(current_path) orelse return null;
+        return try std.fs.path.resolve(allocator, &.{ directory, import_string });
     }
 
     fn compilerTypeMembers(
@@ -1489,6 +1680,302 @@ const FunctionLocation = struct {
     document: *const Document,
     declaration: Declaration,
 };
+
+const ImportedSource = struct {
+    path: []const u8,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+};
+
+const TokenRange = struct {
+    start: usize,
+    end: usize,
+};
+
+const ContainerDeclaration = struct {
+    name_index: usize,
+    kind: enum { constant, function, field },
+};
+
+const ResolvedTypeSite = struct {
+    file: ImportedSource,
+    container: TokenRange,
+};
+
+const QualifiedReceiver = struct {
+    expression: []const u8,
+    start: usize,
+};
+
+fn bareTypeExpression(type_expression: []const u8) []const u8 {
+    var bare = std.mem.trim(u8, type_expression, " \t\r\n");
+    while (bare.len != 0 and (bare[0] == '*' or bare[0] == '?')) {
+        bare = bare[1..];
+        if (std.mem.startsWith(u8, bare, "const ")) bare = bare["const ".len..];
+    }
+    return bare;
+}
+
+fn siteMemberDescription(
+    allocator: std.mem.Allocator,
+    site: ResolvedTypeSite,
+    member_name: []const u8,
+) !?hover.Content {
+    const declaration = containerDeclarationNamed(
+        site.file.source,
+        site.file.tokens,
+        site.container,
+        member_name,
+    ) orelse return null;
+    return try describeBinding(allocator, site.file.source, site.file.tokens[declaration.name_index].loc);
+}
+
+fn qualifiedCallReceiver(source: []const u8, member_start: usize) ?QualifiedReceiver {
+    if (member_start == 0 or source[member_start - 1] != '.') return null;
+    var index = member_start - 1;
+    var saw_call = false;
+    while (index > 0) {
+        if (source[index - 1] == ')') {
+            saw_call = true;
+            var depth: usize = 0;
+            while (index > 0) : (index -= 1) {
+                if (source[index - 1] == ')') depth += 1;
+                if (source[index - 1] == '(') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+            }
+            if (index == 0) return null;
+            index -= 1;
+        }
+        const identifier_end = index;
+        while (index > 0 and (std.ascii.isAlphanumeric(source[index - 1]) or source[index - 1] == '_')) : (index -= 1) {}
+        if (index == identifier_end) return null;
+        if (index == 0 or source[index - 1] != '.') break;
+        index -= 1;
+    }
+    if (!saw_call) return null;
+    if (!std.ascii.isAlphabetic(source[index]) and source[index] != '_') return null;
+    return .{ .expression = source[index .. member_start - 1], .start = index };
+}
+
+fn functionReturnTypeText(
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    name_index: usize,
+) ?[]const u8 {
+    if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return null;
+    const parameters_end = matchingSyntaxToken(tokens, name_index + 1, .l_paren, .r_paren) orelse return null;
+    var body_start = parameters_end + 1;
+    while (body_start < tokens.len and tokens[body_start].tag != .l_brace and
+        tokens[body_start].tag != .semicolon) : (body_start += 1)
+    {}
+    if (body_start == tokens.len) return null;
+    const return_type = std.mem.trim(u8, source[tokens[parameters_end].loc.end..tokens[body_start].loc.start], " \t\r\n");
+    if (return_type.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, return_type, '!')) |error_union| {
+        return std.mem.trim(u8, return_type[error_union + 1 ..], " \t\r\n");
+    }
+    return return_type;
+}
+
+const DeclarationDescent = union(enum) {
+    container: TokenRange,
+    alias_path: []const u8,
+    imported_file: struct {
+        file: []const u8,
+        members: []const []const u8,
+    },
+};
+
+fn dottedPathSegments(allocator: std.mem.Allocator, type_expression: []const u8) !?[]const []const u8 {
+    var segments: std.ArrayList([]const u8) = .empty;
+    var rest = std.mem.trim(u8, type_expression, " \t\r\n");
+    while (true) {
+        const boundary = std.mem.indexOfAny(u8, rest, ".(") orelse rest.len;
+        if (boundary == 0) return null;
+        const segment = rest[0..boundary];
+        if (!isDottedIdentifier(segment)) return null;
+        try segments.append(allocator, segment);
+        if (boundary == rest.len) return try segments.toOwnedSlice(allocator);
+        if (rest[boundary] == '.') {
+            rest = rest[boundary + 1 ..];
+            continue;
+        }
+        var depth: usize = 0;
+        var index = boundary;
+        while (index < rest.len) : (index += 1) {
+            if (rest[index] == '(') depth += 1;
+            if (rest[index] == ')') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+        if (index == rest.len) return null;
+        if (index + 1 == rest.len) return try segments.toOwnedSlice(allocator);
+        if (rest[index + 1] != '.') return null;
+        rest = rest[index + 2 ..];
+    }
+}
+
+fn containerDeclarationNamed(
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    container: TokenRange,
+    name: []const u8,
+) ?ContainerDeclaration {
+    var brace_depth: usize = 0;
+    var parenthesis_depth: usize = 0;
+    for (tokens[container.start..container.end], container.start..) |token, index| {
+        switch (token.tag) {
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .identifier => {
+                if (brace_depth != 0 or parenthesis_depth != 0) continue;
+                if (!std.mem.eql(u8, source[token.loc.start..token.loc.end], name)) continue;
+                if (index > container.start) switch (tokens[index - 1].tag) {
+                    .keyword_const, .keyword_var => return .{ .name_index = index, .kind = .constant },
+                    .keyword_fn => return .{ .name_index = index, .kind = .function },
+                    else => {},
+                };
+                if (index + 1 < container.end and tokens[index + 1].tag == .colon) {
+                    return .{ .name_index = index, .kind = .field };
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn containerLiteralRange(tokens: []const std.zig.Token, keyword_index: usize) ?TokenRange {
+    var brace = keyword_index + 1;
+    while (brace < tokens.len and tokens[brace].tag != .l_brace and tokens[brace].tag != .semicolon) : (brace += 1) {}
+    if (brace == tokens.len or tokens[brace].tag != .l_brace) return null;
+    const closing = matchingSyntaxToken(tokens, brace, .l_brace, .r_brace) orelse return null;
+    return .{ .start = brace + 1, .end = closing };
+}
+
+fn pathEndIndex(tokens: []const std.zig.Token, start: usize, limit: usize) ?usize {
+    if (start >= limit or tokens[start].tag != .identifier) return null;
+    var last = start;
+    var cursor = start + 1;
+    while (cursor < limit) {
+        switch (tokens[cursor].tag) {
+            .period => {
+                if (cursor + 1 >= limit or tokens[cursor + 1].tag != .identifier) return null;
+                last = cursor + 1;
+                cursor += 2;
+            },
+            .l_paren => {
+                const closing = matchingSyntaxToken(tokens, cursor, .l_paren, .r_paren) orelse return null;
+                last = closing;
+                cursor = closing + 1;
+            },
+            .semicolon => return last,
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn constantTarget(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    name_index: usize,
+) !?DeclarationDescent {
+    var equal_index = name_index + 1;
+    var depth: usize = 0;
+    while (equal_index < tokens.len) : (equal_index += 1) {
+        switch (tokens[equal_index].tag) {
+            .l_paren, .l_bracket => depth += 1,
+            .r_paren, .r_bracket => depth -|= 1,
+            .equal => if (depth == 0) break,
+            .semicolon => return null,
+            else => {},
+        }
+    }
+    if (equal_index + 1 >= tokens.len) return null;
+    var value_index = equal_index + 1;
+    while (value_index < tokens.len and
+        (tokens[value_index].tag == .keyword_extern or tokens[value_index].tag == .keyword_packed)) : (value_index += 1)
+    {}
+    switch (tokens[value_index].tag) {
+        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
+            const range = containerLiteralRange(tokens, value_index) orelse return null;
+            return .{ .container = range };
+        },
+        else => {},
+    }
+    if (tokens[value_index].tag == .builtin and
+        std.mem.eql(u8, source[tokens[value_index].loc.start..tokens[value_index].loc.end], "@import"))
+    {
+        if (value_index + 3 >= tokens.len or tokens[value_index + 1].tag != .l_paren or
+            tokens[value_index + 2].tag != .string_literal or tokens[value_index + 3].tag != .r_paren) return null;
+        const literal = source[tokens[value_index + 2].loc.start..tokens[value_index + 2].loc.end];
+        if (literal.len < 2) return null;
+        const cursor = value_index + 4;
+        if (cursor < tokens.len and tokens[cursor].tag == .period) {
+            const last = pathEndIndex(tokens, cursor + 1, tokens.len) orelse return null;
+            var tail: std.ArrayList([]const u8) = .empty;
+            var member_index = cursor + 1;
+            while (member_index <= last) : (member_index += 2) {
+                if (tokens[member_index].tag != .identifier) return null;
+                try tail.append(allocator, source[tokens[member_index].loc.start..tokens[member_index].loc.end]);
+            }
+            return .{ .imported_file = .{
+                .file = literal[1 .. literal.len - 1],
+                .members = try tail.toOwnedSlice(allocator),
+            } };
+        }
+        return .{ .imported_file = .{ .file = literal[1 .. literal.len - 1], .members = &.{} } };
+    }
+    const last = pathEndIndex(tokens, value_index, tokens.len) orelse return null;
+    return .{ .alias_path = source[tokens[value_index].loc.start..tokens[last].loc.end] };
+}
+
+fn typeFunctionResult(
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    name_index: usize,
+) ?DeclarationDescent {
+    if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return null;
+    const parameters_end = matchingSyntaxToken(tokens, name_index + 1, .l_paren, .r_paren) orelse return null;
+    var body_start = parameters_end + 1;
+    while (body_start < tokens.len and tokens[body_start].tag != .l_brace and
+        tokens[body_start].tag != .semicolon) : (body_start += 1)
+    {}
+    if (body_start == tokens.len or tokens[body_start].tag != .l_brace) return null;
+    const return_type = std.mem.trim(u8, source[tokens[parameters_end].loc.end..tokens[body_start].loc.start], " \t\r\n");
+    if (!std.mem.eql(u8, return_type, "type")) return null;
+    const body_end = matchingSyntaxToken(tokens, body_start, .l_brace, .r_brace) orelse return null;
+    var index = body_start + 1;
+    while (index < body_end) : (index += 1) {
+        if (tokens[index].tag != .keyword_return) continue;
+        var value_index = index + 1;
+        while (value_index < body_end and
+            (tokens[value_index].tag == .keyword_extern or tokens[value_index].tag == .keyword_packed)) : (value_index += 1)
+        {}
+        switch (tokens[value_index].tag) {
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
+                const range = containerLiteralRange(tokens, value_index) orelse return null;
+                return .{ .container = range };
+            },
+            else => {},
+        }
+    }
+    index = body_start + 1;
+    while (index < body_end) : (index += 1) {
+        if (tokens[index].tag != .keyword_return) continue;
+        if (pathEndIndex(tokens, index + 1, body_end)) |last| {
+            return .{ .alias_path = source[tokens[index + 1].loc.start..tokens[last].loc.end] };
+        }
+    }
+    return null;
+}
 
 const FunctionBodyTokenBounds = struct {
     opening: usize,
@@ -3970,6 +4457,43 @@ test "LSP hover follows inferred returns through imported type aliases" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "slice: []const u8") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Headers decoded from the used message body") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":null") != null);
+}
+
+test "LSP hover resolves constructed types through imports and type functions" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"initialized","params":{}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://fixtures/member_main.zig","languageId":"zig","version":1,"text":"const registry = @import(\"store_registry.zig\");\nfn run() void {\n    var store = registry.Store.init(8);\n    store.close();\n    var queue = registry.Queue(u8).empty;\n    queue.push(1);\n}\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://fixtures/member_main.zig"},"position":{"line":3,"character":11}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://fixtures/member_main.zig"},"position":{"line":5,"character":11}}}
+        ,
+        \\{"jsonrpc":"2.0","id":4,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 5), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "fn close(self: *Store) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Releases every resource owned by the store.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "fn push(self: *@This(), entry: T) void") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Appends one entry to the queue tail.") != null);
 }
 
 test "LSP publishes memory ownership warnings" {
