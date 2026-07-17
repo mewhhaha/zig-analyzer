@@ -63,6 +63,9 @@ globals:
   several diagnostics from one binding/lifetime model. Splitting each code into
   an independent traversal would duplicate identity rules and let findings
   disagree.
+- `rules/summaries.zig` owns declared and inferred interprocedural ownership
+  effects. Lifecycle rules query this one conservative source and treat
+  recursion, ambiguity, and indirect calls as unresolved.
 - `semantic.zig` owns container, scope, and type facts shared by diagnostics
   that cannot yet be expressed as independent `RuleRun` passes. New unrelated
   rules do not belong there.
@@ -87,8 +90,8 @@ The following rules keep feature work local:
 3. Registries compose modules but do not reinterpret their findings or edits.
 4. Configuration and suppression are applied uniformly. A rule must not read
    `zig-analyzer.json` itself.
-5. Compiler facts cross the boundary as resolved shapes or other small domain
-   values, never raw protocol responses.
+5. Compiler facts cross the boundary as resolved shapes, compile-unit facts, or
+   other small domain values, never raw protocol responses.
 6. File-local analysis does not infer workspace reachability. Multi-file rules
    and actions use their explicit project boundaries.
 7. Shared context modules contain syntax/span operations whose semantics must

@@ -24,6 +24,20 @@ are off until enabled by a profile, the style tier, or a per-rule setting.
 - [`never-mutated-var`](never-mutated-var.md) — Reports a local `var` whose
   binding and reachable mutable aliases are never mutated.
 
+## Contract and compiler-backed project rules
+
+- [`import-boundary`](import-boundary.md) — Reports imports denied by declared
+  project architecture contracts.
+- [`discarded-must-use`](discarded-must-use.md) — Reports explicitly discarded
+  returns from declared must-use callables.
+- [`configuration-divergent-api`](configuration-divergent-api.md) — Reports
+  public API shapes that differ across compiler-analyzed compile units.
+- [`unreachable-public-declaration`](unreachable-public-declaration.md) —
+  Reports public declarations absent from every analyzed compile unit.
+
+Contract rules activate when their corresponding project contract is present.
+Compiler-backed project rules are opt-in.
+
 ## Default correctness warnings
 
 - [`unreleased-allocation`](unreleased-allocation.md) — Reports a mechanically

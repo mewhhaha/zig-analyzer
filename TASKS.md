@@ -304,3 +304,27 @@ Acceptance:
 - [x] Rewrites preserve comments by declining ambiguous forms and have
   positive, negative, suppression, and fix-all coverage.
 - [x] The idiomatic example compiles and documents each editor-visible action.
+
+## ZA-019 — Project contracts and interprocedural facts
+
+Status: complete
+Depends on: ZA-003, ZA-014, ZA-015
+
+Outcome: declared project policy, conservative function summaries, and
+compiler-analyzed build roots extend correctness findings across file and call
+boundaries without guessing unresolved behavior.
+
+Acceptance:
+
+- [x] Import-boundary contracts are enforced project-wide and this repository
+  declares its rules-to-transport boundary in `zig-analyzer.json`.
+- [x] Resource-pair and must-use contracts parse at the configuration trust
+  boundary with precise malformed-input diagnostics.
+- [x] One summary engine represents borrowed, released, escaped,
+  allocator-derived, and owned-return effects from both contracts and source.
+- [x] Allocation lifecycle analysis consumes summaries across direct calls and
+  files while recursion, ambiguity, indirect calls, and unresolved calls stay
+  opaque.
+- [x] Compiler facts enter project analysis as domain values; opt-in findings
+  report divergent public shapes across analyzed roots and public declarations
+  outside every successfully analyzed root's import graph.

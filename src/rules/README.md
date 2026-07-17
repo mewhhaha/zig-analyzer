@@ -31,10 +31,17 @@ share resolved container and scope facts. New syntax-local rules should be
 separate modules; extend a shared engine only when the new finding requires the
 same proof.
 
+`summaries.zig` is the authoritative interprocedural ownership fact source.
+Declared resource contracts and inferred direct-call effects both produce the
+same borrowed, released, escaped, and owned-return summaries. Recursion,
+ambiguous names, indirect calls, and unresolved calls stay opaque. Lifecycle
+engines consume summaries; they do not independently reinterpret callees.
+
 `project.zig` is the corresponding boundary for findings that require multiple
-files. It receives normalized relative paths and complete source text from the
-CLI scanner. File-local runners must not infer build reachability or compare
-compile configurations from a single document.
+files. It receives normalized relative paths, complete source text, and small
+compiler-fact domain values from the CLI scanner. File-local runners must not
+infer build reachability or compare compile configurations from a single
+document.
 
 Each stable rule code has a neighboring `<rule-code>.md` page, linked from
 `RULES.md`. A unit test requires one document, index link, and why/when section

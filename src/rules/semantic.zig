@@ -148,7 +148,14 @@ fn findingsWithShapesAndTokens(
     try findImportIssues(allocator, source, tokens, configuration, &found);
     try findUnsortedImports(allocator, source, tokens, configuration, &found);
     if (allocation_lifecycle.enabled(configuration)) {
-        const allocation_findings = try allocation_lifecycle.warningsWithSyntax(allocator, source, &tree, tokens, &scope_index);
+        const allocation_findings = try allocation_lifecycle.warningsWithSyntax(
+            allocator,
+            source,
+            &tree,
+            tokens,
+            &scope_index,
+            configuration,
+        );
         for (allocation_findings) |finding| try addFinding(allocator, source, configuration, &found, .{
             .rule = finding.rule,
             .level = configuration.level(finding.rule),
