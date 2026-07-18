@@ -452,8 +452,7 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
             for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
                 return .{ .release = callableBaseName(contract.release) };
             };
-            const method = callableBaseName(callable);
-            const release = allocationRelease(method) orelse continue;
+            const release = allocationReleaseForCallable(callable) orelse continue;
             return .{
                 .release = release,
                 .allocator_parameter = allocatorParameter(function, callable),
@@ -485,7 +484,7 @@ fn directOwnedBinding(
         for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
             return .{ .release = callableBaseName(contract.release) };
         };
-        const release = allocationRelease(callableBaseName(callable)) orelse continue;
+        const release = allocationReleaseForCallable(callable) orelse continue;
         return .{ .release = release, .allocator_parameter = allocatorParameter(function, callable) };
     }
     return null;
@@ -754,6 +753,21 @@ fn allocationRelease(method: []const u8) ?[]const u8 {
     return null;
 }
 
+fn allocationReleaseForCallable(callable: []const u8) ?[]const u8 {
+    const method = callableBaseName(callable);
+    const release = allocationRelease(method) orelse return null;
+    if (!std.mem.eql(u8, method, "create")) return release;
+    const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
+    const receiver = callable[0..separator];
+    const receiver_name = if (std.mem.lastIndexOfScalar(u8, receiver, '.')) |receiver_separator|
+        receiver[receiver_separator + 1 ..]
+    else
+        receiver;
+    return if (std.ascii.indexOfIgnoreCase(receiver_name, "alloc") != null or
+        std.ascii.indexOfIgnoreCase(receiver_name, "pool") != null or
+        std.mem.eql(u8, receiver_name, "gpa")) release else null;
+}
+
 fn matchingToken(tokens: []const std.zig.Token, opening: usize) ?usize {
     const closing_tag: std.zig.Token.Tag = switch (tokens[opening].tag) {
         .l_paren => .r_paren,
@@ -812,6 +826,17 @@ test "summaries retain ownership returned through a local binding" {
     const owned = index.ownedReturn("createThing").?;
     try std.testing.expectEqualStrings("destroy", owned.release);
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "summaries do not infer ownership from arbitrary create methods" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn createThing(protocol: *Protocol) !*Thing { return protocol.create(); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.ownedReturn("createThing") == null);
 }
 
 test "summaries exclude nested function bodies from enclosing functions" {

@@ -61,8 +61,12 @@ fn replacementRelinquishesOwnership(
     replacement_start: usize,
     replacement_end: usize,
 ) bool {
-    if (replacement_start + 1 >= replacement_end or context.tokens[replacement_start].tag != .period or
-        context.tokens[replacement_start + 1].tag != .identifier or !context.tokenIs(replacement_start + 1, "empty")) return false;
+    if (replacement_start + 1 >= replacement_end or context.tokens[replacement_start].tag != .period) return false;
+    const resets_to_empty = context.tokens[replacement_start + 1].tag == .identifier and
+        context.tokenIs(replacement_start + 1, "empty") or
+        replacement_start + 2 < replacement_end and context.tokens[replacement_start + 1].tag == .l_brace and
+            context.tokens[replacement_start + 2].tag == .r_brace;
+    if (!resets_to_empty) return false;
     for (context.tokens[search_start..assignment_index], search_start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
         if (index > search_start and context.tokens[index - 1].tag == .equal) return true;
@@ -81,13 +85,16 @@ fn replacementRelinquishesOwnership(
 
 fn replacementConsumesOriginal(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
     var names_original = false;
-    var calls_realloc = false;
+    var transfers_allocation = false;
+    const transfer_methods = [_][]const u8{ "realloc", "reallocAdvanced", "remap" };
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier) continue;
         if (context.tokenIs(index, name)) names_original = true;
-        if (context.tokenIs(index, "realloc")) calls_realloc = true;
+        for (transfer_methods) |method| {
+            if (context.tokenIs(index, method)) transfers_allocation = true;
+        }
     }
-    return names_original and calls_realloc;
+    return names_original and transfers_allocation;
 }
 
 fn releasedBeforeReplacement(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
@@ -387,6 +394,19 @@ test "realloc transfers the original allocation into the replacement" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "advanced realloc and moved empty resources preserve deferred cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn grow(a: anytype) !void { var bytes = try a.alloc(u8, 1); defer a.free(bytes); bytes = try a.reallocAdvanced(bytes, 2, 0); }" ++
+        "fn move(owner: anytype, a: anytype) void { var stack = acquire(); defer stack.deinit(a); owner.stack = stack; stack = .{}; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
 }
 
 test "cleanup reassignment ignores ownership moves and shadow declarations" {

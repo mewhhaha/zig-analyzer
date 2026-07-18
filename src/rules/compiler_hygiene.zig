@@ -23,7 +23,8 @@ fn findUselessErrorReturns(context: RuleRun) !void {
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (!bodyIsProvenInfallible(context, body_open + 1, body_end)) continue;
         const name = context.tokenText(fn_index + 1);
-        if (functionIsUsedAsValue(context, fn_index + 1, name)) continue;
+        if (functionIsUsedAsValue(context, fn_index + 1, name) or
+            functionCallRequiresErrorUnion(context, fn_index + 1, name)) continue;
         try context.emit(.{
             .rule = .useless_error_return,
             .level = level,
@@ -35,6 +36,25 @@ fn findUselessErrorReturns(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn functionCallRequiresErrorUnion(context: RuleRun, declaration_index: usize, name: []const u8) bool {
+    for (context.tokens, 0..) |token, index| {
+        if (index == declaration_index or token.tag != .identifier or !context.tokenIs(index, name) or
+            index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .l_paren) continue;
+        const closing = context.matchingToken(index + 1, .l_paren, .r_paren) orelse continue;
+        if (closing + 1 < context.tokens.len and context.tokens[closing + 1].tag == .keyword_catch) return true;
+        var cursor = index;
+        while (cursor > 0) {
+            cursor -= 1;
+            switch (context.tokens[cursor].tag) {
+                .keyword_try => return true,
+                .semicolon, .l_brace, .r_brace => break,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 fn functionIsUsedAsValue(context: RuleRun, declaration_index: usize, name: []const u8) bool {
@@ -108,10 +128,11 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
         {}
         if (signature_start >= context.tokens.len) continue;
         const signature_end = if (context.tokens[signature_start].tag == .keyword_fn) end: {
+            if (signature_start + 1 < context.tokens.len and context.tokenIs(signature_start + 1, "main")) continue;
             const parameters_open = nextTag(context.tokens, signature_start + 1, .l_paren) orelse continue;
             const parameters_end = context.matchingToken(parameters_open, .l_paren, .r_paren) orelse continue;
             break :end syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
-        } else nextTagBefore(context.tokens, signature_start + 1, .l_brace, .semicolon) orelse continue;
+        } else typedDeclarationEnd(context.tokens, signature_start + 1) orelse continue;
         for (declarations.items) |declaration| {
             const reference = findIdentifier(context, signature_start + 1, signature_end, declaration.name) orelse continue;
             const rule: types.Rule = if (declaration.error_set) .exposed_private_error_set else .exposed_private_type;
@@ -130,6 +151,17 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             });
         }
     }
+}
+
+fn typedDeclarationEnd(tokens: []const std.zig.Token, start: usize) ?usize {
+    var saw_colon = false;
+    for (tokens[start..], start..) |token, index| switch (token.tag) {
+        .colon => saw_colon = true,
+        .equal, .semicolon => return if (saw_colon) index else null,
+        .l_brace, .r_brace => return null,
+        else => {},
+    };
+    return null;
 }
 
 fn publicDeclarationIsReachable(context: RuleRun, declaration_index: usize) bool {
@@ -447,6 +479,15 @@ test "compiler hygiene ignores function types callbacks and public error contrac
     for (found) |finding| try std.testing.expect(finding.rule != .useless_error_return);
 }
 
+test "infallible implementations keep error unions required by their callers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn setup() !void {} fn run() !void { try setup(); }\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .useless_error_return);
+}
+
 test "private containers do not expose their private receiver types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -463,6 +504,15 @@ test "private containers do not expose their private receiver types" {
         if (finding.rule == .exposed_private_type) exposed_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), exposed_count);
+}
+
+test "public aliases publish private components under a name callers can use" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Failure = error{Bad}; pub const PublicFailure = Failure || error{Other}; pub fn main() Failure!void {}\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .exposed_private_error_set);
 }
 
 test "mutated container copies reject constructors and type literals" {

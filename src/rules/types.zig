@@ -105,6 +105,7 @@ pub const Rule = enum {
     prefer_index_of,
     prefer_memset,
     prefer_memcpy,
+    prefer_switch,
     prefer_string_switch,
     prefer_log_over_print,
     prefer_buffered_writer,

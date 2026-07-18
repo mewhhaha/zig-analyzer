@@ -217,6 +217,9 @@ fn allocationFromCall(
 ) ?Allocation {
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return null;
+    for (call.ast.params) |parameter| {
+        if (expressionReferencesField(tree, parameter, "arena")) return null;
+    }
     if (tree.nodeTag(call.ast.fn_expr) == .identifier) {
         const function_name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
         const owned = summary_index.ownedReturnCall(source, null, function_name) orelse return null;
@@ -224,6 +227,7 @@ fn allocationFromCall(
             if (parameter < call.ast.params.len) call.ast.params[parameter] else null
         else
             null;
+        if (allocator_argument) |argument| if (expressionReferencesField(tree, argument, "arena")) return null;
         return .{
             .method = function_name,
             .release = owned.release,
@@ -240,6 +244,7 @@ fn allocationFromCall(
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
     if (allocationRelease(method)) |release| {
         if (expressionReferencesField(tree, receiver, "arena")) return null;
+        if (std.mem.eql(u8, method, "create") and !expressionLooksLikeAllocationOwner(source, tokens, tree, receiver)) return null;
         if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(source, tokens, tree, receiver)) return null;
         return .{
             .method = method,
@@ -256,6 +261,7 @@ fn allocationFromCall(
         if (parameter < call.ast.params.len) call.ast.params[parameter] else null
     else
         null;
+    if (allocator_argument) |argument| if (expressionReferencesField(tree, argument, "arena")) return null;
     return .{
         .method = method,
         .release = owned.release,
@@ -264,6 +270,20 @@ fn allocationFromCall(
         else
             receiver_name,
         .allocator_source = if (allocator_argument) |argument| allocatorSourceName(tree, argument) else null,
+    };
+}
+
+fn expressionLooksLikeAllocationOwner(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
+    expression: std.zig.Ast.Node.Index,
+) bool {
+    if (expressionLooksLikeAllocator(source, tokens, tree, expression)) return true;
+    return switch (tree.nodeTag(expression)) {
+        .identifier => std.ascii.indexOfIgnoreCase(tree.tokenSlice(tree.nodeMainToken(expression)), "pool") != null,
+        .field_access => std.ascii.indexOfIgnoreCase(tree.tokenSlice(tree.nodeData(expression).node_and_token[1]), "pool") != null,
+        else => false,
     };
 }
 
@@ -655,6 +675,7 @@ fn releaseArgumentContainsBinding(
         if (!tokenRefersToBinding(source, tokens, index, binding_name) or
             !identifierRefersToBinding(scope_index, binding_index, index)) continue;
         if (index > start and tokens[index - 1].tag == .period) continue;
+        if (index + 1 < end and tokens[index + 1].tag == .period) continue;
         if (index + 1 < end and tokens[index + 1].tag == .l_bracket) continue;
         return true;
     }
@@ -890,6 +911,13 @@ fn bindingEscapes(
     summary_index: summaries.Index,
 ) bool {
     for (tokens[start..end], start..) |token, index| {
+        if (tokenIsIdentifier(source, token, binding_name) and
+            identifierRefersToBinding(scope_index, binding_index, index) and
+            index + 3 < end and tokens[index + 1].tag == .period and
+            tokens[index + 2].tag == .identifier and tokens[index + 3].tag == .l_paren)
+        {
+            return true;
+        }
         if (token.tag == .l_paren and index > 0 and
             (tokens[index - 1].tag == .identifier or tokens[index - 1].tag == .builtin))
         {
@@ -1458,6 +1486,42 @@ test "allocation release must match method and allocator" {
     try std.testing.expectEqual(types.Rule.mismatched_allocation_release, allocator_findings[0].rule);
 }
 
+test "releasing an owned field does not release its parent allocation" {
+    const source =
+        "fn createButton(allocator: std.mem.Allocator, label: []const u8) !*Button {" ++
+        "const self = try allocator.create(Button);" ++
+        "errdefer allocator.destroy(self);" ++
+        "self.label = try allocator.dupe(u8, label);" ++
+        "errdefer allocator.free(self.label);" ++
+        "return self;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "arbitrary create methods are not assumed to allocate" {
+    const source =
+        "fn run(protocol: *Protocol) !void {" ++
+        "const result = try protocol.create();" ++
+        "result.send();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "opaque methods may take ownership of pool allocations" {
+    const source =
+        "fn run(self: *Server, allocator: std.mem.Allocator) !void {" ++
+        "const socket = try self.socket_pool.create(allocator);" ++
+        "socket.read();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "non-allocator dupe methods may pair with destroy" {
     const source =
         "fn run(parsed: anytype) void {" ++
@@ -1632,6 +1696,30 @@ test "owned returns allocated by an arena parameter need no individual cleanup" 
         "fn run(arena: std.mem.Allocator) !void {" ++
         "const nodes = try nodesAtLoc(arena);" ++
         "_ = nodes;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "owned returns allocated through an arena field need no individual cleanup" {
+    const source =
+        "fn nodesAtLoc(allocator: std.mem.Allocator) ![]Node { return allocator.alloc(Node, 4); }" ++
+        "fn run(context: anytype) !void {" ++
+        "const nodes = try nodesAtLoc(context.state.arena);" ++
+        "_ = nodes;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "qualified constructors passed an arena inherit its lifetime" {
+    const source =
+        "const ZigTag = struct { const node = struct { fn create(allocator: std.mem.Allocator) !*Node { return allocator.create(Node); } }; };" ++
+        "fn run(context: anytype) !void {" ++
+        "const node = try ZigTag.node.create(context.state.arena);" ++
+        "_ = node;" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);

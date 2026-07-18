@@ -817,12 +817,11 @@ const FunctionDeclaration = struct {
     file_index: usize,
     name: []const u8,
     span: std.zig.Token.Loc,
-    source: [:0]const u8,
-    tokens: []const std.zig.Token,
-    body_start: usize,
-    body_end: usize,
+    calls: []const []const u8,
     inline_fn: bool,
 };
+
+const FunctionDeclarationsByName = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize));
 
 fn findRecursiveCalls(
     allocator: std.mem.Allocator,
@@ -832,6 +831,12 @@ fn findRecursiveCalls(
 ) !void {
     if (configuration.level(.recursive_call) == .off) return;
     var declarations: std.ArrayList(FunctionDeclaration) = .empty;
+    var declarations_by_name: FunctionDeclarationsByName = .empty;
+    defer {
+        var declaration_indices = declarations_by_name.valueIterator();
+        while (declaration_indices.next()) |indices| indices.deinit(allocator);
+        declarations_by_name.deinit(allocator);
+    }
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
@@ -840,19 +845,19 @@ fn findRecursiveCalls(
             const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
             const opening = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
             const closing = matchingToken(file.tokens, opening, .l_brace, .r_brace) orelse continue;
+            const name = tokenText(file.source, file.tokens[fn_index + 1]);
             try declarations.append(allocator, .{
                 .file_index = file_index,
-                .name = tokenText(file.source, file.tokens[fn_index + 1]),
+                .name = name,
                 .span = file.tokens[fn_index + 1].loc,
-                .source = file.source,
-                .tokens = file.tokens,
-                .body_start = opening + 1,
-                .body_end = closing,
+                .calls = try collectCalledFunctions(allocator, file.source, file.tokens, opening + 1, closing),
                 .inline_fn = fn_index > 0 and file.tokens[fn_index - 1].tag == .keyword_inline,
             });
+            const entry = try declarations_by_name.getOrPutValue(allocator, name, .empty);
+            try entry.value_ptr.append(allocator, declarations.items.len - 1);
         }
     }
-    for (declarations.items, 0..) |declaration, index| {
+    for (declarations.items) |declaration| {
         if (declaration.inline_fn or !callsFunction(declaration, declaration.name)) continue;
         try found.append(allocator, .{
             .file_index = declaration.file_index,
@@ -860,39 +865,62 @@ fn findRecursiveCalls(
             .span = declaration.span,
             .message = try std.fmt.allocPrint(allocator, "function '{s}' calls itself recursively; use an explicitly bounded worklist", .{declaration.name}),
         });
-        _ = index;
     }
     for (declarations.items, 0..) |left, left_index| {
         if (left.inline_fn) continue;
-        for (declarations.items[left_index + 1 ..]) |right| {
-            if (right.inline_fn or !callsFunction(left, right.name) or !callsFunction(right, left.name)) continue;
-            try found.append(allocator, .{
-                .file_index = right.file_index,
-                .rule = .recursive_call,
-                .span = right.span,
-                .message = try std.fmt.allocPrint(allocator, "mutual recursion cycle '{s} -> {s} -> {s}' has input-controlled stack depth", .{ left.name, right.name, left.name }),
-            });
+        for (left.calls) |called_name| {
+            const right_indices = declarations_by_name.get(called_name) orelse continue;
+            for (right_indices.items) |right_index| {
+                if (right_index <= left_index) continue;
+                const right = declarations.items[right_index];
+                if (right.inline_fn or !callsFunction(right, left.name)) continue;
+                try found.append(allocator, .{
+                    .file_index = right.file_index,
+                    .rule = .recursive_call,
+                    .span = right.span,
+                    .message = try std.fmt.allocPrint(allocator, "mutual recursion cycle '{s} -> {s} -> {s}' has input-controlled stack depth", .{ left.name, right.name, left.name }),
+                });
+            }
         }
     }
 }
 
 fn callsFunction(declaration: FunctionDeclaration, name: []const u8) bool {
-    var index = declaration.body_start;
-    while (index < declaration.body_end) : (index += 1) {
-        const token = declaration.tokens[index];
-        if (token.tag == .keyword_fn and index + 2 < declaration.body_end and
-            declaration.tokens[index + 1].tag == .identifier and declaration.tokens[index + 2].tag == .l_paren)
+    for (declaration.calls) |called_name| if (std.mem.eql(u8, called_name, name)) return true;
+    return false;
+}
+
+fn collectCalledFunctions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    body_start: usize,
+    body_end: usize,
+) ![]const []const u8 {
+    var calls: std.ArrayList([]const u8) = .empty;
+    var index = body_start;
+    while (index < body_end) : (index += 1) {
+        const token = tokens[index];
+        if (token.tag == .keyword_fn and index + 2 < body_end and
+            tokens[index + 1].tag == .identifier and tokens[index + 2].tag == .l_paren)
         {
-            const parameters_end = matchingToken(declaration.tokens, index + 2, .l_paren, .r_paren) orelse continue;
-            const body_opening = syntax_scope.functionBodyAfterParameters(declaration.tokens, parameters_end) orelse continue;
-            const body_closing = matchingToken(declaration.tokens, body_opening, .l_brace, .r_brace) orelse continue;
-            if (body_closing < declaration.body_end) index = body_closing;
+            const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
+            const body_opening = syntax_scope.functionBodyAfterParameters(tokens, parameters_end) orelse continue;
+            const body_closing = matchingToken(tokens, body_opening, .l_brace, .r_brace) orelse continue;
+            if (body_closing < body_end) index = body_closing;
             continue;
         }
-        if (token.tag == .identifier and tokenIs(declaration.source, token, name) and index + 1 < declaration.body_end and declaration.tokens[index + 1].tag == .l_paren and
-            (index == declaration.body_start or declaration.tokens[index - 1].tag != .period)) return true;
+        if (token.tag != .identifier or index + 1 >= body_end or tokens[index + 1].tag != .l_paren or
+            (index > body_start and tokens[index - 1].tag == .period)) continue;
+        const name = tokenText(source, token);
+        var already_recorded = false;
+        for (calls.items) |called_name| if (std.mem.eql(u8, called_name, name)) {
+            already_recorded = true;
+            break;
+        };
+        if (!already_recorded) try calls.append(allocator, name);
     }
-    return false;
+    return try calls.toOwnedSlice(allocator);
 }
 
 fn bindingHasAllocatorType(file: IndexedSourceFile, start: usize, end: usize, name: []const u8) bool {

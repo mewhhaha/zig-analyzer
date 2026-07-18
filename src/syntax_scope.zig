@@ -287,7 +287,10 @@ fn identifierIsNamedDeclaration(tokens: []const std.zig.Token, index: usize) boo
     if (index == 0 or index + 1 >= tokens.len) return false;
     return switch (tokens[index - 1].tag) {
         .keyword_fn => tokens[index + 1].tag == .l_paren,
-        .keyword_const, .keyword_var => (tokens[index + 1].tag == .equal or tokens[index + 1].tag == .colon) and
+        .keyword_const, .keyword_var => switch (tokens[index + 1].tag) {
+            .equal, .colon, .keyword_align, .keyword_addrspace, .keyword_linksection => true,
+            else => false,
+        } and
             declarationKeywordStartsStatement(tokens, index - 1),
         else => false,
     };
@@ -295,6 +298,7 @@ fn identifierIsNamedDeclaration(tokens: []const std.zig.Token, index: usize) boo
 
 fn declarationKeywordStartsStatement(tokens: []const std.zig.Token, index: usize) bool {
     if (index == 0) return true;
+    if (index >= 2 and tokens[index - 1].tag == .string_literal and tokens[index - 2].tag == .keyword_extern) return true;
     return switch (tokens[index - 1].tag) {
         .l_brace,
         .r_brace,
@@ -576,10 +580,21 @@ fn expressionEnd(tokens: []const std.zig.Token, start: usize) ?usize {
             brace_depth -= 1;
         },
         .pipe => inside_capture = !inside_capture,
-        .semicolon, .comma => if (!inside_capture and parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) return index -| 1,
+        .semicolon => if (!inside_capture and parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) return index -| 1,
+        .comma => if (!inside_capture and parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0 and
+            !commaContinuesDestructuringAssignment(tokens, index)) return index -| 1,
         else => {},
     };
     return null;
+}
+
+fn commaContinuesDestructuringAssignment(tokens: []const std.zig.Token, comma_index: usize) bool {
+    for (tokens[comma_index + 1 ..]) |token| switch (token.tag) {
+        .equal => return true,
+        .semicolon, .l_brace, .r_brace => return false,
+        else => {},
+    };
+    return false;
 }
 
 fn spanContains(scope: std.zig.Token.Loc, occurrence: std.zig.Token.Loc) bool {
@@ -787,6 +802,23 @@ test "container declarations remain visible after fields" {
     try std.testing.expect(findBinding(source, tokens, state_use.?) != null);
 }
 
+test "aligned and ABI-named container declarations resolve before their declaration" {
+    const source: [:0]const u8 =
+        "const first = aligned_table[0]; const second = &external_value;\n" ++
+        "const aligned_table align(64) = [_]u8{1}; extern \"c\" var external_value: u8;\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    const declarations_start = std.mem.indexOf(u8, source, "const aligned_table").?;
+    var resolved_uses: usize = 0;
+    for (tokens, 0..) |token, index| {
+        if (token.loc.start >= declarations_start or token.tag != .identifier) continue;
+        const name = tokenText(source, token);
+        if (!std.mem.eql(u8, name, "aligned_table") and !std.mem.eql(u8, name, "external_value")) continue;
+        if (findBinding(source, tokens, index) != null) resolved_uses += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), resolved_uses);
+}
+
 test "captures span an unbraced loop expression with another capture" {
     const source: [:0]const u8 =
         "fn run(optional: ?u8, values: []u8) void { if (optional) |name| for (values, 0..) |value, index| { _ = name + value + index; }; }\n";
@@ -798,4 +830,17 @@ test "captures span an unbraced loop expression with another capture" {
         if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "name")) name_use = index;
     }
     try std.testing.expect(findBinding(source, tokens, name_use.?) != null);
+}
+
+test "captures span an unbraced destructuring assignment" {
+    const source: [:0]const u8 =
+        "fn run(optional: ?Pair) void { var x: u8 = 0; var y: u8 = 0; if (optional) |pair| x, y = pair.values(); _ = x + y; }\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    const use_start = std.mem.indexOf(u8, source, "pair.values").?;
+    var pair_use: ?usize = null;
+    for (tokens, 0..) |token, index| {
+        if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "pair")) pair_use = index;
+    }
+    try std.testing.expect(findBinding(source, tokens, pair_use.?) != null);
 }

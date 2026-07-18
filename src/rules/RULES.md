@@ -240,6 +240,8 @@ Compiler-backed project rules are opt-in.
   slice with one value.
 - [`prefer-memcpy`](prefer-memcpy.md) — Reports element loops that only copy
   corresponding elements between distinct slices.
+- [`prefer-switch`](prefer-switch.md) — Reports integer, enum, or error equality
+  dispatch expressed as a repeated if/else-if chain.
 - [`prefer-string-switch`](prefer-string-switch.md) — Reports repeated string
   equality dispatch over one subject.
 - [`prefer-log-over-print`](prefer-log-over-print.md) — Reports production

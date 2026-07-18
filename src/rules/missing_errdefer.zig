@@ -19,6 +19,7 @@ pub fn run(context: RuleRun) !void {
         const receiver = context.source[context.tokens[acquisition.receiver_start].loc.start..context.tokens[acquisition.receiver_end].loc.end];
         const method = context.tokenText(acquisition.method_index);
         if (std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
+        if (std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
         if (declarationLooksArenaBacked(context, context.tokenText(acquisition.receiver_start))) continue;
         if (scopeReleasesBinding(context, scope_opening, scope_end, binding_name)) continue;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out,
@@ -116,9 +117,17 @@ fn allocatingAcquisition(context: RuleRun, declaration_index: usize, declaration
     const call_close = context.matchingToken(path_end + 1, .l_paren, .r_paren) orelse return null;
     if (call_close + 1 != declaration_end) return null;
     if (!isAllocatingMethod(context.tokenText(path_end))) return null;
+    if (argumentsReferenceArena(context, path_end + 2, call_close)) return null;
     if ((context.tokenIs(path_end, "dupe") or context.tokenIs(path_end, "dupeZ")) and
         !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
     return .{ .receiver_start = equal + 2, .receiver_end = path_end - 2, .method_index = path_end };
+}
+
+fn argumentsReferenceArena(context: RuleRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and std.ascii.indexOfIgnoreCase(context.tokenText(index), "arena") != null) return true;
+    }
+    return false;
 }
 
 fn receiverLooksLikeAllocator(context: RuleRun, receiver_start: usize, receiver_end: usize) bool {
@@ -319,6 +328,19 @@ test "allocations reclaimed by a deferred pool deinit stay clean" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
+test "pool-owned allocations do not require individual error cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn start(self: anytype) !void {\n" ++
+        "    const completion = try self.completion_pool.create(self.allocator);\n" ++
+        "    try self.socket.bind();\n" ++
+        "    use(completion);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
 test "a try inside a nested function declaration is not a fallible operation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -360,6 +382,18 @@ test "dupe on a non-allocator receiver does not invent allocator provenance" {
         "fn complete(tuple_info: anytype, arena_allocator: std.mem.Allocator, ip: anytype) !void {\n" ++
         "    const tuple_types = try tuple_info.types.dupe(arena_allocator, ip);\n" ++
         "    try render(tuple_types);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "constructors passed an arena do not require individual error cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(context: anytype) !void {\n" ++
+        "    const node = try ZigTag.node.create(context.state.arena, .{});\n" ++
+        "    try render(node);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);

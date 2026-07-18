@@ -217,24 +217,15 @@ pub fn fileNameFindingWithTokens(
     if (level == .off) return null;
     const basename = std.fs.path.basename(path);
     if (!std.mem.endsWith(u8, basename, ".zig") or basename.len == ".zig".len) return null;
+    if (std.mem.eql(u8, basename, "build.zig")) return null;
     const name = basename[0 .. basename.len - ".zig".len];
-    var brace_depth: usize = 0;
-    var parenthesis_depth: usize = 0;
-    var bracket_depth: usize = 0;
+    _ = tokens;
+    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    defer tree.deinit(allocator);
     var has_top_level_fields = false;
-    for (tokens, 0..) |token, index| {
-        switch (token.tag) {
-            .l_brace => brace_depth += 1,
-            .r_brace => brace_depth -|= 1,
-            .l_paren => parenthesis_depth += 1,
-            .r_paren => parenthesis_depth -|= 1,
-            .l_bracket => bracket_depth += 1,
-            .r_bracket => bracket_depth -|= 1,
-            .identifier => if (brace_depth == 0 and parenthesis_depth == 0 and bracket_depth == 0 and index + 1 < tokens.len and
-                tokens[index + 1].tag == .colon and (index == 0 or switch (tokens[index - 1].tag) {
-                .keyword_const, .keyword_var, .keyword_fn => false,
-                else => true,
-            })) {
+    for (tree.rootDecls()) |declaration| {
+        switch (tree.nodeTag(declaration)) {
+            .container_field, .container_field_align, .container_field_init => {
                 has_top_level_fields = true;
                 break;
             },
@@ -501,8 +492,22 @@ fn labeledConstructEnd(tokens: []const std.zig.Token, construct: usize) ?usize {
             .r_paren => parenthesis_depth -|= 1,
             .l_bracket => bracket_depth += 1,
             .r_bracket => bracket_depth -|= 1,
-            .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0)
-                return matchingToken(tokens, cursor, .l_brace, .r_brace),
+            .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0) {
+                const body_end = matchingToken(tokens, cursor, .l_brace, .r_brace) orelse return null;
+                if (body_end + 2 < tokens.len and tokens[body_end + 1].tag == .keyword_else) {
+                    const else_start = body_end + 2;
+                    if (tokens[else_start].tag == .l_brace) {
+                        return matchingToken(tokens, else_start, .l_brace, .r_brace);
+                    }
+                    if (else_start + 2 < tokens.len and tokens[else_start].tag == .identifier and
+                        tokens[else_start + 1].tag == .colon and tokens[else_start + 2].tag == .l_brace)
+                    {
+                        return matchingToken(tokens, else_start + 2, .l_brace, .r_brace);
+                    }
+                    return statementEnd(tokens, else_start);
+                }
+                return body_end;
+            },
             .semicolon => if (parenthesis_depth == 0 and bracket_depth == 0) return cursor,
             else => {},
         }
@@ -1186,16 +1191,9 @@ fn findUndefinedValueEscapes(
         if (token.tag != .keyword_var or declaration_index + 3 >= tokens.len or
             tokens[declaration_index + 1].tag != .identifier) continue;
         const statement_end = statementEnd(tokens, declaration_index) orelse continue;
-        var undefined_index: ?usize = null;
-        for (tokens[declaration_index + 2 .. statement_end], declaration_index + 2..) |initializer_token, index| {
-            if (tokenIs(source, initializer_token, "undefined")) {
-                undefined_index = index;
-                break;
-            }
-        }
-        if (undefined_index == null) continue;
+        const undefined_index = undefinedInitializer(tokens, source, declaration_index + 2, statement_end) orelse continue;
         var type_contains_array = false;
-        for (tokens[declaration_index + 2 .. undefined_index.?]) |type_token| {
+        for (tokens[declaration_index + 2 .. undefined_index]) |type_token| {
             if (type_token.tag == .l_bracket) type_contains_array = true;
         }
         if (type_contains_array) continue;
@@ -1241,6 +1239,31 @@ fn findUndefinedValueEscapes(
             break;
         }
     }
+}
+
+fn undefinedInitializer(
+    tokens: []const std.zig.Token,
+    source: []const u8,
+    start: usize,
+    end: usize,
+) ?usize {
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    for (tokens[start..end], start..) |token, index| switch (token.tag) {
+        .l_paren => parenthesis_depth += 1,
+        .r_paren => parenthesis_depth -|= 1,
+        .l_bracket => bracket_depth += 1,
+        .r_bracket => bracket_depth -|= 1,
+        .l_brace => brace_depth += 1,
+        .r_brace => brace_depth -|= 1,
+        .equal => if (parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+            if (index + 1 < end and tokenIs(source, tokens[index + 1], "undefined")) return index + 1;
+            return null;
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn usedByTypeQuery(source: []const u8, tokens: []const std.zig.Token, use_index: usize) bool {
@@ -1726,6 +1749,13 @@ fn collectContainerFields(
                         .r_brace, .comma, .semicolon, .doc_comment, .container_doc_comment => false,
                         else => true,
                     }) continue;
+                if (kind == .structure and index + 1 < closing and tokens[index + 1].tag == .comma) {
+                    try fields.append(allocator, .{
+                        .name = try std.fmt.allocPrint(allocator, "@\"{d}\"", .{fields.items.len}),
+                        .required = true,
+                    });
+                    continue;
+                }
                 if (kind == .structure and (index + 1 >= closing or tokens[index + 1].tag != .colon)) continue;
                 try fields.append(allocator, .{
                     .name = tokenText(source, tokens[index]),
@@ -1808,7 +1838,7 @@ fn findComptimeReflectionIssues(
 }
 
 fn containerHasField(container: Container, name: []const u8) bool {
-    for (container.fields) |field| if (std.mem.eql(u8, field.name, name)) return true;
+    for (container.fields) |field| if (identifierNamesEqual(field.name, name)) return true;
     return false;
 }
 
@@ -1820,7 +1850,7 @@ fn containerHasDeclaration(
 ) bool {
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_const or index + 4 >= tokens.len or
-            !tokenIs(source, tokens[index + 1], container_name) or tokens[index + 2].tag != .equal) continue;
+            !identifierNamesEqual(tokenText(source, tokens[index + 1]), container_name) or tokens[index + 2].tag != .equal) continue;
         var opening = index + 4;
         if (tokens[index + 3].tag == .keyword_union and opening < tokens.len and tokens[opening].tag == .l_paren) {
             opening = (matchingToken(tokens, opening, .l_paren, .r_paren) orelse continue) + 1;
@@ -1833,7 +1863,7 @@ fn containerHasDeclaration(
                 .l_brace => depth += 1,
                 .r_brace => depth -= 1,
                 .keyword_fn, .keyword_const, .keyword_var => if (depth == 1 and member_index + 1 < closing and
-                    tokenIs(source, tokens[member_index + 1], declaration_name)) return true,
+                    identifierNamesEqual(tokenText(source, tokens[member_index + 1]), declaration_name)) return true,
                 else => {},
             }
         }
@@ -2145,7 +2175,7 @@ fn containerNamed(
     for (0..16) |_| {
         var selected: ?Container = null;
         for (containers) |container| {
-            if (!std.mem.eql(u8, container.name, name) or !scopeContains(container.scope, use_index)) continue;
+            if (!identifierNamesEqual(container.name, name) or !scopeContains(container.scope, use_index)) continue;
             if (selected == null or scopeDepth(container.scope) > scopeDepth(selected.?.scope)) selected = container;
         }
         const visible_binding = scope_index.findBindingNamed(name, use_index);
@@ -2160,7 +2190,7 @@ fn containerNamed(
 
 fn containerDeclared(containers: []const Container, name: []const u8) bool {
     for (containers) |container| {
-        if (std.mem.eql(u8, container.name, name)) return true;
+        if (identifierNamesEqual(container.name, name)) return true;
     }
     return false;
 }
@@ -2830,10 +2860,6 @@ fn declarationNamesType(
             }
             if (target_index > import_end and target_index + 1 < tokens.len and isTitleCase(tokenText(source, tokens[target_index]))) {
                 if (tokens[target_index + 1].tag == .semicolon) return true;
-                if (tokens[target_index + 1].tag == .l_paren) {
-                    const call_end = matchingToken(tokens, target_index + 1, .l_paren, .r_paren) orelse return false;
-                    if (call_end + 1 < tokens.len and tokens[call_end + 1].tag == .semicolon) return true;
-                }
             }
         }
     }
@@ -2873,7 +2899,7 @@ fn declarationNamesType(
         .l_paren => {
             const call_end = matchingToken(tokens, target_index + 1, .l_paren, .r_paren) orelse return false;
             if (call_end + 1 >= tokens.len or tokens[call_end + 1].tag != .semicolon) return false;
-            if (isTitleCase(target)) return true;
+            return type_declaring_names.contains(target);
         },
         else => return false,
     }
@@ -3878,6 +3904,17 @@ fn tokenText(source: []const u8, token: std.zig.Token) []const u8 {
     return source[token.loc.start..token.loc.end];
 }
 
+fn identifierNamesEqual(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, identifierName(left), identifierName(right));
+}
+
+fn identifierName(spelling: []const u8) []const u8 {
+    if (spelling.len >= 3 and std.mem.startsWith(u8, spelling, "@\"") and spelling[spelling.len - 1] == '"') {
+        return spelling[2 .. spelling.len - 1];
+    }
+    return spelling;
+}
+
 fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool {
     return std.mem.eql(u8, tokenText(source, token), expected);
 }
@@ -4810,7 +4847,9 @@ test "undefined escape warns only before whole-value initialization" {
     const source: [:0]const u8 =
         "fn leak() u32 { var result: u32 = undefined; return result; }\n" ++
         "fn clean() u32 { var result: u32 = undefined; result = 42; return result; }\n" ++
-        "fn initializedByPointer(fill: anytype) u32 { var result: u32 = undefined; fill(&result); return result; }\n";
+        "fn initializedByPointer(fill: anytype) u32 { var result: u32 = undefined; fill(&result); return result; }\n" ++
+        "fn partial() Pair { var result: Pair = .{ .first = undefined, .second = 1 }; return result; }\n" ++
+        "fn shuffled(value: @Vector(4, u32)) @Vector(4, u32) { var result = @shuffle(u32, value, undefined, [_]i32{ 0, 1, 2, 3 }); return result; }\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
     var warning_count: usize = 0;
     for (found) |finding| if (finding.rule == .undefined_value_escape) {
@@ -5004,7 +5043,7 @@ test "pointer owner stays mutable when another parameter mutates its field type"
     try std.testing.expectEqual(@as(usize, 1), pointer_count);
 }
 
-test "type aliases built from type-returning calls expect TitleCase" {
+test "ambiguous calls do not determine whether a declaration names a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
@@ -5015,12 +5054,7 @@ test "type aliases built from type-returning calls expect TitleCase" {
     var configuration = Configuration.defaults();
     configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
-    var naming_count: usize = 0;
-    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
-        naming_count += 1;
-        try std.testing.expectEqualStrings("bad_list", source[finding.span.start..finding.span.end]);
-    };
-    try std.testing.expectEqual(@as(usize, 1), naming_count);
+    for (found) |finding| try std.testing.expect(finding.rule != .non_idiomatic_name);
 }
 
 test "destructuring assignment counts as mutation of its targets" {
@@ -5262,6 +5296,15 @@ test "top-level sentinel arrays do not make a file a type" {
     const source: [:0]const u8 = "pub const table = [_:0]u8{ 1, 2, 3 };\npub fn run() void {}\n";
     try std.testing.expect((try fileNameFinding(arena.allocator(), source, "tables.zig", configuration)) == null);
     try std.testing.expect((try fileNameFinding(arena.allocator(), source, "Tables.zig", configuration)) != null);
+}
+
+test "build entrypoint keeps its conventional file name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_file_name)] = .information;
+    const source: [:0]const u8 = "pub fn build(b: *Build) void { _ = b; }\n";
+    try std.testing.expect((try fileNameFinding(arena.allocator(), source, "build.zig", configuration)) == null);
 }
 
 test "bound lock results are guards not mutex locks" {
@@ -5651,6 +5694,24 @@ test "void tagged union cases are resolved as members" {
     for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
 }
 
+test "anonymous struct fields resolve by their numbered names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Event = struct { u8, bool, }; fn use(event: Event) void { _ = event.@\"0\"; _ = event.@\"1\"; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
+test "quoted declarations resolve through their unquoted field syntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const IntType = struct { const @\"i64\": IntType = .{}; }; fn use() void { _ = IntType.i64; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
 test "named branches require an enclosing label" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5662,6 +5723,33 @@ test "named branches require an enclosing label" {
         if (finding.rule == .unresolved_label) label_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), label_count);
+}
+
+test "breaks resolve labels on for expressions with else clauses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const all_lower = all_lower: for (\"ABC\") |c| { if (c == 'A') break :all_lower false; } else break :all_lower true;\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_label);
+}
+
+test "breaks resolve labels around for switch expressions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { first }; fn run(modes: []Mode) void { find_mode: for (modes) |mode| switch (mode) { .first => { break :find_mode; } } else {} }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_label);
+}
+
+test "breaks resolve labels on for expressions with labeled else blocks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn find(values: []u8) usize { return blk: for (values, 0..) |value, index| { if (value == 1) break :blk index; } else fallback: { break :fallback 0; }; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_label);
 }
 
 test "field reflection reports missing members on typed values" {

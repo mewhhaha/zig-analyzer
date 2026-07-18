@@ -30,6 +30,7 @@ const rule_modules = .{
     @import("truncating_intcast.zig"),
     @import("padded_byte_compare.zig"),
     @import("compiler_hygiene.zig"),
+    @import("prefer_switch.zig"),
     @import("helping_hand.zig"),
     @import("modernize.zig"),
     @import("discipline_policy.zig"),
