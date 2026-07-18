@@ -132,4 +132,5 @@ configuration, and executable identity all participate in invalidation. Use
 `doctor` checks the host Zig version and every compatibility field in the
 compiler-backend manifest. If the patch or protocol changes, rerun
 `zig build backend`, followed by `zig build install` for an existing
-installation. Protocol v3 backends are not compatible with this release.
+installation. A backend using any protocol version other than the one printed
+by `zig-analyzer version` is not compatible with the current analyzer.
