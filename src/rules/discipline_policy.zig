@@ -275,12 +275,15 @@ fn hasDominatingWhileBound(context: RuleRun, bracket: usize) bool {
         const condition_end = context.matchingToken(while_index + 1, .l_paren, .r_paren) orelse continue;
         if (condition_end + 1 >= bracket or context.tokens[while_index + 2].tag != .identifier or
             !context.tokenIs(while_index + 2, context.tokenText(bracket + 1)) or
-            context.tokens[while_index + 3].tag != .angle_bracket_left or
-            condition_end < while_index + 7 or context.tokens[condition_end - 2].tag != .period or
-            !context.tokenIs(condition_end - 1, "len")) continue;
-        const guarded_sequence_start = while_index + 4;
-        const guarded_sequence_end = condition_end - 2;
-        if (!dottedPathsEqual(context, guarded_sequence_start, guarded_sequence_end, indexed_sequence_start, bracket)) continue;
+            context.tokens[while_index + 3].tag != .angle_bracket_left) continue;
+        const bound_matches = if (condition_end >= while_index + 7 and
+            context.tokens[condition_end - 2].tag == .period and context.tokenIs(condition_end - 1, "len"))
+            dottedPathsEqual(context, while_index + 4, condition_end - 2, indexed_sequence_start, bracket)
+        else if (condition_end == while_index + 5 and context.tokens[condition_end - 1].tag == .number_literal)
+            fixedArrayLengthMatches(context, indexed_sequence_start, bracket, condition_end - 1, while_index)
+        else
+            false;
+        if (!bound_matches) continue;
 
         const loop_body = nextTagBefore(context.tokens, condition_end + 1, .l_brace, .semicolon) orelse continue;
         const loop_end = context.matchingToken(loop_body, .l_brace, .r_brace) orelse continue;
@@ -288,6 +291,26 @@ fn hasDominatingWhileBound(context: RuleRun, bracket: usize) bool {
         return true;
     }
     return false;
+}
+
+fn fixedArrayLengthMatches(
+    context: RuleRun,
+    array_start: usize,
+    array_end: usize,
+    length_index: usize,
+    before: usize,
+) bool {
+    if (array_end != array_start + 1) return false;
+    var matching_length = false;
+    for (context.tokens[0..before], 0..) |token, declaration| {
+        if ((token.tag != .keyword_var and token.tag != .keyword_const) or declaration + 1 >= before or
+            !context.tokenIs(declaration + 1, context.tokenText(array_start))) continue;
+        matching_length = declaration + 5 < before and context.tokens[declaration + 2].tag == .colon and
+            context.tokens[declaration + 3].tag == .l_bracket and context.tokens[declaration + 4].tag == .number_literal and
+            context.tokens[declaration + 5].tag == .r_bracket and
+            std.mem.eql(u8, context.tokenText(declaration + 4), context.tokenText(length_index));
+    }
+    return matching_length;
 }
 
 fn hasDominatingForBound(context: RuleRun, bracket: usize) bool {
@@ -1027,6 +1050,53 @@ test "a matching while condition establishes the bound for its first indexed acc
     const found = try findingsFor(arena.allocator(), source, configuration);
 
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a fixed array length establishes a literal while bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn printSelected(writer: *Writer) !void {\n" ++
+        "const selected: [3]bool = .{ true, false, true };\n" ++
+        "var index: usize = 0;\n" ++
+        "while (index < 3) : (index += 1) {\n" ++
+        "if (selected[index]) try writer.print(\"{d}\", .{index});\n" ++
+        "}\n" ++
+        "_ = one;\n" ++
+        "_ = two;\n" ++
+        "_ = three;\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a shadowed slice does not inherit an outer fixed array bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn printSelected(writer: *Writer, dynamic: []const bool) !void {\n" ++
+        "const selected: [3]bool = .{ true, false, true };\n" ++
+        "{\n" ++
+        "const selected = dynamic;\n" ++
+        "var index: usize = 0;\n" ++
+        "while (index < 3) : (index += 1) {\n" ++
+        "if (selected[index]) try writer.print(\"{d}\", .{index});\n" ++
+        "}\n" ++
+        "}\n" ++
+        "_ = one;\n" ++
+        "_ = two;\n" ++
+        "_ = three;\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 1), found.len);
 }
 
 test "a matching for range establishes the bound for its indexed access" {

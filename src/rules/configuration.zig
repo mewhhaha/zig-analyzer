@@ -796,8 +796,21 @@ fn invalidLevelMessage(allocator: std.mem.Allocator, path: []const u8) ![]const 
 
 fn setTier(configuration: *Configuration, tier: Tier, level: Level) void {
     for (std.enums.values(Rule)) |rule| {
-        if (rule.tier() == tier) configuration.levels[@intFromEnum(rule)] = level;
+        if (rule.tier() == tier and !requiresExplicitConfiguration(rule)) {
+            configuration.levels[@intFromEnum(rule)] = level;
+        }
     }
+}
+
+fn requiresExplicitConfiguration(rule: Rule) bool {
+    return switch (rule) {
+        .import_boundary,
+        .discarded_must_use,
+        .configuration_divergent_api,
+        .unreachable_public_declaration,
+        => true,
+        else => false,
+    };
 }
 
 fn applyLintProfile(configuration: *Configuration, profile: LintProfile) void {
@@ -877,6 +890,21 @@ test "modernize and disciplined profiles enable only their rule families" {
     );
     try std.testing.expectEqual(Level.information, strict.level(.exposed_private_type));
     try std.testing.expectEqual(Level.information, strict.level(.exposed_private_error_set));
+}
+
+test "tier settings preserve contract and compiler fact opt-ins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"correctness":"warning","style":"information"}}
+    );
+
+    try std.testing.expectEqual(Level.off, configuration.level(.import_boundary));
+    try std.testing.expectEqual(Level.off, configuration.level(.discarded_must_use));
+    try std.testing.expectEqual(Level.off, configuration.level(.configuration_divergent_api));
+    try std.testing.expectEqual(Level.off, configuration.level(.unreachable_public_declaration));
+    try std.testing.expectEqual(Level.warning, configuration.level(.missing_errdefer));
+    try std.testing.expectEqual(Level.information, configuration.level(.line_length));
 }
 
 test "threshold and marker rules parse typed settings" {

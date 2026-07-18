@@ -96,6 +96,18 @@ Compiler-backed project rules are opt-in.
   underflows.
 - [`missing-errdefer`](missing-errdefer.md) — Reports an allocation followed by
   another fallible operation without an intervening error-path release.
+- [`copied-io-interface`](copied-io-interface.md) — Reports a standard I/O
+  interface copied away from implementation state used by its callbacks.
+- [`directory-iteration-not-enabled`](directory-iteration-not-enabled.md) —
+  Reports iteration of a directory opened without enabling iteration.
+- [`discarded-read-count`](discarded-read-count.md) — Reports discarded byte
+  counts from partial-read methods.
+- [`discarded-write-count`](discarded-write-count.md) — Reports a discarded
+  partial-write count when `writeAll` is required for complete output.
+- [`unchecked-first-element`](unchecked-first-element.md) — Reports a public
+  function indexing a plain-slice parameter without a visible non-empty proof.
+- [`undefined-readvec-destination`](undefined-readvec-destination.md) — Reports
+  `readVec` calls whose destination slice descriptors remain undefined.
 - [`aliased-memcpy`](aliased-memcpy.md) — Reports `@memcpy` source and
   destination slices derived from the same base value.
 - [`usize-in-packed-struct`](usize-in-packed-struct.md) — Reports pointer-sized
@@ -149,6 +161,8 @@ Compiler-backed project rules are opt-in.
   or `@hasDecl` checks that are always false for a resolved analyzed type shape.
 - [`constant-comptime-condition`](constant-comptime-condition.md) — Reports an
   explicitly comptime condition that is the literal `true` or `false`.
+- [`invariant-loop-condition`](invariant-loop-condition.md) — Reports a simple
+  while condition fixed by a literal constant.
 - [`vague-type-name`](vague-type-name.md) — Reports type names containing
   generic words that do not describe a domain role.
 - [`redundant-qualified-name`](redundant-qualified-name.md) — Reports a nested

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const syntax_scope = @import("../syntax_scope.zig");
+const owned_call = @import("owned_call.zig");
 const types = @import("types.zig");
 
 pub const Source = struct {
@@ -541,6 +542,13 @@ fn directOwnedBinding(
 }
 
 fn allocatorParameter(function: FunctionSummary, callable: []const u8, call_open: usize, call_end: usize) ?usize {
+    if (owned_call.standardAllocatorArgument(callable)) |argument_index| {
+        for (function.parameter_names, 0..) |parameter, parameter_index| {
+            const actual_argument = exactArgumentIndex(function.source, function.tokens, parameter, call_open + 1, call_end) orelse continue;
+            if (actual_argument == argument_index) return parameter_index;
+        }
+        return null;
+    }
     const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
     const receiver = callable[0..separator];
     if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
@@ -803,25 +811,11 @@ fn callableBaseName(callable: []const u8) []const u8 {
 }
 
 fn allocationRelease(method: []const u8) ?[]const u8 {
-    const free_methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "realloc" };
-    for (free_methods) |candidate| if (std.mem.eql(u8, method, candidate)) return "free";
-    if (std.mem.eql(u8, method, "create")) return "destroy";
-    return null;
+    return owned_call.releaseForMethod(method);
 }
 
 fn allocationReleaseForCallable(callable: []const u8) ?[]const u8 {
-    const method = callableBaseName(callable);
-    const release = allocationRelease(method) orelse return null;
-    if (!std.mem.eql(u8, method, "create")) return release;
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
-    const receiver = callable[0..separator];
-    const receiver_name = if (std.mem.lastIndexOfScalar(u8, receiver, '.')) |receiver_separator|
-        receiver[receiver_separator + 1 ..]
-    else
-        receiver;
-    return if (std.ascii.indexOfIgnoreCase(receiver_name, "alloc") != null or
-        std.ascii.indexOfIgnoreCase(receiver_name, "pool") != null or
-        std.mem.eql(u8, receiver_name, "gpa")) release else null;
+    return owned_call.releaseForCallable(callable);
 }
 
 fn matchingToken(tokens: []const std.zig.Token, opening: usize) ?usize {
@@ -890,6 +884,19 @@ test "qualified allocation helpers retain allocator provenance" {
     const sources = [_]Source{.{
         .file_index = 0,
         .source = "fn make(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 { return utils.dupe(u8, allocator, bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("make").?;
+    try std.testing.expectEqualStrings("free", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "standard allocation helpers retain allocator provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn make(allocator: std.mem.Allocator, parts: []const []const u8) ![]u8 { return std.mem.concat(allocator, u8, parts); }",
     }};
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     const owned = index.ownedReturn("make").?;

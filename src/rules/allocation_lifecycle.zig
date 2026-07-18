@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const syntax_scope = @import("../syntax_scope.zig");
+const owned_call = @import("owned_call.zig");
 const summaries = @import("summaries.zig");
 const types = @import("types.zig");
 const tokenRefersToBinding = @import("context.zig").tokenRefersToBinding;
@@ -249,6 +251,21 @@ fn allocationFromCall(
     const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
     const method = tree.tokenSlice(method_token);
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
+    const callable = source[tokens[tree.firstToken(call.ast.fn_expr)].loc.start..tokens[tree.lastToken(call.ast.fn_expr)].loc.end];
+    if (owned_call.standardAllocatorArgument(callable)) |parameter| {
+        if (parameter >= call.ast.params.len) return null;
+        const allocator_argument = call.ast.params[parameter];
+        if (expressionReferencesField(tree, allocator_argument, "arena")) return null;
+        return .{
+            .method = method,
+            .release = "free",
+            .receiver = if (tree.nodeTag(allocator_argument) == .identifier)
+                tree.tokenSlice(tree.nodeMainToken(allocator_argument))
+            else
+                null,
+            .allocator_source = allocatorSourceName(tree, allocator_argument),
+        };
+    }
     if (allocationRelease(method)) |release| {
         if (expressionReferencesField(tree, receiver, "arena")) return null;
         if (std.mem.eql(u8, method, "create") and !expressionLooksLikeAllocationOwner(source, tokens, tree, receiver)) return null;
@@ -535,19 +552,7 @@ fn expressionReferencesField(
 }
 
 fn allocationRelease(method: []const u8) ?[]const u8 {
-    const free_methods = [_][]const u8{
-        "alloc",
-        "allocSentinel",
-        "alignedAlloc",
-        "dupe",
-        "dupeZ",
-        "realloc",
-    };
-    for (free_methods) |candidate| {
-        if (std.mem.eql(u8, method, candidate)) return "free";
-    }
-    if (std.mem.eql(u8, method, "create")) return "destroy";
-    return null;
+    return owned_call.releaseForMethod(method);
 }
 
 fn findMismatchedRelease(
@@ -1725,6 +1730,18 @@ test "dupe methods use a proven allocator receiver" {
     defer freeWarnings(std.testing.allocator, allocator_findings);
     try std.testing.expectEqual(@as(usize, 1), allocator_findings.len);
     try std.testing.expectEqual(types.Rule.mismatched_allocation_release, allocator_findings[0].rule);
+}
+
+test "standard allocation helpers use their allocator argument" {
+    const source =
+        "fn run(allocator: std.mem.Allocator, parts: []const []const u8) !void {" ++
+        "const joined = try std.mem.concat(allocator, u8, parts);" ++
+        "_ = joined.len;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
 }
 
 test "double release and use after release are reported in straight line code" {

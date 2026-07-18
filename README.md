@@ -88,10 +88,14 @@ compiler nor a syntax-based server reports:
 | `@memcpy` between overlapping slices of one buffer | `aliased-memcpy` |
 | `while (i >= 0) : (i -= 1)` on an unsigned index | `unsigned-reverse-loop` |
 | `count * size` passed straight to `alloc` | `allocation-size-overflow` |
+| Copying `file_reader.interface` into a new value | `copied-io-interface` |
+| Calling `iterate()` after `openDir(..., .{})` | `directory-iteration-not-enabled` |
+| Discarding the initialized-byte count from `readVec` | `discarded-read-count` |
+| Passing undefined slice descriptors to `readVec` | `undefined-readvec-destination` |
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 133 rules with stable codes, organized into five named profiles,
+There are 140 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings

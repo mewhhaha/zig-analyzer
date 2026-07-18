@@ -14,7 +14,7 @@ full reanalysis.
 
 ## Rules, tiers, and profiles
 
-There are 133 rules. Each has a stable kebab-case code, such as
+There are 140 rules. Each has a stable kebab-case code, such as
 `missing-errdefer` or `discarded-error`, used consistently in configuration,
 diagnostics, and suppression directives. The full index, with one document
 per rule explaining why it exists and when it fires, is
@@ -67,7 +67,9 @@ rather than silently ignored.
   exclusions narrow; exact files are appropriate for intentionally invalid
   parser, formatter, or syntax-highlighting fixtures.
 - `lints.profile` selects one of the five named profiles.
-- `lints.correctness` and `lints.style` set one level for an entire tier.
+- `lints.correctness` and `lints.style` set one level for a tier. Rules that
+  require a project contract or compiler-backed project facts remain off until
+  they are configured explicitly.
 - `lints.rules` sets individual rules to `off`, `hint`, `information`,
   `warning`, or `error`. A rule with settings of its own takes an object with
   a `level` and its specific options, as `line-length` and `todo-comment`

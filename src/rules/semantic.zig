@@ -675,7 +675,16 @@ fn identifierIsDestructuredAssignmentTarget(tokens: []const std.zig.Token, index
     var cursor = index + 1;
     while (cursor < tokens.len) : (cursor += 1) {
         switch (tokens[cursor].tag) {
-            .comma, .identifier, .period, .l_bracket, .r_bracket, .number_literal => {},
+            .comma,
+            .identifier,
+            .period,
+            .l_bracket,
+            .r_bracket,
+            .number_literal,
+            .keyword_const,
+            .keyword_var,
+            .colon,
+            => {},
             .equal => return true,
             else => return false,
         }
@@ -2905,6 +2914,10 @@ fn declarationNamesType(
         tokens[identifier_index + 2].tag == .builtin and tokens[identifier_index + 3].tag == .l_paren)
     {
         const builtin_name = tokenText(source, tokens[identifier_index + 2]);
+        if (std.mem.eql(u8, builtin_name, "@Vector")) {
+            const call_end = matchingToken(tokens, identifier_index + 3, .l_paren, .r_paren) orelse return false;
+            if (call_end + 1 < tokens.len and tokens[call_end + 1].tag == .l_brace) return false;
+        }
         const type_builtins = [_][]const u8{
             "@This", "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple", "@FieldType",
         };
@@ -3187,6 +3200,7 @@ fn findOfficialStyleIssues(
             if (tokens[pub_index + 2].tag != .identifier) continue;
             if (pub_index > 0 and tokens[pub_index - 1].tag == .doc_comment) continue;
             const declaration_name = tokenText(source, tokens[pub_index + 2]);
+            if (declaration_tag == .keyword_fn and std.mem.eql(u8, declaration_name, "main")) continue;
             try addFinding(allocator, source, configuration, found, .{
                 .rule = .public_declaration_docs,
                 .level = public_docs_level,
@@ -5189,6 +5203,12 @@ test "undefined values initialized by destructuring do not escape" {
         "    quotient, remainder = divmod(1, 2);\n" ++
         "    return quotient + remainder;\n" ++
         "}\n" ++
+        "fn mixed() u32 {\n" ++
+        "    var x: u32 = undefined;\n" ++
+        "    const tuple = .{ 1, 2, 3 };\n" ++
+        "    x, var y: u32, const z = tuple;\n" ++
+        "    return x + y + z;\n" ++
+        "}\n" ++
         "fn leak() u32 { var escaped: u32 = undefined; return escaped; }\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
     var escape_count: usize = 0;
@@ -5197,6 +5217,34 @@ test "undefined values initialized by destructuring do not escape" {
         try std.testing.expectEqualStrings("escaped", source[finding.span.start..finding.span.end]);
     };
     try std.testing.expectEqual(@as(usize, 1), escape_count);
+}
+
+test "vector values use value naming while vector type aliases use type naming" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const vector_value = @Vector(4, u8){ 1, 2, 3, 4 };\n" ++
+        "const VectorType = @Vector(4, u8);\n" ++
+        "const BadVectorValue = @Vector(4, u8){ 1, 2, 3, 4 };\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("BadVectorValue", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "main entry points do not require API documentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "pub fn main() !void {}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.public_declaration_docs)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .public_declaration_docs);
 }
 
 test "needless cast proof stays within the enclosing function" {

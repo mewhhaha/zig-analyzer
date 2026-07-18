@@ -1,5 +1,6 @@
 const std = @import("std");
 const RuleRun = @import("context.zig").RuleRun;
+const owned_call = @import("owned_call.zig");
 const types = @import("types.zig");
 
 pub fn run(context: RuleRun) !void {
@@ -12,34 +13,52 @@ pub fn run(context: RuleRun) !void {
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         if (!startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const acquisition = allocatingAcquisition(context, declaration_index, declaration_end) orelse continue;
+        const acquisition = owningAcquisition(context, declaration_index, declaration_end) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
-        const receiver = context.source[context.tokens[acquisition.receiver_start].loc.start..context.tokens[acquisition.receiver_end].loc.end];
+        const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
+        const callable = context.source[context.tokens[acquisition.callable_start].loc.start..context.tokens[acquisition.method_index].loc.end];
         const method = context.tokenText(acquisition.method_index);
-        if (std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
-        if (std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
-        if (declarationLooksArenaBacked(context, context.tokenText(acquisition.receiver_start))) continue;
+        if (acquisition.kind == .allocation and std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
+        if (acquisition.kind == .allocation and std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
+        if (acquisition.kind == .allocation and declarationLooksArenaBacked(context, context.tokenText(acquisition.release_owner_start))) continue;
         if (scopeReleasesBinding(context, scope_opening, scope_end, binding_name)) continue;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out,
         // error path included.
-        if (scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.receiver_end))) continue;
-        const fallible_index = fallibleBeforeBindingUse(context, declaration_end + 1, scope_end, binding_name) orelse continue;
+        if (acquisition.kind == .allocation and scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end))) continue;
+        const fallible_index = fallibleBeforeBindingUse(
+            context,
+            declaration_end + 1,
+            scope_end,
+            binding_name,
+            acquisition.kind == .network_stream,
+        ) orelse continue;
 
         const release: []const u8 = if (std.mem.eql(u8, method, "create")) "destroy" else "free";
+        const release_statement = switch (acquisition.kind) {
+            .allocation => try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, release, binding_name }),
+            .network_stream => try std.fmt.allocPrint(
+                context.allocator,
+                "{s}.close({s})",
+                .{
+                    binding_name,
+                    context.source[context.tokens[acquisition.close_argument.?.start].loc.start..context.tokens[acquisition.close_argument.?.end - 1].loc.end],
+                },
+            ),
+        };
         const indent = lineIndent(context.source, context.tokens[declaration_index].loc.start);
         const semicolon_end = context.tokens[declaration_end].loc.end;
         const edits = try context.allocator.alloc(types.Edit, 1);
         if (std.mem.indexOfScalarPos(u8, context.source, semicolon_end, '\n')) |line_break| {
             edits[0] = .{
                 .span = .{ .start = line_break + 1, .end = line_break + 1 },
-                .replacement = try std.fmt.allocPrint(context.allocator, "{s}errdefer {s}.{s}({s});\n", .{ indent, receiver, release, binding_name }),
+                .replacement = try std.fmt.allocPrint(context.allocator, "{s}errdefer {s};\n", .{ indent, release_statement }),
             };
         } else {
             edits[0] = .{
                 .span = .{ .start = semicolon_end, .end = semicolon_end },
-                .replacement = try std.fmt.allocPrint(context.allocator, "\n{s}errdefer {s}.{s}({s});", .{ indent, receiver, release, binding_name }),
+                .replacement = try std.fmt.allocPrint(context.allocator, "\n{s}errdefer {s};", .{ indent, release_statement }),
             };
         }
         const fixes = try context.allocator.alloc(types.Fix, 1);
@@ -52,7 +71,7 @@ pub fn run(context: RuleRun) !void {
         const related = try context.allocator.alloc(types.RelatedSpan, 1);
         related[0] = .{
             .span = context.tokens[fallible_index].loc,
-            .message = try context.allocator.dupe(u8, "this fallible operation leaks the allocation when it fails"),
+            .message = try context.allocator.dupe(u8, "this fallible operation leaks the owning value when it fails"),
         };
         try context.emit(.{
             .rule = .missing_errdefer,
@@ -60,8 +79,8 @@ pub fn run(context: RuleRun) !void {
             .span = context.tokens[declaration_index + 1].loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "allocation '{s}' from '{s}.{s}' has no errdefer release before the next fallible operation, so the error path leaks it",
-                .{ binding_name, receiver, method },
+                "owning value '{s}' from '{s}' has no errdefer release before the next fallible operation, so the error path leaks it",
+                .{ binding_name, callable },
             ),
             .related = related,
             .fixes = fixes,
@@ -80,12 +99,15 @@ fn startsStatement(context: RuleRun, index: usize) bool {
 }
 
 const Acquisition = struct {
-    receiver_start: usize,
-    receiver_end: usize,
+    kind: enum { allocation, network_stream } = .allocation,
+    callable_start: usize,
+    release_owner_start: usize,
+    release_owner_end: usize,
     method_index: usize,
+    close_argument: ?TokenRange = null,
 };
 
-fn allocatingAcquisition(context: RuleRun, declaration_index: usize, declaration_end: usize) ?Acquisition {
+fn owningAcquisition(context: RuleRun, declaration_index: usize, declaration_end: usize) ?Acquisition {
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;
     var brace_depth: usize = 0;
@@ -116,11 +138,67 @@ fn allocatingAcquisition(context: RuleRun, declaration_index: usize, declaration
         context.tokens[path_end + 1].tag != .l_paren) return null;
     const call_close = context.matchingToken(path_end + 1, .l_paren, .r_paren) orelse return null;
     if (call_close + 1 != declaration_end) return null;
-    if (!isAllocatingMethod(context.tokenText(path_end))) return null;
+    const callable = context.source[context.tokens[equal + 2].loc.start..context.tokens[path_end].loc.end];
+    if (std.mem.eql(u8, callable, "std.Io.net.IpAddress.connect")) {
+        const io_argument = callArgument(context, path_end + 2, call_close, 1) orelse return null;
+        return .{
+            .kind = .network_stream,
+            .callable_start = equal + 2,
+            .release_owner_start = equal + 2,
+            .release_owner_end = path_end - 2,
+            .method_index = path_end,
+            .close_argument = io_argument,
+        };
+    }
+    const standard_allocator_argument = owned_call.standardAllocatorArgument(callable);
+    if (!isAllocatingMethod(context.tokenText(path_end)) and standard_allocator_argument == null) return null;
     if (argumentsReferenceArena(context, path_end + 2, call_close)) return null;
+    if (standard_allocator_argument) |argument_index| {
+        const argument = callArgument(context, path_end + 2, call_close, argument_index) orelse return null;
+        if (argument.start + 1 != argument.end or context.tokens[argument.start].tag != .identifier) return null;
+        return .{
+            .callable_start = equal + 2,
+            .release_owner_start = argument.start,
+            .release_owner_end = argument.start,
+            .method_index = path_end,
+        };
+    }
     if ((context.tokenIs(path_end, "dupe") or context.tokenIs(path_end, "dupeZ")) and
         !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
-    return .{ .receiver_start = equal + 2, .receiver_end = path_end - 2, .method_index = path_end };
+    return .{
+        .callable_start = equal + 2,
+        .release_owner_start = equal + 2,
+        .release_owner_end = path_end - 2,
+        .method_index = path_end,
+    };
+}
+
+const TokenRange = struct { start: usize, end: usize };
+
+fn callArgument(context: RuleRun, start: usize, end: usize, expected_index: usize) ?TokenRange {
+    var argument_index: usize = 0;
+    var argument_start = start;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    for (context.tokens[start..end], start..) |token, index| {
+        switch (token.tag) {
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => parenthesis_depth -|= 1,
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            .comma => if (parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+                if (argument_index == expected_index) return .{ .start = argument_start, .end = index };
+                argument_index += 1;
+                argument_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (argument_index != expected_index or argument_start >= end) return null;
+    return .{ .start = argument_start, .end = end };
 }
 
 fn argumentsReferenceArena(context: RuleRun, start: usize, end: usize) bool {
@@ -152,9 +230,7 @@ fn receiverLooksLikeAllocator(context: RuleRun, receiver_start: usize, receiver_
 }
 
 fn isAllocatingMethod(name: []const u8) bool {
-    const allocating_methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "create" };
-    for (allocating_methods) |method| if (std.mem.eql(u8, name, method)) return true;
-    return false;
+    return owned_call.releaseForMethod(name) != null and !std.mem.eql(u8, name, "realloc");
 }
 
 fn declarationLooksArenaBacked(context: RuleRun, root_name: []const u8) bool {
@@ -216,7 +292,13 @@ fn scopeDeinitializesReceiver(context: RuleRun, scope_opening: usize, scope_end:
     return false;
 }
 
-fn fallibleBeforeBindingUse(context: RuleRun, start: usize, scope_end: usize, binding: []const u8) ?usize {
+fn fallibleBeforeBindingUse(
+    context: RuleRun,
+    start: usize,
+    scope_end: usize,
+    binding: []const u8,
+    allow_writer_view: bool,
+) ?usize {
     var cursor = start;
     while (cursor < scope_end) {
         const end = context.statementEnd(cursor) orelse return null;
@@ -231,7 +313,11 @@ fn fallibleBeforeBindingUse(context: RuleRun, start: usize, scope_end: usize, bi
                 .keyword_try => if (fallible_index == null) {
                     fallible_index = chunk_index;
                 },
-                .identifier => if (context.tokenIs(chunk_index, binding)) return null,
+                .identifier => if (context.tokenIs(chunk_index, binding)) {
+                    if (fallible_index != null and callsBorrowingWriterMethod(context, cursor, end)) return fallible_index;
+                    if (allow_writer_view and callsMethod(context, cursor, end, "writer")) continue;
+                    return null;
+                },
                 else => {},
             }
         }
@@ -239,6 +325,20 @@ fn fallibleBeforeBindingUse(context: RuleRun, start: usize, scope_end: usize, bi
         cursor = end + 1;
     }
     return null;
+}
+
+fn callsMethod(context: RuleRun, start: usize, end: usize, expected: []const u8) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, expected) and
+            index + 1 < end and context.tokens[index + 1].tag == .l_paren) return true;
+    }
+    return false;
+}
+
+fn callsBorrowingWriterMethod(context: RuleRun, start: usize, end: usize) bool {
+    const borrowing_methods = [_][]const u8{ "write", "writeAll", "print" };
+    for (borrowing_methods) |method| if (callsMethod(context, start, end, method)) return true;
+    return false;
 }
 
 fn lineIndent(source: []const u8, offset: usize) []const u8 {
@@ -373,6 +473,36 @@ test "a multiline typed acquisition with errdefer on the next line stays clean" 
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "standard allocation helpers require error-path cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(allocator: std.mem.Allocator, parts: []const []const u8) !void {\n" ++
+        "    const joined = try std.mem.concat(allocator, u8, parts);\n" ++
+        "    _ = try writer.write(joined);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("    errdefer allocator.free(joined);\n", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "returned network streams require error-path cleanup before fallible writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn connect(io: std.Io, address: std.Io.net.IpAddress) !std.Io.net.Stream {\n" ++
+        "    const stream = try std.Io.net.IpAddress.connect(&address, io, .{});\n" ++
+        "    var stream_writer = stream.writer(io, &.{});\n" ++
+        "    try stream_writer.interface.writeAll(\"request\");\n" ++
+        "    return stream;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("    errdefer stream.close(io);\n", findings[0].fixes[0].edits[0].replacement);
 }
 
 test "dupe on a non-allocator receiver does not invent allocator provenance" {

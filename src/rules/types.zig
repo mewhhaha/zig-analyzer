@@ -140,8 +140,15 @@ pub const Rule = enum {
     assertion_free_test,
     import_boundary,
     discarded_must_use,
+    copied_io_interface,
+    directory_iteration_not_enabled,
+    discarded_read_count,
+    discarded_write_count,
+    unchecked_first_element,
+    undefined_readvec_destination,
     configuration_divergent_api,
     unreachable_public_declaration,
+    invariant_loop_condition,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -191,6 +198,12 @@ pub const Rule = enum {
             .mutated_container_copy,
             .import_boundary,
             .discarded_must_use,
+            .copied_io_interface,
+            .directory_iteration_not_enabled,
+            .discarded_read_count,
+            .discarded_write_count,
+            .unchecked_first_element,
+            .undefined_readvec_destination,
             => .correctness,
             else => .style,
         };
@@ -251,6 +264,7 @@ pub const Rule = enum {
             .prefer_log_over_print,
             .prefer_buffered_writer,
             .prefer_arena,
+            .invariant_loop_condition,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,
