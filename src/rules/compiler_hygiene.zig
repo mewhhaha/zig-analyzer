@@ -1,4 +1,5 @@
 const std = @import("std");
+const syntax_scope = @import("../syntax_scope.zig");
 const RuleRun = @import("context.zig").RuleRun;
 const types = @import("types.zig");
 
@@ -13,17 +14,16 @@ fn findUselessErrorReturns(context: RuleRun) !void {
     const level = context.level(.useless_error_return);
     if (level == .off) return;
     for (context.tokens, 0..) |token, fn_index| {
-        if (token.tag != .keyword_fn or isExported(context, fn_index)) continue;
+        if (token.tag != .keyword_fn or isExported(context, fn_index) or isPublic(context, fn_index) or
+            fn_index + 2 >= context.tokens.len or context.tokens[fn_index + 1].tag != .identifier) continue;
         const opening = nextTag(context.tokens, fn_index + 1, .l_paren) orelse continue;
         const parameters_end = context.matchingToken(opening, .l_paren, .r_paren) orelse continue;
-        const body_open = nextTagBefore(context.tokens, parameters_end + 1, .l_brace, .semicolon) orelse continue;
+        const body_open = syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
         const error_separator = firstTag(context.tokens, parameters_end + 1, body_open, .bang) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (!bodyIsProvenInfallible(context, body_open + 1, body_end)) continue;
-        const name = if (fn_index + 1 < context.tokens.len and context.tokens[fn_index + 1].tag == .identifier)
-            context.tokenText(fn_index + 1)
-        else
-            "function";
+        const name = context.tokenText(fn_index + 1);
+        if (functionIsUsedAsValue(context, fn_index + 1, name)) continue;
         try context.emit(.{
             .rule = .useless_error_return,
             .level = level,
@@ -37,10 +37,21 @@ fn findUselessErrorReturns(context: RuleRun) !void {
     }
 }
 
+fn functionIsUsedAsValue(context: RuleRun, declaration_index: usize, name: []const u8) bool {
+    for (context.tokens, 0..) |token, index| {
+        if (index == declaration_index or token.tag != .identifier or !context.tokenIs(index, name)) continue;
+        if (index + 1 < context.tokens.len and context.tokens[index + 1].tag == .l_paren) continue;
+        return true;
+    }
+    return false;
+}
+
 fn bodyIsProvenInfallible(context: RuleRun, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| switch (token.tag) {
         .keyword_try, .keyword_catch => return false,
         .keyword_error => return false,
+        .keyword_return => if (index + 3 < end and context.tokens[index + 1].tag == .identifier and
+            context.tokens[index + 2].tag == .period and context.tokens[index + 3].tag == .identifier) return false,
         .identifier => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren) return false,
         .builtin => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren and
             !context.tokenIs(index, "@as") and !context.tokenIs(index, "@intCast") and
@@ -88,14 +99,19 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
     }
 
     for (context.tokens, 0..) |token, pub_index| {
-        if (token.tag != .keyword_pub or pub_index + 1 >= context.tokens.len) continue;
+        if (token.tag != .keyword_pub or pub_index + 1 >= context.tokens.len or
+            !publicDeclarationIsReachable(context, pub_index)) continue;
         var signature_start = pub_index + 1;
         if (context.tokens[signature_start].tag == .keyword_extern or context.tokens[signature_start].tag == .keyword_export) continue;
         while (signature_start < context.tokens.len and context.tokens[signature_start].tag != .keyword_fn and
             context.tokens[signature_start].tag != .keyword_const and context.tokens[signature_start].tag != .keyword_var) : (signature_start += 1)
         {}
         if (signature_start >= context.tokens.len) continue;
-        const signature_end = nextTagBefore(context.tokens, signature_start + 1, .l_brace, .semicolon) orelse continue;
+        const signature_end = if (context.tokens[signature_start].tag == .keyword_fn) end: {
+            const parameters_open = nextTag(context.tokens, signature_start + 1, .l_paren) orelse continue;
+            const parameters_end = context.matchingToken(parameters_open, .l_paren, .r_paren) orelse continue;
+            break :end syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
+        } else nextTagBefore(context.tokens, signature_start + 1, .l_brace, .semicolon) orelse continue;
         for (declarations.items) |declaration| {
             const reference = findIdentifier(context, signature_start + 1, signature_end, declaration.name) orelse continue;
             const rule: types.Rule = if (declaration.error_set) .exposed_private_error_set else .exposed_private_type;
@@ -114,6 +130,37 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             });
         }
     }
+}
+
+fn publicDeclarationIsReachable(context: RuleRun, declaration_index: usize) bool {
+    var enclosing = context.enclosingOpeningBrace(declaration_index);
+    while (enclosing) |opening| {
+        const container_declaration = containerDeclarationBefore(context, opening) orelse return false;
+        if (container_declaration == 0 or context.tokens[container_declaration - 1].tag != .keyword_pub) return false;
+        enclosing = context.enclosingOpeningBrace(container_declaration);
+    }
+    return true;
+}
+
+fn containerDeclarationBefore(context: RuleRun, opening: usize) ?usize {
+    var cursor = opening;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .keyword_const => {
+                if (cursor + 3 >= opening or context.tokens[cursor + 1].tag != .identifier or
+                    context.tokens[cursor + 2].tag != .equal) return null;
+                for (context.tokens[cursor + 3 .. opening]) |token| switch (token.tag) {
+                    .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return cursor,
+                    else => {},
+                };
+                return null;
+            },
+            .semicolon, .l_brace, .r_brace, .comma => return null,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn relatedDeclaration(context: RuleRun, declaration: PrivateDeclaration) ![]const types.RelatedSpan {
@@ -281,6 +328,16 @@ fn isExported(context: RuleRun, fn_index: usize) bool {
     return false;
 }
 
+fn isPublic(context: RuleRun, fn_index: usize) bool {
+    var cursor = fn_index;
+    while (cursor > 0 and fn_index - cursor < 4) {
+        cursor -= 1;
+        if (context.tokens[cursor].tag == .keyword_pub) return true;
+        if (context.tokens[cursor].tag == .semicolon or context.tokens[cursor].tag == .l_brace) return false;
+    }
+    return false;
+}
+
 fn identifierDeclarationCount(context: RuleRun, name: []const u8) usize {
     var count: usize = 0;
     for (context.tokens, 0..) |token, index| {
@@ -303,9 +360,25 @@ fn identifierDeclarationCount(context: RuleRun, name: []const u8) usize {
 
 fn findIdentifier(context: RuleRun, start: usize, end: usize, name: []const u8) ?usize {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, name)) return index;
+        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+        if (index > start and context.tokens[index - 1].tag == .period) continue;
+        if (index + 1 < end and context.tokens[index + 1].tag == .period) continue;
+        if (insideStandardFormatterType(context, start, end, index)) continue;
+        return index;
     }
     return null;
+}
+
+fn insideStandardFormatterType(context: RuleRun, start: usize, end: usize, reference: usize) bool {
+    for (context.tokens[start..reference], start..) |token, opening| {
+        if (token.tag != .l_paren or opening < start + 5 or
+            !context.tokenIs(opening - 1, "Alt") or context.tokens[opening - 2].tag != .period or
+            !context.tokenIs(opening - 3, "fmt") or context.tokens[opening - 4].tag != .period or
+            !context.tokenIs(opening - 5, "std")) continue;
+        const closing = context.matchingToken(opening, .l_paren, .r_paren) orelse continue;
+        if (closing < end and reference < closing) return true;
+    }
+    return false;
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -358,6 +431,38 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
         else => {},
     };
     for (seen) |value| try std.testing.expect(value);
+}
+
+test "compiler hygiene ignores function types callbacks and public error contracts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Hooks = struct { callback: *const fn () anyerror!void, };\n" ++
+        "fn callback() !void {}\n" ++
+        "const hooks = Hooks{ .callback = callback };\n" ++
+        "pub fn publicOperation() !void {}\n" ++
+        "fn validate() !void { return ConfigError.InvalidValue; }\n" ++
+        "fn constructed() !struct { value: u8 } { return .{ .value = try load() }; }\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .useless_error_return);
+}
+
+test "private containers do not expose their private receiver types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Secret = struct {};\n" ++
+        "const FormatContext = struct {};\n" ++
+        "const Private = struct { pub fn init() Private { return .{}; } };\n" ++
+        "pub const Api = struct { pub fn secret() Secret { return .{}; } };\n" ++
+        "pub fn formatter() std.fmt.Alt(FormatContext, render) { return .{}; }\n" ++
+        "pub fn qualified() types.Secret { return .{}; }\n";
+    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    var exposed_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .exposed_private_type) exposed_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), exposed_count);
 }
 
 test "mutated container copies reject constructors and type literals" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const syntax_scope = @import("../syntax_scope.zig");
 const types = @import("types.zig");
 
 pub const Source = struct {
@@ -10,6 +11,8 @@ pub const Source = struct {
 };
 
 pub const ParameterEffect = enum { borrowed, released, escaped, unknown };
+
+const TokenRange = struct { start: usize, end: usize };
 
 pub const FunctionSummary = struct {
     file_index: usize,
@@ -24,6 +27,8 @@ pub const FunctionSummary = struct {
     tokens: []const std.zig.Token,
     body_start: usize,
     body_end: usize,
+    parent_function: ?usize = null,
+    nested_function_ranges: []const TokenRange = &.{},
 };
 
 pub const OwnedReturn = struct {
@@ -47,6 +52,7 @@ pub const Index = struct {
         for (index.functions) |function| {
             allocator.free(function.parameter_names);
             allocator.free(function.parameter_effects);
+            allocator.free(function.nested_function_ranges);
         }
         allocator.free(index.functions);
         allocator.free(index.import_aliases);
@@ -227,6 +233,7 @@ pub fn build(
         try collectFunctions(allocator, source_file, tokens, &functions);
         try collectImportAliases(allocator, source_file, tokens, sources, &import_aliases);
     }
+    try collectNestedFunctionRanges(allocator, functions.items);
     const index: Index = .{
         .functions = try functions.toOwnedSlice(allocator),
         .resource_contracts = configuration.resource_contracts,
@@ -241,21 +248,33 @@ pub fn build(
     return index;
 }
 
+fn collectNestedFunctionRanges(allocator: std.mem.Allocator, functions: []FunctionSummary) !void {
+    const nested_ranges = try allocator.alloc(std.ArrayList(TokenRange), functions.len);
+    defer allocator.free(nested_ranges);
+    for (nested_ranges) |*ranges| ranges.* = .empty;
+    errdefer for (nested_ranges) |*ranges| ranges.deinit(allocator);
+    for (functions) |candidate| {
+        const parent = candidate.parent_function orelse continue;
+        try nested_ranges[parent].append(allocator, .{ .start = candidate.body_start, .end = candidate.body_end });
+    }
+    for (functions, nested_ranges) |*function, *ranges| {
+        function.nested_function_ranges = try ranges.toOwnedSlice(allocator);
+    }
+}
+
 fn collectFunctions(
     allocator: std.mem.Allocator,
     source_file: Source,
     tokens: []const std.zig.Token,
     functions: *std.ArrayList(FunctionSummary),
 ) !void {
+    var function_stack: std.ArrayList(usize) = .empty;
+    defer function_stack.deinit(allocator);
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= tokens.len or
             tokens[fn_index + 1].tag != .identifier or tokens[fn_index + 2].tag != .l_paren) continue;
         const parameters_end = matchingToken(tokens, fn_index + 2) orelse continue;
-        var body_start = parameters_end + 1;
-        while (body_start < tokens.len and tokens[body_start].tag != .l_brace and
-            tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start == tokens.len or tokens[body_start].tag != .l_brace) continue;
+        const body_start = syntax_scope.functionBodyAfterParameters(tokens, parameters_end) orelse continue;
         const body_end = matchingToken(tokens, body_start) orelse continue;
         const parameters = try collectParameterNames(
             allocator,
@@ -266,6 +285,12 @@ fn collectFunctions(
         );
         const effects = try allocator.alloc(ParameterEffect, parameters.len);
         @memset(effects, .borrowed);
+        while (function_stack.getLastOrNull()) |candidate| {
+            if (functions.items[candidate].body_end > fn_index) break;
+            _ = function_stack.pop();
+        }
+        const parent_function = function_stack.getLastOrNull();
+        const function_index = functions.items.len;
         try functions.append(allocator, .{
             .file_index = source_file.file_index,
             .name = tokenText(source_file.source, tokens[fn_index + 1]),
@@ -275,7 +300,9 @@ fn collectFunctions(
             .tokens = tokens,
             .body_start = body_start,
             .body_end = body_end,
+            .parent_function = parent_function,
         });
+        try function_stack.append(allocator, function_index);
     }
 }
 
@@ -362,6 +389,7 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
         if (function.unresolved) continue;
         for (function.parameter_names, 0..) |parameter_name, parameter| {
             for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
+                if (tokenBelongsToNestedFunction(function.*, use_index)) continue;
                 if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), parameter_name)) continue;
                 if (useIsDirectRelease(function.*, use_index, configuration.resource_contracts)) {
                     mergeEffect(&function.parameter_effects[parameter], .released);
@@ -385,10 +413,15 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
 const DirectOwnedReturn = struct { release: []const u8, allocator_parameter: ?usize = null };
 
 fn directOwnedReturn(function: FunctionSummary, contracts: []const types.ResourceContract) ?DirectOwnedReturn {
-    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, index| {
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, token_index| {
+        if (tokenBelongsToNestedFunction(function, token_index)) continue;
         if (token.tag != .keyword_return) continue;
-        const statement_end = statementEnd(function.tokens, index, function.body_end);
-        var call_open = index + 1;
+        const statement_end = statementEnd(function.tokens, token_index, function.body_end);
+        if (token_index + 2 == statement_end and function.tokens[token_index + 1].tag == .identifier) {
+            const binding_name = tokenText(function.source, function.tokens[token_index + 1]);
+            if (directOwnedBinding(function, token_index, binding_name, contracts)) |owned| return owned;
+        }
+        var call_open = token_index + 1;
         while (call_open < statement_end) : (call_open += 1) {
             if (function.tokens[call_open].tag != .l_paren) continue;
             const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
@@ -402,6 +435,34 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
                 .allocator_parameter = allocatorParameter(function, callable),
             };
         }
+    }
+    return null;
+}
+
+fn directOwnedBinding(
+    function: FunctionSummary,
+    return_index: usize,
+    binding_name: []const u8,
+    contracts: []const types.ResourceContract,
+) ?DirectOwnedReturn {
+    for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= return_index or
+            function.tokens[declaration_index + 1].tag != .identifier or
+            !std.mem.eql(u8, tokenText(function.source, function.tokens[declaration_index + 1]), binding_name)) continue;
+        const declaration_end = statementEnd(function.tokens, declaration_index, return_index);
+        if (declaration_end >= return_index) continue;
+        var equal_index = declaration_index + 2;
+        while (equal_index < declaration_end and function.tokens[equal_index].tag != .equal) : (equal_index += 1) {}
+        if (equal_index == declaration_end) continue;
+        var call_open = equal_index + 1;
+        while (call_open < declaration_end and function.tokens[call_open].tag != .l_paren) : (call_open += 1) {}
+        if (call_open == declaration_end) continue;
+        const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
+        for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
+            return .{ .release = callableBaseName(contract.release) };
+        };
+        const release = allocationRelease(callableBaseName(callable)) orelse continue;
+        return .{ .release = release, .allocator_parameter = allocatorParameter(function, callable) };
     }
     return null;
 }
@@ -421,6 +482,7 @@ fn propagateCallEffects(index: Index) bool {
     for (index.functions) |*caller| {
         if (caller.unresolved) continue;
         for (caller.tokens[caller.body_start + 1 .. caller.body_end], caller.body_start + 1..) |token, call_open| {
+            if (tokenBelongsToNestedFunction(caller.*, call_open)) continue;
             if (token.tag != .l_paren) continue;
             const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
             const call_end = matchingToken(caller.tokens, call_open) orelse continue;
@@ -499,10 +561,18 @@ fn reachesFunction(index: Index, current: usize, target: usize, visited: []bool)
     visited[current] = true;
     const function = index.functions[current];
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, call_open| {
+        if (tokenBelongsToNestedFunction(function, call_open)) continue;
         if (token.tag != .l_paren) continue;
         const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
         const called = uniqueFunctionIndexForCall(index, function, callable) orelse continue;
         if (called == target or reachesFunction(index, called, target, visited)) return true;
+    }
+    return false;
+}
+
+fn tokenBelongsToNestedFunction(function: FunctionSummary, token_index: usize) bool {
+    for (function.nested_function_ranges) |range| {
+        if (token_index > range.start and token_index < range.end) return true;
     }
     return false;
 }
@@ -680,6 +750,30 @@ test "summaries propagate releases and owned returns through direct calls" {
     try std.testing.expectEqualStrings("free", index.ownedReturn("make").?.release);
     try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("make").?.allocator_parameter);
     try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("forwardMake").?.allocator_parameter);
+}
+
+test "summaries retain ownership returned through a local binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn createThing(allocator: std.mem.Allocator) !*Thing { const thing = try allocator.create(Thing); return thing; }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("createThing").?;
+    try std.testing.expectEqualStrings("destroy", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "summaries exclude nested function bodies from enclosing functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn outer(bytes: []u8) type { return struct { fn inner(bytes: []u8) void { allocator.free(bytes); } }; }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.borrowed, index.parameterEffect("outer", 0));
 }
 
 test "recursive and ambiguous calls remain opaque" {

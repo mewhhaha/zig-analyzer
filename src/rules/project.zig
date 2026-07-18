@@ -775,12 +775,25 @@ fn findAllocationsAfterInit(
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
-            if (token.tag != .keyword_fn or fn_index + 1 >= file.tokens.len or file.tokens[fn_index + 1].tag != .identifier) continue;
+            if (token.tag != .keyword_fn or fn_index + 2 >= file.tokens.len or
+                file.tokens[fn_index + 1].tag != .identifier or file.tokens[fn_index + 2].tag != .l_paren) continue;
             const function_name = tokenText(file.source, file.tokens[fn_index + 1]);
             if (isInitializationName(function_name)) continue;
-            const opening = nextTagBefore(file.tokens, fn_index + 2, .l_brace, .semicolon) orelse continue;
+            const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+            const opening = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
             const closing = matchingToken(file.tokens, opening, .l_brace, .r_brace) orelse continue;
-            for (file.tokens[opening + 1 .. closing], opening + 1..) |body_token, index| {
+            var index = opening + 1;
+            while (index < closing) : (index += 1) {
+                const body_token = file.tokens[index];
+                if (body_token.tag == .keyword_fn and index + 2 < closing and
+                    file.tokens[index + 1].tag == .identifier and file.tokens[index + 2].tag == .l_paren)
+                {
+                    const nested_parameters_end = matchingToken(file.tokens, index + 2, .l_paren, .r_paren) orelse continue;
+                    const nested_opening = syntax_scope.functionBodyAfterParameters(file.tokens, nested_parameters_end) orelse continue;
+                    const nested_closing = matchingToken(file.tokens, nested_opening, .l_brace, .r_brace) orelse continue;
+                    if (nested_closing < closing) index = nested_closing;
+                    continue;
+                }
                 if (body_token.tag != .identifier or index < 2 or file.tokens[index - 1].tag != .period or file.tokens[index - 2].tag != .identifier) continue;
                 var is_allocation = false;
                 for (allocation_methods) |method| {
@@ -822,8 +835,10 @@ fn findRecursiveCalls(
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
-            if (token.tag != .keyword_fn or fn_index + 1 >= file.tokens.len or file.tokens[fn_index + 1].tag != .identifier) continue;
-            const opening = nextTagBefore(file.tokens, fn_index + 2, .l_brace, .semicolon) orelse continue;
+            if (token.tag != .keyword_fn or fn_index + 2 >= file.tokens.len or
+                file.tokens[fn_index + 1].tag != .identifier or file.tokens[fn_index + 2].tag != .l_paren) continue;
+            const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+            const opening = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
             const closing = matchingToken(file.tokens, opening, .l_brace, .r_brace) orelse continue;
             try declarations.append(allocator, .{
                 .file_index = file_index,
@@ -862,7 +877,18 @@ fn findRecursiveCalls(
 }
 
 fn callsFunction(declaration: FunctionDeclaration, name: []const u8) bool {
-    for (declaration.tokens[declaration.body_start..declaration.body_end], declaration.body_start..) |token, index| {
+    var index = declaration.body_start;
+    while (index < declaration.body_end) : (index += 1) {
+        const token = declaration.tokens[index];
+        if (token.tag == .keyword_fn and index + 2 < declaration.body_end and
+            declaration.tokens[index + 1].tag == .identifier and declaration.tokens[index + 2].tag == .l_paren)
+        {
+            const parameters_end = matchingToken(declaration.tokens, index + 2, .l_paren, .r_paren) orelse continue;
+            const body_opening = syntax_scope.functionBodyAfterParameters(declaration.tokens, parameters_end) orelse continue;
+            const body_closing = matchingToken(declaration.tokens, body_opening, .l_brace, .r_brace) orelse continue;
+            if (body_closing < declaration.body_end) index = body_closing;
+            continue;
+        }
         if (token.tag == .identifier and tokenIs(declaration.source, token, name) and index + 1 < declaration.body_end and declaration.tokens[index + 1].tag == .l_paren and
             (index == declaration.body_start or declaration.tokens[index - 1].tag != .period)) return true;
     }
@@ -1108,6 +1134,44 @@ test "disciplined project rules report direct allocation and recursion" {
     };
     try std.testing.expect(saw_allocation);
     try std.testing.expect(saw_recursion);
+}
+
+test "allocation policy attributes nested function work only to the nested function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.allocation_after_init)] = .information;
+    const files = [_]SourceFile{.{
+        .path = "src/factory.zig",
+        .source = "fn Factory() type { return struct { fn work(allocator: std.mem.Allocator) !void { _ = try allocator.alloc(u8, 1); } }; }",
+    }};
+    const found = try findings(arena.allocator(), &files, configuration);
+    var allocations: usize = 0;
+    for (found) |finding| if (finding.rule == .allocation_after_init) {
+        allocations += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "function 'work'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), allocations);
+}
+
+test "recursive calls use the runtime body and stay inside nested functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.recursive_call)] = .information;
+    const files = [_]SourceFile{.{
+        .path = "src/walk.zig",
+        .source = "fn walk() error{Stop}!void { return walk(); } fn Factory() type { return struct { fn inner() void { inner(); } }; }",
+    }};
+    const found = try findings(arena.allocator(), &files, configuration);
+    var recursive_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .recursive_call) {
+            recursive_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, finding.message, "function 'Factory'") == null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), recursive_count);
 }
 
 test "declared import boundaries reject matching project imports" {

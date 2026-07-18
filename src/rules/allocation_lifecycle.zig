@@ -92,8 +92,9 @@ pub fn warningsWithSummaries(
         const binding_name = source[tokens[binding_index].loc.start..tokens[binding_index].loc.end];
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
-        const allocation = allocationFromValue(source, tree, initializer, summary_index) orelse continue;
+        const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
         if (allocation.allocator_source) |allocator_name| {
+            if (std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null) continue;
             if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
         }
         const scope_end = scope_index.enclosingScopeEnd(declaration_index) orelse continue;
@@ -174,17 +175,18 @@ const Allocation = struct {
 fn allocationFromValue(
     source: []const u8,
     tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
     value: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
     return switch (tree.nodeTag(value)) {
-        .@"try", .@"nosuspend", .@"comptime" => allocationFromValue(source, tree, tree.nodeData(value).node, summary_index),
-        .grouped_expression => allocationFromValue(source, tree, tree.nodeData(value).node_and_token[0], summary_index),
-        .@"catch" => allocationFromValue(source, tree, tree.nodeData(value).node_and_node[0], summary_index),
-        .@"orelse" => allocationFromValue(source, tree, tree.nodeData(value).node_and_node[0], summary_index) orelse
-            allocationFromValue(source, tree, tree.nodeData(value).node_and_node[1], summary_index),
-        .block_two, .block_two_semicolon, .block, .block_semicolon => allocationFromBlock(source, tree, value, summary_index),
-        .call, .call_comma, .call_one, .call_one_comma => allocationFromCall(source, tree, value, summary_index),
+        .@"try", .@"nosuspend", .@"comptime" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node, summary_index),
+        .grouped_expression => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_token[0], summary_index),
+        .@"catch" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[0], summary_index),
+        .@"orelse" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[0], summary_index) orelse
+            allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[1], summary_index),
+        .block_two, .block_two_semicolon, .block, .block_semicolon => allocationFromBlock(source, tree, tokens, value, summary_index),
+        .call, .call_comma, .call_one, .call_one_comma => allocationFromCall(source, tree, tokens, value, summary_index),
         else => null,
     };
 }
@@ -192,6 +194,7 @@ fn allocationFromValue(
 fn allocationFromBlock(
     source: []const u8,
     tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
     block: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
@@ -200,7 +203,7 @@ fn allocationFromBlock(
     for (statements) |statement| {
         if (tree.nodeTag(statement) != .@"break") continue;
         const break_value = tree.nodeData(statement).opt_token_and_opt_node[1].unwrap() orelse continue;
-        if (allocationFromValue(source, tree, break_value, summary_index)) |allocation| return allocation;
+        if (allocationFromValue(source, tree, tokens, break_value, summary_index)) |allocation| return allocation;
     }
     return null;
 }
@@ -208,6 +211,7 @@ fn allocationFromBlock(
 fn allocationFromCall(
     source: []const u8,
     tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
     node: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
@@ -236,7 +240,7 @@ fn allocationFromCall(
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
     if (allocationRelease(method)) |release| {
         if (expressionReferencesField(tree, receiver, "arena")) return null;
-        if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(tree, receiver)) return null;
+        if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(source, tokens, tree, receiver)) return null;
         return .{
             .method = method,
             .release = release,
@@ -263,9 +267,19 @@ fn allocationFromCall(
     };
 }
 
-fn expressionLooksLikeAllocator(tree: *const std.zig.Ast, expression: std.zig.Ast.Node.Index) bool {
+fn expressionLooksLikeAllocator(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
+    expression: std.zig.Ast.Node.Index,
+) bool {
     return switch (tree.nodeTag(expression)) {
-        .identifier => true,
+        .identifier => identifier: {
+            const name = tree.tokenSlice(tree.nodeMainToken(expression));
+            break :identifier std.ascii.indexOfIgnoreCase(name, "alloc") != null or
+                std.ascii.indexOfIgnoreCase(name, "arena") != null or
+                std.mem.eql(u8, name, "gpa") or identifierHasAllocatorType(source, tokens, name);
+        },
         .field_access => field: {
             const field_token = tree.nodeData(expression).node_and_token[1];
             const field_name = tree.tokenSlice(field_token);
@@ -280,6 +294,31 @@ fn expressionLooksLikeAllocator(tree: *const std.zig.Ast, expression: std.zig.As
         },
         else => false,
     };
+}
+
+fn identifierHasAllocatorType(source: []const u8, tokens: []const std.zig.Token, name: []const u8) bool {
+    for (tokens, 0..) |token, identifier_index| {
+        if (token.tag != .identifier or !tokenIsIdentifier(source, token, name) or
+            identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .colon) continue;
+        var parenthesis_depth: usize = 0;
+        var bracket_depth: usize = 0;
+        for (tokens[identifier_index + 2 ..], identifier_index + 2..) |type_token, type_index| {
+            switch (type_token.tag) {
+                .l_paren => parenthesis_depth += 1,
+                .r_paren => {
+                    if (parenthesis_depth == 0) break;
+                    parenthesis_depth -= 1;
+                },
+                .l_bracket => bracket_depth += 1,
+                .r_bracket => bracket_depth -|= 1,
+                .comma, .equal, .semicolon, .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0) break,
+                .identifier => if (std.mem.eql(u8, source[type_token.loc.start..type_token.loc.end], "Allocator")) return true,
+                else => {},
+            }
+            if (type_index + 1 >= tokens.len) break;
+        }
+    }
+    return false;
 }
 
 fn allocatorSourceName(tree: *const std.zig.Ast, receiver: std.zig.Ast.Node.Index) ?[]const u8 {
@@ -805,7 +844,7 @@ fn ownershipLeavesScope(
 }
 
 fn conventionalCleanupMethod(method: []const u8) bool {
-    const methods = [_][]const u8{ "close", "deinit", "delete", "destroy", "free", "release" };
+    const methods = [_][]const u8{ "close", "deinit", "delete", "destroy", "free", "release", "shutdown" };
     for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
     return false;
 }
@@ -1373,7 +1412,7 @@ test "release may wrap the owned pointer" {
 
 test "nested labeled allocation expressions do not cross their enclosing scope" {
     const source =
-        "fn resolve(b: anytype, existing: ?[]u8) void {" ++
+        "fn resolve(b: std.mem.Allocator, existing: ?[]u8) void {" ++
         "const sha = existing orelse fetch: {" ++
         "const result = command();" ++
         "break :fetch b.dupe(u8, result);" ++
@@ -1428,6 +1467,27 @@ test "non-allocator dupe methods may pair with destroy" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "dupe methods use a proven allocator receiver" {
+    const wrapper_source =
+        "fn run(index_slice: anytype, gpa: std.mem.Allocator, ip: anytype) !void {" ++
+        "const indices = try index_slice.dupe(gpa, ip);" ++
+        "defer gpa.free(indices);" ++
+        "}";
+    const wrapper_findings = try warnings(std.testing.allocator, wrapper_source);
+    defer freeWarnings(std.testing.allocator, wrapper_findings);
+    try std.testing.expectEqual(@as(usize, 0), wrapper_findings.len);
+
+    const allocator_source =
+        "fn run(a: std.mem.Allocator, other: std.mem.Allocator, bytes: []const u8) !void {" ++
+        "const copy = try a.dupe(u8, bytes);" ++
+        "defer other.free(copy);" ++
+        "}";
+    const allocator_findings = try warnings(std.testing.allocator, allocator_source);
+    defer freeWarnings(std.testing.allocator, allocator_findings);
+    try std.testing.expectEqual(@as(usize, 1), allocator_findings.len);
+    try std.testing.expectEqual(types.Rule.mismatched_allocation_release, allocator_findings[0].rule);
 }
 
 test "double release and use after release are reported in straight line code" {
@@ -1554,9 +1614,24 @@ test "custom allocator free releases its final allocation argument" {
 test "owned wrapper values may use conventional cleanup methods" {
     const source =
         "fn rasterize(a: std.mem.Allocator) !Bitmap { return .{ .data = try a.alloc(u8, 16) }; }" ++
+        "fn createThing(a: std.mem.Allocator) !*Thing { const thing = try a.create(Thing); return thing; }" ++
         "fn run(a: std.mem.Allocator) !void {" ++
         "var bitmap = try rasterize(a);" ++
         "defer bitmap.deinit(a);" ++
+        "const thing = try createThing(a);" ++
+        "defer thing.shutdown();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "owned returns allocated by an arena parameter need no individual cleanup" {
+    const source =
+        "fn nodesAtLoc(arena: std.mem.Allocator) ![]Node { return arena.alloc(Node, 4); }" ++
+        "fn run(arena: std.mem.Allocator) !void {" ++
+        "const nodes = try nodesAtLoc(arena);" ++
+        "_ = nodes;" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);

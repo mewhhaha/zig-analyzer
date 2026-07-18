@@ -38,6 +38,7 @@ pub fn run(context: RuleRun) !void {
             scope_opening,
         ) orelse continue;
         if (!fallibleOperationBetween(context, declaration_end + 1, cleanup_index, scope_opening)) continue;
+        if (bindingAddressEscapesBeforeFallible(context, binding_name, declaration_end + 1, cleanup_index)) continue;
         try context.emit(.{
             .rule = .cleanup_after_fallible_operation,
             .level = level,
@@ -49,6 +50,16 @@ pub fn run(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn bindingAddressEscapesBeforeFallible(context: RuleRun, binding_name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .keyword_try) return false;
+        if (token.tag != .identifier or !context.tokenIs(index, binding_name) or index == start or
+            context.tokens[index - 1].tag != .ampersand) continue;
+        return true;
+    }
+    return false;
 }
 
 fn acquiredResource(context: RuleRun, start: usize, end: usize) ?Resource {
@@ -170,6 +181,31 @@ test "resource cleanup immediately after acquisition is safe" {
         "    defer file.close();\n" ++
         "    try validate();\n" ++
         "}";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "resource transferred by pointer before a fallible operation stays opaque" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn load(allocator: std.mem.Allocator) !void {\n" ++
+        "    var buffer = try std.ArrayList(u8).initCapacity(allocator, 16);\n" ++
+        "    var writer = Writer.fromArrayList(allocator, &buffer);\n" ++
+        "    errdefer writer.deinit();\n" ++
+        "    try writer.writeAll(\"value\");\n" ++
+        "    buffer = writer.toArrayList();\n" ++
+        "    defer buffer.deinit(allocator);\n" ++
+        "}\n";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{

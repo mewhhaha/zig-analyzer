@@ -116,7 +116,30 @@ fn allocatingAcquisition(context: RuleRun, declaration_index: usize, declaration
     const call_close = context.matchingToken(path_end + 1, .l_paren, .r_paren) orelse return null;
     if (call_close + 1 != declaration_end) return null;
     if (!isAllocatingMethod(context.tokenText(path_end))) return null;
+    if ((context.tokenIs(path_end, "dupe") or context.tokenIs(path_end, "dupeZ")) and
+        !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
     return .{ .receiver_start = equal + 2, .receiver_end = path_end - 2, .method_index = path_end };
+}
+
+fn receiverLooksLikeAllocator(context: RuleRun, receiver_start: usize, receiver_end: usize) bool {
+    const receiver_name = context.tokenText(receiver_end);
+    if (std.ascii.indexOfIgnoreCase(receiver_name, "alloc") != null or
+        std.ascii.indexOfIgnoreCase(receiver_name, "arena") != null or
+        std.mem.eql(u8, receiver_name, "gpa")) return true;
+    if (receiver_start != receiver_end) return false;
+    for (context.tokens, 0..) |token, identifier_index| {
+        if (token.tag != .identifier or !context.tokenIs(identifier_index, receiver_name) or
+            identifier_index + 2 >= context.tokens.len or context.tokens[identifier_index + 1].tag != .colon) continue;
+        var type_index = identifier_index + 2;
+        while (type_index < context.tokens.len) : (type_index += 1) {
+            switch (context.tokens[type_index].tag) {
+                .comma, .r_paren, .equal, .semicolon, .l_brace => break,
+                .identifier => if (context.tokenIs(type_index, "Allocator")) return true,
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 fn isAllocatingMethod(name: []const u8) bool {
@@ -327,6 +350,18 @@ test "a multiline typed acquisition with errdefer on the next line stays clean" 
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "dupe on a non-allocator receiver does not invent allocator provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn complete(tuple_info: anytype, arena_allocator: std.mem.Allocator, ip: anytype) !void {\n" ++
+        "    const tuple_types = try tuple_info.types.dupe(arena_allocator, ip);\n" ++
+        "    try render(tuple_types);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 

@@ -374,17 +374,25 @@ fn identifierIsFunctionParameter(tokens: []const std.zig.Token, index: usize) bo
 fn functionBodyAfterParameter(tokens: []const std.zig.Token, index: usize) ?usize {
     const opening = enclosingOpeningParenthesis(tokens, index) orelse return null;
     const closing = matchingToken(tokens, opening, .l_paren, .r_paren) orelse return null;
-    var cursor = closing + 1;
+    return functionBodyAfterParameters(tokens, closing);
+}
+
+pub fn functionBodyAfterParameters(tokens: []const std.zig.Token, parameters_end: usize) ?usize {
+    if (parameters_end >= tokens.len or tokens[parameters_end].tag != .r_paren) return null;
+    var cursor = parameters_end + 1;
     var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
     while (cursor < tokens.len) : (cursor += 1) {
         switch (tokens[cursor].tag) {
             .l_paren => parenthesis_depth += 1,
             .r_paren => parenthesis_depth -|= 1,
-            .l_brace => if (parenthesis_depth == 0) {
-                if (!braceStartsReturnType(tokens, cursor, closing + 1)) return cursor;
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0) {
+                if (!braceStartsReturnType(tokens, cursor, parameters_end + 1)) return cursor;
                 cursor = matchingToken(tokens, cursor, .l_brace, .r_brace) orelse return null;
             },
-            .semicolon => if (parenthesis_depth == 0) return null,
+            .comma, .semicolon => if (parenthesis_depth == 0 and bracket_depth == 0) return null,
             else => {},
         }
     }
