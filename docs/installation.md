@@ -71,6 +71,6 @@ From any project directory:
 /absolute/path/to/zig-analyzer/zig-out/bin/zig-analyzer check .
 ```
 
-The command exits nonzero while findings remain. See the root
-[README](../README.md#use-it) for profiles, per-rule configuration, source
+The command exits nonzero while findings remain. See the
+[linting guide](linting.md) for profiles, per-rule configuration, source
 suppressions, and safe automatic fixes.

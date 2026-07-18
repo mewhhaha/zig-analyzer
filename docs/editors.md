@@ -87,5 +87,5 @@ server. A small configuration that enables idiomatic guidance is:
 }
 ```
 
-The root [README](../README.md#use-it) documents stricter profiles, individual
-rule levels, project contracts, and source suppression directives.
+The [linting guide](linting.md) documents stricter profiles, individual rule
+levels, project contracts, and source suppression directives.

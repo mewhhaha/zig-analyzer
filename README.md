@@ -1,20 +1,24 @@
 # zig-analyzer
 
-A Zig language server that asks a patched compiler what your program means
-instead of guessing from syntax.
+A language server and linter for Zig. Instead of reimplementing Zig's
+semantics, zig-analyzer builds a patched Zig 0.16.0 compiler and asks it what
+each expression resolved to, falling back to syntax-based analysis when a
+file does not compile.
 
-ZLS gives up on comptime. Not on exotic corner cases — on the point of the
-language. Build a type in an `inline for`, pick a declaration with `@field`,
-gate an API behind a comptime flag, and completion starts offering members of
-types your program never instantiates. Hover says `anytype` and walks away.
-Their docs call comptime analysis a work in progress; it's been one for years.
+- [Build and install from source](docs/installation.md)
+- [Editor setup](docs/editors.md) for Helix and Neovim
+- [Lint rules, configuration, and suppressions](docs/linting.md)
+- [Comparison methodology](docs/comparisons.md) and the
+  [published gallery](https://mewhhaha.github.io/zig-analyzer/)
+- [Versioning policy](docs/versioning.md)
 
-This project cheats instead: it builds a patched compiler, asks it what
-everything resolved to, and falls back to syntax only when the file is too
-broken to compile. Hover includes compiler-evaluated values for top-level
-constants, not just the initializer text.
+## Why ask the compiler
 
-## Proof
+Much of Zig's expressiveness lives in comptime: types are constructed in
+`inline for` loops, declarations are selected with `@field`, and APIs are
+gated behind comptime configuration. A language server that reasons from
+syntax alone has to approximate those constructs, and the approximation
+breaks down on ordinary code:
 
 ```zig
 fn Pipeline(comptime stages: []const Stage) type {
@@ -38,75 +42,63 @@ fn result() u32 {
 }
 ```
 
-This compiles. Ask for completion after `pipeline.`:
+This program compiles. Requesting completion after `pipeline.` produces:
 
 | Server | Candidates |
 | --- | --- |
 | zig-analyzer | `Self`, `inner`, `trace` |
 | ZLS 0.16.0 | `value` |
 
-ZLS never followed the loop, so the method the program calls two lines down
-doesn't exist as far as it's concerned. Same story across the corpus: types
-selected through `@field` (ZLS returns nothing), APIs gated behind comptime
-conditions (ZLS offers the branch your build doesn't have).
+Because zig-analyzer queries the compiler, it lists the members the resolved
+type actually has, including the `trace` method the program calls two lines
+later. The same mechanism resolves types selected through `@field` and APIs
+gated behind comptime conditions, and hover shows compiler-evaluated values
+for top-level constants rather than only their initializer text.
 
-The comparison gives ZLS every relevant advantage its configuration exposes:
-an explicit Zig 0.16.0 executable, `enable_build_on_save = true`, and
-`warn_style = true`. The harness sends `textDocument/didSave` and waits up to
-60 seconds for build diagnostics. Under those conditions, zig-analyzer also
-reports these valid-but-dangerous programs while ZLS reports no diagnostic:
-
-| Example | zig-analyzer | ZLS 0.16.0 |
-| --- | --- | --- |
-| Overlapping `@memcpy` slices | `aliased-memcpy` | none |
-| Unsigned `while (i >= 0)` countdown | `unsigned-reverse-loop` | none |
-| Byte equality over struct padding | `padded-byte-compare` | none |
-| An empty `catch {}` | `discarded-error` | none |
-
-Everything is pinned to Zig 0.16.0 and [ZLS 0.16.0 at
+The comparison is pinned to Zig 0.16.0 and [ZLS 0.16.0 at
 `4944862`](https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d),
-kept as a regression corpus including the cases ZLS gets right, with a
-[gallery](https://mewhhaha.github.io/zig-analyzer/) showing every cursor and
-captured response. Reproduce the first completion from
-[`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig),
-or run the complete capture described in
-[`examples/README.md`](examples/README.md).
-The [comparison guide](docs/comparisons.md) separates editor intelligence from
-lint diagnostics and defines the dedicated-linter baselines and methodology.
+and gives ZLS every relevant advantage its configuration exposes: an explicit
+Zig 0.16.0 executable, `enable_build_on_save = true`, `warn_style = true`, a
+`textDocument/didSave` notification for every diagnostic fixture, and a
+60-second wait for build diagnostics. The corpus also records the cases ZLS
+handles correctly and is kept as a regression suite. Every captured request
+and response is published in the
+[gallery](https://mewhhaha.github.io/zig-analyzer/);
+[docs/comparisons.md](docs/comparisons.md) describes the methodology, and
+[examples/README.md](examples/README.md) explains how to reproduce any
+capture, starting with
+[`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig).
 
-## Use it
+## Language server
 
-Requires Zig 0.16.0 exactly:
+zig-analyzer implements diagnostics, completion, hover, references, rename
+(including declarations reached through reflection), call hierarchy, semantic
+tokens, inlay hints, code actions, and formatting that matches `zig fmt`
+byte for byte.
+
+Configure your editor to run the executable with the `lsp` argument;
+[docs/editors.md](docs/editors.md) has complete Helix and Neovim
+configurations. This repository's own `.helix/languages.toml` is already set
+up, so opening `examples/compiler/comptime_pipeline.zig` in Helix reproduces
+the completion above.
+
+If the compiler backend hangs, a watchdog disconnects it and the server
+continues answering from syntax analysis.
+
+## Linter
+
+The `check` command lints a project from the command line or CI:
 
 ```sh
-zig build -Doptimize=ReleaseFast
-zig build backend                    # builds the patched compiler
-zig-out/bin/zig-analyzer doctor      # verifies the setup
+zig-analyzer check .            # lint the project; exits nonzero on findings
+zig-analyzer check --fix .      # apply only provably safe rewrites
+zig-analyzer check --no-cache . # ignore cached results for unchanged files
 ```
 
-See [Build and install from source](docs/installation.md) for the complete
-setup, including the patched backend, and [Editor setup](docs/editors.md) for
-Helix and Neovim configuration.
+The rules focus on valid Zig that is still wrong — patterns neither the
+compiler nor a syntax-based server reports:
 
-Point your editor at `zig-out/bin/zig-analyzer` (`command = "...", args =
-["lsp"]`). This repo's `.helix/languages.toml` already does; open
-`examples/compiler/comptime_pipeline.zig` in Helix and try the completion
-above. You get diagnostics, code actions, completion, hover, references,
-reflection-aware rename, call hierarchy, semantic tokens, inlay hints, and
-`zig fmt` formatting, byte-for-byte.
-
-Or skip the editor and lint in CI:
-
-```sh
-zig-analyzer check .        # lint the project
-zig-analyzer check --fix .  # apply only provably safe rewrites
-zig-analyzer check --no-cache . # bypass cached unchanged-file findings
-```
-
-The linter catches valid Zig that is still wrong — things neither the
-compiler nor ZLS will ever mention:
-
-| You wrote | You get |
+| Pattern | Rule |
 | --- | --- |
 | An allocation, then another `try`, no `errdefer` between | `missing-errdefer`, with a fix |
 | `defer list.deinit();` then `return list.items;` | `returning-deinitialized-view` |
@@ -117,99 +109,57 @@ compiler nor ZLS will ever mention:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-121 rules, stable codes, five focused profiles, quick fixes wherever the
-rewrite is provable, plus refactors ZLS doesn't attempt (`toOwnedSlice`
-returns, `defer`→`errdefer` transfer, `inline else` collapses, `orelse
-unreachable` → `.?`). Configure in `zig-analyzer.json`, suppress in source:
+There are 121 rules with stable codes, organized into five named profiles,
+with quick fixes wherever the rewrite is provable. Project contracts extend
+the built-in analyses with your own import boundaries, resource pairs, and
+must-use functions. Configuration lives in `zig-analyzer.json`, and findings
+can be suppressed with source directives;
+[docs/linting.md](docs/linting.md) documents all of it.
 
-`official`, `idiomatic`, and `strict` progressively add style guidance;
-`modernize` targets pinned-release migrations, while `disciplined` enables the
-bounded-loop, allocation, recursion, assertion, and function-size policies as
-an independent set.
+The engine runs without crashes over TigerBeetle (244 files), the complete
+Zig standard library (550 files), and roughly 6,100 mangled fuzzing variants
+of those sources — a run that surfaced two real bugs in the standard library.
+Worst-case single-file analysis time on that corpus is 39 ms.
 
-Project contracts make the strongest proofs extensible without heuristics:
+## Installation
 
-```json
-{
-  "contracts": {
-    "imports": [{ "from": "src/rules", "deny": ["src/lsp_server.zig"] }],
-    "resources": [{ "acquire": "Db.open", "release": "Db.close" }],
-    "must-use": ["Builder.finish"]
-  }
-}
+Building requires Zig 0.16.0 exactly:
+
+```sh
+zig build -Doptimize=ReleaseFast
+zig build backend                    # builds the patched compiler
+zig-out/bin/zig-analyzer doctor      # verifies the setup
 ```
 
-The CLI also builds conservative function summaries across direct calls.
-Borrowing, release, escape, allocator provenance, and owned returns flow across
-files; recursion, function pointers, ambiguous names, and unresolved calls stay
-opaque. Opt-in compiler-backed project rules can compare public type shapes
-across analyzed build roots and report public declarations outside every
-successfully analyzed root's import graph.
+[docs/installation.md](docs/installation.md) covers the complete setup,
+including how the patched backend is built and how to use it from other
+projects.
 
-```json
-{
-  "lints": {
-    "profile": "idiomatic",
-    "rules": {
-      "discarded-error": "warning",
-      "line-length": { "level": "warning", "max-columns": 100 },
-      "todo-comment": { "level": "hint", "markers": ["TODO", "FIXME"] }
-    },
-    "banned": [{ "path": "std.BoundedArray", "hint": "use stdx.BoundedArrayType" }]
-  }
-}
-```
+## Versioning
 
-Suppress an intentional finding with a source directive:
+Release versions track the supported Zig release: the base version names the
+Zig version the analyzer targets, and a numeric suffix increments with each
+zig-analyzer release, as in `0.16.0-1`. The suffix carries no compatibility
+meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
-```zig
-// zig-analyzer: disable-next-line missing-errdefer
-const buffer = try allocator.alloc(u8, 4);
-```
+## Project status
 
-The available forms are:
+zig-analyzer is an experiment, not a production language server. Most of its
+code was written by LLM agents working against the repository's review
+findings and test suite. The lint rules are token-level heuristics validated
+by a few hundred tests, not a semantic model. Analysis is per-file. The
+compiler backend is pinned to exactly Zig 0.16.0 and requires porting work
+for each new Zig release. [TASKS.md](TASKS.md) records which planned work is
+complete.
 
-```zig
-// zig-analyzer: disable-file discarded-error
+The project's claim is narrow: querying the compiler produces better editor
+answers than reimplementing it.
 
-operation() catch {}; // zig-analyzer: disable-line discarded-error
+## Contributing and license
 
-// zig-analyzer: disable discarded-error, needless-defer-block
-operation() catch {};
-defer { close(); }
-// zig-analyzer: enable discarded-error, needless-defer-block
-```
-
-`disable-next-line` applies only to the following line. `disable` remains in
-effect until the matching `enable`, and `disable-file` must appear before any
-code. Directives accept comma-separated rule codes; omit the codes or use
-`all` to target every rule. Malformed directives and unknown rule codes are
-reported instead of being ignored.
-
-It holds up: the engine runs crash-free over TigerBeetle (244 files), the
-entire Zig std (550 files), and ~6,100 mangled variants — and found two real
-bugs in std doing it. Worst-case file analysis is 39 ms, down from 637 before
-the accidentally-quadratic scans were found. A hung backend gets disconnected
-by a watchdog and the server keeps answering from syntax.
-
-## What this actually is
-
-A vibecoded project. Most of it was written by LLM agents pointed at their own
-review findings; the commit history says `ok`, `stuff`, and `uppiedates`. The
-rules are token heuristics with a few hundred tests, not a semantic model.
-The backend is pinned to exactly Zig 0.16.0 and will rot when Zig moves.
-Analysis is per-file. Some TASKS.md items are unfinished because they are.
-
-It is not the production comptime-aware Zig language server. It's a working
-argument that asking the compiler beats reimplementing it.
-
-## No contributions
-
-Don't send PRs. Nobody here is going to maintain your feature.
-
-Fork it and make it amazing. It's MIT — take the rules, the corpus harness,
-the backend protocol, whatever survives contact with your standards, and build
-the real one. [ARCHITECTURE.md](ARCHITECTURE.md) has the module boundaries,
-[`src/rules/README.md`](src/rules/README.md) has the rule contract,
-[TASKS.md](TASKS.md) says what's done. You don't need permission and you don't
-need to credit anyone. Go.
+This repository does not accept pull requests; there is no maintenance
+commitment behind it. It is MIT-licensed, so fork freely — the rules, the
+comparison harness, and the backend protocol can all be reused without
+permission. [ARCHITECTURE.md](ARCHITECTURE.md) documents the module
+boundaries, [EXTENDING.md](EXTENDING.md) the extension seams, and
+[`src/rules/README.md`](src/rules/README.md) the rule contract.
