@@ -17,7 +17,9 @@ pub const suppressionEdits = semantic.suppressionEdits;
 pub const findings = semantic.findings;
 pub const findingsWithTokens = semantic.findingsWithTokens;
 pub const findingsWithShapes = semantic.findingsWithShapes;
+pub const findingsWithShapesAndTokens = semantic.findingsWithShapesAndTokens;
 pub const fileNameFinding = semantic.fileNameFinding;
+pub const fileNameFindingWithTokens = semantic.fileNameFindingWithTokens;
 pub const isSuppressed = semantic.isSuppressed;
 
 test {

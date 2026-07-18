@@ -79,7 +79,7 @@ pub fn findingsWithShapes(
     return try findingsWithShapesAndTokens(allocator, source, tokens, configuration, resolved_shapes);
 }
 
-fn findingsWithShapesAndTokens(
+pub fn findingsWithShapesAndTokens(
     allocator: std.mem.Allocator,
     source: [:0]const u8,
     tokens: []const std.zig.Token,
@@ -201,11 +201,23 @@ pub fn fileNameFinding(
 ) !?Finding {
     const level = configuration.level(.non_idiomatic_file_name);
     if (level == .off) return null;
+    const tokens = try tokenize(allocator, source);
+    defer allocator.free(tokens);
+    return fileNameFindingWithTokens(allocator, source, tokens, path, configuration);
+}
+
+pub fn fileNameFindingWithTokens(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    path: []const u8,
+    configuration: Configuration,
+) !?Finding {
+    const level = configuration.level(.non_idiomatic_file_name);
+    if (level == .off) return null;
     const basename = std.fs.path.basename(path);
     if (!std.mem.endsWith(u8, basename, ".zig") or basename.len == ".zig".len) return null;
     const name = basename[0 .. basename.len - ".zig".len];
-    const tokens = try tokenize(allocator, source);
-    defer allocator.free(tokens);
     var brace_depth: usize = 0;
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;

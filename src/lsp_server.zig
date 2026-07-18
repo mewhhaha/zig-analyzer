@@ -1079,7 +1079,7 @@ pub const Server = struct {
     ) !?lsp.types.Location {
         const binding_spans = try document.scopedIdentifierSpans(allocator, identifier_span.start) orelse return null;
         if (binding_spans.len == 0 or std.meta.eql(binding_spans[0], identifier_span)) return null;
-        const tokens = try tokenize(allocator, document.source);
+        const tokens = document.tokens;
         const binding_index = for (tokens, 0..) |token, index| {
             if (std.meta.eql(token.loc, binding_spans[0])) break index;
         } else return null;
@@ -1470,7 +1470,7 @@ pub const Server = struct {
         const file = ImportedSource{
             .path = path,
             .source = document.source,
-            .tokens = try tokenize(allocator, document.source),
+            .tokens = document.tokens,
         };
         var pending: std.ArrayList([]const u8) = .empty;
         try pending.appendSlice(allocator, segments);
@@ -1720,13 +1720,25 @@ pub const Server = struct {
         var document_findings: std.ArrayList(analysis.Finding) = .empty;
         try document_findings.appendSlice(
             allocator,
-            try analysis.findingsWithShapes(allocator, document.source, lint_configuration, resolved_shapes),
+            try analysis.findingsWithShapesAndTokens(
+                allocator,
+                document.source,
+                document.tokens,
+                lint_configuration,
+                resolved_shapes,
+            ),
         );
         try document_findings.appendSlice(
             allocator,
             try server.moduleMemberFindings(allocator, document, lint_configuration),
         );
-        if (try analysis.fileNameFinding(allocator, document.source, document.uri, lint_configuration)) |finding| {
+        if (try analysis.fileNameFindingWithTokens(
+            allocator,
+            document.source,
+            document.tokens,
+            document.uri,
+            lint_configuration,
+        )) |finding| {
             try document_findings.append(allocator, finding);
         }
         return try document_findings.toOwnedSlice(allocator);
@@ -1740,7 +1752,7 @@ pub const Server = struct {
     ) ![]const analysis.Finding {
         const level = configuration.level(.unresolved_member);
         if (level == .off) return &.{};
-        const tokens = try tokenize(allocator, document.source);
+        const tokens = document.tokens;
         var candidate_receivers: std.StringHashMapUnmanaged(void) = .empty;
         for (document.declarations) |declaration| {
             if (declaration.brace_depth != 0 or declaration.kind != .constant) continue;
@@ -1792,7 +1804,7 @@ pub const Server = struct {
             server.recordCompilerFailure(err);
             return &.{};
         };
-        const tokens = try tokenize(allocator, document.source);
+        const tokens = document.tokens;
         var candidate_names: std.StringHashMapUnmanaged(void) = .empty;
         var shapes: std.ArrayList(analysis.ResolvedShape) = .empty;
         for (tokens, 0..) |token, index| {

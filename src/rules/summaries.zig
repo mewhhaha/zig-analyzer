@@ -42,8 +42,17 @@ const ImportAlias = struct {
     target_file_index: usize,
 };
 
+const FileSummary = struct {
+    file_index: usize,
+    source: [:0]const u8,
+    function_start: usize,
+    function_end: usize,
+    local_bindings: std.StringHashMapUnmanaged(void),
+};
+
 pub const Index = struct {
     functions: []FunctionSummary,
+    files: []FileSummary,
     resource_contracts: []const types.ResourceContract,
     import_aliases: []const ImportAlias,
     owned_tokens: []const []const std.zig.Token,
@@ -55,6 +64,8 @@ pub const Index = struct {
             allocator.free(function.nested_function_ranges);
         }
         allocator.free(index.functions);
+        for (index.files) |*file| file.local_bindings.deinit(allocator);
+        allocator.free(index.files);
         allocator.free(index.import_aliases);
         for (index.owned_tokens) |tokens| allocator.free(tokens);
         allocator.free(index.owned_tokens);
@@ -153,9 +164,10 @@ pub const Index = struct {
     }
 
     fn uniqueFunctionInFile(index: Index, file_index: usize, name: []const u8) ?FunctionSummary {
+        const file = index.fileForIndex(file_index) orelse return null;
         var selected: ?FunctionSummary = null;
-        for (index.functions) |function| {
-            if (function.file_index != file_index or !std.mem.eql(u8, function.name, name)) continue;
+        for (index.functions[file.function_start..file.function_end]) |function| {
+            if (!std.mem.eql(u8, function.name, name)) continue;
             if (selected != null) return null;
             selected = function;
         }
@@ -188,31 +200,24 @@ pub const Index = struct {
     }
 
     fn fileIndexForSource(index: Index, source: []const u8) ?usize {
-        var selected: ?usize = null;
-        for (index.functions) |function| {
-            if (function.source.ptr != source.ptr or function.source.len != source.len) continue;
-            if (selected != null and selected.? != function.file_index) return null;
-            selected = function.file_index;
-        }
-        return selected;
+        return (index.fileForSource(source) orelse return null).file_index;
     }
 
     fn sourceHasLocalBinding(index: Index, source: []const u8, name: []const u8) bool {
-        var tokens: ?[]const std.zig.Token = null;
-        for (index.functions) |function| {
-            if (function.source.ptr != source.ptr or function.source.len != source.len) continue;
-            tokens = function.tokens;
-            for (function.parameter_names) |parameter| {
-                if (std.mem.eql(u8, parameter, name)) return true;
-            }
+        const file = index.fileForSource(source) orelse return false;
+        return file.local_bindings.contains(name);
+    }
+
+    fn fileForSource(index: Index, source: []const u8) ?FileSummary {
+        for (index.files) |file| {
+            if (file.source.ptr == source.ptr and file.source.len == source.len) return file;
         }
-        const source_tokens = tokens orelse return false;
-        for (source_tokens, 0..) |token, token_index| {
-            if ((token.tag != .keyword_const and token.tag != .keyword_var) or
-                token_index + 1 >= source_tokens.len or source_tokens[token_index + 1].tag != .identifier) continue;
-            if (std.mem.eql(u8, tokenText(source, source_tokens[token_index + 1]), name)) return true;
-        }
-        return false;
+        return null;
+    }
+
+    fn fileForIndex(index: Index, file_index: usize) ?FileSummary {
+        for (index.files) |file| if (file.file_index == file_index) return file;
+        return null;
     }
 };
 
@@ -222,6 +227,7 @@ pub fn build(
     configuration: types.Configuration,
 ) !Index {
     var functions: std.ArrayList(FunctionSummary) = .empty;
+    var files: std.ArrayList(FileSummary) = .empty;
     var import_aliases: std.ArrayList(ImportAlias) = .empty;
     var owned_tokens: std.ArrayList([]const std.zig.Token) = .empty;
     for (sources) |source_file| {
@@ -230,17 +236,35 @@ pub fn build(
             try owned_tokens.append(allocator, allocated);
             break :tokens allocated;
         };
+        const function_start = functions.items.len;
         try collectFunctions(allocator, source_file, tokens, &functions);
+        var local_bindings: std.StringHashMapUnmanaged(void) = .empty;
+        for (functions.items[function_start..]) |function| {
+            for (function.parameter_names) |parameter| try local_bindings.put(allocator, parameter, {});
+        }
+        for (tokens, 0..) |token, token_index| {
+            if ((token.tag != .keyword_const and token.tag != .keyword_var) or
+                token_index + 1 >= tokens.len or tokens[token_index + 1].tag != .identifier) continue;
+            try local_bindings.put(allocator, tokenText(source_file.source, tokens[token_index + 1]), {});
+        }
+        try files.append(allocator, .{
+            .file_index = source_file.file_index,
+            .source = source_file.source,
+            .function_start = function_start,
+            .function_end = functions.items.len,
+            .local_bindings = local_bindings,
+        });
         try collectImportAliases(allocator, source_file, tokens, sources, &import_aliases);
     }
     try collectNestedFunctionRanges(allocator, functions.items);
     const index: Index = .{
         .functions = try functions.toOwnedSlice(allocator),
+        .files = try files.toOwnedSlice(allocator),
         .resource_contracts = configuration.resource_contracts,
         .import_aliases = try import_aliases.toOwnedSlice(allocator),
         .owned_tokens = try owned_tokens.toOwnedSlice(allocator),
     };
-    markRecursiveFunctions(index);
+    try markRecursiveFunctions(allocator, index);
     inferDirectEffects(index, configuration);
     for (0..index.functions.len) |_| {
         if (!propagateCallEffects(index)) break;
@@ -545,29 +569,53 @@ fn mergeEffect(current: *ParameterEffect, incoming: ParameterEffect) void {
     current.* = .unknown;
 }
 
-fn markRecursiveFunctions(index: Index) void {
-    for (index.functions, 0..) |_, start| {
-        var visited: [256]bool = @splat(false);
-        if (index.functions.len > visited.len) return;
-        if (reachesFunction(index, start, start, &visited)) {
-            index.functions[start].unresolved = true;
-            @memset(index.functions[start].parameter_effects, .unknown);
+const VisitState = enum { unvisited, active, complete };
+
+fn markRecursiveFunctions(allocator: std.mem.Allocator, index: Index) !void {
+    const states = try allocator.alloc(VisitState, index.functions.len);
+    defer allocator.free(states);
+    @memset(states, .unvisited);
+    var stack: std.ArrayList(usize) = .empty;
+    defer stack.deinit(allocator);
+    for (index.functions, 0..) |_, function_index| {
+        if (states[function_index] == .unvisited) {
+            try visitFunction(allocator, index, function_index, states, &stack);
         }
     }
 }
 
-fn reachesFunction(index: Index, current: usize, target: usize, visited: []bool) bool {
-    if (visited[current]) return false;
-    visited[current] = true;
-    const function = index.functions[current];
+fn visitFunction(
+    allocator: std.mem.Allocator,
+    index: Index,
+    function_index: usize,
+    states: []VisitState,
+    stack: *std.ArrayList(usize),
+) !void {
+    states[function_index] = .active;
+    try stack.append(allocator, function_index);
+    const function = index.functions[function_index];
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, call_open| {
-        if (tokenBelongsToNestedFunction(function, call_open)) continue;
-        if (token.tag != .l_paren) continue;
+        if (tokenBelongsToNestedFunction(function, call_open) or token.tag != .l_paren) continue;
         const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
         const called = uniqueFunctionIndexForCall(index, function, callable) orelse continue;
-        if (called == target or reachesFunction(index, called, target, visited)) return true;
+        switch (states[called]) {
+            .unvisited => try visitFunction(allocator, index, called, states, stack),
+            .active => {
+                var cycle_start = stack.items.len;
+                while (cycle_start > 0) {
+                    cycle_start -= 1;
+                    if (stack.items[cycle_start] == called) break;
+                }
+                for (stack.items[cycle_start..]) |recursive_function| {
+                    index.functions[recursive_function].unresolved = true;
+                    @memset(index.functions[recursive_function].parameter_effects, .unknown);
+                }
+            },
+            .complete => {},
+        }
     }
-    return false;
+    std.debug.assert(stack.pop().? == function_index);
+    states[function_index] = .complete;
 }
 
 fn tokenBelongsToNestedFunction(function: FunctionSummary, token_index: usize) bool {
@@ -585,9 +633,10 @@ fn uniqueFunctionIndexForCall(index: Index, caller: FunctionSummary, callable: [
         caller.file_index;
     const name = if (separator) |position| callable[position + 1 ..] else callable;
     if (std.mem.indexOfScalar(u8, name, '.') != null) return null;
+    const file = index.fileForIndex(file_index) orelse return null;
     var selected: ?usize = null;
-    for (index.functions, 0..) |function, function_index| {
-        if (function.file_index != file_index or !std.mem.eql(u8, function.name, name)) continue;
+    for (index.functions[file.function_start..file.function_end], file.function_start..) |function, function_index| {
+        if (!std.mem.eql(u8, function.name, name)) continue;
         if (selected != null) return null;
         selected = function_index;
     }

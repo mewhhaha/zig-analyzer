@@ -21,6 +21,7 @@ pub const Document = struct {
     generation: u32,
     source: [:0]u8,
     tree: std.zig.Ast,
+    tokens: []const std.zig.Token,
     declarations: []Declaration,
 
     pub fn open(
@@ -42,12 +43,14 @@ pub const Document = struct {
             .generation = 1,
             .source = owned_source,
             .tree = parsed.tree,
+            .tokens = parsed.tokens,
             .declarations = parsed.declarations,
         };
     }
 
     pub fn deinit(document: *Document) void {
         document.tree.deinit(document.allocator);
+        document.allocator.free(document.tokens);
         document.allocator.free(document.declarations);
         document.allocator.free(document.source);
         document.allocator.free(document.uri);
@@ -98,10 +101,12 @@ pub const Document = struct {
         errdefer parsed.deinit(document.allocator);
 
         document.tree.deinit(document.allocator);
+        document.allocator.free(document.tokens);
         document.allocator.free(document.declarations);
         document.allocator.free(document.source);
         document.source = next_source;
         document.tree = parsed.tree;
+        document.tokens = parsed.tokens;
         document.declarations = parsed.declarations;
         document.version = next_version;
         document.generation +%= 1;
@@ -267,10 +272,12 @@ pub const Store = struct {
 
 const ParsedSource = struct {
     tree: std.zig.Ast,
+    tokens: []const std.zig.Token,
     declarations: []Declaration,
 
     fn deinit(parsed: *ParsedSource, allocator: std.mem.Allocator) void {
         parsed.tree.deinit(allocator);
+        allocator.free(parsed.tokens);
         allocator.free(parsed.declarations);
     }
 };
@@ -278,19 +285,31 @@ const ParsedSource = struct {
 fn parseSource(allocator: std.mem.Allocator, source: [:0]const u8) !ParsedSource {
     var tree = try std.zig.Ast.parse(allocator, source, .zig);
     errdefer tree.deinit(allocator);
-    const declarations = try collectDeclarations(allocator, source);
-    return .{ .tree = tree, .declarations = declarations };
+    var tokens: std.ArrayList(std.zig.Token) = .empty;
+    errdefer tokens.deinit(allocator);
+    var tokenizer = std.zig.Tokenizer.init(source);
+    while (true) {
+        const token = tokenizer.next();
+        try tokens.append(allocator, token);
+        if (token.tag == .eof) break;
+    }
+    const owned_tokens = try tokens.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_tokens);
+    const declarations = try collectDeclarations(allocator, source, owned_tokens);
+    return .{ .tree = tree, .tokens = owned_tokens, .declarations = declarations };
 }
 
-fn collectDeclarations(allocator: std.mem.Allocator, source: [:0]const u8) ![]Declaration {
+fn collectDeclarations(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+) ![]Declaration {
     var declarations: std.ArrayList(Declaration) = .empty;
     errdefer declarations.deinit(allocator);
 
-    var tokenizer = std.zig.Tokenizer.init(source);
     var expected_kind: ?Declaration.Kind = null;
     var brace_depth: u32 = 0;
-    while (true) {
-        const token = tokenizer.next();
+    for (tokens) |token| {
         switch (token.tag) {
             .keyword_const => expected_kind = .constant,
             .keyword_var => expected_kind = .variable,

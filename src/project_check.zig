@@ -29,11 +29,53 @@ const FileCheckResult = struct {
     failure: ?anyerror = null,
 };
 
+const ProjectCheckResult = struct {
+    output: ?[]u8 = null,
+    findings: usize = 0,
+    failure: ?anyerror = null,
+};
+
 const ReportedFinding = struct {
     rule: analysis.Rule,
     level: analysis.Level,
     span: std.zig.Token.Loc,
     message: []const u8,
+};
+
+const SourceLocator = struct {
+    source: []const u8,
+    line_starts: []const usize,
+
+    fn init(allocator: std.mem.Allocator, source: []const u8) !SourceLocator {
+        const line_starts = try allocator.alloc(usize, std.mem.countScalar(u8, source, '\n') + 1);
+        line_starts[0] = 0;
+        var line_count: usize = 1;
+        for (source, 0..) |byte, offset| {
+            if (byte != '\n') continue;
+            line_starts[line_count] = offset + 1;
+            line_count += 1;
+        }
+        return .{ .source = source, .line_starts = line_starts };
+    }
+
+    fn location(locator: SourceLocator, offset: usize) SourceLocation {
+        const bounded_offset = @min(offset, locator.source.len);
+        var lower: usize = 0;
+        var upper = locator.line_starts.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (locator.line_starts[middle] <= bounded_offset)
+                lower = middle + 1
+            else
+                upper = middle;
+        }
+        const line_index = lower - 1;
+        const column_source = locator.source[locator.line_starts[line_index]..bounded_offset];
+        return .{
+            .line = line_index + 1,
+            .column = (std.unicode.utf8CountCodepoints(column_source) catch column_source.len) + 1,
+        };
+    }
 };
 
 const LoadedFile = struct {
@@ -108,16 +150,29 @@ fn runWithWriter(
         const display_path = try displayPath(arena, root, loaded_file.relative_path);
         try writer.print("{s}: information[generated-source]: skipped translate-c output\n", .{display_path});
     }
-    if (loaded_files.len > 1 or configuration.level(.import_boundary) != .off) {
-        try reportProjectFindings(io, arena, root, loaded_files, configuration, writer, &summary);
-    }
     const file_results = try arena.alloc(FileCheckResult, loaded_files.len);
     for (file_results) |*result| result.* = .{};
     defer for (file_results) |result| if (result.output) |output| allocator.free(output);
+    var project_result: ProjectCheckResult = .{};
+    defer if (project_result.output) |output| allocator.free(output);
 
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     var concurrency_available = true;
+    if (loaded_files.len > 1 or configuration.level(.import_boundary) != .off) {
+        group.concurrent(io, checkProjectTask, .{
+            io,
+            allocator,
+            root,
+            loaded_files,
+            configuration,
+            cache,
+            &project_result,
+        }) catch {
+            concurrency_available = false;
+            checkProjectTask(io, allocator, root, loaded_files, configuration, cache, &project_result);
+        };
+    }
     for (loaded_files, file_results) |loaded_file, *result| {
         if (concurrency_available) {
             group.concurrent(io, checkFileTask, .{ io, allocator, root, loaded_file, configuration, options.fix, cache, result }) catch {
@@ -129,6 +184,9 @@ fn runWithWriter(
         }
     }
     try group.await(io);
+    if (project_result.failure) |failure| return failure;
+    if (project_result.output) |output| try writer.writeAll(output);
+    summary.findings += project_result.findings;
     for (file_results) |result| {
         if (result.failure) |failure| return failure;
         if (result.output) |output| try writer.writeAll(output);
@@ -145,12 +203,48 @@ fn runWithWriter(
     return if (summary.findings == 0) 0 else 1;
 }
 
+fn checkProjectTask(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    loaded_files: []const LoadedFile,
+    configuration: analysis.Configuration,
+    cache: check_cache.Cache,
+    result: *ProjectCheckResult,
+) void {
+    var project_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer project_arena_state.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    var summary: Summary = .{};
+    reportProjectFindings(
+        io,
+        project_arena_state.allocator(),
+        root,
+        loaded_files,
+        configuration,
+        cache,
+        &output.writer,
+        &summary,
+    ) catch |err| {
+        output.deinit();
+        result.failure = err;
+        return;
+    };
+    result.output = output.toOwnedSlice() catch |err| {
+        output.deinit();
+        result.failure = err;
+        return;
+    };
+    result.findings = summary.findings;
+}
+
 fn reportProjectFindings(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: ScanRoot,
     loaded_files: []const LoadedFile,
     configuration: analysis.Configuration,
+    cache: check_cache.Cache,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
@@ -163,15 +257,56 @@ fn reportProjectFindings(
             .tokens = loaded_file.tokens,
         });
     }
+    const cache_sources = try allocator.alloc(check_cache.ProjectSource, files.items.len);
+    for (files.items, cache_sources) |file, *cache_source| cache_source.* = .{
+        .path = file.path,
+        .source = file.source,
+    };
+    const source_locators = try allocator.alloc(?SourceLocator, files.items.len);
+    @memset(source_locators, null);
+    const compiler_independent = configuration.level(.configuration_divergent_api) == .off and
+        configuration.level(.unreachable_public_declaration) == .off;
+    if (compiler_independent) if (cache.loadProject(io, allocator, cache_sources)) |cached| {
+        for (cached) |finding| {
+            const file = files.items[finding.file_index];
+            if (source_locators[finding.file_index] == null) {
+                source_locators[finding.file_index] = try SourceLocator.init(allocator, file.source);
+            }
+            const display_path = try displayPath(allocator, root, file.path);
+            const location = source_locators[finding.file_index].?.location(finding.start);
+            try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
+                display_path,
+                location.line,
+                location.column,
+                @tagName(finding.level),
+                finding.rule.code(),
+                finding.message,
+            });
+            summary.findings += 1;
+        }
+        return;
+    };
     const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration);
     const findings = try project_rules.findingsWithCompilerFacts(allocator, files.items, configuration, compiler_facts);
+    var records: std.ArrayList(check_cache.ProjectRecord) = .empty;
     for (findings) |finding| {
         const file = files.items[finding.file_index];
         if (analysis.isSuppressed(file.source, finding.rule, finding.span.start)) continue;
         const level = configuration.level(finding.rule);
         if (level == .off) continue;
+        try records.append(allocator, .{
+            .file_index = finding.file_index,
+            .rule = finding.rule,
+            .level = level,
+            .start = finding.span.start,
+            .end = finding.span.end,
+            .message = finding.message,
+        });
+        if (source_locators[finding.file_index] == null) {
+            source_locators[finding.file_index] = try SourceLocator.init(allocator, file.source);
+        }
         const display_path = try displayPath(allocator, root, file.path);
-        const location = sourceLocation(file.source, finding.span.start);
+        const location = source_locators[finding.file_index].?.location(finding.span.start);
         try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
             display_path,
             location.line,
@@ -182,6 +317,7 @@ fn reportProjectFindings(
         });
         summary.findings += 1;
     }
+    if (compiler_independent) cache.storeProject(io, allocator, cache_sources, records.items);
 }
 
 fn collectCompilerFacts(
@@ -509,8 +645,9 @@ fn checkFile(
         file_configuration,
         cache,
     );
+    const source_locator = if (reported.len == 0) null else try SourceLocator.init(file_arena, checked_source);
     for (reported) |finding| {
-        const location = sourceLocation(checked_source, finding.span.start);
+        const location = source_locator.?.location(finding.span.start);
         try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
             display_path,
             location.line,
@@ -601,7 +738,7 @@ fn reportedFindings(
         .span = finding.span,
         .message = finding.message,
     });
-    if (try analysis.fileNameFinding(allocator, source, path, configuration)) |finding| {
+    if (try analysis.fileNameFindingWithTokens(allocator, source, tokens, path, configuration)) |finding| {
         try reported.append(allocator, .{
             .rule = finding.rule,
             .level = finding.level,
@@ -691,15 +828,16 @@ fn displayPath(allocator: std.mem.Allocator, root: ScanRoot, relative_path: []co
 
 const SourceLocation = struct { line: usize, column: usize };
 
-fn sourceLocation(source: []const u8, offset: usize) SourceLocation {
-    const bounded_offset = @min(offset, source.len);
-    const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..bounded_offset], '\n')) |newline| newline + 1 else 0;
-    const column_source = source[line_start..bounded_offset];
-    const column = std.unicode.utf8CountCodepoints(column_source) catch column_source.len;
-    return .{
-        .line = std.mem.countScalar(u8, source[0..bounded_offset], '\n') + 1,
-        .column = column + 1,
-    };
+test "source locations use indexed UTF-8 line and column positions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const source = "const π = 1;\n  π\n";
+    const locator = try SourceLocator.init(arena_state.allocator(), source);
+
+    try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 1 }, locator.location(0));
+    const second_pi = std.mem.lastIndexOf(u8, source, "π").?;
+    try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 3 }, locator.location(second_pi));
+    try std.testing.expectEqual(SourceLocation{ .line = 3, .column = 1 }, locator.location(source.len));
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {

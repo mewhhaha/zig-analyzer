@@ -13,9 +13,28 @@ pub const Record = struct {
     message: []const u8,
 };
 
+pub const ProjectSource = struct {
+    path: []const u8,
+    source: []const u8,
+};
+
+pub const ProjectRecord = struct {
+    file_index: usize,
+    rule: analysis.Rule,
+    level: analysis.Level,
+    start: usize,
+    end: usize,
+    message: []const u8,
+};
+
 const StoredFile = struct {
     version: u8,
     findings: []const Record,
+};
+
+const StoredProject = struct {
+    version: u8,
+    findings: []const ProjectRecord,
 };
 
 pub const Cache = struct {
@@ -142,6 +161,51 @@ pub const Cache = struct {
         atomic_file.replace(io) catch return;
     }
 
+    pub fn loadProject(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        sources: []const ProjectSource,
+    ) ?[]const ProjectRecord {
+        const dir = cache.dir orelse return null;
+        var file_name_buffer: ["project-".len + std.crypto.hash.Blake3.digest_length * 2 + ".json".len]u8 = undefined;
+        const file_name = cache.projectFileName(sources, &file_name_buffer);
+        const bytes = dir.readFileAlloc(io, file_name, allocator, .limited(cache_file_limit)) catch return null;
+        const parsed = std.json.parseFromSlice(StoredProject, allocator, bytes, .{}) catch return null;
+        if (parsed.value.version != format_version) return null;
+        for (parsed.value.findings) |finding| {
+            if (finding.file_index >= sources.len or finding.start > finding.end or
+                finding.end > sources[finding.file_index].source.len) return null;
+        }
+        return parsed.value.findings;
+    }
+
+    pub fn storeProject(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        sources: []const ProjectSource,
+        findings: []const ProjectRecord,
+    ) void {
+        const dir = cache.dir orelse return;
+        var encoded: std.Io.Writer.Allocating = .init(allocator);
+        defer encoded.deinit();
+        std.json.Stringify.value(
+            StoredProject{ .version = format_version, .findings = findings },
+            .{},
+            &encoded.writer,
+        ) catch return;
+        const bytes = encoded.toOwnedSlice() catch return;
+        defer allocator.free(bytes);
+
+        var file_name_buffer: ["project-".len + std.crypto.hash.Blake3.digest_length * 2 + ".json".len]u8 = undefined;
+        const file_name = cache.projectFileName(sources, &file_name_buffer);
+        var atomic_file = dir.createFileAtomic(io, file_name, .{ .replace = true }) catch return;
+        defer atomic_file.deinit(io);
+        atomic_file.file.writeStreamingAll(io, bytes) catch return;
+        atomic_file.replace(io) catch return;
+    }
+
     fn fileName(
         cache: Cache,
         relative_path: []const u8,
@@ -158,6 +222,29 @@ pub const Cache = struct {
         const hexadecimal = std.fmt.bytesToHex(digest, .lower);
         @memcpy(buffer[0..hexadecimal.len], &hexadecimal);
         @memcpy(buffer[hexadecimal.len..], ".json");
+        return buffer;
+    }
+
+    fn projectFileName(
+        cache: Cache,
+        sources: []const ProjectSource,
+        buffer: *["project-".len + std.crypto.hash.Blake3.digest_length * 2 + ".json".len]u8,
+    ) []const u8 {
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&cache.identity);
+        hasher.update("project-v1");
+        for (sources) |source| {
+            hasher.update(std.mem.asBytes(&source.path.len));
+            hasher.update(source.path);
+            hasher.update(std.mem.asBytes(&source.source.len));
+            hasher.update(source.source);
+        }
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const hexadecimal = std.fmt.bytesToHex(digest, .lower);
+        @memcpy(buffer[0.."project-".len], "project-");
+        @memcpy(buffer["project-".len..][0..hexadecimal.len], &hexadecimal);
+        @memcpy(buffer["project-".len + hexadecimal.len ..], ".json");
         return buffer;
     }
 };
@@ -205,4 +292,39 @@ test "cache invalidates source path and configuration changes" {
     var contract_cache = Cache.init(io, temporary.dir, contract_configuration);
     defer contract_cache.deinit(io);
     try std.testing.expect(contract_cache.load(io, allocator, "src/main.zig", "fn missing") == null);
+}
+
+test "project cache invalidates when any source changes" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var cache = Cache.init(io, temporary.dir, analysis.Configuration.defaults());
+    defer cache.deinit(io);
+    const sources = [_]ProjectSource{
+        .{ .path = "src/main.zig", .source = "const support = @import(\"support.zig\");" },
+        .{ .path = "src/support.zig", .source = "pub const value = 1;" },
+    };
+    const records = [_]ProjectRecord{.{
+        .file_index = 0,
+        .rule = .duplicate_module_import,
+        .level = .warning,
+        .start = 6,
+        .end = 13,
+        .message = "duplicate import",
+    }};
+    cache.storeProject(io, allocator, &sources, &records);
+
+    const loaded = cache.loadProject(io, allocator, &sources).?;
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings(records[0].message, loaded[0].message);
+
+    const changed_sources = [_]ProjectSource{
+        sources[0],
+        .{ .path = "src/support.zig", .source = "pub const value = 2;" },
+    };
+    try std.testing.expect(cache.loadProject(io, allocator, &changed_sources) == null);
 }
