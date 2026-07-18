@@ -6,3 +6,6 @@
   source suppressions
 - [Versioning](versioning.md): how releases track Zig versions
 - [Language-server examples](../examples/README.md)
+- [Architecture](../ARCHITECTURE.md): module boundaries and data flow
+- [Developing](../DEVELOPING.md): local verification and maintenance workflow
+- [Extending](../EXTENDING.md): extension seams for rules and editor features

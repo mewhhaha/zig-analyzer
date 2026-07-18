@@ -128,11 +128,11 @@ meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
 zig-analyzer is an experiment, not a production language server. Most of its
 code was written by LLM agents working against the repository's review
-findings and test suite. The lint rules are token-level heuristics validated
-by a few hundred tests, not a semantic model. Analysis is per-file. The
-compiler backend is pinned to exactly Zig 0.16.0 and requires porting work
-for each new Zig release. [TASKS.md](TASKS.md) records which planned work is
-complete.
+findings and test suite. The lint rules combine token-level file analysis,
+conservative cross-file summaries, and compiler-backed project facts; they
+stay opaque when a relationship cannot be proven. The compiler backend is
+pinned to exactly Zig 0.16.0 and requires porting work for each new Zig
+release. [TASKS.md](TASKS.md) records which planned work is complete.
 
 The project's claim is narrow: querying the compiler produces better editor
 answers than reimplementing it.
