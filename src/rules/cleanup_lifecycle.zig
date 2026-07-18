@@ -36,6 +36,7 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
                 context.tokens[index - 1].tag == .keyword_var)) continue;
             const assignment_end = context.statementEnd(index) orelse continue;
             if (replacementConsumesOriginal(context, cleanup_binding, index + 2, assignment_end) or
+                replacementRestoresWriterList(context, cleanup_binding, defer_end + 1, index, index + 2, assignment_end) or
                 replacementRelinquishesOwnership(context, cleanup_binding, defer_end + 1, index, index + 2, assignment_end) or
                 releasedBeforeReplacement(context, cleanup_binding, defer_end + 1, index)) continue;
             try context.emit(.{
@@ -51,6 +52,43 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn replacementRestoresWriterList(
+    context: RuleRun,
+    name: []const u8,
+    search_start: usize,
+    assignment_index: usize,
+    replacement_start: usize,
+    replacement_end: usize,
+) bool {
+    var writer_name: ?[]const u8 = null;
+    for (context.tokens[replacement_start..replacement_end], replacement_start..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, "toArrayList") or index < 2 or
+            context.tokens[index - 1].tag != .period or context.tokens[index - 2].tag != .identifier) continue;
+        writer_name = context.tokenText(index - 2);
+        break;
+    }
+    const expected_writer = writer_name orelse return false;
+    for (context.tokens[search_start..assignment_index], search_start..) |token, method_index| {
+        if (token.tag != .identifier or !context.tokenIs(method_index, "fromArrayList") or
+            method_index == 0 or context.tokens[method_index - 1].tag != .period or method_index + 1 >= assignment_index or
+            context.tokens[method_index + 1].tag != .l_paren) continue;
+        var equal_index = method_index;
+        while (equal_index > search_start and context.tokens[equal_index].tag != .equal and
+            context.tokens[equal_index].tag != .semicolon) : (equal_index -= 1)
+        {}
+        if (context.tokens[equal_index].tag != .equal or equal_index < 2 or
+            context.tokens[equal_index - 1].tag != .identifier or !context.tokenIs(equal_index - 1, expected_writer) or
+            (context.tokens[equal_index - 2].tag != .keyword_var and context.tokens[equal_index - 2].tag != .keyword_const)) continue;
+        const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
+        if (call_end >= assignment_index) continue;
+        for (context.tokens[method_index + 2 .. call_end], method_index + 2..) |argument, argument_index| {
+            if (argument.tag == .ampersand and argument_index + 1 < call_end and
+                context.tokens[argument_index + 1].tag == .identifier and context.tokenIs(argument_index + 1, name)) return true;
+        }
+    }
+    return false;
 }
 
 fn replacementRelinquishesOwnership(
@@ -255,7 +293,8 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
         .{ .name = "realloc" },
     };
     for (context.tokens, 0..) |token, method_index| {
-        if (token.tag != .identifier or method_index + 1 >= context.tokens.len or context.tokens[method_index + 1].tag != .l_paren) continue;
+        if (token.tag != .identifier or method_index == 0 or method_index + 1 >= context.tokens.len or
+            context.tokens[method_index - 1].tag != .period or context.tokens[method_index + 1].tag != .l_paren) continue;
         var allocation_method: ?Method = null;
         for (methods) |method| {
             if (context.tokenIs(method_index, method.name)) allocation_method = method;
@@ -322,7 +361,7 @@ fn identifierIsRuntimeBound(context: RuleRun, identifier_index: usize, use_index
         if (index > body_start + 1 and
             (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var))
         {
-            if (declarationValueIsComptime(context, index)) continue;
+            if (context.tokens[index - 1].tag == .keyword_const and declarationValueIsComptime(context, index)) continue;
             return true;
         }
         if (index > body_start and context.tokens[index - 1].tag == .pipe) return true;
@@ -349,9 +388,48 @@ fn declarationValueIsComptime(context: RuleRun, name_index: usize) bool {
     var index = name_index + 1;
     while (index < end and context.tokens[index].tag != .equal) : (index += 1) {}
     if (index + 1 >= end) return false;
+
+    const value_start = index + 1;
+    if (value_start + 1 < end and context.tokens[value_start].tag == .identifier and
+        context.tokens[value_start + 1].tag == .l_paren)
+    {
+        const call_end = context.matchingToken(value_start + 1, .l_paren, .r_paren) orelse return false;
+        if (call_end + 1 != end) return false;
+
+        var returns_type = false;
+        for (context.tokens[0..name_index], 0..) |token, function_index| {
+            if (token.tag != .keyword_fn or function_index + 2 >= name_index or
+                context.tokens[function_index + 1].tag != .identifier or
+                !context.tokenIs(function_index + 1, context.tokenText(value_start))) continue;
+            const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
+            if (parameters_end + 1 < name_index and context.tokenIs(parameters_end + 1, "type")) {
+                returns_type = true;
+                break;
+            }
+        }
+        if (returns_type) {
+            for (context.tokens[value_start + 2 .. call_end]) |token| switch (token.tag) {
+                .number_literal,
+                .char_literal,
+                .string_literal,
+                .plus,
+                .minus,
+                .asterisk,
+                .slash,
+                .percent,
+                .comma,
+                .l_paren,
+                .r_paren,
+                => {},
+                else => return false,
+            };
+            return true;
+        }
+    }
+
     for (context.tokens[index + 1 .. end]) |token| {
         switch (token.tag) {
-            .number_literal, .char_literal, .plus, .minus, .asterisk, .slash, .percent, .l_paren, .r_paren => {},
+            .number_literal, .char_literal, .string_literal, .plus, .minus, .asterisk, .slash, .percent, .l_paren, .r_paren => {},
             else => return false,
         }
     }
@@ -451,6 +529,24 @@ test "assigning a same-named field does not reassign the deferred binding" {
     for (findings.items) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
 }
 
+test "allocating writers restore their array list before deferred cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn render(allocator: std.mem.Allocator) !void {" ++
+        "var output: std.ArrayList(u8) = .empty;" ++
+        "defer output.deinit(allocator);" ++
+        "var output_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &output);" ++
+        "defer output = output_writer.toArrayList();" ++
+        "try output_writer.writer.writeAll(\"done\");" ++
+        "}";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
+}
+
 test "constant allocation products are not runtime overflow risks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -476,6 +572,18 @@ test "allocSentinel checks the length rather than the sentinel" {
     try std.testing.expectEqual(types.Rule.allocation_size_overflow, findings.items[0].rule);
 }
 
+test "user methods named alloc are not allocator calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "const Slab = struct { pub fn alloc(self: *Slab) *u8 { return self.value; } value: *u8 };";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .allocation_size_overflow);
+}
+
 test "appending a resource to a container transfers ownership" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -498,6 +606,46 @@ test "locally declared literal factors are not runtime overflow risks" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "literal string lengths are not runtime overflow risks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "test \"input\" { const line = \"hello\"; const repeat = 4_000; const bytes = try std.testing.allocator.alloc(u8, line.len * repeat); defer std.testing.allocator.free(bytes); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "constants from locally instantiated types are not runtime overflow risks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn Block(comptime size: usize) type { return struct { pub const byte_size = size; }; } fn run(a: anytype) !void { const B = Block(64); const bytes = try a.alloc(u8, 3 * B.byte_size / 2); defer a.free(bytes); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "runtime const values and mutable literals still require checked allocation multiplication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn run(a: anytype) !void { const width = loadWidth(); var height = 4; const first = try a.alloc(u8, width * 2); defer a.free(first); const second = try a.alloc(u8, height * 2); defer a.free(second); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var allocation_findings: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .allocation_size_overflow) {
+        allocation_findings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), allocation_findings);
 }
 
 test "comptime parameters do not make allocation sizes runtime" {

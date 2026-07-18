@@ -48,6 +48,7 @@ pub const Server = struct {
     workspace_document_changes: bool = false,
     workspace_create_file: bool = false,
     compiler_worker: ?*CompilerWorker = null,
+    compiler_type_shapes: std.StringHashMapUnmanaged(CompilerTypeShapes) = .empty,
 
     pub fn init(
         io: std.Io,
@@ -69,6 +70,7 @@ pub const Server = struct {
         if (server.compiler) |*compiler| compiler.deinit();
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         if (server.zig_lib_directory) |directory| server.allocator.free(directory);
+        server.clearCompilerTypeShapes();
         server.documents.deinit();
         server.* = undefined;
     }
@@ -256,6 +258,7 @@ pub const Server = struct {
         }
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
+        server.clearCompilerTypeShapes();
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         server.compiler_root_uri = null;
         server.compiler_start_attempted = false;
@@ -1034,6 +1037,7 @@ pub const Server = struct {
         std.log.err("compiler backend request failed: {t}; syntax service remains active", .{err});
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
+        server.clearCompilerTypeShapes();
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         server.compiler_root_uri = null;
     }
@@ -1872,6 +1876,9 @@ pub const Server = struct {
         }
         if (!server.compilerAnalysisCurrent(document)) return &.{};
         const compiler = if (server.compiler) |*active| active else return &.{};
+        if (try server.cachedCompilerTypeShapes(allocator, document, compiler.client.generation)) |cached| {
+            return cached;
+        }
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
             server.recordCompilerFailure(err);
             return &.{};
@@ -1924,7 +1931,54 @@ pub const Server = struct {
                 .fields = shape.fields,
             });
         }
-        return try shapes.toOwnedSlice(allocator);
+        const resolved_shapes = try shapes.toOwnedSlice(allocator);
+        try server.storeCompilerTypeShapes(document, compiler.client.generation, resolved_shapes);
+        return resolved_shapes;
+    }
+
+    fn cachedCompilerTypeShapes(
+        server: *const Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        compiler_generation: u32,
+    ) !?[]const analysis.ResolvedShape {
+        const cached = server.compiler_type_shapes.get(document.uri) orelse return null;
+        if (cached.document_version != document.version or cached.compiler_generation != compiler_generation) return null;
+        return try copyResolvedShapes(allocator, cached.shapes);
+    }
+
+    fn storeCompilerTypeShapes(
+        server: *Server,
+        document: *const Document,
+        compiler_generation: u32,
+        shapes: []const analysis.ResolvedShape,
+    ) !void {
+        var storage = std.heap.ArenaAllocator.init(server.allocator);
+        errdefer storage.deinit();
+        const stored_shapes = try copyResolvedShapes(storage.allocator(), shapes);
+        const cached: CompilerTypeShapes = .{
+            .document_version = document.version,
+            .compiler_generation = compiler_generation,
+            .storage = storage,
+            .shapes = stored_shapes,
+        };
+        if (server.compiler_type_shapes.getPtr(document.uri)) |previous| {
+            previous.deinit();
+            previous.* = cached;
+            return;
+        }
+        const owned_uri = try server.allocator.dupe(u8, document.uri);
+        errdefer server.allocator.free(owned_uri);
+        try server.compiler_type_shapes.put(server.allocator, owned_uri, cached);
+    }
+
+    fn clearCompilerTypeShapes(server: *Server) void {
+        var values = server.compiler_type_shapes.valueIterator();
+        while (values.next()) |cached| cached.deinit();
+        var uris = server.compiler_type_shapes.keyIterator();
+        while (uris.next()) |uri| server.allocator.free(uri.*);
+        server.compiler_type_shapes.deinit(server.allocator);
+        server.compiler_type_shapes = .empty;
     }
 
     fn moduleView(
@@ -2203,6 +2257,7 @@ const CompilerWorker = struct {
     fn restartCompiler(worker: *CompilerWorker) void {
         if (worker.server.compiler) |*compiler| compiler.deinit();
         worker.server.compiler = null;
+        worker.server.clearCompilerTypeShapes();
         if (worker.server.compiler_root_uri) |uri| worker.server.allocator.free(uri);
         worker.server.compiler_root_uri = null;
         worker.server.compiler_start_attempted = false;
@@ -2224,6 +2279,35 @@ const CompilerWorker = struct {
         return true;
     }
 };
+
+const CompilerTypeShapes = struct {
+    document_version: i32,
+    compiler_generation: u32,
+    storage: std.heap.ArenaAllocator,
+    shapes: []const analysis.ResolvedShape,
+
+    fn deinit(cached: *CompilerTypeShapes) void {
+        cached.storage.deinit();
+        cached.* = undefined;
+    }
+};
+
+fn copyResolvedShapes(
+    allocator: std.mem.Allocator,
+    shapes: []const analysis.ResolvedShape,
+) ![]const analysis.ResolvedShape {
+    const copied = try allocator.alloc(analysis.ResolvedShape, shapes.len);
+    for (shapes, copied) |shape, *destination| {
+        const fields = try allocator.alloc([]const u8, shape.fields.len);
+        for (shape.fields, fields) |field, *copied_field| copied_field.* = try allocator.dupe(u8, field);
+        destination.* = .{
+            .type_name = try allocator.dupe(u8, shape.type_name),
+            .kind = shape.kind,
+            .fields = fields,
+        };
+    }
+    return copied;
+}
 
 const SyntaxMember = struct {
     name: []const u8,
@@ -4830,6 +4914,36 @@ test "fix-all edits keep same-position insertions in input order and drop overla
     try std.testing.expectEqualStrings("first insertion", survivors[0].replacement);
     try std.testing.expectEqualStrings("second insertion", survivors[1].replacement);
     try std.testing.expectEqualStrings("replacement", survivors[2].replacement);
+}
+
+test "compiler type shapes stay cached for the analyzed document generation" {
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open("file:///cached.zig", 1, "const State = enum { ready };\n");
+    const document = server.documents.getConst("file:///cached.zig").?;
+    const shapes = [_]analysis.ResolvedShape{.{
+        .type_name = "State",
+        .kind = .enumeration,
+        .fields = &.{"ready"},
+    }};
+    try server.storeCompilerTypeShapes(document, 7, &shapes);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const cached = (try server.cachedCompilerTypeShapes(arena_state.allocator(), document, 7)).?;
+    try std.testing.expectEqual(@as(usize, 1), cached.len);
+    try std.testing.expectEqualStrings("State", cached[0].type_name);
+    try std.testing.expectEqualStrings("ready", cached[0].fields[0]);
+    try std.testing.expect(try server.cachedCompilerTypeShapes(arena_state.allocator(), document, 8) == null);
+
+    const changes = [_]lsp.types.TextDocument.ContentChangeEvent{.{
+        .text_document_content_change_whole_document = .{ .text = "const State = enum { waiting };\n" },
+    }};
+    try server.documents.change("file:///cached.zig", 2, &changes);
+    const changed_document = server.documents.getConst("file:///cached.zig").?;
+    try std.testing.expect(try server.cachedCompilerTypeShapes(arena_state.allocator(), changed_document, 7) == null);
 }
 
 test "member resolution finds explicit struct fields" {

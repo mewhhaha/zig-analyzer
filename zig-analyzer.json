@@ -1,6 +1,6 @@
 {
   "check": {
-    "exclude": [".claude", "tmp"]
+    "exclude": [".claude", "examples/diagnostics", "tmp"]
   },
   "contracts": {
     "imports": [

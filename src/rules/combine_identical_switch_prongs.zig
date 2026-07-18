@@ -80,8 +80,8 @@ fn prongBodyEnd(context: RuleRun, start: usize, switch_end: usize) ?usize {
     if (context.tokens[start].tag == .l_brace) return context.matchingToken(start, .l_brace, .r_brace);
     var depth: usize = 0;
     for (context.tokens[start..switch_end], start..) |token, index| switch (token.tag) {
-        .l_paren, .l_bracket => depth += 1,
-        .r_paren, .r_bracket => depth -|= 1,
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
         .comma => if (depth == 0) return if (index == start) null else index - 1,
         else => {},
     };
@@ -126,6 +126,22 @@ test "identical switch prong preference respects source suppression" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "nested switches report their identical prongs once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (outer) {\n" ++
+        "    .active => switch (inner) {\n" ++
+        "        .first => run(),\n" ++
+        "        .second => run(),\n" ++
+        "    },\n" ++
+        "    .inactive => stop(),\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

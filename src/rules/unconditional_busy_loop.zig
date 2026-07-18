@@ -23,6 +23,7 @@ pub fn run(context: RuleRun) !void {
         } else {
             body_end = context.statementEnd(body_start) orelse continue;
         }
+        if (insideNoreturnFunction(context, while_index)) continue;
         if (bodyCanExit(context, body_start, body_end)) continue;
         try context.emit(.{
             .rule = .unconditional_busy_loop,
@@ -34,6 +35,33 @@ pub fn run(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn insideNoreturnFunction(context: RuleRun, loop_index: usize) bool {
+    for (context.tokens[0..loop_index], 0..) |token, function_index| {
+        if (token.tag != .keyword_fn) continue;
+        var parameters_start = function_index + 1;
+        while (parameters_start < loop_index and context.tokens[parameters_start].tag != .l_paren) : (parameters_start += 1) {}
+        if (parameters_start == loop_index) continue;
+        const parameters_end = context.matchingToken(parameters_start, .l_paren, .r_paren) orelse continue;
+        var body_start = parameters_end + 1;
+        while (body_start < loop_index) : (body_start += 1) {
+            if (context.tokens[body_start].tag != .l_brace) continue;
+            const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
+            if (body_end < loop_index) {
+                if (body_start > parameters_end + 1 and switch (context.tokens[body_start - 1].tag) {
+                    .period, .keyword_error, .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => true,
+                    else => false,
+                }) continue;
+                break;
+            }
+            for (context.tokens[parameters_end + 1 .. body_start], parameters_end + 1..) |return_token, return_index| {
+                if (return_token.tag == .identifier and context.tokenIs(return_index, "noreturn")) return true;
+            }
+            return false;
+        }
+    }
+    return false;
 }
 
 fn bodyCanExit(context: RuleRun, start: usize, end: usize) bool {
@@ -92,6 +120,17 @@ test "a labeled continue to an enclosing loop counts as an exit" {
         "    }\n" ++
         "}\n" ++
         "fn stuck() void { while (true) { continue; } }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "terminal loops satisfy noreturn functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn trampoline() noreturn { switchContext(); while (true) {} }\n" ++
+        "fn stuck() void { while (true) {} }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);

@@ -452,7 +452,10 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
         "pub fn secret() Secret { return .{}; }\n" ++
         "pub fn fail() Failure!void { return error.Bad; }\n" ++
         "fn use(self: *State) void { _ = old; var copy: std.ArrayList(u8) = self.list; _ = copy.pop(); }\n";
-    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.exposed_private_type)] = .warning;
+    configuration.levels[@intFromEnum(types.Rule.exposed_private_error_set)] = .warning;
+    const found = try findingsFor(arena.allocator(), source, configuration);
     var seen = [_]bool{false} ** 5;
     for (found) |finding| switch (finding.rule) {
         .useless_error_return => seen[0] = true,
@@ -498,7 +501,9 @@ test "private containers do not expose their private receiver types" {
         "pub const Api = struct { pub fn secret() Secret { return .{}; } };\n" ++
         "pub fn formatter() std.fmt.Alt(FormatContext, render) { return .{}; }\n" ++
         "pub fn qualified() types.Secret { return .{}; }\n";
-    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.exposed_private_type)] = .warning;
+    const found = try findingsFor(arena.allocator(), source, configuration);
     var exposed_count: usize = 0;
     for (found) |finding| {
         if (finding.rule == .exposed_private_type) exposed_count += 1;
@@ -511,7 +516,9 @@ test "public aliases publish private components under a name callers can use" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "const Failure = error{Bad}; pub const PublicFailure = Failure || error{Other}; pub fn main() Failure!void {}\n";
-    const found = try findingsFor(arena.allocator(), source, types.Configuration.defaults());
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.exposed_private_error_set)] = .warning;
+    const found = try findingsFor(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .exposed_private_error_set);
 }
 

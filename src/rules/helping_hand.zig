@@ -18,6 +18,7 @@ fn findRangeLoops(context: RuleRun) !void {
     if (level == .off) return;
     for (context.tokens, 0..) |token, var_index| {
         if (token.tag != .keyword_var or var_index + 5 >= context.tokens.len or context.tokens[var_index + 1].tag != .identifier) continue;
+        if (context.tokens[var_index + 2].tag != .colon or !context.tokenIs(var_index + 3, "usize")) continue;
         const declaration_end = context.statementEnd(var_index) orelse continue;
         const equal = findTag(context.tokens, var_index + 2, declaration_end, .equal) orelse continue;
         if (equal + 1 >= declaration_end or !context.tokenIs(equal + 1, "0")) continue;
@@ -169,6 +170,28 @@ fn findStringDispatch(context: RuleRun) !void {
         const current_subject = std.mem.trim(u8, context.source[context.tokens[index + 4].loc.start..context.tokens[comma - 1].loc.end], " \t\r\n");
         const literal = context.tokenText(comma + 1);
         const continues_chain = if_index > 0 and context.tokens[if_index - 1].tag == .keyword_else;
+        const maps_to_value = maps: {
+            if (if_index + 1 >= context.tokens.len or context.tokens[if_index + 1].tag != .l_paren) break :maps false;
+            const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse break :maps false;
+            const value_start = condition_end + 1;
+            if (value_start >= context.tokens.len) break :maps false;
+            if (context.tokens[value_start].tag == .period) {
+                break :maps value_start + 2 < context.tokens.len and context.tokens[value_start + 1].tag == .identifier and
+                    context.tokens[value_start + 2].tag == .keyword_else;
+            }
+            break :maps value_start + 1 < context.tokens.len and switch (context.tokens[value_start].tag) {
+                .identifier, .number_literal, .string_literal, .char_literal => context.tokens[value_start + 1].tag == .keyword_else,
+                else => false,
+            };
+        };
+        if (!maps_to_value) {
+            subject = null;
+            first = null;
+            arms = 0;
+            first_literal = null;
+            second_literal = null;
+            continue;
+        }
         if (subject == null or !continues_chain) {
             subject = current_subject;
             first = index;
@@ -199,7 +222,8 @@ fn findStringDispatch(context: RuleRun) !void {
 fn findDebugPrints(context: RuleRun) !void {
     const level = context.level(.prefer_log_over_print);
     if (level == .off) return;
-    if (std.mem.indexOf(u8, context.source, "pub fn build(") != null) return;
+    if (std.mem.indexOf(u8, context.source, "pub fn build(") != null or
+        std.mem.indexOf(u8, context.source, "pub fn main(") != null) return;
     for (context.tokens, 0..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, "print") or index < 4 or
             !context.tokenIs(index - 4, "std") or !context.tokenIs(index - 2, "debug")) continue;
@@ -473,7 +497,7 @@ test "helping-hand rules recognize their exact manual idioms" {
         "for (values, 0..) |value, index| { if (value == needle) return index; }\n" ++
         "for (buffer) |*element| { element.* = 0; }\n" ++
         "var dst: [4]u8 = undefined; const src = [_]u8{ 1, 2, 3, 4 }; for (0..dst.len) |j| { dst[j] = src[j]; }\n" ++
-        "if (std.mem.eql(u8, cmd, \"start\")) {} else if (std.mem.eql(u8, cmd, \"stop\")) {} else if (std.mem.eql(u8, cmd, \"status\")) {}\n" ++
+        "const action = if (std.mem.eql(u8, cmd, \"start\")) .start else if (std.mem.eql(u8, cmd, \"stop\")) .stop else if (std.mem.eql(u8, cmd, \"status\")) .status else .unknown; _ = action;\n" ++
         "std.debug.print(\"hello\", .{});\n" ++
         "const output = try std.fs.cwd().createFile(\"out\", .{}); const writer = output.writer(); for (values) |value| { try writer.write(value); }\n" ++
         "const a = try allocator.alloc(u8, 1); defer allocator.free(a);\n" ++
@@ -502,6 +526,43 @@ test "helping-hand rules recognize their exact manual idioms" {
         if (!seen) std.debug.print("missing helping-hand test finding {s}\n", .{rule.code()});
         try std.testing.expect(seen);
     }
+}
+
+test "range loops preserve non-usize counter types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn run() void { var seed: u64 = 0; while (seed < 16) : (seed += 1) use(seed); }";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_range_for)] = .information;
+    const found = try findingsFor(arena.allocator(), source, configuration);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "string dispatch with branch bodies stays explicit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(name: []const u8) !void {\n" ++
+        "    if (std.mem.eql(u8, name, \"first\")) { try expectFirst();\n" ++
+        "    } else if (std.mem.eql(u8, name, \"second\")) { try expectSecond();\n" ++
+        "    } else if (std.mem.eql(u8, name, \"third\")) { try expectThird(); }\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_string_switch)] = .information;
+    const found = try findingsFor(arena.allocator(), source, configuration);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "command output from main is not replaced with logging" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "pub fn main() void { std.debug.print(\"usage: tool\\n\", .{}); }\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.prefer_log_over_print)] = .information;
+    const found = try findingsFor(arena.allocator(), source, configuration);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "debug output reachable only from tests remains test output" {

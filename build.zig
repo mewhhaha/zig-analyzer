@@ -71,6 +71,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_comptime_fixture_tests.step);
 
+    const no_argument_command = b.addRunArtifact(executable);
+    no_argument_command.expectStdOutEqual(
+        \\zig-analyzer - compiler-backed language intelligence for Zig
+        \\
+        \\Usage:
+        \\  zig-analyzer lsp
+        \\  zig-analyzer check [--fix] [--no-cache] [path]
+        \\  zig-analyzer doctor
+        \\  zig-analyzer backend bootstrap
+        \\  zig-analyzer version
+        \\
+    );
+    test_step.dependOn(&no_argument_command.step);
+
     const fixtures_step = b.step("fixtures", "Run the comptime regression fixtures");
     fixtures_step.dependOn(&run_comptime_fixture_tests.step);
 

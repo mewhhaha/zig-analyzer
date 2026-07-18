@@ -14,7 +14,7 @@ full reanalysis.
 
 ## Rules, tiers, and profiles
 
-There are 121 rules. Each has a stable kebab-case code, such as
+There are 133 rules. Each has a stable kebab-case code, such as
 `missing-errdefer` or `discarded-error`, used consistently in configuration,
 diagnostics, and suppression directives. The full index, with one document
 per rule explaining why it exists and when it fires, is
@@ -63,7 +63,9 @@ rather than silently ignored.
 }
 ```
 
-- `check.exclude` lists relative paths that `zig-analyzer check` skips.
+- `check.exclude` lists relative paths that `zig-analyzer check` skips. Keep
+  exclusions narrow; exact files are appropriate for intentionally invalid
+  parser, formatter, or syntax-highlighting fixtures.
 - `lints.profile` selects one of the five named profiles.
 - `lints.correctness` and `lints.style` set one level for an entire tier.
 - `lints.rules` sets individual rules to `off`, `hint`, `information`,

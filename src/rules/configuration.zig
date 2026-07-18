@@ -89,20 +89,15 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                 return configuration;
             },
         };
-        configuration.lint_profile = if (std.mem.eql(u8, profile_name, "official"))
-            .official
-        else if (std.mem.eql(u8, profile_name, "idiomatic"))
-            .idiomatic
-        else if (std.mem.eql(u8, profile_name, "strict"))
-            .strict
-        else if (std.mem.eql(u8, profile_name, "modernize"))
-            .modernize
-        else if (std.mem.eql(u8, profile_name, "disciplined"))
-            .disciplined
-        else {
+        const lint_profile = std.meta.stringToEnum(LintProfile, profile_name) orelse {
             configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, strict, modernize, or disciplined");
             return configuration;
         };
+        if (lint_profile == .none) {
+            configuration.warning = try allocator.dupe(u8, "zig-analyzer.json key 'lints.profile' must be official, idiomatic, strict, modernize, or disciplined");
+            return configuration;
+        }
+        configuration.lint_profile = lint_profile;
         applyLintProfile(&configuration, configuration.lint_profile);
     }
     if (lints.get("correctness")) |value| {
@@ -650,6 +645,14 @@ const DirectiveKind = enum {
     enable,
 };
 
+const directive_kinds = std.StaticStringMap(DirectiveKind).initComptime(.{
+    .{ "disable-file", .disable_file },
+    .{ "disable-line", .disable_line },
+    .{ "disable-next-line", .disable_next_line },
+    .{ "disable", .disable },
+    .{ "enable", .enable },
+});
+
 const Directive = struct {
     kind: DirectiveKind,
     targets: []const u8,
@@ -664,18 +667,7 @@ fn directiveOnLine(line: []const u8) ?Directive {
     const remainder = std.mem.trim(u8, comment[marker.len..], " \t\r");
     const name_end = std.mem.indexOfAny(u8, remainder, " \t\r") orelse remainder.len;
     const name = remainder[0..name_end];
-    const kind: DirectiveKind = if (std.mem.eql(u8, name, "disable-file"))
-        .disable_file
-    else if (std.mem.eql(u8, name, "disable-line"))
-        .disable_line
-    else if (std.mem.eql(u8, name, "disable-next-line"))
-        .disable_next_line
-    else if (std.mem.eql(u8, name, "disable"))
-        .disable
-    else if (std.mem.eql(u8, name, "enable"))
-        .enable
-    else
-        return null;
+    const kind = directive_kinds.get(name) orelse return null;
     return .{
         .kind = kind,
         .targets = std.mem.trim(u8, remainder[name_end..], " \t\r"),
@@ -876,8 +868,15 @@ test "modernize and disciplined profiles enable only their rule families" {
         \\{"lints":{"profile":"idiomatic"}}
     );
     try std.testing.expectEqual(Level.information, idiomatic.level(.prefer_range_for));
+    try std.testing.expectEqual(Level.off, idiomatic.level(.exposed_private_type));
     try std.testing.expectEqual(Level.off, idiomatic.level(.allocator_first_parameter));
     try std.testing.expectEqual(Level.off, idiomatic.level(.minority_naming_style));
+
+    const strict = try parse(arena.allocator(),
+        \\{"lints":{"profile":"strict"}}
+    );
+    try std.testing.expectEqual(Level.information, strict.level(.exposed_private_type));
+    try std.testing.expectEqual(Level.information, strict.level(.exposed_private_error_set));
 }
 
 test "threshold and marker rules parse typed settings" {

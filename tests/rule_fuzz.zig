@@ -229,8 +229,7 @@ fn generateCleanProgram(allocator: std.mem.Allocator, seed: u64) ![:0]const u8 {
     var builder = ProgramBuilder.init(allocator, prng.random());
     try builder.append("const std = @import(\"std\");\n", .{});
     const function_count = builder.random.intRangeAtMost(usize, 3, 8);
-    var round: usize = 0;
-    while (round < function_count) : (round += 1) {
+    for (0..function_count) |_| {
         const template = templates[builder.random.uintLessThan(usize, templates.len)];
         try template(&builder);
     }
@@ -431,8 +430,7 @@ test "byte mutations never crash the rules" {
     while (seed < mutation_seed_count) : (seed += 1) {
         defer _ = arena.reset(.retain_capacity);
         const pristine = try generateCleanProgram(allocator, seed);
-        var round: usize = 0;
-        while (round < mutations_per_seed) : (round += 1) {
+        for (0..mutations_per_seed) |_| {
             const mutated = try mutateBytes(allocator, pristine, random);
             _ = try analysis.findings(allocator, mutated, configuration);
         }
@@ -443,8 +441,7 @@ fn mutateBytes(allocator: std.mem.Allocator, source: [:0]const u8, random: std.R
     var bytes: std.ArrayList(u8) = .empty;
     try bytes.appendSlice(allocator, source);
     const mutation_count = random.intRangeAtMost(usize, 1, 8);
-    var applied: usize = 0;
-    while (applied < mutation_count) : (applied += 1) {
+    for (0..mutation_count) |_| {
         if (bytes.items.len == 0) break;
         switch (random.uintLessThan(u8, 4)) {
             0 => bytes.items[random.uintLessThan(usize, bytes.items.len)] =

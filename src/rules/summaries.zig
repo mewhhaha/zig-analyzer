@@ -28,6 +28,7 @@ pub const FunctionSummary = struct {
     body_start: usize,
     body_end: usize,
     parent_function: ?usize = null,
+    externally_visible: bool = false,
     nested_function_ranges: []const TokenRange = &.{},
 };
 
@@ -150,6 +151,23 @@ pub const Index = struct {
             }
         }
         return false;
+    }
+
+    pub fn privateFunctionContaining(
+        index: Index,
+        source: []const u8,
+        token_index: usize,
+    ) ?FunctionSummary {
+        const file = index.fileForSource(source) orelse return null;
+        var selected: ?FunctionSummary = null;
+        for (index.functions[file.function_start..file.function_end]) |function| {
+            if (function.externally_visible or token_index <= function.body_start or token_index >= function.body_end) continue;
+            if (selected == null or function.body_start > selected.?.body_start) selected = function;
+        }
+        const function = selected orelse return null;
+        const unique = index.uniqueFunctionInFile(file.file_index, function.name) orelse return null;
+        if (unique.body_start != function.body_start) return null;
+        return function;
     }
 
     fn ownedReturnForCall(index: Index, source: []const u8, callable: []const u8) ?OwnedReturn {
@@ -341,6 +359,18 @@ fn collectFunctions(
             .body_start = body_start,
             .body_end = body_end,
             .parent_function = parent_function,
+            .externally_visible = visible: {
+                var modifier_index = fn_index;
+                while (modifier_index > 0) {
+                    modifier_index -= 1;
+                    switch (tokens[modifier_index].tag) {
+                        .keyword_pub, .keyword_export => break :visible true,
+                        .semicolon, .l_brace, .r_brace => break :visible false,
+                        else => {},
+                    }
+                }
+                break :visible false;
+            },
         });
         try function_stack.append(allocator, function_index);
     }
@@ -465,13 +495,15 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
         while (call_open < statement_end) : (call_open += 1) {
             if (function.tokens[call_open].tag != .l_paren) continue;
             const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
+            const call_end = matchingToken(function.tokens, call_open) orelse continue;
+            if (call_end > statement_end) continue;
             for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
                 return .{ .release = callableBaseName(contract.release) };
             };
             const release = allocationReleaseForCallable(callable) orelse continue;
             return .{
                 .release = release,
-                .allocator_parameter = allocatorParameter(function, callable),
+                .allocator_parameter = allocatorParameter(function, callable, call_open, call_end),
             };
         }
     }
@@ -497,21 +529,29 @@ fn directOwnedBinding(
         while (call_open < declaration_end and function.tokens[call_open].tag != .l_paren) : (call_open += 1) {}
         if (call_open == declaration_end) continue;
         const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
+        const call_end = matchingToken(function.tokens, call_open) orelse continue;
+        if (call_end > declaration_end) continue;
         for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
             return .{ .release = callableBaseName(contract.release) };
         };
         const release = allocationReleaseForCallable(callable) orelse continue;
-        return .{ .release = release, .allocator_parameter = allocatorParameter(function, callable) };
+        return .{ .release = release, .allocator_parameter = allocatorParameter(function, callable, call_open, call_end) };
     }
     return null;
 }
 
-fn allocatorParameter(function: FunctionSummary, callable: []const u8) ?usize {
+fn allocatorParameter(function: FunctionSummary, callable: []const u8, call_open: usize, call_end: usize) ?usize {
     const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
     const receiver = callable[0..separator];
-    if (std.mem.indexOfScalar(u8, receiver, '.') != null) return null;
+    if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
+        for (function.parameter_names, 0..) |parameter, index| {
+            if (std.mem.eql(u8, parameter, receiver)) return index;
+        }
+    }
     for (function.parameter_names, 0..) |parameter, index| {
-        if (std.mem.eql(u8, parameter, receiver)) return index;
+        if (std.ascii.indexOfIgnoreCase(parameter, "alloc") == null and
+            !std.mem.eql(u8, parameter, "gpa") and !std.mem.eql(u8, parameter, "arena")) continue;
+        if (exactArgumentIndex(function.source, function.tokens, parameter, call_open + 1, call_end) != null) return index;
     }
     return null;
 }
@@ -841,6 +881,19 @@ test "summaries retain ownership returned through a local binding" {
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     const owned = index.ownedReturn("createThing").?;
     try std.testing.expectEqualStrings("destroy", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "qualified allocation helpers retain allocator provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn make(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 { return utils.dupe(u8, allocator, bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("make").?;
+    try std.testing.expectEqualStrings("free", owned.release);
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
 }
 

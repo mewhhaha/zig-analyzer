@@ -331,9 +331,11 @@ fn collectCompilerFacts(
         configuration.level(.unreachable_public_declaration) == .off) return .{};
     const public_type_names = try collectPublicTypeNames(allocator, loaded_files);
     var root_paths: std.ArrayList([]const u8) = .empty;
+    var root_declarations_complete = true;
     for (loaded_files) |loaded_file| {
         if (!std.mem.eql(u8, std.fs.path.basename(loaded_file.relative_path), "build.zig")) continue;
         const build_source = loaded_file.source orelse continue;
+        if (!try compile_units.rootSourceDeclarationsAreStatic(allocator, build_source)) root_declarations_complete = false;
         const build_directory = std.fs.path.dirname(try std.fs.path.join(
             allocator,
             &.{ root.absolute_path, loaded_file.relative_path },
@@ -381,7 +383,7 @@ fn collectCompilerFacts(
             .shapes = try shapes.toOwnedSlice(allocator),
         });
     }
-    const roots_complete = units.items.len == root_paths.items.len;
+    const roots_complete = root_declarations_complete and units.items.len == root_paths.items.len;
     return .{
         .units = try units.toOwnedSlice(allocator),
         .roots_complete = roots_complete,

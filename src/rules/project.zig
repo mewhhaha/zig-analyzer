@@ -419,6 +419,33 @@ fn findUnreferencedTests(
     found: *std.ArrayList(Finding),
 ) !void {
     if (configuration.level(.unreferenced_test_file) == .off) return;
+    const build_reachable = try allocator.alloc(bool, files.len);
+    defer allocator.free(build_reachable);
+    @memset(build_reachable, false);
+    for (files, 0..) |file, file_index| {
+        build_reachable[file_index] = std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig");
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (files, 0..) |file, file_index| {
+            if (!build_reachable[file_index]) continue;
+            for (file.tokens, 0..) |token, index| {
+                if (token.tag != .builtin or !tokenIs(file.source, token, "@import") or
+                    index + 2 >= file.tokens.len or file.tokens[index + 1].tag != .l_paren or
+                    file.tokens[index + 2].tag != .string_literal) continue;
+                const spelling = stringValue(file.source, file.tokens[index + 2]) orelse continue;
+                if (!std.mem.endsWith(u8, spelling, ".zig")) continue;
+                const resolved_path = try resolveImportPath(allocator, file.path, spelling);
+                for (files, 0..) |candidate, candidate_index| {
+                    if (build_reachable[candidate_index] or !std.mem.eql(u8, candidate.path, resolved_path)) continue;
+                    build_reachable[candidate_index] = true;
+                    changed = true;
+                }
+                allocator.free(resolved_path);
+            }
+        }
+    }
     for (files, 0..) |file, file_index| {
         if (!looksLikeTestPath(file.path) or !containsTestDeclaration(file.tokens)) continue;
         var referenced = false;
@@ -428,12 +455,50 @@ fn findUnreferencedTests(
                 break;
             }
         }
+        if (!referenced) for (files, 0..) |importing_file, importing_index| {
+            if (importing_index == file_index) continue;
+            for (importing_file.tokens, 0..) |token, index| {
+                if (token.tag != .builtin or !tokenIs(importing_file.source, token, "@import") or
+                    index + 2 >= importing_file.tokens.len or importing_file.tokens[index + 1].tag != .l_paren or
+                    importing_file.tokens[index + 2].tag != .string_literal) continue;
+                const spelling = stringValue(importing_file.source, importing_file.tokens[index + 2]) orelse continue;
+                if (!std.mem.endsWith(u8, spelling, ".zig")) continue;
+                const resolved_path = try resolveImportPath(allocator, importing_file.path, spelling);
+                if (std.mem.eql(u8, resolved_path, file.path)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (referenced) break;
+        };
         if (!referenced) for (files, 0..) |build_file, build_index| {
-            if (build_index == file_index or !std.mem.eql(u8, std.fs.path.basename(build_file.path), "build.zig")) continue;
+            if (build_index == file_index or !build_reachable[build_index]) continue;
             if (sourceMentionsPath(build_file.source, file.path)) {
                 referenced = true;
                 break;
             }
+            var enumerates_directory = false;
+            for (build_file.tokens) |token| {
+                if (token.tag == .identifier and tokenIs(build_file.source, token, "iterate")) {
+                    enumerates_directory = true;
+                    break;
+                }
+            }
+            if (!enumerates_directory) continue;
+            var directory = std.fs.path.dirname(file.path);
+            while (directory) |candidate_directory| {
+                for (build_file.tokens) |token| {
+                    if (token.tag != .string_literal) continue;
+                    const spelling = stringValue(build_file.source, token) orelse continue;
+                    if (std.mem.eql(u8, spelling, candidate_directory)) {
+                        referenced = true;
+                        break;
+                    }
+                }
+                if (referenced) break;
+                directory = std.fs.path.dirname(candidate_directory);
+            }
+            if (referenced) break;
         };
         if (referenced) continue;
         try found.append(allocator, .{
@@ -669,7 +734,9 @@ fn findInconsistentParameterVocabulary(
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
-            if (token.tag != .keyword_fn or foreignDeclaration(file.tokens, fn_index)) continue;
+            if (token.tag != .keyword_fn or fn_index + 2 >= file.tokens.len or
+                file.tokens[fn_index + 1].tag != .identifier or file.tokens[fn_index + 2].tag != .l_paren or
+                foreignDeclaration(file.tokens, fn_index)) continue;
             const opening = nextTagBefore(file.tokens, fn_index + 1, .l_paren, .semicolon) orelse continue;
             const closing = matchingToken(file.tokens, opening, .l_paren, .r_paren) orelse continue;
             var start = opening + 1;
@@ -1107,6 +1174,33 @@ test "project findings compose imports tests c imports and build options" {
     };
     const found = try findings(arena.allocator(), &files, configuration);
     try std.testing.expectEqual(@as(usize, 4), found.len);
+}
+
+test "test files imported from a test block are referenced" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.unreferenced_test_file)] = .information;
+    const files = [_]SourceFile{
+        .{ .path = "src/parser.zig", .source = "test { _ = @import(\"parser_test.zig\"); }" },
+        .{ .path = "src/parser_test.zig", .source = "test \"parser\" {}" },
+    };
+    const found = try findings(arena.allocator(), &files, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .unreferenced_test_file);
+}
+
+test "build helpers may enumerate test directories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.unreferenced_test_file)] = .information;
+    const files = [_]SourceFile{
+        .{ .path = "build.zig", .source = "pub fn build(b: *Build) void { @import(\"tests/add_cases.zig\").add(b); }" },
+        .{ .path = "tests/add_cases.zig", .source = "pub fn add(b: *Build) void { var dir = b.path(\"tests/cases\").openDir(.{ .iterate = true }); var iterator = dir.iterate(); _ = iterator; }" },
+        .{ .path = "tests/cases/parser.zig", .source = "test \"parser\" {}" },
+    };
+    const found = try findings(arena.allocator(), &files, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .unreferenced_test_file);
 }
 
 test "project conventions require a strong corpus majority" {

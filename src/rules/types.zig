@@ -187,8 +187,6 @@ pub const Rule = enum {
             .unconditional_busy_loop,
             .padded_byte_compare,
             .useless_error_return,
-            .exposed_private_type,
-            .exposed_private_error_set,
             .deprecated_declaration,
             .mutated_container_copy,
             .import_boundary,
@@ -270,6 +268,8 @@ pub const Rule = enum {
             .unsafe_orelse_unreachable,
             .error_collapsed_to_absence,
             .public_declaration_docs,
+            .exposed_private_type,
+            .exposed_private_error_set,
             => .strict,
             else => null,
         };

@@ -178,6 +178,27 @@ pub fn declaredRootSources(
     return try roots.toOwnedSlice(allocator);
 }
 
+pub fn rootSourceDeclarationsAreStatic(
+    allocator: std.mem.Allocator,
+    build_source: [:0]const u8,
+) !bool {
+    const tokens = try tokenize(allocator, build_source);
+    defer allocator.free(tokens);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(build_source, token, "root_source_file")) continue;
+        var path_builtin = index + 1;
+        while (path_builtin < tokens.len and path_builtin - index < 12 and
+            tokens[path_builtin].tag != .l_paren) : (path_builtin += 1)
+        {}
+        if (path_builtin == tokens.len or path_builtin - index >= 12 or path_builtin < 2 or
+            tokens[path_builtin - 1].tag != .identifier or
+            (!tokenIs(build_source, tokens[path_builtin - 1], "path") and
+                !tokenIs(build_source, tokens[path_builtin - 1], "pathFromRoot")) or
+            path_builtin + 1 >= tokens.len or tokens[path_builtin + 1].tag != .string_literal) return false;
+    }
+    return true;
+}
+
 fn declaredNamedModuleSource(
     allocator: std.mem.Allocator,
     build_source: [:0]const u8,
@@ -291,6 +312,16 @@ test "build roots are deduplicated and resolved from the build directory" {
     try std.testing.expectEqual(@as(usize, 2), roots.len);
     try std.testing.expectEqualStrings("/workspace/src/main.zig", roots[0]);
     try std.testing.expectEqualStrings("/workspace/tools/tool.zig", roots[1]);
+}
+
+test "dynamic build roots make compiler coverage incomplete" {
+    const static_source: [:0]const u8 =
+        "const app = b.addExecutable(.{ .root_source_file = b.path(\"src/main.zig\") });";
+    const dynamic_source: [:0]const u8 =
+        "const app = b.addExecutable(.{ .root_source_file = b.path(b.fmt(\"examples/{s}\", .{entry.name})) });";
+
+    try std.testing.expect(try rootSourceDeclarationsAreStatic(std.testing.allocator, static_source));
+    try std.testing.expect(!try rootSourceDeclarationsAreStatic(std.testing.allocator, dynamic_source));
 }
 
 test "root selection follows actual imports and isolates unrelated documents" {

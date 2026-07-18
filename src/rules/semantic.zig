@@ -1172,7 +1172,7 @@ fn bindingObviouslyEscapes(
     end: usize,
 ) bool {
     for (tokens[start..end], start..) |token, index| {
-        if (token.tag == .keyword_return) {
+        if (token.tag == .keyword_return or token.tag == .keyword_break) {
             const return_end = statementEnd(tokens, index) orelse continue;
             for (tokens[index + 1 .. @min(return_end, end)]) |return_token| {
                 if (tokenIs(source, return_token, binding_name)) return true;
@@ -1399,22 +1399,56 @@ fn findErrorValueComparisons(
         const tag = tree.nodeTag(node);
         if (tag != .equal_equal and tag != .bang_equal) continue;
         const left, const right = tree.nodeData(node).node_and_node;
-        const error_value = if (tree.nodeTag(left) == .error_value)
-            left
+        const error_value, const compared_value = if (tree.nodeTag(left) == .error_value)
+            .{ left, right }
         else if (tree.nodeTag(right) == .error_value)
-            right
+            .{ right, left }
         else
             continue;
+        if (tree.nodeTag(compared_value) != .identifier) continue;
         const operator_index: usize = tree.nodeMainToken(node);
         if (operator_index >= tokens.len) continue;
+        const binding_index: usize = tree.nodeMainToken(compared_value);
+        if (binding_index >= tokens.len) continue;
+        const binding_name = tokenText(source, tokens[binding_index]);
+        const error_source = tree.getNodeSource(error_value);
+        const error_name_start = std.mem.lastIndexOfScalar(u8, error_source, '.') orelse continue;
+        const error_name = error_source[error_name_start + 1 ..];
+        const error_is_declared: ?bool = declared: {
+            var cursor = binding_index;
+            while (cursor > 0) {
+                cursor -= 1;
+                if (tokens[cursor].tag != .identifier or !tokenIs(source, tokens[cursor], binding_name) or
+                    cursor + 3 >= binding_index or tokens[cursor + 1].tag != .colon) continue;
+                if (cursor == 0) continue;
+                switch (tokens[cursor - 1].tag) {
+                    .keyword_const, .keyword_var, .l_paren, .comma => {},
+                    else => continue,
+                }
+                if (tokens[cursor + 2].tag != .keyword_error or tokens[cursor + 3].tag != .l_brace) break :declared null;
+                const closing = matchingToken(tokens, cursor + 3, .l_brace, .r_brace) orelse break :declared null;
+                if (closing >= binding_index or closing + 1 >= tokens.len) break :declared null;
+                switch (tokens[closing + 1].tag) {
+                    .equal, .comma, .r_paren => {},
+                    else => break :declared null,
+                }
+                for (tokens[cursor + 4 .. closing]) |member| {
+                    if (member.tag == .identifier and tokenIs(source, member, error_name)) break :declared true;
+                }
+                break :declared false;
+            }
+            break :declared null;
+        };
+        if (error_is_declared != false) continue;
+        const impossible_result = if (tag == .equal_equal) "true" else "false";
         try addFinding(allocator, source, configuration, found, .{
             .rule = .error_value_comparison,
             .level = level,
             .span = tokens[operator_index].loc,
             .message = try std.fmt.allocPrint(
                 allocator,
-                "comparison with '{s}' can widen the error set; use switch to preserve exhaustive checking",
-                .{tree.getNodeSource(error_value)},
+                "comparison with '{s}' can never be {s}; explicit error set of '{s}' does not contain it",
+                .{ error_source, impossible_result, binding_name },
             ),
         });
     }
@@ -1526,7 +1560,13 @@ fn findUnusedPrivateDeclarations(
             if (keyword_index >= tokens.len or tokens[keyword_index].tag != .keyword_const or
                 keyword_index + 1 >= tokens.len or tokens[keyword_index + 1].tag != .identifier or
                 !declarationIsPrivate(tokens, keyword_index) or insideFunctionOrTestBody(tokens, keyword_index)) continue;
-            try declarations.append(allocator, .{ .name_index = keyword_index + 1, .kind = .constant });
+            const statement_end = statementEnd(tokens, keyword_index) orelse continue;
+            var equal_index = keyword_index + 2;
+            while (equal_index < statement_end and tokens[equal_index].tag != .equal) : (equal_index += 1) {}
+            const direct_import = equal_index + 5 == statement_end and tokens[equal_index + 1].tag == .builtin and
+                tokenIs(source, tokens[equal_index + 1], "@import") and tokens[equal_index + 2].tag == .l_paren and
+                tokens[equal_index + 3].tag == .string_literal and tokens[equal_index + 4].tag == .r_paren;
+            if (!direct_import) try declarations.append(allocator, .{ .name_index = keyword_index + 1, .kind = .constant });
             continue;
         }
         if (tree.nodeTag(node) != .fn_decl) continue;
@@ -2009,7 +2049,7 @@ fn findSwitches(
         }
         if (else_index) |index| {
             const level = configuration.level(.non_exhaustive_switch_else);
-            if (level == .off) continue;
+            if (level == .off or missing.items.len > maximum_named_else_cases) continue;
             const fixes: []const Fix = if (elseCaptureCanBePreserved(tokens, index, closing)) fixes: {
                 const replacement = try caseSelectorText(allocator, missing.items);
                 const edits = try allocator.alloc(Edit, 1);
@@ -2053,6 +2093,8 @@ fn findSwitches(
         });
     }
 }
+
+const maximum_named_else_cases = 8;
 
 const BindingDeclarationSites = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize));
 const FunctionReturnTypes = std.StringHashMapUnmanaged([]const u8);
@@ -3732,7 +3774,7 @@ fn findImportIssues(
                 });
             } else try seen_paths.put(allocator, path, tokens[index + 5].loc);
         }
-        if (unused_level != .off and identifierUseCount(source, alias) == 1) {
+        if (unused_level != .off and identifierUseCount(source, tokens, alias) == 1) {
             const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start) fixes: {
                 const edits = try allocator.alloc(Edit, 1);
                 edits[0] = .{ .span = declaration_span, .replacement = "" };
@@ -3767,15 +3809,10 @@ fn findImportIssues(
     }
 }
 
-fn identifierUseCount(source: []const u8, name: []const u8) usize {
+fn identifierUseCount(source: []const u8, tokens: []const std.zig.Token, name: []const u8) usize {
     var count: usize = 0;
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, name)) |offset| {
-        const before_is_identifier = offset > 0 and isIdentifierCharacter(source[offset - 1]);
-        const end = offset + name.len;
-        const after_is_identifier = end < source.len and isIdentifierCharacter(source[end]);
-        if (!before_is_identifier and !after_is_identifier) count += 1;
-        start = end;
+    for (tokens) |token| {
+        if (token.tag == .identifier and tokenIs(source, token, name)) count += 1;
     }
     return count;
 }
@@ -4203,7 +4240,7 @@ test "error comparisons and mixed operators report precise findings" {
     const source: [:0]const u8 =
         "fn classify(err: error{Missing}, value: u8) bool {\n" ++
         "    _ = 1 + value << 3;\n" ++
-        "    return err == error.Missing;\n" ++
+        "    return err == error.Other;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
     configuration.levels[@intFromEnum(Rule.mixed_bitwise_arithmetic)] = .warning;
@@ -4221,6 +4258,17 @@ test "error comparisons and mixed operators report precise findings" {
     };
     try std.testing.expect(saw_error_comparison);
     try std.testing.expect(saw_mixed_operators);
+}
+
+test "comparison with a member of an explicit error set is valid" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn classify(err: error{Missing}) bool {\n" ++
+        "    return err == error.Missing;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .error_value_comparison);
 }
 
 test "unused private declarations omit public used and reflected names" {
@@ -4243,6 +4291,27 @@ test "unused private declarations omit public used and reflected names" {
     try std.testing.expectEqual(@as(usize, 2), names.items.len);
     try std.testing.expectEqualStrings("unused", names.items[0]);
     try std.testing.expectEqualStrings("private_unused", names.items[1]);
+}
+
+test "unused module aliases belong to unused import analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const module = @import(\"module.zig\");\n" ++
+        "const Parser = @import(\"module.zig\").ParserType;\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.unused_private_declaration)] = .warning;
+    configuration.levels[@intFromEnum(Rule.unused_import)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var unused_imports: usize = 0;
+    var unused_private_declarations: usize = 0;
+    for (found) |finding| switch (finding.rule) {
+        .unused_import => unused_imports += 1,
+        .unused_private_declaration => unused_private_declarations += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), unused_imports);
+    try std.testing.expectEqual(@as(usize, 1), unused_private_declarations);
 }
 
 test "semantic findings understand captures mutations and shadowed switch operands" {
@@ -4839,6 +4908,20 @@ test "resource diagnostics require visible close unlock or ownership transfer" {
         warning_count += 1;
     };
     try std.testing.expectEqual(@as(usize, 3), warning_count);
+}
+
+test "resource ownership can leave a nested block through break" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(allocator: anytype) !Step {\n" ++
+        "    return .{ .remove = value: {\n" ++
+        "        var list = try std.ArrayList(u8).initCapacity(allocator, 0);\n" ++
+        "        break :value list;\n" ++
+        "    } };\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .missing_resource_cleanup);
 }
 
 test "public lock APIs and temporary unlock restoration do not require local cleanup" {
@@ -5502,6 +5585,40 @@ test "inline else is exhaustive by construction" {
         "        .fast => 0,\n" ++
         "        inline else => |m| @intFromEnum(m),\n" ++
         "    };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    for (found) |finding| try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
+}
+
+test "switch else reports eight remaining cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { a, b, c, d, e, f, g, h, i };\n" ++
+        "fn run(mode: Mode) usize {\n" ++
+        "    return switch (mode) { .a => 0, else => 1 };\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var finding_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .non_exhaustive_switch_else) continue;
+        finding_count += 1;
+        try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finding_count);
+}
+
+test "switch else permits fallback over nine remaining cases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { a, b, c, d, e, f, g, h, i, j };\n" ++
+        "fn run(mode: Mode) usize {\n" ++
+        "    return switch (mode) { .a => 0, else => 1 };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
     configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;

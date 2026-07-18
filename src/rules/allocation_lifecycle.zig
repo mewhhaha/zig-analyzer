@@ -96,6 +96,13 @@ pub fn warningsWithSummaries(
         if (allocation.allocator_source) |allocator_name| {
             if (std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null) continue;
             if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
+            if (privateAllocatorParameterIsAlwaysArenaBacked(
+                source,
+                tokens,
+                declaration_index,
+                allocator_name,
+                summary_index,
+            )) continue;
         }
         const scope_end = scope_index.enclosingScopeEnd(declaration_index) orelse continue;
         if (statement_end >= scope_end) continue;
@@ -378,6 +385,107 @@ fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, all
         name = allocatorCallReceiver(source, tokens, declaration) orelse return false;
     }
     return false;
+}
+
+fn privateAllocatorParameterIsAlwaysArenaBacked(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    declaration_index: usize,
+    allocator_name: []const u8,
+    summary_index: summaries.Index,
+) bool {
+    const function = summary_index.privateFunctionContaining(source, declaration_index) orelse return false;
+    const parameter_index = for (function.parameter_names, 0..) |parameter, index| {
+        if (std.mem.eql(u8, parameter, allocator_name)) break index;
+    } else return false;
+
+    var call_chain: [16]usize = undefined;
+    return privateParameterIsAlwaysArenaBacked(
+        source,
+        tokens,
+        function,
+        parameter_index,
+        summary_index,
+        &call_chain,
+        0,
+    );
+}
+
+fn privateParameterIsAlwaysArenaBacked(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    function: summaries.FunctionSummary,
+    parameter_index: usize,
+    summary_index: summaries.Index,
+    call_chain: *[16]usize,
+    call_depth: usize,
+) bool {
+    if (call_depth == call_chain.len) return false;
+    for (call_chain[0..call_depth]) |body_start| if (body_start == function.body_start) return false;
+    call_chain[call_depth] = function.body_start;
+    var found_call = false;
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !tokenIsIdentifier(source, token, function.name)) continue;
+        if (index > 0 and tokens[index - 1].tag == .keyword_fn) continue;
+        if (index > 0 and tokens[index - 1].tag == .period) continue;
+        if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) return false;
+        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse return false;
+        const argument = argument: {
+            var argument_index: usize = 0;
+            var argument_start = index + 2;
+            var depth: usize = 0;
+            for (tokens[index + 2 .. closing], index + 2..) |argument_token, argument_token_index| switch (argument_token.tag) {
+                .l_paren, .l_bracket, .l_brace => depth += 1,
+                .r_paren, .r_bracket, .r_brace => depth -|= 1,
+                .comma => if (depth == 0) {
+                    if (argument_index == parameter_index) break :argument TokenRange{
+                        .start = argument_start,
+                        .end = argument_token_index,
+                    };
+                    argument_index += 1;
+                    argument_start = argument_token_index + 1;
+                },
+                else => {},
+            };
+            if (argument_index != parameter_index or argument_start >= closing) return false;
+            break :argument TokenRange{ .start = argument_start, .end = closing };
+        };
+        const arena_backed = arena_backed: {
+            if (argument.start + 2 < argument.end and tokens[argument.start].tag == .identifier and
+                tokens[argument.start + 1].tag == .period and tokens[argument.start + 2].tag == .identifier and
+                tokenIsIdentifier(source, tokens[argument.start + 2], "allocator"))
+            {
+                const receiver = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
+                break :arena_backed std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+                    allocatorIsArenaBacked(source, tokens, receiver);
+            }
+            if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) {
+                break :arena_backed false;
+            }
+            const argument_name = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
+            break :arena_backed std.ascii.indexOfIgnoreCase(argument_name, "arena") != null or
+                allocatorIsArenaBacked(source, tokens, argument_name);
+        };
+        if (!arena_backed) {
+            if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) return false;
+            const caller = summary_index.privateFunctionContaining(source, index) orelse return false;
+            const argument_name = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
+            const caller_parameter = for (caller.parameter_names, 0..) |parameter, caller_index| {
+                if (std.mem.eql(u8, parameter, argument_name)) break caller_index;
+            } else return false;
+            if (!privateParameterIsAlwaysArenaBacked(
+                source,
+                tokens,
+                caller,
+                caller_parameter,
+                summary_index,
+                call_chain,
+                call_depth + 1,
+            )) return false;
+        }
+        found_call = true;
+    }
+    return found_call;
 }
 
 const TokenRange = struct { start: usize, end: usize };
@@ -836,14 +944,25 @@ fn ownershipLeavesScope(
         if (closing_parenthesis >= end) continue;
         const receiver_is_binding = index >= 2 and tokenIsIdentifier(source, tokens[index - 2], binding_name) and
             identifierRefersToBinding(scope_index, binding_index, index - 2);
+        const argument_start = lastCallArgumentStart(tokens, index + 1, closing_parenthesis);
         const argument_contains_binding = releaseArgumentContainsBinding(
             source,
             tokens,
             scope_index,
             binding_name,
             binding_index,
-            lastCallArgumentStart(tokens, index + 1, closing_parenthesis),
+            argument_start,
             closing_parenthesis,
+        ) or releaseArgumentContainsOptionalCapture(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            start,
+            argument_start,
+            closing_parenthesis,
+            index,
         );
         const receiver_cleanup = receiver_is_binding and conventionalCleanupMethod(method);
         if (!receiver_cleanup and (!expected_cleanup or !argument_contains_binding)) continue;
@@ -862,6 +981,48 @@ fn ownershipLeavesScope(
     )) return .released;
     if (bindingEscapes(source, tokens, scope_index, binding_name, binding_index, start, end, release_method, summary_index)) return .released;
     return if (found_errdefer) .errdefer_only else .missing;
+}
+
+fn releaseArgumentContainsOptionalCapture(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    search_start: usize,
+    argument_start: usize,
+    argument_end: usize,
+    release_index: usize,
+) bool {
+    for (tokens[argument_start..argument_end], argument_start..) |argument, argument_index| {
+        if (argument.tag != .identifier) continue;
+        const capture_name = source[argument.loc.start..argument.loc.end];
+        var capture_index = search_start;
+        while (capture_index + 3 < release_index) : (capture_index += 1) {
+            if (tokens[capture_index].tag != .pipe or tokens[capture_index + 1].tag != .identifier or
+                !tokenIsIdentifier(source, tokens[capture_index + 1], capture_name) or
+                tokens[capture_index + 2].tag != .pipe or tokens[capture_index + 3].tag != .l_brace) continue;
+            const body_end = scope_index.matchingToken(capture_index + 3) orelse continue;
+            if (body_end < release_index) continue;
+            var if_index = search_start;
+            while (if_index + 1 < capture_index) : (if_index += 1) {
+                if (tokens[if_index].tag != .keyword_if or tokens[if_index + 1].tag != .l_paren) continue;
+                const condition_end = scope_index.matchingToken(if_index + 1) orelse continue;
+                if (condition_end + 1 != capture_index or
+                    !identifierRefersToBinding(scope_index, capture_index + 1, argument_index) or !containsBinding(
+                    source,
+                    tokens,
+                    scope_index,
+                    binding_name,
+                    binding_index,
+                    if_index + 2,
+                    condition_end,
+                )) continue;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 fn conventionalCleanupMethod(method: []const u8) bool {
@@ -1372,6 +1533,18 @@ test "errdefer and success cleanup are not a double release" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "optional capture cleanup releases an optional owned return" {
+    const source =
+        "fn make(allocator: std.mem.Allocator) ![]u8 { return allocator.alloc(u8, 16); }" ++
+        "fn run(allocator: std.mem.Allocator) void {" ++
+        "const maybe_bytes = make(allocator) catch null;" ++
+        "if (maybe_bytes) |bytes| { defer allocator.free(bytes); inspect(bytes); }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "an indirect helper transfer remains conservative" {
     const source =
         "fn register(bytes: []u8) void { store(bytes); }" ++
@@ -1637,6 +1810,63 @@ test "allocations through a binding derived from a local arena are exempt" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "private allocation functions called only with an arena allocator are exempt" {
+    const source =
+        "fn normalize(alloc: std.mem.Allocator, input: []const u8) !void {" ++
+        "var lowered = try alloc.dupe(u8, input);" ++
+        "lowered = try alloc.dupe(u8, lowered);" ++
+        "}" ++
+        "fn run(gpa: std.mem.Allocator, input: []const u8) !void {" ++
+        "var arena = std.heap.ArenaAllocator.init(gpa);" ++
+        "defer arena.deinit();" ++
+        "const a = arena.allocator();" ++
+        "try normalize(a, input);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "private allocation functions remain checked when any caller uses a general allocator" {
+    const source =
+        "fn normalize(alloc: std.mem.Allocator, input: []const u8) !void {" ++
+        "var lowered = try alloc.dupe(u8, input);" ++
+        "lowered = try alloc.dupe(u8, lowered);" ++
+        "defer alloc.free(lowered);" ++
+        "}" ++
+        "fn run(gpa: std.mem.Allocator, input: []const u8) !void {" ++
+        "try normalize(gpa, input);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    var saw_overwrite = false;
+    for (found) |finding| if (finding.rule == .overwritten_owning_value) {
+        saw_overwrite = true;
+    };
+    try std.testing.expect(saw_overwrite);
+}
+
+test "public allocation functions remain checked despite local arena callers" {
+    const source =
+        "pub inline fn normalize(alloc: std.mem.Allocator, input: []const u8) !void {" ++
+        "var lowered = try alloc.dupe(u8, input);" ++
+        "lowered = try alloc.dupe(u8, lowered);" ++
+        "defer alloc.free(lowered);" ++
+        "}" ++
+        "fn run(gpa: std.mem.Allocator, input: []const u8) !void {" ++
+        "var arena = std.heap.ArenaAllocator.init(gpa);" ++
+        "defer arena.deinit();" ++
+        "try normalize(arena.allocator(), input);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    var saw_overwrite = false;
+    for (found) |finding| if (finding.rule == .overwritten_owning_value) {
+        saw_overwrite = true;
+    };
+    try std.testing.expect(saw_overwrite);
 }
 
 test "releasing a field of the same name is not a release of the local binding" {

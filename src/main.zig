@@ -29,7 +29,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer arguments.deinit();
     _ = arguments.next();
 
-    const command = arguments.next() orelse "lsp";
+    const command = arguments.next() orelse {
+        try std.Io.File.stdout().writeStreamingAll(io, usage);
+        return 0;
+    };
     if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
         try writeVersion(io);
         return 0;
