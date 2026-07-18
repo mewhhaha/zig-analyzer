@@ -67,9 +67,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_comptime_fixture_tests = b.addRunArtifact(comptime_fixture_tests);
+    const compiler_patch_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compiler/protocol_invariant.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
+        }),
+    });
+    const run_compiler_patch_tests = b.addRunArtifact(compiler_patch_tests);
     const test_step = b.step("test", "Run zig-analyzer tests");
     test_step.dependOn(&run_module_tests.step);
     test_step.dependOn(&run_comptime_fixture_tests.step);
+    test_step.dependOn(&run_compiler_patch_tests.step);
 
     const no_argument_command = b.addRunArtifact(executable);
     no_argument_command.expectStdOutEqual(
