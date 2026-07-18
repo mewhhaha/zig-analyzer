@@ -28,7 +28,10 @@ shared domain types          rules/types.zig, rules/context.zig,
 The compiler backend is another boundary. `compiler_client.zig` speaks the
 versioned protocol, `compiler_session.zig` owns process and generation state,
 and analysis consumes resolved shapes rather than compiler or JSON protocol
-objects.
+objects. The LSP keeps compiler work on a debounced worker with its own
+document snapshots. Foreground requests use current syntax immediately;
+compiler-enriched diagnostics publish only when the worker generation still
+matches the latest document version.
 
 ## Thin modules
 

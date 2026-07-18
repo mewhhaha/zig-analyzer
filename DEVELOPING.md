@@ -1,8 +1,8 @@
 # Developing zig-analyzer
 
 This document covers contributor setup, the compiler backend, verification,
-and manual editor testing. The user-facing motivation and behavior comparison
-live in [README.md](README.md).
+and manual editor testing. The user-facing motivation and behavior live in
+[README.md](README.md).
 
 ## Build and verify
 
@@ -67,8 +67,8 @@ runs `zig-out/bin/zig-analyzer lsp`. On Helix versions with workspace trust
 enabled, run `:workspace-trust` once before checking health. Use `:lsp-restart`
 after rebuilding the analyzer.
 
-The comparison sources are valid Zig programs. `zig build examples` compiles
-and runs their tests. `examples/diagnostics/compiler_error.zig` and
+The example sources are valid Zig programs. `zig build examples` compiles and
+runs their tests. `examples/diagnostics/compiler_error.zig` and
 `examples/diagnostics/code_actions.zig` are intentionally invalid and excluded
 from that build so they can exercise diagnostics and actions.
 
@@ -81,11 +81,7 @@ every rule. The same tests run under `zig build test`; the continuous
 Zig 0.16.0.
 
 See [examples/README.md](examples/README.md) for exact completion, hover,
-navigation, rename, diagnostic, and code-action cases. To reproduce the ZLS
-comparison, use ZLS 0.16.0 at commit
-`494486203c3a48927f2383aa3d5ce5fca112186d`, change the Helix
-`language-servers` entry temporarily, run `:lsp-restart`, and repeat the same
-requests.
+navigation, rename, diagnostic, and code-action cases.
 
 ## Comptime fixture walkthrough
 

@@ -135,6 +135,7 @@ fn findSummaryLifecycleDifferences(
     defer summary_index.deinit(allocator);
 
     for (files, 0..) |file, file_index| {
+        if (!summary_index.hasImportedLifecycleFacts(file.source)) continue;
         var tree = try std.zig.Ast.parse(allocator, file.source, .zig);
         defer tree.deinit(allocator);
         var scope_index = try syntax_scope.Index.init(allocator, file.source, file.tokens);

@@ -136,6 +136,22 @@ pub const Index = struct {
         return ownedReturnFromFunction(function);
     }
 
+    pub fn hasImportedLifecycleFacts(index: Index, source: []const u8) bool {
+        for (index.import_aliases) |import_alias| {
+            if (import_alias.source.ptr != source.ptr or import_alias.source.len != source.len) continue;
+            const file = index.fileForIndex(import_alias.target_file_index) orelse continue;
+            for (index.functions[file.function_start..file.function_end]) |function| {
+                if (ownedReturnFromFunction(function) != null) return true;
+                if (function.unresolved) continue;
+                for (function.parameter_effects) |effect| switch (effect) {
+                    .borrowed, .released => return true,
+                    .escaped, .unknown => {},
+                };
+            }
+        }
+        return false;
+    }
+
     fn ownedReturnForCall(index: Index, source: []const u8, callable: []const u8) ?OwnedReturn {
         if (index.acquireContract(callable)) |contract| {
             return .{ .release = callableBaseName(contract.release) };
@@ -875,6 +891,19 @@ test "qualified summaries require a proven import alias" {
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     try std.testing.expectEqual(ParameterEffect.borrowed, index.parameterEffectForCall(caller, "inspection.inspect", 0));
     try std.testing.expectEqual(ParameterEffect.unknown, index.parameterEffectForCall(caller, "object.inspect", 0));
+    try std.testing.expect(index.hasImportedLifecycleFacts(caller));
+}
+
+test "imports without ownership facts skip cross-file lifecycle analysis" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const caller: [:0]const u8 = "const command = @import(\"command.zig\"); fn run() void { command.execute(); }";
+    const sources = [_]Source{
+        .{ .file_index = 0, .path = "src/command.zig", .source = "pub fn execute() void {}" },
+        .{ .file_index = 1, .path = "src/main.zig", .source = caller },
+    };
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(!index.hasImportedLifecycleFacts(caller));
 }
 
 test "owned return summaries do not apply to unrelated object methods" {

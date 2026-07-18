@@ -1,4 +1,4 @@
-# Language-server comparison examples
+# Language-server examples
 
 The completion, hover, navigation, and rename sources compile with Zig 0.16.0.
 Run those example tests with:
@@ -9,9 +9,7 @@ zig build examples
 
 `diagnostics/compiler_error.zig` is intentionally excluded from that build. It
 is valid Zig syntax with a semantic return-type error and is used by the
-compiler-integration tests. It is not a ZLS comparison: because the isolated
-file is outside the repository build graph, build-on-save does not ask ZLS to
-compile it.
+compiler-integration tests.
 
 `diagnostics/code_actions.zig` is also intentionally incomplete. Open it in
 Helix and use `space a` on the affected expression to exercise switch-prong and
@@ -21,9 +19,9 @@ requesting the extract-constant refactor. Run the fix-all source action to see
 only semantics-preserving rewrites applied; scaffolding and generation remain
 explicit actions. The repository configuration enables the `idiomatic` profile,
 so the mixed-operator parentheses action and other style diagnostics are visible
-without changing configuration. The error comparison is a correctness warning
-and intentionally has no automatic rewrite because introducing a `switch` is
-context-dependent.
+without changing configuration. The error-value diagnostic is a correctness
+warning and intentionally has no automatic rewrite because introducing a
+`switch` is context-dependent.
 
 The lower half of that fixture exercises the Zig-native action registry. Request
 actions on `fallible()`, `optional()`, `values.items`, the ownership `defer`, the
@@ -73,7 +71,7 @@ so the file remains a safe compilation fixture while every diagnostic is
 visible in the editor.
 
 Seven smaller diagnostic fixtures each isolate one valid Zig program that the
-compiler and ZLS accept but zig-analyzer warns about:
+compiler accepts but zig-analyzer warns about:
 
 | File | Diagnostic |
 | --- | --- |
@@ -86,50 +84,39 @@ compiler and ZLS accept but zig-analyzer warns about:
 | `diagnostics/helper_release.zig` | `unreleased-allocation` |
 
 For compiler-derived completion cases, leave the source unchanged and place the
-cursor directly after the listed dot, before the existing member name. The
-expected sets are pinned in the capture script so a changed ZLS response forces
-this comparison to be reviewed:
+cursor directly after the listed dot, before the existing member name:
 
-| File | Cursor expression | zig-analyzer | ZLS 0.16.0 |
-| --- | --- | --- | --- |
-| `compiler/comptime_pipeline.zig` | `pipeline.` | `Self`, `inner`, `trace` | `value` |
-| `compiler/indirect_type_lookup.zig` | `ActiveImplementation.` | `verify` | none |
-| `compiler/conditional_api.zig` | `ActiveApi.` | `recordMetric` | `disabled`, `recordMetric` |
-| `compiler/parsed_configuration.zig` | `ResilientClient.` | `retryBudget` | `retryBudget`, `singleAttempt` |
-| `compiler/reflected_strategy.zig` | `ReadingStrategy.` | `encode` | `encode`, `unsupported` |
-| `compiler/reified_flags.zig` | `flags.` | `verbose`, `cache`, `trace` | none |
+| File | Cursor expression | Expected candidates |
+| --- | --- | --- |
+| `compiler/comptime_pipeline.zig` | `pipeline.` | `Self`, `inner`, `trace` |
+| `compiler/indirect_type_lookup.zig` | `ActiveImplementation.` | `verify` |
+| `compiler/conditional_api.zig` | `ActiveApi.` | `recordMetric` |
+| `compiler/parsed_configuration.zig` | `ResilientClient.` | `retryBudget` |
+| `compiler/reflected_strategy.zig` | `ReadingStrategy.` | `encode` |
+| `compiler/reified_flags.zig` | `flags.` | `verbose`, `cache`, `trace` |
 
-The comptime-branch rows are precision differences, not missing-completion
-claims: ZLS finds the usable member but also includes an impossible branch. The
-reified `@Struct` row is a full miss: ZLS 0.16.0 offers no candidates for
-fields that exist only after reification. The recursive
-wrapper remains a compiler regression fixture, but it is no longer a gallery
-comparison because both servers provide its useful `inner` and `unwrap`
-members.
+The recursive wrapper remains a compiler regression fixture. Its useful
+members are `inner` and `unwrap`.
 
-The `zls` fixtures cover ordinary parity cases. Struct fields expose
+The `lsp` fixtures cover syntax-backed cases. Struct fields expose
 `display_name` and `login_count`, standard-library completion includes `eql`,
-and the imported catalog exposes `default_limit` and `clampToLimit` in both
-servers.
+and the imported catalog exposes `default_limit` and `clampToLimit`.
 
-The remaining rename case is `zls/scoped_rename.zig`. Rename the `value`
+The rename case is `lsp/scoped_rename.zig`. Rename the `value`
 parameter of `increment` to `number`. A scope-aware result changes that
 parameter and the use on the following line, while leaving the unrelated
 `value` parameter in `describe` untouched.
 
-Use `zls/hover.zig` to exercise hover resolution. Hover both uses of `incoming`,
+Use `lsp/hover.zig` to exercise hover resolution. Hover both uses of `incoming`,
 the `doubled` local at the call site, `addSample`, and `retry_limit`. The results
 show declared types for parameters and locals, the function signature and doc
 comment, and the bounded constant value. The field, import, and standard-library
 examples also provide contextual hover information for `display_name`,
 `clampToLimit`, and `eql` respectively.
 
-Use `zls/language_hover.zig` to compare reference hover. Hover `const`, `bool`,
+Use `lsp/language_hover.zig` to exercise language hover. Hover `const`, `bool`,
 `true`, `@sizeOf`, and the statement terminators. zig-analyzer documents Zig
-language tokens as well as declarations. The pinned ZLS comparison documents
-`@sizeOf` and gives compact type/value summaries for `bool` and `true`, but it
-returns no hover for `const` and no language-level explanation for the
-statement terminator.
+language tokens as well as declarations.
 
 Hover also follows an inferred local initialized by a function call when the
 function has an explicit return type. Imported dotted types, nested namespace
@@ -137,31 +124,10 @@ aliases, and private backing structs are followed to the final field, so a field
 such as `slice: []const Header` retains its declaration and documentation even
 when the local itself has no type annotation.
 
-To compare in Helix, first use this repository's default local configuration:
+To exercise the examples in Helix, use this repository's local configuration:
 
 ```sh
 zig build backend
 zig build
 hx examples/compiler/comptime_pipeline.zig
 ```
-
-After testing zig-analyzer, temporarily change the `language-servers` entry in
-`.helix/languages.toml` from `zig-analyzer-local` to `zls`, run
-`:lsp-restart`, and repeat the same requests with ZLS 0.16.0. Restore the local
-entry afterward so Helix uses this repository's analyzer again.
-
-The checked-in gallery is captured with an explicit Zig executable and ZLS's
-strongest relevant settings: build-on-save and style warnings are enabled, a
-save event is sent for every diagnostic fixture, and the harness waits up to
-60 seconds for ZLS's build diagnostics. Reproduce that exact comparison with:
-
-```sh
-node docs/tools/capture_comparisons.js \
-  --repo . \
-  --zls /path/to/zls-0.16.0 \
-  --zig /path/to/zig-0.16.0
-```
-
-The comparison generator also pins the expected empty ZLS diagnostic sets. If
-ZLS starts reporting one of those safety or lifetime problems, regeneration
-fails until the stale card is removed or rewritten.

@@ -240,6 +240,29 @@ Compiler-backed project rules are opt-in.
   slice with one value.
 - [`prefer-memcpy`](prefer-memcpy.md) — Reports element loops that only copy
   corresponding elements between distinct slices.
+- [`prefer-expression-initializer`](prefer-expression-initializer.md) — Reports
+  undefined locals assigned exactly once by every branch of an adjacent
+  `if` or `switch`.
+- [`combine-identical-switch-prongs`](combine-identical-switch-prongs.md) —
+  Reports adjacent uncaptured switch prongs with identical bodies.
+- [`prefer-optional-while-capture`](prefer-optional-while-capture.md) — Reports
+  `while (true)` loops whose first statement unwraps an optional or breaks.
+- [`prefer-loop-else`](prefer-loop-else.md) — Reports a flag used only to run
+  fallback work when a loop does not break.
+- [`prefer-orelse`](prefer-orelse.md) — Reports optional `if` expressions that
+  return their capture unchanged or choose a fallback.
+- [`prefer-starts-with`](prefer-starts-with.md) — Reports `indexOf(...) == 0`
+  prefix tests.
+- [`prefer-ends-with`](prefer-ends-with.md) — Reports guarded manual suffix
+  comparisons.
+- [`prefer-count-scalar`](prefer-count-scalar.md) — Reports loops that only
+  count elements equal to one scalar.
+- [`prefer-replace-scalar`](prefer-replace-scalar.md) — Reports loops that only
+  replace elements equal to one scalar.
+- [`prefer-multi-sequence-for`](prefer-multi-sequence-for.md) — Reports indexed
+  pairing of sequences whose equal lengths were asserted.
+- [`prefer-early-return`](prefer-early-return.md) — Reports an `if` whose
+  `else` branch only returns and can serve as a guard clause.
 - [`prefer-switch`](prefer-switch.md) — Reports integer, enum, or error equality
   dispatch expressed as a repeated if/else-if chain.
 - [`prefer-string-switch`](prefer-string-switch.md) — Reports repeated string

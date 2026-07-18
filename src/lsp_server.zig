@@ -21,9 +21,14 @@ const Declaration = document_module.Declaration;
 pub fn run(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) !void {
     var read_buffer: [4096]u8 = undefined;
     var stdio = lsp.Transport.Stdio.init(&read_buffer, .stdin(), .stdout());
-    var server = Server.init(io, allocator, environ, &stdio.transport);
+    var thread_safe_transport = lsp.ThreadSafeTransport(.{
+        .thread_safe_read = false,
+        .thread_safe_write = true,
+    }).init(&stdio.transport);
+    var server = Server.init(io, allocator, environ, &thread_safe_transport.transport);
     defer server.deinit();
-    try lsp.basic_server.run(io, allocator, &stdio.transport, &server, std.log.err);
+    try server.startCompilerWorker();
+    try lsp.basic_server.run(io, allocator, &thread_safe_transport.transport, &server, std.log.err);
     if (!server.shutdown_requested) return error.ExitWithoutShutdown;
 }
 
@@ -42,6 +47,7 @@ pub const Server = struct {
     shutdown_requested: bool = false,
     workspace_document_changes: bool = false,
     workspace_create_file: bool = false,
+    compiler_worker: ?*CompilerWorker = null,
 
     pub fn init(
         io: std.Io,
@@ -59,11 +65,22 @@ pub const Server = struct {
     }
 
     pub fn deinit(server: *Server) void {
+        if (server.compiler_worker) |worker| worker.deinit();
         if (server.compiler) |*compiler| compiler.deinit();
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         if (server.zig_lib_directory) |directory| server.allocator.free(directory);
         server.documents.deinit();
         server.* = undefined;
+    }
+
+    fn startCompilerWorker(server: *Server) !void {
+        std.debug.assert(server.compiler_worker == null);
+        server.compiler_worker = try CompilerWorker.create(
+            server.io,
+            server.allocator,
+            server.environ,
+            server.transport,
+        );
     }
 
     pub fn initialize(
@@ -165,6 +182,12 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        if (server.compiler_worker) |worker| {
+            try server.publishDiagnostics(arena, params.textDocument.uri);
+            const document = server.documents.getConst(params.textDocument.uri).?;
+            try worker.schedule(document, false);
+            return;
+        }
         try server.ensureCompiler(arena, params.textDocument.uri);
         try server.syncCompilerOverlay(params.textDocument.uri);
         try server.publishDiagnostics(arena, params.textDocument.uri);
@@ -180,6 +203,12 @@ pub const Server = struct {
             params.textDocument.version,
             params.contentChanges,
         );
+        if (server.compiler_worker) |worker| {
+            try server.publishDiagnostics(arena, params.textDocument.uri);
+            const document = server.documents.getConst(params.textDocument.uri).?;
+            try worker.schedule(document, false);
+            return;
+        }
         if (server.compiler == null and server.compiler_restart_available) {
             server.compiler_restart_available = false;
             server.compiler_start_attempted = false;
@@ -194,6 +223,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didClose"),
     ) !void {
+        if (server.compiler_worker) |worker| worker.cancel(params.textDocument.uri);
         if (server.compiler) |*compiler| {
             compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err);
         }
@@ -219,6 +249,11 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didSave"),
     ) !void {
+        if (server.compiler_worker) |worker| {
+            const document = server.documents.getConst(params.textDocument.uri) orelse return;
+            try worker.schedule(document, true);
+            return;
+        }
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
@@ -294,13 +329,7 @@ pub const Server = struct {
                 .detail = declarationKindName(declaration.kind),
             });
         }
-        const compiler_declarations = if (server.compiler) |*compiler|
-            compiler.workspaceDeclarations(arena) catch |err| declarations: {
-                server.recordCompilerFailure(err);
-                break :declarations &.{};
-            }
-        else
-            &.{};
+        const compiler_declarations = try server.compilerWorkspaceDeclarations(arena, document);
         for (compiler_declarations) |fully_qualified_name| {
             if (completions.items.len == 4096) break;
             if (!isRelatedCompilerDeclaration(document, fully_qualified_name)) continue;
@@ -1609,12 +1638,37 @@ pub const Server = struct {
         return try std.fs.path.resolve(allocator, &.{ directory, import_string });
     }
 
+    fn compilerWorkspaceDeclarations(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+    ) ![]const []const u8 {
+        if (server.compiler_worker) |worker| {
+            if (!worker.lockCurrent(document)) return &.{};
+            defer worker.analysis_mutex.unlock(server.io);
+            const compiled_document = worker.server.documents.getConst(document.uri).?;
+            return worker.server.compilerWorkspaceDeclarations(allocator, compiled_document);
+        }
+        if (!server.compilerAnalysisCurrent(document)) return &.{};
+        const compiler = if (server.compiler) |*active| active else return &.{};
+        return compiler.workspaceDeclarations(allocator) catch |err| {
+            server.recordCompilerFailure(err);
+            return &.{};
+        };
+    }
+
     fn compilerTypeMembers(
         server: *Server,
         allocator: std.mem.Allocator,
         document: *const Document,
         receiver: []const u8,
     ) !?[]const []const u8 {
+        if (server.compiler_worker) |worker| {
+            if (!worker.lockCurrent(document)) return null;
+            defer worker.analysis_mutex.unlock(server.io);
+            const compiled_document = worker.server.documents.getConst(document.uri).?;
+            return worker.server.compilerTypeMembers(allocator, compiled_document, receiver);
+        }
         const compiler = if (server.compiler) |*active| active else return null;
         const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
         const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
@@ -1654,6 +1708,12 @@ pub const Server = struct {
         document: *const Document,
         type_name: []const u8,
     ) !?analysis.ResolvedShape {
+        if (server.compiler_worker) |worker| {
+            if (!worker.lockCurrent(document)) return null;
+            defer worker.analysis_mutex.unlock(server.io);
+            const compiled_document = worker.server.documents.getConst(document.uri).?;
+            return worker.server.resolvedShapeForName(allocator, compiled_document, type_name);
+        }
         if (!server.compilerAnalysisCurrent(document)) return null;
         const compiler = if (server.compiler) |*active| active else return null;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
@@ -1690,6 +1750,12 @@ pub const Server = struct {
         document: *const Document,
         name: []const u8,
     ) !?compiler_client.ResolvedValue {
+        if (server.compiler_worker) |worker| {
+            if (!worker.lockCurrent(document)) return null;
+            defer worker.analysis_mutex.unlock(server.io);
+            const compiled_document = worker.server.documents.getConst(document.uri).?;
+            return worker.server.resolvedValueForName(allocator, compiled_document, name);
+        }
         if (!server.compilerAnalysisCurrent(document)) return null;
         const compiler = if (server.compiler) |*active| active else return null;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
@@ -1798,6 +1864,12 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         document: *const Document,
     ) ![]const analysis.ResolvedShape {
+        if (server.compiler_worker) |worker| {
+            if (!worker.lockCurrent(document)) return &.{};
+            defer worker.analysis_mutex.unlock(server.io);
+            const compiled_document = worker.server.documents.getConst(document.uri).?;
+            return worker.server.compilerTypeShapes(allocator, compiled_document);
+        }
         if (!server.compilerAnalysisCurrent(document)) return &.{};
         const compiler = if (server.compiler) |*active| active else return &.{};
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
@@ -1969,6 +2041,187 @@ pub const Server = struct {
         };
         server.zig_lib_directory = try server.allocator.dupe(u8, result.stdout[value_start..value_end]);
         return server.zig_lib_directory.?;
+    }
+};
+
+const CompilerWorker = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    server: Server,
+    queue_mutex: std.Io.Mutex = .init,
+    queue_condition: std.Io.Condition = .init,
+    analysis_mutex: std.Io.Mutex = .init,
+    pending: ?Job = null,
+    latest_generation: u64 = 0,
+    stopping: bool = false,
+    future: ?std.Io.Future(void) = null,
+
+    const Job = struct {
+        uri: []u8,
+        source: []u8,
+        version: i32,
+        generation: u64,
+        restart: bool,
+
+        fn deinit(job: *Job, allocator: std.mem.Allocator) void {
+            allocator.free(job.uri);
+            allocator.free(job.source);
+            job.* = undefined;
+        }
+    };
+
+    fn create(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        environ: std.process.Environ,
+        transport: *lsp.Transport,
+    ) !*CompilerWorker {
+        const worker = try allocator.create(CompilerWorker);
+        errdefer allocator.destroy(worker);
+        worker.* = .{
+            .io = io,
+            .allocator = allocator,
+            .server = Server.init(io, allocator, environ, transport),
+        };
+        worker.future = try io.concurrent(CompilerWorker.run, .{worker});
+        return worker;
+    }
+
+    fn deinit(worker: *CompilerWorker) void {
+        worker.queue_mutex.lockUncancelable(worker.io);
+        worker.stopping = true;
+        if (worker.pending) |*job| job.deinit(worker.allocator);
+        worker.pending = null;
+        worker.queue_condition.signal(worker.io);
+        worker.queue_mutex.unlock(worker.io);
+
+        if (worker.future) |*future| {
+            future.cancel(worker.io);
+        }
+        worker.server.deinit();
+        const allocator = worker.allocator;
+        worker.* = undefined;
+        allocator.destroy(worker);
+    }
+
+    fn schedule(worker: *CompilerWorker, document: *const Document, restart: bool) !void {
+        var job: Job = .{
+            .uri = try worker.allocator.dupe(u8, document.uri),
+            .source = undefined,
+            .version = document.version,
+            .generation = 0,
+            .restart = restart,
+        };
+        errdefer worker.allocator.free(job.uri);
+        job.source = try worker.allocator.dupe(u8, document.source);
+        errdefer worker.allocator.free(job.source);
+
+        worker.queue_mutex.lockUncancelable(worker.io);
+        defer worker.queue_mutex.unlock(worker.io);
+        worker.latest_generation +%= 1;
+        if (worker.latest_generation == 0) worker.latest_generation = 1;
+        job.generation = worker.latest_generation;
+        if (worker.pending) |*previous| {
+            job.restart = job.restart or previous.restart;
+            previous.deinit(worker.allocator);
+        }
+        worker.pending = job;
+        worker.queue_condition.signal(worker.io);
+    }
+
+    fn cancel(worker: *CompilerWorker, uri: []const u8) void {
+        worker.queue_mutex.lockUncancelable(worker.io);
+        defer worker.queue_mutex.unlock(worker.io);
+        worker.latest_generation +%= 1;
+        if (worker.latest_generation == 0) worker.latest_generation = 1;
+        if (worker.pending) |*job| {
+            if (std.mem.eql(u8, job.uri, uri)) {
+                job.deinit(worker.allocator);
+                worker.pending = null;
+            }
+        }
+    }
+
+    fn run(worker: *CompilerWorker) void {
+        while (true) {
+            worker.queue_mutex.lockUncancelable(worker.io);
+            while (worker.pending == null and !worker.stopping) {
+                worker.queue_condition.waitUncancelable(worker.io, &worker.queue_mutex);
+            }
+            if (worker.stopping) {
+                worker.queue_mutex.unlock(worker.io);
+                return;
+            }
+            const observed_generation = worker.latest_generation;
+            worker.queue_mutex.unlock(worker.io);
+
+            worker.io.sleep(.fromMilliseconds(100), .awake) catch return;
+
+            worker.queue_mutex.lockUncancelable(worker.io);
+            if (worker.stopping) {
+                worker.queue_mutex.unlock(worker.io);
+                return;
+            }
+            if (worker.latest_generation != observed_generation) {
+                worker.queue_mutex.unlock(worker.io);
+                continue;
+            }
+            var job = worker.pending orelse {
+                worker.queue_mutex.unlock(worker.io);
+                continue;
+            };
+            worker.pending = null;
+            worker.queue_mutex.unlock(worker.io);
+            defer job.deinit(worker.allocator);
+
+            worker.process(&job) catch |err| {
+                std.log.err("background compiler update failed for '{s}': {t}", .{ job.uri, err });
+            };
+        }
+    }
+
+    fn process(worker: *CompilerWorker, job: *const Job) !void {
+        worker.analysis_mutex.lockUncancelable(worker.io);
+        defer worker.analysis_mutex.unlock(worker.io);
+        var arena_state = std.heap.ArenaAllocator.init(worker.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        if (job.restart) worker.restartCompiler();
+        try worker.server.documents.open(job.uri, job.version, job.source);
+        try worker.server.ensureCompiler(arena, job.uri);
+        try worker.server.syncCompilerOverlay(job.uri);
+        const document = worker.server.documents.getConst(job.uri).?;
+        if (!worker.server.compilerAnalysisCurrent(document)) return;
+
+        worker.queue_mutex.lockUncancelable(worker.io);
+        defer worker.queue_mutex.unlock(worker.io);
+        if (worker.stopping or job.generation != worker.latest_generation) return;
+        try worker.server.publishDiagnostics(arena, job.uri);
+    }
+
+    fn restartCompiler(worker: *CompilerWorker) void {
+        if (worker.server.compiler) |*compiler| compiler.deinit();
+        worker.server.compiler = null;
+        if (worker.server.compiler_root_uri) |uri| worker.server.allocator.free(uri);
+        worker.server.compiler_root_uri = null;
+        worker.server.compiler_start_attempted = false;
+        worker.server.compiler_restart_available = true;
+    }
+
+    fn lockCurrent(worker: *CompilerWorker, document: *const Document) bool {
+        if (!worker.analysis_mutex.tryLock()) return false;
+        const compiled_document = worker.server.documents.getConst(document.uri) orelse {
+            worker.analysis_mutex.unlock(worker.io);
+            return false;
+        };
+        if (compiled_document.version != document.version or
+            !worker.server.compilerAnalysisCurrent(compiled_document))
+        {
+            worker.analysis_mutex.unlock(worker.io);
+            return false;
+        }
+        return true;
     }
 };
 
@@ -4619,8 +4872,8 @@ test "module diagnostics report only missing public members" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     server.compiler_start_attempted = true;
     defer server.deinit();
-    try server.documents.open("file://examples/zls/imports/main.zig", 1, source);
-    const document = server.documents.getConst("file://examples/zls/imports/main.zig").?;
+    try server.documents.open("file://examples/lsp/imports/main.zig", 1, source);
+    const document = server.documents.getConst("file://examples/lsp/imports/main.zig").?;
     const found = try server.documentFindings(arena, document, analysis.Configuration.defaults());
     var missing_member_count: usize = 0;
     for (found) |finding| {
@@ -4643,8 +4896,8 @@ test "module diagnostics resolve nested imported aliases once" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     server.compiler_start_attempted = true;
     defer server.deinit();
-    try server.documents.open("file://examples/zls/imports/nested.zig", 1, source);
-    const document = server.documents.getConst("file://examples/zls/imports/nested.zig").?;
+    try server.documents.open("file://examples/lsp/imports/nested.zig", 1, source);
+    const document = server.documents.getConst("file://examples/lsp/imports/nested.zig").?;
 
     const view = (try server.moduleView(arena, document, "Message")).?;
     var ping_member_count: usize = 0;
@@ -4704,13 +4957,13 @@ test "definition follows a constant alias into an imported declaration" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     server.compiler_start_attempted = true;
     defer server.deinit();
-    try server.documents.open("file://examples/zls/imports/alias.zig", 1, source);
-    const document = server.documents.getConst("file://examples/zls/imports/alias.zig").?;
+    try server.documents.open("file://examples/lsp/imports/alias.zig", 1, source);
+    const document = server.documents.getConst("file://examples/lsp/imports/alias.zig").?;
     const usage_start = std.mem.lastIndexOf(u8, source, "Alias").?;
     const identifier_span = document.identifierAt(usage_start).?;
 
     const location = (try server.aliasTargetDefinition(arena, document, identifier_span)).?;
-    try std.testing.expect(std.mem.endsWith(u8, location.uri, "/examples/zls/imports/catalog.zig"));
+    try std.testing.expect(std.mem.endsWith(u8, location.uri, "/examples/lsp/imports/catalog.zig"));
     try std.testing.expectEqual(@as(u32, 2), location.range.start.line);
     try std.testing.expectEqual(@as(u32, 10), location.range.start.character);
 }
@@ -4729,17 +4982,17 @@ test "LSP member completion and rename respect syntax context" {
         ,
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///comparison.zig","languageId":"zig","version":1,"text":"const Profile = struct { display_name: []const u8, login_count: u32 };\nfn show(profile: Profile) []const u8 { return profile.display_name; }\nfn increment(value: u32) u32 { return value + 1; }\nfn describe(value: []const u8) []const u8 { return value; }\nconst std = @import(\"std\");\nfn namesMatch(left: []const u8, right: []const u8) bool { return std.mem.eql(u8, left, right); }\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///language_server.zig","languageId":"zig","version":1,"text":"const Profile = struct { display_name: []const u8, login_count: u32 };\nfn show(profile: Profile) []const u8 { return profile.display_name; }\nfn increment(value: u32) u32 { return value + 1; }\nfn describe(value: []const u8) []const u8 { return value; }\nconst std = @import(\"std\");\nfn namesMatch(left: []const u8, right: []const u8) bool { return std.mem.eql(u8, left, right); }\n"}}}
         ,
-        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///comparison.zig"},"position":{"line":1,"character":54}}}
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///language_server.zig"},"position":{"line":1,"character":54}}}
         ,
-        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///comparison.zig"},"position":{"line":5,"character":73}}}
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///language_server.zig"},"position":{"line":5,"character":73}}}
         ,
-        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///comparison.zig"},"position":{"line":2,"character":15},"newName":"number"}}
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///language_server.zig"},"position":{"line":2,"character":15},"newName":"number"}}
         ,
-        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///comparison.zig"},"position":{"line":1,"character":55}}}
+        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language_server.zig"},"position":{"line":1,"character":55}}}
         ,
-        \\{"jsonrpc":"2.0","id":7,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///comparison.zig"},"position":{"line":5,"character":74}}}
+        \\{"jsonrpc":"2.0","id":7,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///language_server.zig"},"position":{"line":5,"character":74}}}
         ,
         \\{"jsonrpc":"2.0","id":5,"method":"shutdown"}
         ,
@@ -4775,13 +5028,13 @@ test "LSP import completion and definition resolve another file" {
         ,
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig","languageId":"zig","version":1,"text":"const catalog = @import(\"catalog.zig\");\nfn result() u32 { return catalog.clampToLimit(100); }\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig","languageId":"zig","version":1,"text":"const catalog = @import(\"catalog.zig\");\nfn result() u32 { return catalog.clampToLimit(100); }\n"}}}
         ,
-        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":1,"character":33}}}
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig"},"position":{"line":1,"character":33}}}
         ,
-        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":1,"character":36}}}
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig"},"position":{"line":1,"character":36}}}
         ,
-        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":1,"character":36}}}
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig"},"position":{"line":1,"character":36}}}
         ,
         \\{"jsonrpc":"2.0","id":4,"method":"shutdown"}
         ,
@@ -4815,17 +5068,17 @@ test "LSP resolves import paths and nested imported definitions" {
         ,
         \\{"jsonrpc":"2.0","method":"initialized","params":{}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig","languageId":"zig","version":1,"text":"const Message = @import(\"catalog.zig\").MessagePool.Message;\nfn use(_: *Message.Ping) void {}\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig","languageId":"zig","version":1,"text":"const Message = @import(\"catalog.zig\").MessagePool.Message;\nfn use(_: *Message.Ping) void {}\n"}}}
         ,
-        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":1,"character":19}}}
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig"},"position":{"line":1,"character":19}}}
         ,
-        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":26}}}
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig"},"position":{"line":0,"character":26}}}
         ,
-        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":40}}}
+        \\{"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig"},"position":{"line":0,"character":40}}}
         ,
-        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":0,"character":52}}}
+        \\{"jsonrpc":"2.0","id":5,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig"},"position":{"line":0,"character":52}}}
         ,
-        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/zls/imports/nested.zig"},"position":{"line":1,"character":20}}}
+        \\{"jsonrpc":"2.0","id":6,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://examples/lsp/imports/nested.zig"},"position":{"line":1,"character":20}}}
         ,
         \\{"jsonrpc":"2.0","id":7,"method":"shutdown"}
         ,
@@ -5432,13 +5685,13 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     const incoming = [_][]const u8{
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig","languageId":"zig","version":1,"text":"const catalog = @import(\"catalog.zig\");\nfn result() u32 { return catalog.clampToLimit(100); }\n"}}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig","languageId":"zig","version":1,"text":"const catalog = @import(\"catalog.zig\");\nfn result() u32 { return catalog.clampToLimit(100); }\n"}}}
         ,
-        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig","version":2},"contentChanges":[{"text":"fn result() u32 { return catalog.clampToLimit(100); }\n"}]}}
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig","version":2},"contentChanges":[{"text":"fn result() u32 { return catalog.clampToLimit(100); }\n"}]}}
         ,
-        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":0,"character":35}}}
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig"},"position":{"line":0,"character":35}}}
         ,
-        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/zls/imports/main.zig"},"position":{"line":0,"character":33}}}
+        \\{"jsonrpc":"2.0","id":3,"method":"textDocument/completion","params":{"textDocument":{"uri":"file://examples/lsp/imports/main.zig"},"position":{"line":0,"character":33}}}
         ,
         \\{"jsonrpc":"2.0","id":4,"method":"shutdown"}
         ,
@@ -5456,6 +5709,46 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":[]") != null);
+}
+
+test "LSP answers from current syntax while the compiler worker is busy" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///busy.zig","languageId":"zig","version":1,"text":"const first = 1;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///busy.zig","version":2},"contentChanges":[{"text":"const second = 2;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///busy.zig"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    try server.startCompilerWorker();
+    const worker = server.compiler_worker.?;
+    worker.server.compiler_start_attempted = true;
+    worker.server.compiler_restart_available = false;
+    worker.analysis_mutex.lockUncancelable(std.testing.io);
+    var worker_locked = true;
+    defer {
+        if (worker_locked) worker.analysis_mutex.unlock(std.testing.io);
+        server.deinit();
+    }
+
+    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 5), transport.output_count);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "first") == null);
+
+    worker.analysis_mutex.unlock(std.testing.io);
+    worker_locked = false;
 }
 
 test "LSP discards an out-of-order document version instead of clobbering newer text" {

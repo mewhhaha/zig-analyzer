@@ -17,10 +17,10 @@ test {
     _ = @import("diagnostics/use_after_release.zig");
     _ = @import("diagnostics/dangling_slice.zig");
     _ = @import("diagnostics/helper_release.zig");
-    _ = @import("zls/imports/main.zig");
-    _ = @import("zls/hover.zig");
-    _ = @import("zls/language_hover.zig");
-    _ = @import("zls/scoped_rename.zig");
-    _ = @import("zls/stdlib_completion.zig");
-    _ = @import("zls/struct_fields.zig");
+    _ = @import("lsp/imports/main.zig");
+    _ = @import("lsp/hover.zig");
+    _ = @import("lsp/language_hover.zig");
+    _ = @import("lsp/scoped_rename.zig");
+    _ = @import("lsp/stdlib_completion.zig");
+    _ = @import("lsp/struct_fields.zig");
 }

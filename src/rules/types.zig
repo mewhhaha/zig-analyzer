@@ -105,6 +105,17 @@ pub const Rule = enum {
     prefer_index_of,
     prefer_memset,
     prefer_memcpy,
+    prefer_expression_initializer,
+    combine_identical_switch_prongs,
+    prefer_optional_while_capture,
+    prefer_loop_else,
+    prefer_orelse,
+    prefer_starts_with,
+    prefer_ends_with,
+    prefer_count_scalar,
+    prefer_replace_scalar,
+    prefer_multi_sequence_for,
+    prefer_early_return,
     prefer_switch,
     prefer_string_switch,
     prefer_log_over_print,
@@ -367,6 +378,28 @@ fn derivedRuleCode(comptime enum_name: []const u8) []const u8 {
 test "rule codes follow enum names" {
     try std.testing.expectEqualStrings("missing-switch-prong", Rule.missing_switch_prong.code());
     try std.testing.expectEqualStrings("padded-byte-compare", Rule.padded_byte_compare.code());
+}
+
+test "subjective preference rules require explicit opt in" {
+    const preferences = [_]Rule{
+        .prefer_expression_initializer,
+        .combine_identical_switch_prongs,
+        .prefer_optional_while_capture,
+        .prefer_loop_else,
+        .prefer_orelse,
+        .prefer_starts_with,
+        .prefer_ends_with,
+        .prefer_count_scalar,
+        .prefer_replace_scalar,
+        .prefer_multi_sequence_for,
+        .prefer_early_return,
+    };
+    const configuration = Configuration.defaults();
+    for (preferences) |rule| {
+        try std.testing.expectEqual(Tier.style, rule.tier());
+        try std.testing.expectEqual(@as(?LintProfile, null), rule.profile());
+        try std.testing.expectEqual(Level.off, configuration.level(rule));
+    }
 }
 
 test "rule reference documents every rule" {

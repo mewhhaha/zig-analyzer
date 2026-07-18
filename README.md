@@ -8,8 +8,6 @@ file does not compile.
 - [Build and install from source](docs/installation.md)
 - [Editor setup](docs/editors.md) for Helix and Neovim
 - [Lint rules, configuration, and suppressions](docs/linting.md)
-- [Comparison methodology](docs/comparisons.md) and the
-  [published gallery](https://mewhhaha.github.io/zig-analyzer/)
 - [Versioning policy](docs/versioning.md)
 
 ## Why ask the compiler
@@ -42,32 +40,14 @@ fn result() u32 {
 }
 ```
 
-This program compiles. Requesting completion after `pipeline.` produces:
-
-| Server | Candidates |
-| --- | --- |
-| zig-analyzer | `Self`, `inner`, `trace` |
-| ZLS 0.16.0 | `value` |
+This program compiles. Requesting completion after `pipeline.` produces
+`Self`, `inner`, and `trace`.
 
 Because zig-analyzer queries the compiler, it lists the members the resolved
 type actually has, including the `trace` method the program calls two lines
 later. The same mechanism resolves types selected through `@field` and APIs
 gated behind comptime conditions, and hover shows compiler-evaluated values
 for top-level constants rather than only their initializer text.
-
-The comparison is pinned to Zig 0.16.0 and [ZLS 0.16.0 at
-`4944862`](https://github.com/zigtools/zls/commit/494486203c3a48927f2383aa3d5ce5fca112186d),
-and gives ZLS every relevant advantage its configuration exposes: an explicit
-Zig 0.16.0 executable, `enable_build_on_save = true`, `warn_style = true`, a
-`textDocument/didSave` notification for every diagnostic fixture, and a
-60-second wait for build diagnostics. The corpus also records the cases ZLS
-handles correctly and is kept as a regression suite. Every captured request
-and response is published in the
-[gallery](https://mewhhaha.github.io/zig-analyzer/);
-[docs/comparisons.md](docs/comparisons.md) describes the methodology, and
-[examples/README.md](examples/README.md) explains how to reproduce any
-capture, starting with
-[`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig).
 
 ## Language server
 
@@ -82,8 +62,10 @@ configurations. This repository's own `.helix/languages.toml` is already set
 up, so opening `examples/compiler/comptime_pipeline.zig` in Helix reproduces
 the completion above.
 
-If the compiler backend hangs, a watchdog disconnects it and the server
-continues answering from syntax analysis.
+Compiler updates run on a debounced background worker. The server answers from
+the latest syntax immediately, then publishes compiler-enriched diagnostics
+only if that result still matches the current document version. If the backend
+hangs, a watchdog disconnects it without blocking foreground requests.
 
 ## Linter
 
@@ -109,7 +91,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 121 rules with stable codes, organized into five named profiles,
+There are 133 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings
@@ -159,7 +141,7 @@ answers than reimplementing it.
 
 This repository does not accept pull requests; there is no maintenance
 commitment behind it. It is MIT-licensed, so fork freely — the rules, the
-comparison harness, and the backend protocol can all be reused without
+example fixtures, and the backend protocol can all be reused without
 permission. [ARCHITECTURE.md](ARCHITECTURE.md) documents the module
 boundaries, [EXTENDING.md](EXTENDING.md) the extension seams, and
 [`src/rules/README.md`](src/rules/README.md) the rule contract.

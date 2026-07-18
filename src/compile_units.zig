@@ -336,7 +336,7 @@ test "root selection follows actual imports and isolates unrelated documents" {
     try std.testing.expectEqualStrings(unrelated_path, unrelated_root);
 }
 
-test "comparison root selection isolates standalone examples" {
+test "example root selection isolates standalone examples" {
     const io = std.testing.io;
     const repository = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repository);

@@ -74,17 +74,17 @@ pub fn build(b: *std.Build) void {
     const fixtures_step = b.step("fixtures", "Run the comptime regression fixtures");
     fixtures_step.dependOn(&run_comptime_fixture_tests.step);
 
-    const comparison_examples_tests = b.addTest(.{
+    const language_server_examples_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/examples.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const run_comparison_examples_tests = b.addRunArtifact(comparison_examples_tests);
-    const examples_step = b.step("examples", "Compile and test the language-server comparison examples");
-    examples_step.dependOn(&run_comparison_examples_tests.step);
-    test_step.dependOn(&run_comparison_examples_tests.step);
+    const run_language_server_examples_tests = b.addRunArtifact(language_server_examples_tests);
+    const examples_step = b.step("examples", "Compile and test the language-server examples");
+    examples_step.dependOn(&run_language_server_examples_tests.step);
+    test_step.dependOn(&run_language_server_examples_tests.step);
     const pipeline_example_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/compiler/comptime_pipeline.zig"),
