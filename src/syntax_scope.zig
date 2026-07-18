@@ -405,7 +405,7 @@ fn braceStartsReturnType(tokens: []const std.zig.Token, opening: usize, return_t
             .keyword_switch,
             .keyword_if,
             => return true,
-            .bang, .question_mark, .asterisk, .asterisk_asterisk, .identifier, .l_paren, .r_paren, .comma => {},
+            .bang, .question_mark, .asterisk, .asterisk_asterisk, .identifier, .builtin, .l_paren, .r_paren, .comma => {},
             else => return false,
         }
     }

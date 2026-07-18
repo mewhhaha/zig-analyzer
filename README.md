@@ -82,6 +82,10 @@ zig build backend                    # builds the patched compiler
 zig-out/bin/zig-analyzer doctor      # verifies the setup
 ```
 
+See [Build and install from source](docs/installation.md) for the complete
+setup, including the patched backend, and [Editor setup](docs/editors.md) for
+Helix and Neovim configuration.
+
 Point your editor at `zig-out/bin/zig-analyzer` (`command = "...", args =
 ["lsp"]`). This repo's `.helix/languages.toml` already does; open
 `examples/compiler/comptime_pipeline.zig` in Helix and try the completion
@@ -154,10 +158,31 @@ successfully analyzed root's import graph.
 }
 ```
 
+Suppress an intentional finding with a source directive:
+
 ```zig
 // zig-analyzer: disable-next-line missing-errdefer
 const buffer = try allocator.alloc(u8, 4);
 ```
+
+The available forms are:
+
+```zig
+// zig-analyzer: disable-file discarded-error
+
+operation() catch {}; // zig-analyzer: disable-line discarded-error
+
+// zig-analyzer: disable discarded-error, needless-defer-block
+operation() catch {};
+defer { close(); }
+// zig-analyzer: enable discarded-error, needless-defer-block
+```
+
+`disable-next-line` applies only to the following line. `disable` remains in
+effect until the matching `enable`, and `disable-file` must appear before any
+code. Directives accept comma-separated rule codes; omit the codes or use
+`all` to target every rule. Malformed directives and unknown rule codes are
+reported instead of being ignored.
 
 It holds up: the engine runs crash-free over TigerBeetle (244 files), the
 entire Zig std (550 files), and ~6,100 mangled variants — and found two real

@@ -123,7 +123,7 @@ fn findingsWithShapesAndTokens(
     try findDiscardedErrors(allocator, source, tokens, configuration, &found);
     try findCatchDiagnostics(allocator, source, tokens, configuration, &found);
     try findMissingResourceCleanup(allocator, source, tokens, configuration, &found);
-    try findUndefinedValueEscapes(allocator, source, tokens, configuration, &found);
+    try findUndefinedValueEscapes(allocator, source, tokens, &scope_index, configuration, &found);
     try findBooleanComparisons(allocator, source, tokens, &scope_index, configuration, &found);
     try findErrorValueComparisons(allocator, source, tokens, &tree, configuration, &found);
     try findMixedBitwiseArithmetic(allocator, source, tokens, &tree, configuration, &found);
@@ -137,7 +137,7 @@ fn findingsWithShapesAndTokens(
     // The Rule enum entry remains so existing configurations still parse.
     try findNeedlessCasts(allocator, source, tokens, &scope_index, configuration, &found);
     try findNeedlessElse(allocator, source, tokens, configuration, &found);
-    try findNonIdiomaticNames(allocator, source, tokens, configuration, &found);
+    try findNonIdiomaticNames(allocator, source, tokens, &tree, resolved_shapes, configuration, &found);
     try findOfficialStyleIssues(allocator, source, tokens, configuration, &found);
     try findOptionalCaptureIdioms(allocator, source, tokens, configuration, &found);
     try findTryIdioms(allocator, source, tokens, configuration, &found);
@@ -318,7 +318,8 @@ fn findUnresolvedIdentifiers(
         const name = tokenText(source, token);
         if (std.mem.eql(u8, name, "_") or std.zig.isPrimitive(name) or
             scope_index.findBinding(token_index) != null or
-            syntax_scope.isContainerFieldDeclaration(tokens, token_index)) continue;
+            syntax_scope.isContainerFieldDeclaration(tokens, token_index) or
+            containerHeaderResolvesToNestedDeclaration(source, tokens, token_index, name)) continue;
         // Field names and enum literals are resolved through their receiver or
         // result type. Calls retain the more specific unresolved-call finding.
         if (token_index > 0 and tokens[token_index - 1].tag == .period) continue;
@@ -332,6 +333,47 @@ fn findUnresolvedIdentifiers(
             .message = try std.fmt.allocPrint(allocator, "use of unresolved identifier '{s}'", .{name}),
         });
     }
+}
+
+fn containerHeaderResolvesToNestedDeclaration(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    identifier_index: usize,
+    name: []const u8,
+) bool {
+    var container_keyword: ?usize = null;
+    var cursor = identifier_index;
+    while (cursor > 0 and identifier_index - cursor < 32) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
+                container_keyword = cursor;
+                break;
+            },
+            .semicolon, .l_brace, .r_brace, .equal => return false,
+            else => {},
+        }
+    }
+    if (container_keyword == null) return false;
+
+    var opening = identifier_index + 1;
+    while (opening < tokens.len and tokens[opening].tag != .l_brace) : (opening += 1) {
+        if (tokens[opening].tag == .semicolon) return false;
+    }
+    if (opening == tokens.len) return false;
+    const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse return false;
+
+    var depth: usize = 0;
+    for (tokens[opening + 1 .. closing], opening + 1..) |token, index| {
+        switch (token.tag) {
+            .l_brace => depth += 1,
+            .r_brace => depth -|= 1,
+            .keyword_const, .keyword_var, .keyword_fn => if (depth == 0 and index + 1 < closing and
+                tokens[index + 1].tag == .identifier and tokenIs(source, tokens[index + 1], name)) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn findUnresolvedMembers(
@@ -1002,6 +1044,9 @@ fn findMissingResourceCleanup(
         const scope_end = enclosingScopeEnd(tokens, lock_index) orelse continue;
         const receiver = tokenText(source, tokens[lock_index - 2]);
         if (bindingHasRelease(source, tokens, receiver, lock_index + 3, scope_end, "unlock", null)) continue;
+        const scope_opening = matchingOpeningToken(tokens, scope_end, .l_brace, .r_brace) orelse continue;
+        if (bindingHasRelease(source, tokens, receiver, scope_opening + 1, lock_index, "unlock", null)) continue;
+        if (lockCleanupIsPublicContract(source, tokens, lock_index, scope_end)) continue;
         try addFinding(allocator, source, configuration, found, .{
             .rule = .missing_resource_cleanup,
             .level = level,
@@ -1009,6 +1054,28 @@ fn findMissingResourceCleanup(
             .message = try std.fmt.allocPrint(allocator, "mutex '{s}' is locked without a visible unlock before leaving this scope", .{receiver}),
         });
     }
+}
+
+fn lockCleanupIsPublicContract(source: []const u8, tokens: []const std.zig.Token, index: usize, scope_end: usize) bool {
+    const closing = enclosingScopeEnd(tokens, index) orelse return false;
+    const opening = matchingOpeningToken(tokens, closing, .l_brace, .r_brace) orelse return false;
+    var cursor = opening;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .keyword_fn => {
+                if (cursor == 0 or tokens[cursor - 1].tag != .keyword_pub or cursor + 1 >= tokens.len or
+                    tokens[cursor + 1].tag != .identifier) return false;
+                const function_name = tokenText(source, tokens[cursor + 1]);
+                if (std.mem.startsWith(u8, function_name, "lock")) return true;
+                for (tokens[index + 1 .. scope_end]) |token| if (token.tag == .keyword_return) return true;
+                return false;
+            },
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn initializerNamesManagedResource(
@@ -1096,6 +1163,7 @@ fn findUndefinedValueEscapes(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
@@ -1119,16 +1187,21 @@ fn findUndefinedValueEscapes(
         }
         if (type_contains_array) continue;
         const binding_name = tokenText(source, tokens[declaration_index + 1]);
+        const binding_index = declaration_index + 1;
         const scope_end = enclosingScopeEnd(tokens, declaration_index) orelse continue;
         var index = statement_end + 1;
         while (index < scope_end and index < tokens.len) : (index += 1) {
             if (!tokenIs(source, tokens[index], binding_name)) continue;
+            if (index > 0 and tokens[index - 1].tag == .period) continue;
+            const visible_binding = scope_index.findBinding(index) orelse continue;
+            if (visible_binding.token_index != binding_index) continue;
             if (index > 0 and (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var) or
                 identifierIsCaptureBinding(tokens, index))
             {
                 index = enclosingScopeEnd(tokens, index) orelse index;
                 continue;
             }
+            if (usedByTypeQuery(source, tokens, index) or useBelongsToErrdefer(tokens, index)) continue;
             if (index + 1 < tokens.len and tokens[index + 1].tag == .equal) break;
             if (identifierIsDestructuredAssignmentTarget(tokens, index)) break;
             if (index > 0 and tokens[index - 1].tag == .ampersand or usedByAssembly(tokens, index)) break;
@@ -1155,6 +1228,28 @@ fn findUndefinedValueEscapes(
             break;
         }
     }
+}
+
+fn usedByTypeQuery(source: []const u8, tokens: []const std.zig.Token, use_index: usize) bool {
+    if (use_index < 2 or tokens[use_index - 1].tag != .l_paren or tokens[use_index - 2].tag != .builtin) return false;
+    return tokenIs(source, tokens[use_index - 2], "@TypeOf") or tokenIs(source, tokens[use_index - 2], "@typeInfo");
+}
+
+fn useBelongsToErrdefer(tokens: []const std.zig.Token, use_index: usize) bool {
+    var cursor = use_index;
+    var braces: usize = 0;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_brace => braces += 1,
+            .l_brace => braces -|= 1,
+            .keyword_errdefer => return true,
+            .semicolon => if (braces == 0) return false,
+            .keyword_fn, .keyword_test => return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn statementEnd(tokens: []const std.zig.Token, start: usize) ?usize {
@@ -2458,16 +2553,33 @@ fn findNonIdiomaticNames(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
+    resolved_shapes: []const ResolvedShape,
     configuration: Configuration,
     found: *std.ArrayList(Finding),
 ) !void {
     const level = configuration.level(.non_idiomatic_name);
     if (level == .off) return;
     const foreign_binding_dominated = fileIsDominatedByForeignBindings(source, tokens);
-    // Aliases like 'const Alias = Target;' inherit Target's convention, so one
-    // pass collects every name declared as a type or type-returning function.
     var type_declaring_names: std.StringHashMapUnmanaged(void) = .empty;
     defer type_declaring_names.deinit(allocator);
+    var structural_type_declarations: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer structural_type_declarations.deinit(allocator);
+    var value_declarations: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer value_declarations.deinit(allocator);
+    for (0..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const declaration = tree.fullVarDecl(node) orelse continue;
+        const initializer = declaration.ast.init_node.unwrap() orelse continue;
+        const keyword_index: usize = declaration.ast.mut_token;
+        if (keyword_index + 1 >= tokens.len or tokens[keyword_index].tag != .keyword_const or
+            tokens[keyword_index + 1].tag != .identifier) continue;
+        if (nodeIsTypeExpression(tree, initializer)) {
+            try structural_type_declarations.put(allocator, keyword_index + 1, {});
+        } else if (nodeIsValueExpression(tree, initializer)) {
+            try value_declarations.put(allocator, keyword_index + 1, {});
+        }
+    }
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or index == 0) continue;
         const declares_type = switch (tokens[index - 1].tag) {
@@ -2476,6 +2588,11 @@ fn findNonIdiomaticNames(
             else => false,
         };
         if (declares_type) try type_declaring_names.put(allocator, tokenText(source, token), {});
+        if (tokens[index - 1].tag == .keyword_comptime and index + 2 < tokens.len and tokens[index + 1].tag == .colon and
+            tokenIs(source, tokens[index + 2], "type"))
+        {
+            try type_declaring_names.put(allocator, tokenText(source, token), {});
+        }
     }
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or index == 0) continue;
@@ -2490,10 +2607,15 @@ fn findNonIdiomaticNames(
         if (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index)) continue;
         const name = tokenText(source, token);
         if (std.mem.startsWith(u8, name, "@\"")) continue;
-        const is_namespace = declaration_tag == .keyword_const and declarationIsNamespace(tokens, index);
+        const is_namespace = declaration_tag == .keyword_const and
+            (declarationIsNamespace(tokens, index) or declarationIsBareImport(source, tokens, index));
         const is_type = declaration_tag == .keyword_const and
-            declarationNamesType(source, tokens, index, &type_declaring_names);
+            (structural_type_declarations.contains(index) or
+                (!insideFunctionOrTestBody(tokens, index) and resolvedShapeNamesType(name, resolved_shapes)) or
+                declarationNamesType(source, tokens, index, &type_declaring_names));
         const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index);
+        if (declaration_tag == .keyword_const and !is_namespace and !is_type and
+            !value_declarations.contains(index)) continue;
         const idiomatic = if (is_namespace)
             isSnakeCase(name) or isTitleCase(name)
         else if (type_function or is_type)
@@ -2518,6 +2640,88 @@ fn findNonIdiomaticNames(
             .message = try std.fmt.allocPrint(allocator, "declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention }),
         });
     }
+}
+
+fn nodeIsValueExpression(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .char_literal,
+        .number_literal,
+        .unreachable_literal,
+        .enum_literal,
+        .string_literal,
+        .multiline_string_literal,
+        .error_value,
+        .anyframe_literal,
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
+        .array_init,
+        .array_init_comma,
+        .struct_init_one,
+        .struct_init_one_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .struct_init,
+        .struct_init_comma,
+        => true,
+        .identifier => {
+            const name = tree.tokenSlice(tree.nodeMainToken(node));
+            return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or
+                std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined");
+        },
+        else => false,
+    };
+}
+
+fn resolvedShapeNamesType(name: []const u8, resolved_shapes: []const ResolvedShape) bool {
+    for (resolved_shapes) |shape| if (std.mem.eql(u8, name, shape.type_name)) return true;
+    return false;
+}
+
+fn nodeIsTypeExpression(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .optional_type,
+        .array_type,
+        .array_type_sentinel,
+        .ptr_type_aligned,
+        .ptr_type_sentinel,
+        .ptr_type,
+        .ptr_type_bit_range,
+        .fn_proto_simple,
+        .fn_proto_multi,
+        .fn_proto_one,
+        .fn_proto,
+        .anyframe_type,
+        .error_set_decl,
+        .error_union,
+        .merge_error_sets,
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        else => false,
+    };
+}
+
+fn declarationIsBareImport(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
+    return identifier_index + 6 < tokens.len and tokens[identifier_index + 1].tag == .equal and
+        tokens[identifier_index + 2].tag == .builtin and tokenIs(source, tokens[identifier_index + 2], "@import") and
+        tokens[identifier_index + 3].tag == .l_paren and tokens[identifier_index + 4].tag == .string_literal and
+        tokens[identifier_index + 5].tag == .r_paren and tokens[identifier_index + 6].tag == .semicolon;
 }
 
 fn declarationInitializedByExternBuiltin(source: []const u8, tokens: []const std.zig.Token, identifier_index: usize) bool {
@@ -2600,7 +2804,7 @@ fn declarationNamesType(
     {
         const builtin_name = tokenText(source, tokens[identifier_index + 2]);
         const type_builtins = [_][]const u8{
-            "@This", "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple",
+            "@This", "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple", "@FieldType",
         };
         for (type_builtins) |name| if (std.mem.eql(u8, builtin_name, name)) return true;
         if (std.mem.eql(u8, builtin_name, "@import")) {
@@ -2611,8 +2815,13 @@ fn declarationNamesType(
             {
                 target_index += 2;
             }
-            if (target_index > import_end and target_index + 1 < tokens.len and
-                tokens[target_index + 1].tag == .semicolon and isTitleCase(tokenText(source, tokens[target_index]))) return true;
+            if (target_index > import_end and target_index + 1 < tokens.len and isTitleCase(tokenText(source, tokens[target_index]))) {
+                if (tokens[target_index + 1].tag == .semicolon) return true;
+                if (tokens[target_index + 1].tag == .l_paren) {
+                    const call_end = matchingToken(tokens, target_index + 1, .l_paren, .r_paren) orelse return false;
+                    if (call_end + 1 < tokens.len and tokens[call_end + 1].tag == .semicolon) return true;
+                }
+            }
         }
     }
     const declaration_end = statementEnd(tokens, identifier_index) orelse return false;
@@ -4260,6 +4469,52 @@ test "naming resolves type functions aliases and namespace structs" {
     try std.testing.expectEqual(@as(usize, 2), naming_count);
 }
 
+test "structural type aliases and bare type imports keep TitleCase names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const StaticAllocator = @import(\"static_allocator.zig\");\n" ++
+        "const ImportedGenerated = @import(\"generated.zig\").GeneratedType(u8);\n" ++
+        "const Message = struct { value: u8 };\n" ++
+        "const Messages = [4]?*Message;\n" ++
+        "const Bytes = []const u8;\n" ++
+        "const Callback = *const fn (Message) void;\n" ++
+        "const Reflected = @FieldType(Message, \"value\");\n" ++
+        "const Failure = error{Failed};\n" ++
+        "const Result = Failure!Message;\n" ++
+        "const MessageAlias = Message;\n" ++
+        "fn Generic(comptime Source: type) type { const Alias = Source; return Alias; }\n" ++
+        "const BadValue = 1;\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("BadValue", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "compiler-resolved type aliases require TitleCase names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "const external_type = external_value;\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    const found = try findingsWithShapes(arena.allocator(), source, configuration, &.{.{
+        .type_name = "external_type",
+        .kind = .structure,
+        .fields = &.{"value"},
+    }});
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("external_type", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
 test "idiomatic rewrites are offered only for mechanically bounded forms" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4519,6 +4774,23 @@ test "resource diagnostics require visible close unlock or ownership transfer" {
     try std.testing.expectEqual(@as(usize, 3), warning_count);
 }
 
+test "public lock APIs and temporary unlock restoration do not require local cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn lockDemand(self: *State) void { self.mutex.lock(); }\n" ++
+        "pub fn drain(self: *State) Iterator { self.mutex.lock(); return .{ .state = self }; }\n" ++
+        "pub fn run(mutex: anytype) void { mutex.lock(); }\n" ++
+        "fn restore(self: *State) void { self.mutex.unlock(); defer self.mutex.lock(); work(); }\n" ++
+        "fn leak(mutex: anytype) void { mutex.lock(); }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var warning_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        warning_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), warning_count);
+}
+
 test "undefined escape warns only before whole-value initialization" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4532,6 +4804,29 @@ test "undefined escape warns only before whole-value initialization" {
         warning_count += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), warning_count);
+}
+
+test "undefined tracking ignores same-named members type queries and guarded errdefer cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn outputs(fill: anytype, buffer: anytype) !void {\n" ++
+        "    var len: usize = undefined;\n" ++
+        "    try fill(buffer.len, &len);\n" ++
+        "    _ = len;\n" ++
+        "}\n" ++
+        "fn parse(fill: anytype) !void {\n" ++
+        "    var value: struct { field: bool } = undefined;\n" ++
+        "    try fill(@TypeOf(value), &value);\n" ++
+        "    _ = value.field;\n" ++
+        "}\n" ++
+        "fn pipelines() !void {\n" ++
+        "    var values: Pair = undefined;\n" ++
+        "    errdefer if (initialized()) { @field(values, \"first\").deinit(); };\n" ++
+        "    @field(values, \"first\") = try make();\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .undefined_value_escape);
 }
 
 test "comptime hints use proven container members and explicit constant conditions" {
@@ -5230,6 +5525,29 @@ test "resolved bindings and qualified members do not report unresolved identifie
         "    const third, const fourth = pair;\n" ++
         "    if (maybe) |value| return entry.value + value + first + second + third + fourth;\n" ++
         "    return error.Missing;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_identifier);
+}
+
+test "container tags declared inside their container resolve in the header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Value = union(Key) { item: u8, pub const Key = enum { item } };\n" ++
+        "const Handle = enum(Backing) { root, pub const Backing = u16 };\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_identifier);
+}
+
+test "generic parameters remain visible after switch return types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Options = struct {};\n" ++
+        "fn encode(data: anytype, opts: Options) switch (@TypeOf(data)) { []u8 => u8, else => void } {\n" ++
+        "    _ = data;\n" ++
+        "    _ = opts;\n" ++
         "}\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .unresolved_identifier);

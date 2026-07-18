@@ -12,6 +12,9 @@ pub fn run(context: RuleRun) !void {
         // A 'comptime var' array is interned into the binary; slices of it are
         // valid after the function returns.
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
+        // A function with only comptime parameters is evaluated from values
+        // known during compilation, so its local result storage is promoted.
+        if (enclosingFunctionHasOnlyComptimeParameters(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
         const declaration_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
@@ -40,6 +43,46 @@ pub fn run(context: RuleRun) !void {
             });
         }
     }
+}
+
+fn enclosingFunctionHasOnlyComptimeParameters(context: RuleRun, declaration_index: usize) bool {
+    const body_opening = context.enclosingOpeningBrace(declaration_index) orelse return false;
+    var function_index = body_opening;
+    while (function_index > 0) {
+        function_index -= 1;
+        switch (context.tokens[function_index].tag) {
+            .keyword_fn => break,
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    } else return false;
+
+    var parameters_opening = function_index + 1;
+    while (parameters_opening < body_opening and context.tokens[parameters_opening].tag != .l_paren) : (parameters_opening += 1) {}
+    if (parameters_opening == body_opening) return false;
+    const parameters_closing = context.matchingToken(parameters_opening, .l_paren, .r_paren) orelse return false;
+    if (parameters_closing == parameters_opening + 1) return false;
+
+    var saw_parameter = false;
+    var segment_has_comptime = false;
+    var nested: usize = 0;
+    for (context.tokens[parameters_opening + 1 .. parameters_closing]) |token| {
+        switch (token.tag) {
+            .l_paren, .l_bracket, .l_brace => nested += 1,
+            .r_paren, .r_bracket, .r_brace => nested -|= 1,
+            .keyword_comptime => {
+                if (nested == 0) segment_has_comptime = true;
+            },
+            .comma => if (nested == 0) {
+                if (!segment_has_comptime) return false;
+                saw_parameter = true;
+                segment_has_comptime = false;
+            },
+            else => {},
+        }
+    }
+    if (!segment_has_comptime) return false;
+    return saw_parameter or segment_has_comptime;
 }
 
 fn declarationStoresArray(context: RuleRun, declaration_index: usize, declaration_end: usize) bool {
@@ -151,6 +194,40 @@ test "comptime var arrays are interned and outlive the function" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "functions with only comptime parameters return promoted local slices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn description(comptime input: []const u8) []const u8 { var output: [input.len]u8 = undefined; return output[0..1]; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = @import("types.zig").Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "a runtime parameter keeps local slice storage temporary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn bytes(comptime size: usize, fill: u8) []const u8 { var output: [size]u8 = undefined; output[0] = fill; return output[0..1]; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = @import("types.zig").Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
 }
 
 test "heap-backed slices and local array values do not warn" {
