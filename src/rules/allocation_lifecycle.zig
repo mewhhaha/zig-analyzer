@@ -244,7 +244,10 @@ fn allocationFromCall(
             .allocator_source = allocatorSourceName(tree, receiver),
         };
     }
-    const owned = summary_index.ownedReturnCall(source, receiver_name, method) orelse return null;
+    const owned = if (receiver_name) |name|
+        summary_index.ownedReturnCall(source, name, method) orelse return null
+    else
+        return null;
     const allocator_argument = if (owned.allocator_parameter) |parameter|
         if (parameter < call.ast.params.len) call.ast.params[parameter] else null
     else
@@ -575,9 +578,29 @@ fn releaseCallContainsBinding(
         scope_index,
         binding_name,
         binding_index,
-        method_index + 2,
+        lastCallArgumentStart(tokens, method_index + 1, closing),
         closing,
     );
+}
+
+fn lastCallArgumentStart(tokens: []const std.zig.Token, opening: usize, closing: usize) usize {
+    var parentheses: usize = 0;
+    var brackets: usize = 0;
+    var braces: usize = 0;
+    var start = opening + 1;
+    for (tokens[opening + 1 .. closing], opening + 1..) |token, index| switch (token.tag) {
+        .l_paren => parentheses += 1,
+        .r_paren => parentheses -|= 1,
+        .l_bracket => brackets += 1,
+        .r_bracket => brackets -|= 1,
+        .l_brace => braces += 1,
+        .r_brace => braces -|= 1,
+        .comma => if (parentheses == 0 and brackets == 0 and braces == 0) {
+            start = index + 1;
+        },
+        else => {},
+    };
+    return start;
 }
 
 fn releaseArgumentContainsBinding(
@@ -592,7 +615,8 @@ fn releaseArgumentContainsBinding(
     for (start..end) |index| {
         if (!tokenRefersToBinding(source, tokens, index, binding_name) or
             !identifierRefersToBinding(scope_index, binding_index, index)) continue;
-        if (index + 1 < end and (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket)) continue;
+        if (index > start and tokens[index - 1].tag == .period) continue;
+        if (index + 1 < end and tokens[index + 1].tag == .l_bracket) continue;
         return true;
     }
     return false;
@@ -669,9 +693,21 @@ fn firstUseAfterRelease(
         }
         if (belongs_to_release) continue;
         if (index + 1 < tokens.len and tokens[index + 1].tag == .equal) return null;
+        if (!useDefinitelyReadsReleasedAllocation(source, tokens, index, end)) continue;
         return index;
     }
     return null;
+}
+
+fn useDefinitelyReadsReleasedAllocation(source: []const u8, tokens: []const std.zig.Token, use_index: usize, end: usize) bool {
+    if (use_index + 1 >= end) return false;
+    if (tokens[use_index + 1].tag == .l_bracket or tokens[use_index + 1].tag == .period_asterisk) return true;
+    if (use_index + 2 >= end or tokens[use_index + 1].tag != .period or tokens[use_index + 2].tag != .identifier) return false;
+    const member = source[tokens[use_index + 2].loc.start..tokens[use_index + 2].loc.end];
+    if (std.mem.eql(u8, member, "len")) return false;
+    if (!std.mem.eql(u8, member, "ptr")) return true;
+    return use_index + 3 < end and
+        (tokens[use_index + 3].tag == .period_asterisk or tokens[use_index + 3].tag == .l_bracket);
 }
 
 fn owningAssignment(
@@ -729,7 +765,10 @@ fn ownershipLeavesScope(
     for (tokens[start..end], start..) |token, index| {
         if ((token.tag == .keyword_return or token.tag == .keyword_break) and
             controlFlowValueContainsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, end)) return .released;
-        if (token.tag != .identifier or !std.mem.eql(u8, source[token.loc.start..token.loc.end], release_method)) continue;
+        if (token.tag != .identifier) continue;
+        const method = source[token.loc.start..token.loc.end];
+        const expected_cleanup = std.mem.eql(u8, method, release_method);
+        if (!expected_cleanup and !conventionalCleanupMethod(method)) continue;
         if (index == 0 or index + 2 >= end or tokens[index - 1].tag != .period or tokens[index + 1].tag != .l_paren) {
             continue;
         }
@@ -743,10 +782,11 @@ fn ownershipLeavesScope(
             scope_index,
             binding_name,
             binding_index,
-            index + 2,
+            lastCallArgumentStart(tokens, index + 1, closing_parenthesis),
             closing_parenthesis,
         );
-        if (!receiver_is_binding and !argument_contains_binding) continue;
+        const receiver_cleanup = receiver_is_binding and conventionalCleanupMethod(method);
+        if (!receiver_cleanup and (!expected_cleanup or !argument_contains_binding)) continue;
         if (!statementStartsWithErrdefer(tokens, index)) return .released;
         found_errdefer = true;
     }
@@ -762,6 +802,12 @@ fn ownershipLeavesScope(
     )) return .released;
     if (bindingEscapes(source, tokens, scope_index, binding_name, binding_index, start, end, release_method, summary_index)) return .released;
     return if (found_errdefer) .errdefer_only else .missing;
+}
+
+fn conventionalCleanupMethod(method: []const u8) bool {
+    const methods = [_][]const u8{ "close", "deinit", "delete", "destroy", "free", "release" };
+    for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
+    return false;
 }
 
 fn controlFlowValueContainsBinding(
@@ -811,7 +857,11 @@ fn bindingEscapes(
             const closing = scope_index.matchingToken(index) orelse continue;
             if (closing >= end or !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, closing)) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
-            if (std.mem.eql(u8, method, release_method)) continue;
+            if (std.mem.eql(u8, method, release_method)) {
+                const method_call = index >= 2 and tokens[index - 2].tag == .period;
+                if (method_call) continue;
+                return true;
+            }
             if (tokens[index - 1].tag == .identifier) {
                 switch (localCallOwnership(
                     source,
@@ -1399,7 +1449,7 @@ test "double release and use after release are reported in straight line code" {
         "fn run(allocator: std.mem.Allocator) !void {" ++
         "const buffer = try allocator.alloc(u8, 16);" ++
         "allocator.free(buffer);" ++
-        "consume(buffer);" ++
+        "_ = buffer[0];" ++
         "}";
     const use_findings = try warnings(std.testing.allocator, use_source);
     defer freeWarnings(std.testing.allocator, use_findings);
@@ -1408,6 +1458,31 @@ test "double release and use after release are reported in straight line code" {
         if (finding.rule == .use_after_release) saw_use = true;
     }
     try std.testing.expect(saw_use);
+}
+
+test "released slice metadata remains usable without reading freed memory" {
+    const source =
+        "fn run(a: std.mem.Allocator) !void {" ++
+        "const buffer = try a.alloc(u8, 16);" ++
+        "a.free(buffer);" ++
+        "_ = @intFromPtr(buffer.ptr);" ++
+        "_ = buffer.len;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .use_after_release);
+}
+
+test "passing a released value is not by itself proof of a memory read" {
+    const source =
+        "fn run(a: std.mem.Allocator, owner: anytype) !void {" ++
+        "const buffer = try a.alloc(u8, 16);" ++
+        "a.free(buffer);" ++
+        "_ = owner.isAllocated(buffer);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .use_after_release);
 }
 
 test "overwriting an owning allocation before release is reported" {
@@ -1446,6 +1521,62 @@ test "releasing a field of the same name is not a release of the local binding" 
         "const name = try a.dupe(u8, new);" ++
         "a.free(self.name);" ++
         "self.name = name;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "custom allocator free does not release its backing buffer argument" {
+    const source =
+        "fn run(a: std.mem.Allocator, bitmap: anytype, ptr: [*]u8) !void {" ++
+        "const backing = try a.alloc(u8, 16);" ++
+        "defer a.free(backing);" ++
+        "bitmap.free(backing, ptr);" ++
+        "_ = backing.ptr;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "custom allocator free releases its final allocation argument" {
+    const source =
+        "fn run(a: std.mem.Allocator, bitmap: anytype, backing: []u8) !void {" ++
+        "const ptr = try bitmap.alloc(u8, backing, 16);" ++
+        "bitmap.free(backing, ptr);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "owned wrapper values may use conventional cleanup methods" {
+    const source =
+        "fn rasterize(a: std.mem.Allocator) !Bitmap { return .{ .data = try a.alloc(u8, 16) }; }" ++
+        "fn run(a: std.mem.Allocator) !void {" ++
+        "var bitmap = try rasterize(a);" ++
+        "defer bitmap.deinit(a);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "qualified init calls do not inherit unrelated local summaries" {
+    const source =
+        "fn init(a: std.mem.Allocator) !Owner { return .{ .bytes = try a.alloc(u8, 4) }; }" ++
+        "fn run() void { var random = std.Random.DefaultPrng.init(1); _ = random.random(); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "derived allocation passed to an unqualified free wrapper transfers ownership" {
+    const source =
+        "fn run(a: std.mem.Allocator) !void {" ++
+        "const memory = try a.alloc(u8, 8);" ++
+        "free(null, memory.ptr, memory.len);" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
