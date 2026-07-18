@@ -117,7 +117,7 @@ compiler nor ZLS will ever mention:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-120 rules, stable codes, five focused profiles, quick fixes wherever the
+121 rules, stable codes, five focused profiles, quick fixes wherever the
 rewrite is provable, plus refactors ZLS doesn't attempt (`toOwnedSlice`
 returns, `defer`→`errdefer` transfer, `inline else` collapses, `orelse
 unreachable` → `.?`). Configure in `zig-analyzer.json`, suppress in source:

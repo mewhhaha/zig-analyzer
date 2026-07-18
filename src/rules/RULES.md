@@ -273,6 +273,9 @@ Compiler-backed project rules are opt-in.
   allocator-storing managed containers that should use current unmanaged APIs.
 - [`modernize-deprecated-io`](modernize-deprecated-io.md) — Reports known
   pre-`std.Io` adapters and names their current replacement.
+- [`modernize-deprecated-stdlib`](modernize-deprecated-stdlib.md) — Reports
+  `std` declarations deprecated or removed in the pinned release and names the
+  current replacement.
 
 ## Disciplined profile
 

@@ -699,6 +699,8 @@ pub const Server = struct {
         };
         var actions: std.ArrayList(lsp.types.CodeAction.Result) = .empty;
         var fix_all_edits: std.ArrayList(analysis.Edit) = .empty;
+        var offered_line_suppressions: std.ArrayList(OfferedSuppression) = .empty;
+        var offered_file_suppressions: std.ArrayList(OfferedSuppression) = .empty;
 
         for (document_findings) |finding| {
             for (finding.fixes) |fix| {
@@ -775,6 +777,25 @@ pub const Server = struct {
                         } });
                     },
                     else => {},
+                }
+                const suppression = try analysis.suppressionEdits(arena, document.source, finding.rule, finding.span.start);
+                if (!suppressionOffered(offered_line_suppressions.items, finding.rule, suppression.line.span.start)) {
+                    try offered_line_suppressions.append(arena, .{ .rule = finding.rule, .at = suppression.line.span.start });
+                    try actions.append(arena, .{ .code_action = .{
+                        .title = try std.fmt.allocPrint(arena, "Suppress '{s}' on this line", .{finding.rule.code()}),
+                        .kind = .quickfix,
+                        .isPreferred = false,
+                        .edit = try action_lsp.documentEdit(arena, document, &.{suppression.line}),
+                    } });
+                }
+                if (!suppressionOffered(offered_file_suppressions.items, finding.rule, suppression.file.span.start)) {
+                    try offered_file_suppressions.append(arena, .{ .rule = finding.rule, .at = suppression.file.span.start });
+                    try actions.append(arena, .{ .code_action = .{
+                        .title = try std.fmt.allocPrint(arena, "Suppress '{s}' in this file", .{finding.rule.code()}),
+                        .kind = .quickfix,
+                        .isPreferred = false,
+                        .edit = try action_lsp.documentEdit(arena, document, &.{suppression.file}),
+                    } });
                 }
             }
         }
@@ -3171,6 +3192,18 @@ const CleanupAction = struct {
     edit: analysis.Edit,
 };
 
+const OfferedSuppression = struct {
+    rule: analysis.Rule,
+    at: usize,
+};
+
+fn suppressionOffered(offered: []const OfferedSuppression, rule: analysis.Rule, at: usize) bool {
+    for (offered) |entry| {
+        if (entry.rule == rule and entry.at == at) return true;
+    }
+    return false;
+}
+
 fn allocationCleanupEdit(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -5160,6 +5193,41 @@ test "LSP advertises and returns complete filtered code actions" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "value == 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "cleanup();") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"\"") != null);
+}
+
+test "LSP offers line and file suppression quickfixes for a finding" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{"textDocument":{"codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["quickfix"]}}}}}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///suppress.zig","languageId":"zig","version":1,"text":"fn run() void {\n    var value = 1;\n    _ = value;\n}\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///suppress.zig"},"range":{"start":{"line":1,"character":8},"end":{"line":1,"character":13}},"context":{"diagnostics":[],"only":["quickfix"]}}}
+        ,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    server.compiler_start_attempted = true;
+    defer server.deinit();
+
+    try lsp.basic_server.run(
+        std.testing.io,
+        std.testing.allocator,
+        &transport.transport,
+        &server,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), transport.output_count);
+    const response = transport.output(2);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Suppress 'never-mutated-var' on this line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Suppress 'never-mutated-var' in this file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "    // zig-analyzer: disable-next-line never-mutated-var\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "// zig-analyzer: disable-file never-mutated-var\\n") != null);
+    try std.testing.expect(std.mem.count(u8, response, "Suppress 'never-mutated-var' on this line") == 1);
 }
 
 test "LSP returns Zig error recovery actions" {

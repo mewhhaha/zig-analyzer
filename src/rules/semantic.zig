@@ -20,6 +20,7 @@ pub const RelatedSpan = rule_types.RelatedSpan;
 pub const parseConfiguration = configuration_parser.parse;
 pub const suppressionWarning = configuration_parser.suppressionWarning;
 pub const isSuppressed = configuration_parser.isSuppressed;
+pub const suppressionEdits = configuration_parser.suppressionEdits;
 
 const ContainerKind = enum { enumeration, tagged_union, structure, error_set };
 
