@@ -475,6 +475,23 @@ fn labelIsVisible(source: []const u8, tokens: []const std.zig.Token, name: []con
             else => false,
         };
         if (!valid_construct) continue;
+        if (tokens[construct].tag != .l_brace) {
+            var cursor = construct + 1;
+            var parenthesis_depth: usize = 0;
+            var bracket_depth: usize = 0;
+            while (cursor < use_index) : (cursor += 1) switch (tokens[cursor].tag) {
+                .l_paren => parenthesis_depth += 1,
+                .r_paren => parenthesis_depth -|= 1,
+                .l_bracket => bracket_depth += 1,
+                .r_bracket => bracket_depth -|= 1,
+                .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0) {
+                    const body_end = matchingToken(tokens, cursor, .l_brace, .r_brace) orelse break;
+                    if (use_index < body_end) return true;
+                    break;
+                },
+                else => {},
+            };
+        }
         const end = labeledConstructEnd(tokens, construct) orelse continue;
         if (use_index > construct and use_index < end) return true;
     }
@@ -5749,6 +5766,19 @@ test "breaks resolve labels on for expressions with labeled else blocks" {
     const source: [:0]const u8 =
         "fn find(values: []u8) usize { return blk: for (values, 0..) |value, index| { if (value == 1) break :blk index; } else fallback: { break :fallback 0; }; }\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_label);
+}
+
+test "breaks resolve a labeled for body when its else expression ends a switch prong" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Value = union(enum) { one: []const bool }; " ++
+        "fn contains(value: Value) bool { return switch (value) { " ++
+        ".one => |items| found: for (items) |item| { if (item) break :found true; } else false, " ++
+        "}; }\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+
     for (found) |finding| try std.testing.expect(finding.rule != .unresolved_label);
 }
 

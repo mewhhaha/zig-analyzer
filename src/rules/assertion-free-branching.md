@@ -1,6 +1,6 @@
 # `assertion-free-branching`
 
-Reports a nontrivial function with computed indexing but no visible assertion, unreachable arm, or early-return bounds validation.
+Reports a nontrivial function with computed indexing but no visible assertion, unreachable arm, loop bound, or early-exit bounds validation.
 
 **Why it matters.** Assertions state the invariant behind pointer and range computation where Debug builds can check it.
 
