@@ -71,6 +71,8 @@ captured response. Reproduce the first completion from
 [`examples/compiler/comptime_pipeline.zig`](examples/compiler/comptime_pipeline.zig),
 or run the complete capture described in
 [`examples/README.md`](examples/README.md).
+The [comparison guide](docs/comparisons.md) separates editor intelligence from
+lint diagnostics and defines the dedicated-linter baselines and methodology.
 
 ## Use it
 
