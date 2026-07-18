@@ -106,11 +106,13 @@ similarly belongs in `src/project_check.zig`, outside file-local analysis.
 Run the narrow test for the changed module while iterating, then run:
 
 ```sh
-zig fmt --check build.zig src tests fixtures examples
+git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
 zig build check
 zig build test
 zig build fixtures
 zig build examples
+zig build -Doptimize=ReleaseFast
+zig-out/bin/zig-analyzer check --no-cache .
 ```
 
 Compiler protocol work also requires `zig build backend-test`. Changes to LSP

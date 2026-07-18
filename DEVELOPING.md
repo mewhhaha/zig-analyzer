@@ -11,13 +11,15 @@ The project pins Zig 0.16.0 at commit
 
 ```sh
 zig version # must print 0.16.0
-zig build
+git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
+zig build -Doptimize=ReleaseFast
 zig build backend
 zig build test
 zig build backend-test
 zig build fixtures
 zig build examples
 zig build fuzz-rules
+zig-out/bin/zig-analyzer check --no-cache .
 zig build run -- doctor
 zig build run -- version
 ```
