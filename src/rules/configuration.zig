@@ -2,6 +2,7 @@ const std = @import("std");
 const rule_types = @import("types.zig");
 
 const Configuration = rule_types.Configuration;
+const Edit = rule_types.Edit;
 const Level = rule_types.Level;
 const LintProfile = rule_types.LintProfile;
 const Rule = rule_types.Rule;
@@ -575,6 +576,72 @@ pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
     return disabled;
 }
 
+pub const SuppressionEdits = struct {
+    line: Edit,
+    file: Edit,
+};
+
+/// Byte edits that would suppress the rule reported at offset: one placing a
+/// disable-next-line directive above the finding's line (extending a directive
+/// already there), one placing a disable-file directive in the file header.
+pub fn suppressionEdits(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    rule: Rule,
+    offset: usize,
+) !SuppressionEdits {
+    const target_line_start = lineStart(source, offset);
+    const line_edit = if (extendableDirectiveEnd(source, target_line_start)) |directive_end| Edit{
+        .span = .{ .start = directive_end, .end = directive_end },
+        .replacement = try std.fmt.allocPrint(allocator, ", {s}", .{rule.code()}),
+    } else line_edit: {
+        var indentation_end = target_line_start;
+        while (indentation_end < source.len and
+            (source[indentation_end] == ' ' or source[indentation_end] == '\t')) indentation_end += 1;
+        break :line_edit Edit{
+            .span = .{ .start = target_line_start, .end = target_line_start },
+            .replacement = try std.fmt.allocPrint(
+                allocator,
+                "{s}// zig-analyzer: disable-next-line {s}\n",
+                .{ source[target_line_start..indentation_end], rule.code() },
+            ),
+        };
+    };
+    const header_end = fileHeaderEnd(source);
+    return .{
+        .line = line_edit,
+        .file = .{
+            .span = .{ .start = header_end, .end = header_end },
+            .replacement = try std.fmt.allocPrint(allocator, "// zig-analyzer: disable-file {s}\n", .{rule.code()}),
+        },
+    };
+}
+
+/// End of the rule list of a disable-next-line directive directly above the
+/// target line, when appending another rule name keeps the directive valid.
+fn extendableDirectiveEnd(source: []const u8, target_line_start: usize) ?usize {
+    if (target_line_start == 0) return null;
+    const previous_line_start = lineStart(source, target_line_start - 1);
+    const previous_line = source[previous_line_start .. target_line_start - 1];
+    const directive = directiveOnLine(previous_line) orelse return null;
+    if (directive.kind != .disable_next_line) return null;
+    if (directive.targets.len == 0 or std.mem.eql(u8, directive.targets, "all")) return null;
+    return previous_line_start + std.mem.trimEnd(u8, previous_line, " \t\r").len;
+}
+
+/// Start of the first line containing code; a disable-file directive inserted
+/// here stays within the file header after any module doc comments.
+fn fileHeaderEnd(source: []const u8) usize {
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const end = lineEnd(source, cursor);
+        if (lineHasCode(source[cursor..end])) return cursor;
+        if (end == source.len) break;
+        cursor = end + 1;
+    }
+    return cursor;
+}
+
 const DirectiveKind = enum {
     disable_file,
     disable_line,
@@ -1050,4 +1117,74 @@ test "directive markers inside strings are ignored" {
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(std.testing.allocator, source));
     const marker = std.mem.indexOf(u8, source, "marker").?;
     try std.testing.expect(!isSuppressed(source, .never_mutated_var, marker));
+}
+
+test "suppression edits insert an indented next-line directive that suppresses the finding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source =
+        "fn run() void {\n" ++
+        "    var value = 1;\n" ++
+        "}\n";
+    const offset = std.mem.indexOf(u8, source, "value").?;
+    const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
+
+    const suppressed = try applyEdit(arena.allocator(), source, edits.line);
+    try std.testing.expectEqualStrings(
+        "fn run() void {\n" ++
+            "    // zig-analyzer: disable-next-line never-mutated-var\n" ++
+            "    var value = 1;\n" ++
+            "}\n",
+        suppressed,
+    );
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
+    try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
+}
+
+test "suppression edits extend a next-line directive already above the finding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source =
+        "// zig-analyzer: disable-next-line needless-defer-block\n" ++
+        "var value = 1;\n";
+    const offset = std.mem.indexOf(u8, source, "value").?;
+    const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
+
+    const suppressed = try applyEdit(arena.allocator(), source, edits.line);
+    try std.testing.expectEqualStrings(
+        "// zig-analyzer: disable-next-line needless-defer-block, never-mutated-var\n" ++
+            "var value = 1;\n",
+        suppressed,
+    );
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .needless_defer_block, std.mem.indexOf(u8, suppressed, "value").?));
+}
+
+test "suppression file edit lands after module doc comments and suppresses the whole file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source =
+        "//! Module docs.\n" ++
+        "\n" ++
+        "var value = 1;\n" ++
+        "var again = 2;\n";
+    const offset = std.mem.indexOf(u8, source, "again").?;
+    const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
+
+    const suppressed = try applyEdit(arena.allocator(), source, edits.file);
+    try std.testing.expectEqualStrings(
+        "//! Module docs.\n" ++
+            "\n" ++
+            "// zig-analyzer: disable-file never-mutated-var\n" ++
+            "var value = 1;\n" ++
+            "var again = 2;\n",
+        suppressed,
+    );
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "again").?));
+    try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
+}
+
+fn applyEdit(allocator: std.mem.Allocator, source: []const u8, edit: Edit) ![]u8 {
+    return std.mem.concat(allocator, u8, &.{ source[0..edit.span.start], edit.replacement, source[edit.span.end..] });
 }
