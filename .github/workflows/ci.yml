@@ -19,7 +19,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Check formatting
-        run: zig fmt --check build.zig src tests
+        run: git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
       - name: Run tests
         run: zig build test --summary all
       - name: Build analyzer
