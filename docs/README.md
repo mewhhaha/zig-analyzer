@@ -1,9 +1,11 @@
 # Documentation
 
 - [Build and install from source](installation.md)
-- [Editor setup](editors.md), including Helix and Neovim
+- [Editor setup](editors.md) for Helix and Neovim
+- [Linting](linting.md): rules, profiles, configuration, contracts, and
+  source suppressions
 - [Comparisons](comparisons.md) with ZLS and dedicated Zig linters
-- [Lint configuration and source suppressions](../README.md#use-it)
+- [Versioning](versioning.md): how releases track Zig versions
 - [Language-server comparison examples](../examples/README.md)
 
 The generated comparison gallery is served from `docs/index.html`; its capture
