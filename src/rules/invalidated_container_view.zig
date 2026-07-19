@@ -166,6 +166,9 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
         for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, method_index| {
             if (candidate.tag != .identifier or !context.tokenIs(method_index, "realloc") or
                 method_index + 1 >= scope_end or context.tokens[method_index + 1].tag != .l_paren) continue;
+            if (method_index < 2 or context.tokens[method_index - 1].tag != .period or
+                context.tokens[method_index - 2].tag != .identifier or
+                !allocatorBinding(context, context.tokenText(method_index - 2), method_index)) continue;
             const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
             const allocation = firstArgument(context, method_index + 2, call_end) orelse continue;
             if (!rangeContainsPath(context, declaration_index + 3, declaration_end, allocation)) continue;
@@ -183,6 +186,23 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
             break;
         }
     }
+}
+
+fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
+    if (std.ascii.indexOfIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
+    var name_index = before;
+    while (name_index > 0) {
+        name_index -= 1;
+        if (!context.tokenIs(name_index, name) or name_index + 2 >= before or
+            context.tokens[name_index + 1].tag != .colon) continue;
+        var type_index = name_index + 2;
+        while (type_index < before) : (type_index += 1) {
+            if (context.tokens[type_index].tag == .identifier and context.tokenIs(type_index, "Allocator")) return true;
+            if (context.tokens[type_index].tag == .comma or context.tokens[type_index].tag == .r_paren or
+                context.tokens[type_index].tag == .equal or context.tokens[type_index].tag == .semicolon) return false;
+        }
+    }
+    return false;
 }
 
 const TokenRange = struct { start: usize, end: usize };
@@ -410,6 +430,28 @@ test "views returned after their source allocation is reallocated report" {
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.invalidated_container_view, findings.items[0].rule);
+}
+
+test "custom realloc methods do not imply allocator invalidation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn resize(frame: *Frame, width: usize) !View {\n" ++
+        "    const previous = View{ .pixels = frame.pixels };\n" ++
+        "    frame.pixels = try frame.buffer.realloc(frame.pixels, width);\n" ++
+        "    return previous;\n" ++
+        "}\n";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
