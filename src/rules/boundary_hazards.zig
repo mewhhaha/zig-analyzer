@@ -91,9 +91,12 @@ fn findDiscardedResources(context: RuleRun) !void {
                 context.tokens[call_index + 1].tag != .l_paren) continue;
             for (acquisitions) |acquisition| {
                 if (!context.tokenIs(call_index, acquisition)) continue;
-                if ((std.mem.eql(u8, acquisition, "openFile") or std.mem.eql(u8, acquisition, "createFile") or
-                    std.mem.eql(u8, acquisition, "openDir") or std.mem.eql(u8, acquisition, "openDirAbsolute")) and
-                    !ioDirectoryCall(context, call_index)) continue;
+                const is_directory_method = std.mem.eql(u8, acquisition, "openFile") or
+                    std.mem.eql(u8, acquisition, "createFile") or
+                    std.mem.eql(u8, acquisition, "openDir") or
+                    std.mem.eql(u8, acquisition, "openDirAbsolute");
+                if (is_directory_method and !ioDirectoryCall(context, call_index)) continue;
+                if (!is_directory_method and !posixAcquisitionCall(context, call_index)) continue;
                 try context.emit(.{
                     .rule = .discarded_resource,
                     .level = level,
@@ -108,6 +111,15 @@ fn findDiscardedResources(context: RuleRun) !void {
             }
         }
     }
+}
+
+fn posixAcquisitionCall(context: RuleRun, call_index: usize) bool {
+    if (call_index >= 2 and context.tokens[call_index - 1].tag == .period and
+        context.tokenIs(call_index - 2, "posix")) return true;
+    return call_index >= 6 and context.tokens[call_index - 1].tag == .period and
+        context.tokenIs(call_index - 2, "linux") and context.tokens[call_index - 3].tag == .period and
+        context.tokenIs(call_index - 4, "os") and context.tokens[call_index - 5].tag == .period and
+        context.tokenIs(call_index - 6, "std");
 }
 
 fn findUnwaitedChildProcesses(context: RuleRun) !void {
@@ -724,6 +736,16 @@ test "discarded descriptors and child pipe closes report" {
         "const Child = std.process.Child; fn childRun() !void { var child = Child.init(args, a); child.stdin.?.close(); _ = try child.wait(); }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 2), findings.len);
+}
+
+test "custom open and socket methods do not imply OS resource ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(registry: *Registry) !void { _ = try registry.open(); _ = registry.socket(); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "clearing a manually closed child pipe transfers the closed state" {
