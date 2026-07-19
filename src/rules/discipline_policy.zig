@@ -167,7 +167,7 @@ fn findLongFunctions(context: RuleRun) !void {
             insideKeywordBlock(context, fn_index, .keyword_comptime)) continue;
         const body_open = nextTagBefore(context.tokens, fn_index + 1, .l_brace, .semicolon) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        const lines = lineNumber(context.source, context.tokens[body_end].loc.end) - lineNumber(context.source, token.loc.start) + 1;
+        const lines = lineSpan(context.source, token.loc.start, context.tokens[body_end].loc.end);
         if (lines <= context.configuration.function_length_limit) continue;
         const name = if (fn_index + 1 < context.tokens.len and context.tokens[fn_index + 1].tag == .identifier) context.tokenText(fn_index + 1) else "function";
         try context.emit(.{
@@ -186,7 +186,7 @@ fn findUncheckedIndexing(context: RuleRun) !void {
         if (!isNamedFunction(context, fn_index)) continue;
         const body_open = nextTagBefore(context.tokens, fn_index + 1, .l_brace, .semicolon) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        if (lineNumber(context.source, context.tokens[body_end].loc.end) - lineNumber(context.source, token.loc.start) < 8) continue;
+        if (lineSpan(context.source, token.loc.start, context.tokens[body_end].loc.end) < 9) continue;
         if (hasInvariantCheck(context, body_open + 1, body_end)) continue;
         const bracket = computedBracket(context, body_open + 1, body_end) orelse continue;
         if (hasDominatingWhileBound(context, bracket) or hasDominatingForBound(context, bracket)) continue;
@@ -943,8 +943,8 @@ fn commentStart(line: []const u8) ?usize {
     return null;
 }
 
-fn lineNumber(source: []const u8, offset: usize) usize {
-    return std.mem.count(u8, source[0..@min(offset, source.len)], "\n") + 1;
+fn lineSpan(source: []const u8, start: usize, end: usize) usize {
+    return std.mem.count(u8, source[@min(start, source.len)..@min(end, source.len)], "\n") + 1;
 }
 
 fn nextTagBefore(tokens: []const std.zig.Token, start: usize, wanted: std.zig.Token.Tag, stop: std.zig.Token.Tag) ?usize {
