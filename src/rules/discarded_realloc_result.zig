@@ -32,7 +32,7 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
-    if (std.mem.indexOf(u8, name, "alloc") != null) return true;
+    if (allocatorRoleName(name)) return true;
     var name_index = before;
     while (name_index > 0) {
         name_index -= 1;
@@ -46,6 +46,12 @@ fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
         }
     }
     return false;
+}
+
+fn allocatorRoleName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "alloc") or std.mem.eql(u8, name, "allocator") or
+        std.mem.eql(u8, name, "gpa")) return true;
+    return std.mem.endsWith(u8, name, "_allocator") or std.mem.endsWith(u8, name, "Allocator");
 }
 
 test "discarded realloc results report" {
@@ -79,6 +85,16 @@ test "an unrelated realloc method is not an allocator contract" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn resize(buffer: *Buffer) void { _ = buffer.realloc(32); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "allocation domain objects are not allocator bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn resize(allocation: *Allocation, bytes: []u8) void { _ = allocation.realloc(bytes); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
