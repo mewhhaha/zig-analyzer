@@ -12,9 +12,11 @@ pub fn run(context: RuleRun) !void {
         const statement_end = context.statementEnd(equal_index) orelse continue;
         for (context.tokens[equal_index + 1 .. statement_end], equal_index + 1..) |candidate, method_index| {
             if (candidate.tag != .identifier or !context.tokenIs(method_index, "write") or
-                method_index == 0 or method_index + 1 >= statement_end or
+                method_index < 2 or method_index + 1 >= statement_end or
                 context.tokens[method_index - 1].tag != .period or
                 context.tokens[method_index + 1].tag != .l_paren) continue;
+            if (context.tokens[method_index - 2].tag != .identifier or
+                !ioReceiver(context.tokenText(method_index - 2))) continue;
             try context.emit(.{
                 .rule = .discarded_write_count,
                 .level = level,
@@ -27,6 +29,12 @@ pub fn run(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn ioReceiver(name: []const u8) bool {
+    const fragments = [_][]const u8{ "writer", "file", "stream", "socket" };
+    for (fragments) |fragment| if (std.ascii.indexOfIgnoreCase(name, fragment) != null) return true;
+    return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
 }
 
 test "discarding a partial write count reports" {
@@ -47,6 +55,16 @@ test "writeAll and used write counts stay clean" {
         "    const written = try writer.write(bytes);\n" ++
         "    consume(written);\n" ++
         "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "custom write methods do not imply partial byte output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn update(registry: *Registry, value: Value) !void { _ = try registry.write(value); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
