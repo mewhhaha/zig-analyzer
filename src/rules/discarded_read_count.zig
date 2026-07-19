@@ -41,8 +41,15 @@ pub fn run(context: RuleRun) !void {
 
 fn ioReceiver(name: []const u8) bool {
     const fragments = [_][]const u8{ "reader", "file", "stream", "socket" };
-    for (fragments) |fragment| if (std.ascii.indexOfIgnoreCase(name, fragment) != null) return true;
+    for (fragments) |fragment| if (hasRoleName(name, fragment)) return true;
     return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
+}
+
+fn hasRoleName(name: []const u8, role: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, role) or name.len <= role.len) return std.ascii.eqlIgnoreCase(name, role);
+    const suffix = name[name.len - role.len ..];
+    if (!std.ascii.eqlIgnoreCase(suffix, role)) return false;
+    return name[name.len - role.len - 1] == '_' or std.ascii.isUpper(suffix[0]);
 }
 
 const PartialRead = struct {
@@ -95,6 +102,16 @@ test "custom read methods do not imply partial byte input" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn query(registry: *Registry, key: Key) !void { _ = try registry.read(key); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "profile reads do not look like file input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn query(profile: *Profile, key: Key) !void { _ = try profile.read(key); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
