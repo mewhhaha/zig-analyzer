@@ -456,35 +456,33 @@ fn findOverflowBeforeClamp(context: RuleRun) !void {
             context.tokens[clamp_index + 1].tag != .l_paren) continue;
         const closing = context.matchingToken(clamp_index + 1, .l_paren, .r_paren) orelse continue;
         const comma = topLevelComma(context, clamp_index + 2, closing) orelse continue;
-        const operator = if (context.tokenIs(clamp_index, "@min"))
-            arithmeticInRange(context, .plus, clamp_index + 2, comma) orelse
-                arithmeticInRange(context, .plus, comma + 1, closing)
-        else
-            arithmeticInRange(context, .minus, clamp_index + 2, comma) orelse
-                arithmeticInRange(context, .minus, comma + 1, closing);
-        const operator_index = operator orelse continue;
-        const argument = if (operator_index < comma)
-            TokenRange{ .start = clamp_index + 2, .end = comma }
-        else
-            TokenRange{ .start = comma + 1, .end = closing };
-        if (!integerExpression(context, argument.start, operator_index) or
-            !integerExpression(context, operator_index + 1, argument.end) or
-            !runtimeExpression(context, argument.start, operator_index) or
-            !runtimeExpression(context, operator_index + 1, argument.end)) continue;
-        if (arithmeticHasVisibleGuard(context, operator_index, argument.start, argument.end, clamp_index)) continue;
+        const arguments = [_]TokenRange{
+            .{ .start = clamp_index + 2, .end = comma },
+            .{ .start = comma + 1, .end = closing },
+        };
+        for (arguments) |argument| {
+            const operator_tag: std.zig.Token.Tag = if (context.tokenIs(clamp_index, "@min")) .plus else .minus;
+            const operator_index = arithmeticInRange(context, operator_tag, argument.start, argument.end) orelse continue;
+            if (!integerExpression(context, argument.start, operator_index) or
+                !integerExpression(context, operator_index + 1, argument.end) or
+                !runtimeExpression(context, argument.start, operator_index) or
+                !runtimeExpression(context, operator_index + 1, argument.end)) continue;
+            if (arithmeticHasVisibleGuard(context, operator_index, argument.start, argument.end, clamp_index)) continue;
 
-        const operation = if (context.tokens[operator_index].tag == .plus) "addition" else "subtraction";
-        const failure = if (context.tokens[operator_index].tag == .plus) "overflow" else "underflow";
-        try context.emit(.{
-            .rule = .overflow_before_clamp,
-            .level = level,
-            .span = context.tokens[operator_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
-                "integer {s} is evaluated before {s} and can {s}; guard it or use checked or saturating arithmetic",
-                .{ operation, context.tokenText(clamp_index), failure },
-            ),
-        });
+            const operation = if (context.tokens[operator_index].tag == .plus) "addition" else "subtraction";
+            const failure = if (context.tokens[operator_index].tag == .plus) "overflow" else "underflow";
+            try context.emit(.{
+                .rule = .overflow_before_clamp,
+                .level = level,
+                .span = context.tokens[operator_index].loc,
+                .message = try std.fmt.allocPrint(
+                    context.allocator,
+                    "integer {s} is evaluated before {s} and can {s}; guard it or use checked or saturating arithmetic",
+                    .{ operation, context.tokenText(clamp_index), failure },
+                ),
+            });
+            break;
+        }
     }
 }
 
@@ -774,11 +772,14 @@ test "checked addition is not made safe by a later minimum" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "const Writer = struct { offset: usize, output: []u8, " ++
-        "fn end(self: *Writer, amount: usize) usize { return @min(self.output.len, self.offset + amount); } };";
+        "fn end(self: *Writer, amount: usize) usize { return @min(self.output.len, self.offset + amount); } }; " ++
+        "fn second(limit: usize, offset: usize, amount: usize) usize { " ++
+        "return @min(limit + 1, offset + amount); }";
     const found = try findingsFor(arena.allocator(), source);
 
-    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqual(types.Rule.overflow_before_clamp, found[0].rule);
+    try std.testing.expectEqual(types.Rule.overflow_before_clamp, found[1].rule);
 }
 
 test "safe clamp arithmetic remains clean" {
