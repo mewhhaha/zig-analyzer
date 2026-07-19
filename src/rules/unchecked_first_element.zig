@@ -85,10 +85,12 @@ fn hasNonEmptyProof(context: RuleRun, name: []const u8, declaration_index: usize
 fn conditionBeforeUseProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, use_index: usize) bool {
     var index = start;
     while (index + 6 < use_index) : (index += 1) {
-        if (context.tokens[index].tag == .identifier and context.tokenIs(index, name) and
-            context.tokens[index + 1].tag == .period and context.tokenIs(index + 2, "len") and
-            (context.tokens[index + 3].tag == .angle_bracket_right or context.tokens[index + 3].tag == .bang_equal) and
-            context.tokens[index + 4].tag == .number_literal and context.tokenIs(index + 4, "0")) return true;
+        if (context.tokens[index].tag == .identifier and context.tokenIs(index, "assert") and
+            index + 1 < use_index and context.tokens[index + 1].tag == .l_paren)
+        {
+            const condition_end = context.matchingToken(index + 1, .l_paren, .r_paren) orelse continue;
+            if (condition_end < use_index and conditionProvesNonEmpty(context, name, index + 2, condition_end)) return true;
+        }
         if (context.tokens[index].tag != .keyword_if or index + 8 >= use_index or
             context.tokens[index + 1].tag != .l_paren or !context.tokenIs(index + 2, name) or
             context.tokens[index + 3].tag != .period or !context.tokenIs(index + 4, "len") or
@@ -144,6 +146,17 @@ test "guards fixed arrays and sentinel slices stay clean" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "non-dominating length checks do not prove a first element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn first(bytes: []const u8) u8 { if (bytes.len > 0) log(bytes.len); return bytes[0]; } " ++
+        "pub fn asserted(bytes: []const u8) u8 { std.debug.assert(bytes.len > 0); return bytes[0]; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
