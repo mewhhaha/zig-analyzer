@@ -122,10 +122,17 @@ fn matchingOpeningParenthesis(context: RuleRun, closing: usize) ?usize {
 }
 
 fn bindingHasDirectoryType(context: RuleRun, binding: []const u8, before: usize) bool {
+    if (parameterHasDirectoryType(context, binding, before)) |is_directory| return is_directory;
     var index = before;
     while (index > 0) {
         index -= 1;
-        if (!context.tokenIs(index, binding) or index + 1 >= before or context.tokens[index + 1].tag != .colon) continue;
+        if (!context.tokenIs(index, binding) or index == 0 or index + 1 >= before or
+            (context.tokens[index - 1].tag != .keyword_const and context.tokens[index - 1].tag != .keyword_var) or
+            context.tokens[index + 1].tag != .colon) continue;
+        if (context.enclosingOpeningBrace(index)) |opening| {
+            const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+            if (before >= closing) continue;
+        }
         const type_end = @min(before, index + 10);
         var saw_std = false;
         for (context.tokens[index + 2 .. type_end], index + 2..) |token, type_index| {
@@ -133,8 +140,34 @@ fn bindingHasDirectoryType(context: RuleRun, binding: []const u8, before: usize)
             if (context.tokenIs(type_index, "std")) saw_std = true;
             if (saw_std and context.tokenIs(type_index, "Dir")) return true;
         }
+        return false;
     }
     return false;
+}
+
+fn parameterHasDirectoryType(context: RuleRun, binding: []const u8, use_index: usize) ?bool {
+    for (context.tokens[0..use_index], 0..) |token, function_index| {
+        if (token.tag != .keyword_fn or function_index + 2 >= use_index or
+            context.tokens[function_index + 2].tag != .l_paren) continue;
+        const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
+        var body_start = parameters_end + 1;
+        while (body_start < use_index and context.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
+        if (body_start >= use_index) continue;
+        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
+        if (use_index >= body_end) continue;
+        for (context.tokens[function_index + 3 .. parameters_end], function_index + 3..) |parameter, name_index| {
+            if (parameter.tag != .identifier or !context.tokenIs(name_index, binding) or
+                name_index + 1 >= parameters_end or context.tokens[name_index + 1].tag != .colon) continue;
+            var saw_std = false;
+            var type_index = name_index + 2;
+            while (type_index < parameters_end and context.tokens[type_index].tag != .comma) : (type_index += 1) {
+                if (context.tokenIs(type_index, "std")) saw_std = true;
+                if (saw_std and context.tokenIs(type_index, "Dir")) return true;
+            }
+            return false;
+        }
+    }
+    return null;
 }
 
 fn iterationCall(context: RuleRun, binding: []const u8, start: usize, end: usize) ?usize {
@@ -232,6 +265,19 @@ test "standard arguments do not give custom directories provenance" {
         "    var iterator = directory.iterate();\n" ++
         "    _ = &iterator;\n" ++
         "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "directory parameters do not lend provenance across functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn standard(directory: std.Io.Dir) void { _ = directory; } " ++
+        "fn custom(directory: *Tree, path: []const u8) !void { " ++
+        "var child = try directory.openDir(std.heap.page_allocator, path, .{}); " ++
+        "var iterator = child.iterate(); _ = &iterator; }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
