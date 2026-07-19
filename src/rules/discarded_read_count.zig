@@ -15,6 +15,8 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[method_index - 1].tag != .period or context.tokens[method_index + 1].tag != .l_paren) continue;
             const method = context.tokenText(method_index);
             const partial_read = partialRead(method) orelse continue;
+            if (method_index < 2 or context.tokens[method_index - 2].tag != .identifier or
+                !ioReceiver(context.tokenText(method_index - 2))) continue;
             try context.emit(.{
                 .rule = .discarded_read_count,
                 .level = level,
@@ -35,6 +37,12 @@ pub fn run(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn ioReceiver(name: []const u8) bool {
+    const fragments = [_][]const u8{ "reader", "file", "stream", "socket" };
+    for (fragments) |fragment| if (std.ascii.indexOfIgnoreCase(name, fragment) != null) return true;
+    return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
 }
 
 const PartialRead = struct {
@@ -77,6 +85,16 @@ test "complete reads and handled counts stay clean" {
         "    const count = try reader.readVec(buffers);\n" ++
         "    consume(count);\n" ++
         "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "custom read methods do not imply partial byte input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn query(registry: *Registry, key: Key) !void { _ = try registry.read(key); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
