@@ -86,25 +86,46 @@ fn findWaitsWhileHoldingLocks(context: RuleRun) !void {
     for (context.tokens, 0..) |token, function_index| {
         if (token.tag != .keyword_fn) continue;
         const function = functionRange(context, function_index) orelse continue;
-        const lock_index = methodInRange(context, "lock", function.body_start + 1, function.body_end) orelse continue;
-        const lock_field = selfFieldBeforeMethod(context, lock_index) orelse continue;
-        const lock_scope = context.enclosingOpeningBrace(lock_index) orelse continue;
-        const lock_scope_end = context.matchingToken(lock_scope, .l_brace, .r_brace) orelse continue;
-        const while_index = tokenTagInRange(context, .keyword_while, lock_index + 1, lock_scope_end) orelse continue;
-        const unlock_index = methodInRange(context, "unlock", lock_index + 1, function.body_end);
-        if (unlock_index != null and unlock_index.? < while_index and !precededByDefer(context, unlock_index.?)) continue;
-        const state_field = loadedSelfField(context, while_index, function.body_end) orelse continue;
-        if (!anotherFunctionSignals(context, function.start, context.enclosingOpeningBrace(function.start), lock_field, state_field)) continue;
-        try context.emit(.{
-            .rule = .wait_while_holding_lock,
-            .level = level,
-            .span = context.tokens[while_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
-                "loop waits for '{s}' while holding '{s}', but another operation needs that lock to update the state",
-                .{ state_field, lock_field },
-            ),
-        });
+        var reported = false;
+        for (context.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |body_token, lock_index| {
+            if (body_token.tag != .identifier or !context.tokenIs(lock_index, "lock")) continue;
+            const lock_field = selfFieldBeforeMethod(context, lock_index) orelse continue;
+            const lock_scope = context.enclosingOpeningBrace(lock_index) orelse continue;
+            const lock_scope_end = context.matchingToken(lock_scope, .l_brace, .r_brace) orelse continue;
+            var while_index = lock_index + 1;
+            while (while_index < lock_scope_end) : (while_index += 1) {
+                if (context.tokens[while_index].tag != .keyword_while) continue;
+                const unlock_index = selfFieldMethodInRange(
+                    context,
+                    lock_field,
+                    "unlock",
+                    lock_index + 1,
+                    while_index,
+                );
+                if (unlock_index != null and !precededByDefer(context, unlock_index.?)) continue;
+                const state_field = loadedSelfField(context, while_index, lock_scope_end) orelse continue;
+                if (!anotherFunctionSignals(
+                    context,
+                    function.start,
+                    context.enclosingOpeningBrace(function.start),
+                    lock_field,
+                    state_field,
+                )) continue;
+                try context.emit(.{
+                    .rule = .wait_while_holding_lock,
+                    .level = level,
+                    .span = context.tokens[while_index].loc,
+                    .message = try std.fmt.allocPrint(
+                        context.allocator,
+                        "loop waits for '{s}' while holding '{s}', but another operation needs that lock to update the state",
+                        .{ state_field, lock_field },
+                    ),
+                });
+                reported = true;
+                break;
+            }
+            if (reported) break;
+        }
     }
 }
 
@@ -139,8 +160,12 @@ fn methodInRange(context: RuleRun, method: []const u8, start: usize, end: usize)
     return null;
 }
 
-fn tokenTagInRange(context: RuleRun, tag: std.zig.Token.Tag, start: usize, end: usize) ?usize {
-    for (context.tokens[start..end], start..) |token, index| if (token.tag == tag) return index;
+fn selfFieldMethodInRange(context: RuleRun, field: []const u8, method: []const u8, start: usize, end: usize) ?usize {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, method)) continue;
+        const candidate = selfFieldBeforeMethod(context, index) orelse continue;
+        if (std.mem.eql(u8, candidate, field)) return index;
+    }
     return null;
 }
 
@@ -230,6 +255,21 @@ test "an unrelated defer does not turn an immediate unlock into deferred cleanup
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "later waits and matching unlock fields retain lock state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = struct { mutex: Mutex, other: Mutex, ready: Atomic(bool), " ++
+        "fn wait(self: *State) void { self.mutex.lock(); self.other.unlock(); while (workPending()) { work(); } " ++
+        "while (!self.ready.load(.acquire)) {} } " ++
+        "fn signal(self: *State) void { self.mutex.lock(); defer self.mutex.unlock(); " ++
+        "self.ready.store(true, .release); } };";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(types.Rule.wait_while_holding_lock, findings[0].rule);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
