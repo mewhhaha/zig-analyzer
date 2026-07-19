@@ -89,12 +89,36 @@ fn optionEnablesIteration(context: RuleRun, start: usize, end: usize) bool {
 }
 
 fn callHasDirectoryProvenance(context: RuleRun, method_index: usize) bool {
-    const statement_start = statementStart(context, method_index);
-    for (context.tokens[statement_start..method_index], statement_start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, "std")) return true;
+    if (method_index < 2) return false;
+    if (context.tokens[method_index - 2].tag == .identifier) {
+        if (bindingHasDirectoryType(context, context.tokenText(method_index - 2), method_index)) return true;
+        return dottedPathStartsWithStd(context, method_index - 2);
     }
-    if (method_index < 2 or context.tokens[method_index - 2].tag != .identifier) return false;
-    return bindingHasDirectoryType(context, context.tokenText(method_index - 2), method_index);
+    if (context.tokens[method_index - 2].tag != .r_paren) return false;
+    const opening = matchingOpeningParenthesis(context, method_index - 2) orelse return false;
+    if (opening == 0 or context.tokens[opening - 1].tag != .identifier) return false;
+    return dottedPathStartsWithStd(context, opening - 1);
+}
+
+fn dottedPathStartsWithStd(context: RuleRun, last_identifier: usize) bool {
+    var first_identifier = last_identifier;
+    while (first_identifier >= 2 and context.tokens[first_identifier - 1].tag == .period and
+        context.tokens[first_identifier - 2].tag == .identifier) : (first_identifier -= 2)
+    {}
+    return context.tokenIs(first_identifier, "std");
+}
+
+fn matchingOpeningParenthesis(context: RuleRun, closing: usize) ?usize {
+    var depth: usize = 0;
+    var index = closing + 1;
+    while (index > 0) {
+        index -= 1;
+        if (context.tokens[index].tag == .r_paren) depth += 1;
+        if (context.tokens[index].tag != .l_paren) continue;
+        depth -= 1;
+        if (depth == 0) return index;
+    }
+    return null;
 }
 
 fn bindingHasDirectoryType(context: RuleRun, binding: []const u8, before: usize) bool {
@@ -124,16 +148,6 @@ fn iterationCall(context: RuleRun, binding: []const u8, start: usize, end: usize
             context.tokens[index + 3].tag == .l_paren) return index + 2;
     }
     return null;
-}
-
-fn statementStart(context: RuleRun, index: usize) usize {
-    var cursor = index;
-    while (cursor > 0) {
-        const previous = context.tokens[cursor - 1].tag;
-        if (previous == .semicolon or previous == .l_brace or previous == .r_brace) break;
-        cursor -= 1;
-    }
-    return cursor;
 }
 
 test "iterating a directory opened with default options reports" {
@@ -201,6 +215,20 @@ test "custom openDir method stays clean" {
     const source: [:0]const u8 =
         "fn walk(tree: anytype, path: []const u8) !void {\n" ++
         "    var directory = try tree.openDir(path, .{});\n" ++
+        "    var iterator = directory.iterate();\n" ++
+        "    _ = &iterator;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "standard arguments do not give custom directories provenance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn walk(tree: anytype, path: []const u8) !void {\n" ++
+        "    var directory = try tree.openDir(std.heap.page_allocator, path, .{});\n" ++
         "    var iterator = directory.iterate();\n" ++
         "    _ = &iterator;\n" ++
         "}\n";
