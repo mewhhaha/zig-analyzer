@@ -672,11 +672,10 @@ fn storedIndexOperand(context: RuleRun, reference_field: []const u8, operand_ind
 fn referenceFieldRemoval(context: RuleRun, reference_field: []const u8, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or (!context.tokenIs(method_index, "orderedRemove") and
-            !context.tokenIs(method_index, "swapRemove")) or method_index < start + 2) continue;
-        const receiver_start = method_index -| 12;
-        for (context.tokens[receiver_start..method_index], receiver_start..) |receiver, index| {
-            if (receiver.tag == .identifier and context.tokenIs(index, reference_field)) return true;
-        }
+            !context.tokenIs(method_index, "swapRemove")) or method_index < start + 2 or
+            context.tokens[method_index - 1].tag != .period or
+            !context.tokenIs(method_index - 2, reference_field)) continue;
+        return true;
     }
     return false;
 }
@@ -909,6 +908,30 @@ test "an explicit self repair call keeps self-referential indices opaque" {
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &findings });
 
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "removing from an unrelated list does not repair stored indices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Node = struct { links: std.ArrayList(u32) }; " ++
+        "const Graph = struct { nodes: std.ArrayList(Node), " ++
+        "fn addEdge(self: *Graph, from: u32, to: u32) !void { " ++
+        "if (to >= self.nodes.items.len) return error.UnknownNode; " ++
+        "try self.nodes.items[from].links.append(a, to); } " ++
+        "fn removeNode(self: *Graph, id: u32, scratch: *std.ArrayList(u32)) void { " ++
+        "_ = self.nodes.orderedRemove(id); for (self.nodes.items) |*node| { " ++
+        "if (node.links.items[0] == id) log(id); _ = scratch.orderedRemove(0); " ++
+        "if (node.links.items[0] > id) node.links.items[0] -= 1; } } };";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(rule_types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &findings });
+
+    var stale_count: usize = 0;
+    for (findings.items) |finding| {
+        if (finding.rule == .stale_index_map) stale_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), stale_count);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
