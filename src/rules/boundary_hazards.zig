@@ -25,9 +25,10 @@ fn findPointerOnlyFrees(context: RuleRun) !void {
         if (token.tag != .keyword_fn) continue;
         const function = functionRange(context, function_index) orelse continue;
         const pointer_name = manyPointerParameter(context, function.parameters_start, function.parameters_end) orelse continue;
-        if (hasLengthParameter(context, function.parameters_start, function.parameters_end)) continue;
-        const slice_name = sliceFromPointer(context, pointer_name, function.body_start + 1, function.body_end) orelse continue;
-        const free_index = freeOfBinding(context, slice_name, function.body_start + 1, function.body_end) orelse continue;
+        const slice = sliceFromPointer(context, pointer_name, function.body_start + 1, function.body_end) orelse continue;
+        if (hasLengthParameter(context, function.parameters_start, function.parameters_end) and
+            sliceHasNamedBound(context, slice.bracket_start + 1, slice.bracket_end)) continue;
+        const free_index = freeOfBinding(context, slice.binding, function.body_start + 1, function.body_end) orelse continue;
         try context.emit(.{
             .rule = .pointer_only_free,
             .level = level,
@@ -35,7 +36,7 @@ fn findPointerOnlyFrees(context: RuleRun) !void {
             .message = try std.fmt.allocPrint(
                 context.allocator,
                 "freeing slice '{s}' reconstructed from pointer '{s}' without its allocation length can pass the allocator the wrong layout",
-                .{ slice_name, pointer_name },
+                .{ slice.binding, pointer_name },
             ),
         });
     }
@@ -359,7 +360,13 @@ fn integerParameter(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     return null;
 }
 
-fn sliceFromPointer(context: RuleRun, pointer_name: []const u8, start: usize, end: usize) ?[]const u8 {
+const ReconstructedSlice = struct {
+    binding: []const u8,
+    bracket_start: usize,
+    bracket_end: usize,
+};
+
+fn sliceFromPointer(context: RuleRun, pointer_name: []const u8, start: usize, end: usize) ?ReconstructedSlice {
     for (context.tokens[start..end], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 6 >= end or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
@@ -368,11 +375,21 @@ fn sliceFromPointer(context: RuleRun, pointer_name: []const u8, start: usize, en
         var index = declaration_index + 2;
         while (index + 1 < statement_end) : (index += 1) {
             if (context.tokenIs(index, pointer_name) and context.tokens[index + 1].tag == .l_bracket) {
-                return context.tokenText(declaration_index + 1);
+                const bracket_end = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
+                return .{
+                    .binding = context.tokenText(declaration_index + 1),
+                    .bracket_start = index + 1,
+                    .bracket_end = bracket_end,
+                };
             }
         }
     }
     return null;
+}
+
+fn sliceHasNamedBound(context: RuleRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end]) |token| if (token.tag == .identifier) return true;
+    return false;
 }
 
 fn freeOfBinding(context: RuleRun, binding: []const u8, start: usize, end: usize) ?usize {
@@ -750,6 +767,19 @@ test "pointer-only frees and nullable pointer lengths preserve allocation contra
         "fn copy(a: anytype, ptr: ?[*]const u8, len: usize) ![]u8 { const out = try a.alloc(u8, len); if (ptr) |p| { @memcpy(out, p[0..len]); } return out; }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 2), findings.len);
+}
+
+test "unrelated integer parameters do not supply allocation lengths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn release(a: anytype, ptr: [*]u8, flags: u32) void { " ++
+        "const bytes = ptr[0..16]; a.free(bytes); _ = flags; } " ++
+        "fn releaseKnown(a: anytype, ptr: [*]u8, len: usize) void { " ++
+        "const bytes = ptr[0..len]; a.free(bytes); }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(types.Rule.pointer_only_free, findings[0].rule);
 }
 
 test "discarded descriptors and child pipe closes report" {
