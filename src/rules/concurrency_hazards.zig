@@ -126,9 +126,9 @@ fn selfFieldBeforeMethod(context: RuleRun, method_index: usize) ?[]const u8 {
 }
 
 fn precededByDefer(context: RuleRun, method_index: usize) bool {
-    const start = method_index -| 8;
-    for (context.tokens[start..method_index]) |token| if (token.tag == .keyword_defer) return true;
-    return false;
+    if (method_index >= 5 and context.tokens[method_index - 5].tag == .keyword_defer) return true;
+    const block = context.enclosingOpeningBrace(method_index) orelse return false;
+    return block > 0 and context.tokens[block - 1].tag == .keyword_defer;
 }
 
 fn methodInRange(context: RuleRun, method: []const u8, start: usize, end: usize) ?usize {
@@ -213,6 +213,20 @@ test "a deferred unlock runs before a wait outside its nested scope" {
         "while (!self.ready.load(.acquire)) {} } " ++
         "fn signal(self: *State) void { self.mutex.lock(); defer self.mutex.unlock(); " ++
         "self.ready.store(true, .release); } };";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "an unrelated defer does not turn an immediate unlock into deferred cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = struct { primary: Mutex, secondary: Mutex, " ++
+        "fn forward(self: *State) void { self.primary.lock(); defer {} self.primary.unlock(); " ++
+        "self.secondary.lock(); defer self.secondary.unlock(); } " ++
+        "fn reverse(self: *State) void { self.secondary.lock(); defer self.secondary.unlock(); " ++
+        "self.primary.lock(); defer self.primary.unlock(); } };";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
