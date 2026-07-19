@@ -143,6 +143,7 @@ const Declaration = struct {
 };
 
 fn bindingDeclaration(context: RuleRun, binding: []const u8, before: usize) ?Declaration {
+    if (parameterShadowsBinding(context, binding, before)) return null;
     var index = before;
     while (index > 1) {
         index -= 1;
@@ -157,6 +158,24 @@ fn bindingDeclaration(context: RuleRun, binding: []const u8, before: usize) ?Dec
         return .{ .start = index - 1, .end = end };
     }
     return null;
+}
+
+fn parameterShadowsBinding(context: RuleRun, binding: []const u8, use_index: usize) bool {
+    for (context.tokens[0..use_index], 0..) |token, function_index| {
+        if (token.tag != .keyword_fn or function_index + 2 >= use_index or
+            context.tokens[function_index + 2].tag != .l_paren) continue;
+        const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
+        var body_start = parameters_end + 1;
+        while (body_start < use_index and context.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
+        if (body_start >= use_index) continue;
+        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
+        if (use_index >= body_end) continue;
+        for (context.tokens[function_index + 3 .. parameters_end], function_index + 3..) |parameter, index| {
+            if (parameter.tag == .identifier and context.tokenIs(index, binding) and index + 1 < parameters_end and
+                context.tokens[index + 1].tag == .colon) return true;
+        }
+    }
+    return false;
 }
 
 fn findMethod(context: RuleRun, start: usize, end: usize, methods: []const []const u8) ?usize {
@@ -248,6 +267,17 @@ test "I/O implementations do not lend provenance across functions" {
     const source: [:0]const u8 =
         "fn standard(file: std.Io.File, io: std.Io, buffer: []u8) void { " ++
         "var implementation: std.Io.File.Reader = file.reader(io, buffer); _ = implementation; } " ++
+        "fn custom(implementation: *Custom) void { const reader = implementation.interface; _ = reader; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "parameters shadow global I/O implementations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "var implementation: std.Io.File.Reader = undefined; " ++
         "fn custom(implementation: *Custom) void { const reader = implementation.interface; _ = reader; }";
     const findings = try findingsFor(arena.allocator(), source);
 
