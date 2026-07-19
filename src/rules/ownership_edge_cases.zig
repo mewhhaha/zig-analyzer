@@ -234,7 +234,7 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
         const statement_end = context.statementEnd(equal_index) orelse continue;
         const removal = methodCallInRange(context, &.{ "swapRemove", "orderedRemove" }, equal_index + 1, statement_end) orelse continue;
         const field = receiverFieldBeforeMethod(context, removal) orelse continue;
-        const element_type = arrayListElementType(context, field) orelse continue;
+        const element_type = arrayListElementType(context, removal, field) orelse continue;
         const owned_field = sliceFieldOfType(context, element_type) orelse continue;
         if (!containerCleansElementField(context, removal, owned_field)) continue;
         if (removedFieldReleasedBefore(context, field, owned_field, removal)) continue;
@@ -438,12 +438,16 @@ fn receiverFieldBeforeMethod(context: RuleRun, method_index: usize) ?[]const u8 
     return context.tokenText(method_index - 2);
 }
 
-fn arrayListElementType(context: RuleRun, field_name: []const u8) ?[]const u8 {
-    for (context.tokens, 0..) |token, field_index| {
-        if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or field_index + 6 >= context.tokens.len or
+fn arrayListElementType(context: RuleRun, removal_index: usize, field_name: []const u8) ?[]const u8 {
+    const function_body = context.enclosingOpeningBrace(removal_index) orelse return null;
+    const container_start = context.enclosingOpeningBrace(function_body) orelse return null;
+    const container_end = context.matchingToken(container_start, .l_brace, .r_brace) orelse return null;
+    for (context.tokens[container_start + 1 .. container_end], container_start + 1..) |token, field_index| {
+        if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or field_index + 6 >= container_end or
+            context.enclosingOpeningBrace(field_index) != container_start or
             context.tokens[field_index + 1].tag != .colon) continue;
-        for (context.tokens[field_index + 2 .. @min(field_index + 12, context.tokens.len)], field_index + 2..) |candidate, index| {
-            if (candidate.tag == .identifier and context.tokenIs(index, "ArrayList") and index + 2 < context.tokens.len and
+        for (context.tokens[field_index + 2 .. @min(field_index + 12, container_end)], field_index + 2..) |candidate, index| {
+            if (candidate.tag == .identifier and context.tokenIs(index, "ArrayList") and index + 2 < container_end and
                 context.tokens[index + 1].tag == .l_paren and context.tokens[index + 2].tag == .identifier)
             {
                 return context.tokenText(index + 2);
@@ -669,6 +673,19 @@ test "pointer-returning accessors and cleaned removed fields retain ownership" {
         "fn remove(self: *Registry, a: anytype, i: usize) void { a.free(self.rows.items[i].name); _ = self.rows.swapRemove(i); } };" ++
         "const Stack = struct { contexts: []Context, fn deinit(self: *Stack) void { free(self.contexts); } }; " ++
         "fn getStack() *Stack { return global_stack; } fn current() Context { const stack = getStack(); return stack.contexts[0]; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "discarded removals use their containing type's field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const OwnedRow = struct { name: []u8 }; const ValueRow = struct { id: usize }; " ++
+        "const Decoy = struct { rows: std.ArrayList(OwnedRow) }; " ++
+        "const Registry = struct { rows: std.ArrayList(ValueRow), owner: OwnedRow, " ++
+        "fn deinit(self: *Registry, a: anytype) void { a.free(self.owner.name); } " ++
+        "fn remove(self: *Registry, i: usize) void { _ = self.rows.swapRemove(i); } };";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
