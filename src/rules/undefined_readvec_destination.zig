@@ -98,7 +98,11 @@ fn destinationInitializedBefore(context: RuleRun, binding: []const u8, descripto
     var index = start;
     while (index + 1 < end) : (index += 1) {
         if (!context.tokenIs(index, binding)) continue;
-        if (context.tokens[index + 1].tag == .equal) return true;
+        if (context.tokens[index + 1].tag == .equal) {
+            if (index + 2 < end and context.tokens[index + 2].tag == .identifier and
+                context.tokenIs(index + 2, "undefined")) continue;
+            return true;
+        }
         if (descriptor_count > 64 or context.tokens[index + 1].tag != .l_bracket or
             index + 2 >= end or context.tokens[index + 2].tag != .number_literal) continue;
         const closing = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
@@ -148,6 +152,20 @@ test "partially initialized descriptor arrays report" {
         "    var storage: [16]u8 = undefined;\n" ++
         "    var buffers: [2][]u8 = undefined;\n" ++
         "    buffers[0] = &storage;\n" ++
+        "    _ = try reader.readVec(&buffers);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "undefined reassignment does not initialize descriptors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn receive(reader: anytype) !void {\n" ++
+        "    var buffers: [1][]u8 = undefined;\n" ++
+        "    buffers = undefined;\n" ++
         "    _ = try reader.readVec(&buffers);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
