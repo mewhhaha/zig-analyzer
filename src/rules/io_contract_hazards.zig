@@ -23,7 +23,7 @@ pub fn run(context: RuleRun) !void {
         const copy_index = truncatingCopy(context, source_name, amount.name, amount.declaration_end + 1, function.body_end) orelse continue;
         if (hasExplicitCapacityFailure(context, source_name, function.body_start + 1, amount.declaration_end)) continue;
         if (writesTerminatorAtAmount(context, amount.name, copy_index + 1, function.body_end) and
-            minimumReservesTerminator(context, amount.minimum_index, amount.declaration_end)) continue;
+            minimumReservesTerminator(context, source_name, amount.minimum_index, amount.declaration_end)) continue;
         try context.emit(.{
             .rule = .silent_buffer_truncation,
             .level = level,
@@ -108,13 +108,21 @@ fn minimumBinding(context: RuleRun, source_name: []const u8, start: usize, end: 
     return null;
 }
 
-fn minimumReservesTerminator(context: RuleRun, minimum_index: usize, declaration_end: usize) bool {
+fn minimumReservesTerminator(
+    context: RuleRun,
+    source_name: []const u8,
+    minimum_index: usize,
+    declaration_end: usize,
+) bool {
     if (minimum_index + 1 >= declaration_end or context.tokens[minimum_index + 1].tag != .l_paren) return false;
     const closing = context.matchingToken(minimum_index + 1, .l_paren, .r_paren) orelse return false;
     var index = minimum_index + 2;
     while (index + 2 < @min(closing, declaration_end)) : (index += 1) {
-        if (context.tokenIs(index, "len") and context.tokens[index + 1].tag == .minus and
-            context.tokens[index + 2].tag == .number_literal and context.tokenIs(index + 2, "1")) return true;
+        if (!context.tokenIs(index, "len") or context.tokens[index + 1].tag != .minus or
+            context.tokens[index + 2].tag != .number_literal or !context.tokenIs(index + 2, "1")) continue;
+        const direct_source_length = index >= 2 and context.tokens[index - 1].tag == .period and
+            context.tokenIs(index - 2, source_name) and (index < 4 or context.tokens[index - 3].tag != .period);
+        if (!direct_source_length) return true;
     }
     return false;
 }
@@ -209,6 +217,18 @@ test "terminating at the full buffer length does not make truncation safe" {
     const source: [:0]const u8 =
         "fn setTitle(self: *Message, title: []const u8) void { " ++
         "const length = @min(title.len, self.title.len); " ++
+        "@memcpy(self.title[0..length], title[0..length]); self.title[length] = 0; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "shortening the source does not reserve destination capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn setTitle(self: *Message, title: []const u8) void { " ++
+        "const length = @min(title.len - 1, self.title.len); " ++
         "@memcpy(self.title[0..length], title[0..length]); self.title[length] = 0; }";
     const findings = try findingsFor(arena.allocator(), source);
 
