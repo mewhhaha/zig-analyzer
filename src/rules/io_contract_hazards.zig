@@ -22,7 +22,8 @@ pub fn run(context: RuleRun) !void {
         const amount = minimumBinding(context, source_name, function.body_start + 1, function.body_end) orelse continue;
         const copy_index = truncatingCopy(context, source_name, amount.name, amount.declaration_end + 1, function.body_end) orelse continue;
         if (hasExplicitCapacityFailure(context, source_name, function.body_start + 1, amount.declaration_end)) continue;
-        if (writesTerminatorAtAmount(context, amount.name, copy_index + 1, function.body_end)) continue;
+        if (writesTerminatorAtAmount(context, amount.name, copy_index + 1, function.body_end) and
+            minimumReservesTerminator(context, amount.minimum_index, amount.declaration_end)) continue;
         try context.emit(.{
             .rule = .silent_buffer_truncation,
             .level = level,
@@ -85,7 +86,11 @@ fn sliceParameter(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     return null;
 }
 
-const MinimumBinding = struct { name: []const u8, declaration_end: usize };
+const MinimumBinding = struct {
+    name: []const u8,
+    minimum_index: usize,
+    declaration_end: usize,
+};
 
 fn minimumBinding(context: RuleRun, source_name: []const u8, start: usize, end: usize) ?MinimumBinding {
     for (context.tokens[start..end], start..) |token, declaration_index| {
@@ -94,9 +99,24 @@ fn minimumBinding(context: RuleRun, source_name: []const u8, start: usize, end: 
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const minimum_index = builtinInRange(context, "@min", declaration_index + 2, declaration_end) orelse continue;
         if (!pathInRange(context, source_name, "len", minimum_index + 1, declaration_end)) continue;
-        return .{ .name = context.tokenText(declaration_index + 1), .declaration_end = declaration_end };
+        return .{
+            .name = context.tokenText(declaration_index + 1),
+            .minimum_index = minimum_index,
+            .declaration_end = declaration_end,
+        };
     }
     return null;
+}
+
+fn minimumReservesTerminator(context: RuleRun, minimum_index: usize, declaration_end: usize) bool {
+    if (minimum_index + 1 >= declaration_end or context.tokens[minimum_index + 1].tag != .l_paren) return false;
+    const closing = context.matchingToken(minimum_index + 1, .l_paren, .r_paren) orelse return false;
+    var index = minimum_index + 2;
+    while (index + 2 < @min(closing, declaration_end)) : (index += 1) {
+        if (context.tokenIs(index, "len") and context.tokens[index + 1].tag == .minus and
+            context.tokens[index + 2].tag == .number_literal and context.tokenIs(index + 2, "1")) return true;
+    }
+    return false;
 }
 
 fn truncatingCopy(context: RuleRun, source_name: []const u8, amount_name: []const u8, start: usize, end: usize) ?usize {
@@ -172,14 +192,27 @@ test "returning the written byte count makes truncation visible" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
-test "fixed C buffers explicitly terminate intentionally truncated text" {
+test "fixed C buffers reserve space before terminating truncated text" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn setTitle(self: *Message, title: []const u8) void { " ++
-        "const length = @min(title.len, self.title.len); @memcpy(self.title[0..length], title[0..length]); self.title[length] = 0; }";
+        "const length = @min(title.len, self.title.len - 1); " ++
+        "@memcpy(self.title[0..length], title[0..length]); self.title[length] = 0; }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "terminating at the full buffer length does not make truncation safe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn setTitle(self: *Message, title: []const u8) void { " ++
+        "const length = @min(title.len, self.title.len); " ++
+        "@memcpy(self.title[0..length], title[0..length]); self.title[length] = 0; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
