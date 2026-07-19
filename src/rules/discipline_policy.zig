@@ -56,22 +56,23 @@ fn drainedArrayListPath(context: RuleRun, start: usize, end: usize, before: usiz
 }
 
 fn lengthComparedWithZero(context: RuleRun, length_index: usize, start: usize, end: usize) bool {
-    if (length_index + 2 < end and comparisonOperator(context.tokens[length_index + 1].tag) and
+    if (length_index + 2 < end and lengthExceedsZero(context.tokens[length_index + 1].tag) and
         context.tokens[length_index + 2].tag == .number_literal and context.tokenIs(length_index + 2, "0")) return true;
     return length_index >= start + 2 and context.tokens[length_index - 2].tag == .number_literal and
-        context.tokenIs(length_index - 2, "0") and comparisonOperator(context.tokens[length_index - 1].tag);
+        context.tokenIs(length_index - 2, "0") and zeroBelowLength(context.tokens[length_index - 1].tag);
 }
 
-fn comparisonOperator(tag: std.zig.Token.Tag) bool {
+fn lengthExceedsZero(tag: std.zig.Token.Tag) bool {
     return switch (tag) {
-        .angle_bracket_left,
-        .angle_bracket_left_equal,
         .angle_bracket_right,
-        .angle_bracket_right_equal,
         .bang_equal,
         => true,
         else => false,
     };
+}
+
+fn zeroBelowLength(tag: std.zig.Token.Tag) bool {
+    return tag == .angle_bracket_left or tag == .bang_equal;
 }
 
 fn arrayListPathVisible(context: RuleRun, path_start: usize, path_end: usize, before: usize) bool {
@@ -1409,7 +1410,9 @@ test "one-off and non-front array list removals remain clean" {
         "var queue = std.ArrayList(u32).empty; defer queue.deinit(allocator); " ++
         "while (queue.items.len != 0) { _ = queue.orderedRemove(queue.items.len - 1); } } " ++
         "fn custom(queue: *CustomQueue) void { " ++
-        "while (queue.items.len != 0) { _ = queue.orderedRemove(0); } }";
+        "while (queue.items.len != 0) { _ = queue.orderedRemove(0); } } " ++
+        "fn empty(queue: *std.ArrayList(u32)) void { " ++
+        "while (queue.items.len <= 0) { _ = queue.orderedRemove(0); } }";
     var configuration = types.Configuration.defaults();
     configuration.levels[@intFromEnum(types.Rule.quadratic_front_removal)] = .information;
 
