@@ -91,7 +91,10 @@ fn findReallocFallbackLeaks(context: RuleRun) !void {
     if (level == .off) return;
     for (context.tokens, 0..) |token, method_index| {
         if (token.tag != .identifier or !context.tokenIs(method_index, "realloc") or
-            method_index + 1 >= context.tokens.len or context.tokens[method_index + 1].tag != .l_paren) continue;
+            method_index < 2 or context.tokens[method_index - 1].tag != .period or
+            context.tokens[method_index - 2].tag != .identifier or method_index + 1 >= context.tokens.len or
+            context.tokens[method_index + 1].tag != .l_paren) continue;
+        const allocator_name = context.tokenText(method_index - 2);
         const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
         const original = firstBareArgument(context, method_index + 2, call_end) orelse continue;
         var catch_index = call_end + 1;
@@ -105,7 +108,7 @@ fn findReallocFallbackLeaks(context: RuleRun) !void {
         {}
         if (body_open >= context.tokens.len or context.tokens[body_open].tag != .l_brace) continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        const replacement = allocatedBinding(context, body_open + 1, body_end) orelse continue;
+        const replacement = allocatedBinding(context, allocator_name, body_open + 1, body_end) orelse continue;
         if (!rangeReturnsBinding(context, replacement, body_open + 1, body_end) or
             rangeReleasesBinding(context, original, body_open + 1, body_end)) continue;
         try context.emit(.{
@@ -320,12 +323,14 @@ fn firstBareArgument(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     return if (index == start + 1) context.tokenText(start) else null;
 }
 
-fn allocatedBinding(context: RuleRun, start: usize, end: usize) ?[]const u8 {
+fn allocatedBinding(context: RuleRun, allocator_name: []const u8, start: usize, end: usize) ?[]const u8 {
     for (context.tokens[start..end], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= end or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        if (declaration_end <= end and rangeAllocates(context, declaration_index + 2, declaration_end)) {
+        if (declaration_end <= end and
+            rangeCallsPathMethod(context, allocator_name, "alloc", declaration_index + 2, declaration_end))
+        {
             return context.tokenText(declaration_index + 1);
         }
     }
@@ -642,6 +647,17 @@ test "realloc fallback leaks do not require reading the original allocation" {
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(types.Rule.unreleased_allocation, findings[0].rule);
+}
+
+test "realloc fallback ownership requires one allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn resize(buffer: *Buffer, allocator: anytype, original: []u8, n: usize) ![]u8 { " ++
+        "return buffer.realloc(original, n) catch { const replacement = try allocator.alloc(u8, n); " ++
+        "return replacement; }; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "pointer-returning accessors and cleaned removed fields retain ownership" {
