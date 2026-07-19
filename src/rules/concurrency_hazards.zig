@@ -88,7 +88,9 @@ fn findWaitsWhileHoldingLocks(context: RuleRun) !void {
         const function = functionRange(context, function_index) orelse continue;
         const lock_index = methodInRange(context, "lock", function.body_start + 1, function.body_end) orelse continue;
         const lock_field = selfFieldBeforeMethod(context, lock_index) orelse continue;
-        const while_index = tokenTagInRange(context, .keyword_while, lock_index + 1, function.body_end) orelse continue;
+        const lock_scope = context.enclosingOpeningBrace(lock_index) orelse continue;
+        const lock_scope_end = context.matchingToken(lock_scope, .l_brace, .r_brace) orelse continue;
+        const while_index = tokenTagInRange(context, .keyword_while, lock_index + 1, lock_scope_end) orelse continue;
         const unlock_index = methodInRange(context, "unlock", lock_index + 1, function.body_end);
         if (unlock_index != null and unlock_index.? < while_index and !precededByDefer(context, unlock_index.?)) continue;
         const state_field = loadedSelfField(context, while_index, function.body_end) orelse continue;
@@ -200,6 +202,20 @@ test "waiting for state while its signaling lock is held reports" {
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(types.Rule.wait_while_holding_lock, findings[0].rule);
+}
+
+test "a deferred unlock runs before a wait outside its nested scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = struct { mutex: Mutex, ready: Atomic(bool), " ++
+        "fn wait(self: *State) void { { self.mutex.lock(); defer self.mutex.unlock(); work(); } " ++
+        "while (!self.ready.load(.acquire)) {} } " ++
+        "fn signal(self: *State) void { self.mutex.lock(); defer self.mutex.unlock(); " ++
+        "self.ready.store(true, .release); } };";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
