@@ -612,9 +612,9 @@ fn selfReferencesRepaired(
 ) bool {
     if (callsOpaqueSelfRepair(context, removed_index, start, end)) return true;
     if (referenceFieldCleared(context, reference_field, start, end)) return true;
-    return comparesReferenceWithRemovedIndex(context, removed_index, .equal_equal, start, end) and
+    return comparesReferenceWithRemovedIndex(context, reference_field, removed_index, .equal_equal, start, end) and
         referenceFieldRemoval(context, reference_field, start, end) and
-        comparesReferenceWithRemovedIndex(context, removed_index, .angle_bracket_right, start, end) and
+        comparesReferenceWithRemovedIndex(context, reference_field, removed_index, .angle_bracket_right, start, end) and
         decrementsReference(context, start, end);
 }
 
@@ -642,6 +642,7 @@ fn referenceFieldCleared(context: RuleRun, reference_field: []const u8, start: u
 
 fn comparesReferenceWithRemovedIndex(
     context: RuleRun,
+    reference_field: []const u8,
     removed_index: []const u8,
     comparison: std.zig.Token.Tag,
     start: usize,
@@ -649,14 +650,21 @@ fn comparesReferenceWithRemovedIndex(
 ) bool {
     for (context.tokens[start..end], start..) |token, comparison_index| {
         if (token.tag != comparison or comparison_index == start or comparison_index + 1 >= end) continue;
-        if ((context.tokens[comparison_index - 1].tag == .identifier or
-            context.tokens[comparison_index - 1].tag == .asterisk or
-            context.tokens[comparison_index - 1].tag == .period_asterisk) and
+        if (storedIndexOperand(context, reference_field, comparison_index - 1, start) and
             context.tokenIs(comparison_index + 1, removed_index)) return true;
         if (context.tokenIs(comparison_index - 1, removed_index) and
-            (context.tokens[comparison_index + 1].tag == .identifier or
-                context.tokens[comparison_index + 1].tag == .asterisk or
-                context.tokens[comparison_index + 1].tag == .period_asterisk)) return true;
+            storedIndexOperand(context, reference_field, comparison_index + 1, start)) return true;
+    }
+    return false;
+}
+
+fn storedIndexOperand(context: RuleRun, reference_field: []const u8, operand_index: usize, start: usize) bool {
+    const tag = context.tokens[operand_index].tag;
+    if (tag == .identifier or tag == .asterisk or tag == .period_asterisk) return true;
+    if (tag != .r_bracket) return false;
+    const receiver_start = @max(start, operand_index -| 16);
+    for (context.tokens[receiver_start..operand_index], receiver_start..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, reference_field)) return true;
     }
     return false;
 }
@@ -872,9 +880,9 @@ test "removing equal references and shifting later indices repairs ordered remov
         "try self.nodes.items[from].links.append(a, to); } " ++
         "fn removeNode(self: *Graph, id: u32) void { _ = self.nodes.orderedRemove(id); " ++
         "for (self.nodes.items) |*node| { var link_index: usize = 0; " ++
-        "while (link_index < node.links.items.len) { const link = &node.links.items[link_index]; " ++
-        "if (link.* == id) { _ = node.links.orderedRemove(link_index); continue; } " ++
-        "if (link.* > id) link.* -= 1; link_index += 1; } } } };";
+        "while (link_index < node.links.items.len) { " ++
+        "if (node.links.items[link_index] == id) { _ = node.links.orderedRemove(link_index); continue; } " ++
+        "if (node.links.items[link_index] > id) node.links.items[link_index] -= 1; link_index += 1; } } } };";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(rule_types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &findings });
