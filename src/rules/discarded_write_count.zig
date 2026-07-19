@@ -33,8 +33,15 @@ pub fn run(context: RuleRun) !void {
 
 fn ioReceiver(name: []const u8) bool {
     const fragments = [_][]const u8{ "writer", "file", "stream", "socket" };
-    for (fragments) |fragment| if (std.ascii.indexOfIgnoreCase(name, fragment) != null) return true;
+    for (fragments) |fragment| if (hasRoleName(name, fragment)) return true;
     return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
+}
+
+fn hasRoleName(name: []const u8, role: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(name, role) or name.len <= role.len) return std.ascii.eqlIgnoreCase(name, role);
+    const suffix = name[name.len - role.len ..];
+    if (!std.ascii.eqlIgnoreCase(suffix, role)) return false;
+    return name[name.len - role.len - 1] == '_' or std.ascii.isUpper(suffix[0]);
 }
 
 test "discarding a partial write count reports" {
@@ -65,6 +72,16 @@ test "custom write methods do not imply partial byte output" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn update(registry: *Registry, value: Value) !void { _ = try registry.write(value); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "profile writes do not look like file output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn update(profile: *Profile, value: Value) !void { _ = try profile.write(value); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
