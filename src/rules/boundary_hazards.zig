@@ -52,8 +52,7 @@ fn findNullablePointerLengths(context: RuleRun) !void {
         const length_name = integerParameter(context, function.parameters_start, function.parameters_end) orelse continue;
         const allocation = allocationWithLength(context, length_name, function.body_start + 1, function.body_end) orelse continue;
         const branch = optionalPointerBranch(context, pointer_name, allocation.declaration_end + 1, function.body_end) orelse continue;
-        if (!rangeCalls(context, "copyForwards", branch.start, branch.end) and
-            !rangeCallsBuiltin(context, "@memcpy", branch.start, branch.end)) continue;
+        if (!rangeCopiesName(context, branch.capture, branch.body_start + 1, branch.end)) continue;
         if (!rangeReturns(context, allocation.binding, branch.end + 1, function.body_end)) continue;
         try context.emit(.{
             .rule = .nullable_pointer_length,
@@ -420,14 +419,28 @@ fn allocationWithLength(context: RuleRun, length_name: []const u8, start: usize,
 
 const TokenRange = struct { start: usize, end: usize };
 
-fn optionalPointerBranch(context: RuleRun, pointer_name: []const u8, start: usize, end: usize) ?TokenRange {
+const OptionalBranch = struct {
+    start: usize,
+    body_start: usize,
+    end: usize,
+    capture: []const u8,
+};
+
+fn optionalPointerBranch(context: RuleRun, pointer_name: []const u8, start: usize, end: usize) ?OptionalBranch {
     for (context.tokens[start..end], start..) |token, if_index| {
-        if (token.tag != .keyword_if or !rangeContainsName(context, pointer_name, if_index, @min(if_index + 12, end))) continue;
-        var body_start = if_index + 1;
-        while (body_start < end and context.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
-        if (body_start >= end) continue;
+        if (token.tag != .keyword_if or if_index + 1 >= end or context.tokens[if_index + 1].tag != .l_paren) continue;
+        const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
+        if (condition_end + 4 >= end or !rangeContainsName(context, pointer_name, if_index + 2, condition_end) or
+            context.tokens[condition_end + 1].tag != .pipe or context.tokens[condition_end + 2].tag != .identifier or
+            context.tokens[condition_end + 3].tag != .pipe or context.tokens[condition_end + 4].tag != .l_brace) continue;
+        const body_start = condition_end + 4;
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        return .{ .start = if_index, .end = body_end };
+        return .{
+            .start = if_index,
+            .body_start = body_start,
+            .end = body_end,
+            .capture = context.tokenText(condition_end + 2),
+        };
     }
     return null;
 }
@@ -440,9 +453,12 @@ fn rangeCalls(context: RuleRun, method: []const u8, start: usize, end: usize) bo
     return false;
 }
 
-fn rangeCallsBuiltin(context: RuleRun, builtin: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .builtin and context.tokenIs(index, builtin)) return true;
+fn rangeCopiesName(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, copy_index| {
+        if ((token.tag != .builtin or !context.tokenIs(copy_index, "@memcpy")) and
+            (token.tag != .identifier or !context.tokenIs(copy_index, "copyForwards"))) continue;
+        const statement_end = context.statementEnd(copy_index) orelse continue;
+        if (statement_end <= end and rangeContainsName(context, name, copy_index + 1, statement_end)) return true;
     }
     return false;
 }
@@ -780,6 +796,16 @@ test "unrelated integer parameters do not supply allocation lengths" {
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(types.Rule.pointer_only_free, findings[0].rule);
+}
+
+test "nullable pointer fallback copies initialize their allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn copy(a: anytype, ptr: ?[*]const u8, fallback: []const u8, len: usize) ![]u8 { " ++
+        "const out = try a.alloc(u8, len); if (ptr == null) { @memcpy(out, fallback[0..len]); } return out; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "discarded descriptors and child pipe closes report" {
