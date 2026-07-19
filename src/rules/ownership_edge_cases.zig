@@ -252,9 +252,11 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
 }
 
 fn removedFieldReleasedBefore(context: RuleRun, sequence_field: []const u8, owned_field: []const u8, removal_index: usize) bool {
-    const start = removal_index -| 40;
+    const removal_scope = context.enclosingOpeningBrace(removal_index) orelse return false;
+    const start = removal_scope + 1;
     for (context.tokens[start..removal_index], start..) |token, free_index| {
-        if (token.tag != .identifier or !context.tokenIs(free_index, "free")) continue;
+        if (token.tag != .identifier or !context.tokenIs(free_index, "free") or
+            context.enclosingOpeningBrace(free_index) != removal_scope) continue;
         const statement_end = context.statementEnd(free_index) orelse continue;
         if (statement_end > removal_index) continue;
         var saw_sequence = false;
@@ -686,6 +688,32 @@ test "discarded removals use their containing type's field" {
         "const Registry = struct { rows: std.ArrayList(ValueRow), owner: OwnedRow, " ++
         "fn deinit(self: *Registry, a: anytype) void { a.free(self.owner.name); } " ++
         "fn remove(self: *Registry, i: usize) void { _ = self.rows.swapRemove(i); } };";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "discarded removal cleanup must dominate in the same scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Row = struct { name: []u8 }; const Registry = struct { rows: std.ArrayList(Row), " ++
+        "fn deinit(self: *Registry, a: anytype) void { for (self.rows.items) |row| a.free(row.name); } " ++
+        "fn remove(self: *Registry, a: anytype, i: usize, cleanup: bool) void { " ++
+        "if (cleanup) { a.free(self.rows.items[i].name); } _ = self.rows.swapRemove(i); } };";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, findings[0].rule);
+}
+
+test "discarded removal cleanup is independent of token distance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Row = struct { name: []u8 }; const Registry = struct { rows: std.ArrayList(Row), " ++
+        "fn deinit(self: *Registry, a: anytype) void { for (self.rows.items) |row| a.free(row.name); } " ++
+        "fn remove(self: *Registry, a: anytype, i: usize) void { a.free(self.rows.items[i].name); " ++
+        "const one = 1; const two = 2; const three = 3; const four = 4; const five = 5; " ++
+        "_ = one + two + three + four + five; _ = self.rows.swapRemove(i); } };";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
