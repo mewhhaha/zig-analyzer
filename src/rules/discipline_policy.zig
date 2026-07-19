@@ -347,7 +347,10 @@ fn testHasAssertion(context: RuleRun, start: usize, end: usize) bool {
     if (testIsCompileSmoke(context, start, end)) return true;
     for (context.tokens[start..end], start..) |token, index| switch (token.tag) {
         .keyword_try, .keyword_catch => return true,
-        .identifier, .builtin => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren) return true,
+        .identifier => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren) {
+            const name = context.tokenText(index);
+            if (std.mem.eql(u8, name, "assert") or std.mem.startsWith(u8, name, "expect")) return true;
+        },
         else => {},
     };
     return false;
@@ -1005,6 +1008,22 @@ test "disciplined and policy rules report their bounded local shapes" {
         if (!seen) std.debug.print("missing discipline test finding {s}\n", .{rule.code()});
         try std.testing.expect(seen);
     }
+}
+
+test "ordinary calls do not turn smoke tests into assertions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "test \"setup only\" { setup(); }\n" ++
+        "test \"fallible smoke\" { try setup(); }\n" ++
+        "test \"expectation\" { try std.testing.expect(value); }\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.assertion_free_test)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.assertion_free_test, found[0].rule);
 }
 
 test "a queue pop loop states exhaustion through its optional capture" {
