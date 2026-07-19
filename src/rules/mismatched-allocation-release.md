@@ -9,4 +9,5 @@ allocator.
 contracts, and allocator identity must be preserved.
 
 **When it matters.** It applies when both acquisition and release
-receiver/method identities are mechanically visible.
+receiver/method identities are mechanically visible, including allocator
+values derived through `.allocator()`.

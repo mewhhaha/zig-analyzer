@@ -8,17 +8,25 @@ pub fn run(context: RuleRun) !void {
 
     for (context.tokens, 0..) |token, cast_index| {
         if (token.tag != .builtin or !context.tokenIs(cast_index, "@intCast") or
-            cast_index + 3 >= context.tokens.len or
-            context.tokens[cast_index + 1].tag != .l_paren or
-            context.tokens[cast_index + 2].tag != .identifier or
-            context.tokens[cast_index + 3].tag != .r_paren) continue;
+            cast_index + 3 >= context.tokens.len or context.tokens[cast_index + 1].tag != .l_paren) continue;
+        const value = castValue(context, cast_index) orelse continue;
         const target_type = castTargetType(context, cast_index) orelse continue;
-        const target_width = intTypeWidth(target_type) orelse continue;
-        const value_name = context.tokenText(cast_index + 2);
+        const target = intType(target_type) orelse continue;
+        const value_name = context.tokenText(value.binding_index);
         const function = enclosingFunction(context, cast_index) orelse continue;
         const declaration = soleDeclaration(context, function, value_name, cast_index) orelse continue;
-        const source_width = intTypeWidth(declaration.type_text) orelse continue;
-        if (target_width >= source_width) continue;
+        const source_type = if (value.field_index) |field_index|
+            if (value.is_length)
+                if (structFieldHasLength(context, declaration.type_text, context.tokenText(field_index)))
+                    "usize"
+                else
+                    continue
+            else
+                structFieldType(context, declaration.type_text, context.tokenText(field_index)) orelse continue
+        else
+            declaration.type_text;
+        const source = intType(source_type) orelse continue;
+        if (target.width >= source.width and (target.signed or !source.signed)) continue;
         if (capturedName(context, function.body_start + 1, cast_index, value_name)) continue;
         if (guardMentions(context, declaration.guard_scan_start, cast_index, value_name)) continue;
         try context.emit(.{
@@ -27,36 +35,171 @@ pub fn run(context: RuleRun) !void {
             .span = token.loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "@intCast narrows '{s}' from {s} to {s} without a range guard; an out-of-range value is safety-checked illegal behavior",
-                .{ value_name, declaration.type_text, target_type },
+                "@intCast converts '{s}' from {s} to {s} without a range guard; an out-of-range value is safety-checked illegal behavior",
+                .{
+                    context.source[context.tokens[value.binding_index].loc.start..context.tokens[value.value_end_index].loc.end],
+                    source_type,
+                    target_type,
+                },
             ),
         });
     }
 }
 
-/// Matches only 'const x: <type> = @intCast(v);' and '@as(<type>, @intCast(v))';
-/// any other cast context leaves the target type unknown.
+const CastValue = struct {
+    binding_index: usize,
+    field_index: ?usize = null,
+    value_end_index: usize,
+    is_length: bool = false,
+};
+
+fn castValue(context: RuleRun, cast_index: usize) ?CastValue {
+    if (context.tokens[cast_index + 2].tag != .identifier) return null;
+    if (context.tokens[cast_index + 3].tag == .r_paren) return .{
+        .binding_index = cast_index + 2,
+        .value_end_index = cast_index + 2,
+    };
+    if (cast_index + 7 < context.tokens.len and context.tokens[cast_index + 3].tag == .period and
+        context.tokens[cast_index + 4].tag == .identifier and context.tokens[cast_index + 5].tag == .period and
+        context.tokenIs(cast_index + 6, "len") and context.tokens[cast_index + 7].tag == .r_paren) return .{
+        .binding_index = cast_index + 2,
+        .field_index = cast_index + 4,
+        .value_end_index = cast_index + 6,
+        .is_length = true,
+    };
+    if (cast_index + 5 >= context.tokens.len or context.tokens[cast_index + 3].tag != .period or
+        context.tokens[cast_index + 4].tag != .identifier or context.tokens[cast_index + 5].tag != .r_paren) return null;
+    return .{
+        .binding_index = cast_index + 2,
+        .field_index = cast_index + 4,
+        .value_end_index = cast_index + 4,
+    };
+}
+
 fn castTargetType(context: RuleRun, cast_index: usize) ?[]const u8 {
     const tokens = context.tokens;
-    if (cast_index >= 5 and cast_index + 4 < tokens.len and
+    const cast_close = context.matchingToken(cast_index + 1, .l_paren, .r_paren) orelse return null;
+    if (cast_index >= 5 and cast_close + 1 < tokens.len and
         (tokens[cast_index - 5].tag == .keyword_const or tokens[cast_index - 5].tag == .keyword_var) and
         tokens[cast_index - 4].tag == .identifier and tokens[cast_index - 3].tag == .colon and
         tokens[cast_index - 2].tag == .identifier and tokens[cast_index - 1].tag == .equal and
-        tokens[cast_index + 4].tag == .semicolon) return context.tokenText(cast_index - 2);
-    if (cast_index >= 4 and cast_index + 4 < tokens.len and
+        tokens[cast_close + 1].tag == .semicolon) return context.tokenText(cast_index - 2);
+    if (cast_index >= 4 and cast_close + 1 < tokens.len and
         tokens[cast_index - 4].tag == .builtin and context.tokenIs(cast_index - 4, "@as") and
         tokens[cast_index - 3].tag == .l_paren and tokens[cast_index - 2].tag == .identifier and
         tokens[cast_index - 1].tag == .comma and
-        tokens[cast_index + 4].tag == .r_paren) return context.tokenText(cast_index - 2);
+        tokens[cast_close + 1].tag == .r_paren) return context.tokenText(cast_index - 2);
+    return writeIntTargetType(context, cast_index, cast_close);
+}
+
+fn writeIntTargetType(context: RuleRun, cast_index: usize, cast_close: usize) ?[]const u8 {
+    var write_index = cast_index;
+    while (write_index > cast_index -| 48) {
+        write_index -= 1;
+        if (!context.tokenIs(write_index, "writeInt") or write_index < 4 or
+            context.tokens[write_index - 1].tag != .period or !context.tokenIs(write_index - 2, "mem") or
+            context.tokens[write_index - 3].tag != .period or !context.tokenIs(write_index - 4, "std") or
+            write_index + 2 >= cast_index or context.tokens[write_index + 1].tag != .l_paren or
+            context.tokens[write_index + 2].tag != .identifier) continue;
+        const call_close = context.matchingToken(write_index + 1, .l_paren, .r_paren) orelse continue;
+        if (cast_close >= call_close or callArgumentIndex(context, write_index + 2, cast_index) != 2) continue;
+        return context.tokenText(write_index + 2);
+    }
     return null;
 }
 
+fn callArgumentIndex(context: RuleRun, start: usize, target: usize) usize {
+    var argument: usize = 0;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    for (context.tokens[start..target]) |token| switch (token.tag) {
+        .l_paren => parenthesis_depth += 1,
+        .r_paren => parenthesis_depth -|= 1,
+        .l_bracket => bracket_depth += 1,
+        .r_bracket => bracket_depth -|= 1,
+        .l_brace => brace_depth += 1,
+        .r_brace => brace_depth -|= 1,
+        .comma => if (parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) {
+            argument += 1;
+        },
+        else => {},
+    };
+    return argument;
+}
+
 /// usize and isize count as 64 bits, so usize <-> u64 is never a narrowing.
-fn intTypeWidth(text: []const u8) ?u32 {
-    if (std.mem.eql(u8, text, "usize") or std.mem.eql(u8, text, "isize")) return 64;
+const IntType = struct { width: u32, signed: bool };
+
+fn intType(text: []const u8) ?IntType {
+    if (std.mem.eql(u8, text, "usize")) return .{ .width = 64, .signed = false };
+    if (std.mem.eql(u8, text, "isize")) return .{ .width = 64, .signed = true };
+    if (std.mem.eql(u8, text, "c_short")) return .{ .width = 16, .signed = true };
+    if (std.mem.eql(u8, text, "c_int")) return .{ .width = 32, .signed = true };
+    if (std.mem.eql(u8, text, "c_longlong")) return .{ .width = 64, .signed = true };
+    if (std.mem.eql(u8, text, "c_ushort")) return .{ .width = 16, .signed = false };
+    if (std.mem.eql(u8, text, "c_uint")) return .{ .width = 32, .signed = false };
+    if (std.mem.eql(u8, text, "c_ulonglong")) return .{ .width = 64, .signed = false };
     if (text.len < 2 or (text[0] != 'u' and text[0] != 'i')) return null;
     for (text[1..]) |character| if (!std.ascii.isDigit(character)) return null;
-    return std.fmt.parseInt(u32, text[1..], 10) catch null;
+    return .{
+        .width = std.fmt.parseInt(u32, text[1..], 10) catch return null,
+        .signed = text[0] == 'i',
+    };
+}
+
+fn structFieldType(context: RuleRun, type_name: []const u8, field_name: []const u8) ?[]const u8 {
+    for (context.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .identifier or !context.tokenIs(declaration_index, type_name) or declaration_index == 0 or
+            context.tokens[declaration_index - 1].tag != .keyword_const) continue;
+        var struct_index = declaration_index + 1;
+        while (struct_index < context.tokens.len and struct_index < declaration_index + 5 and
+            context.tokens[struct_index].tag != .keyword_struct) : (struct_index += 1)
+        {}
+        if (struct_index >= context.tokens.len or context.tokens[struct_index].tag != .keyword_struct or
+            struct_index + 1 >= context.tokens.len or context.tokens[struct_index + 1].tag != .l_brace) continue;
+        const container_end = context.matchingToken(struct_index + 1, .l_brace, .r_brace) orelse continue;
+        var depth: usize = 0;
+        for (context.tokens[struct_index + 2 .. container_end], struct_index + 2..) |field, field_index| {
+            switch (field.tag) {
+                .l_brace => depth += 1,
+                .r_brace => depth -|= 1,
+                .identifier => if (depth == 0 and context.tokenIs(field_index, field_name) and
+                    field_index + 2 < container_end and context.tokens[field_index + 1].tag == .colon and
+                    context.tokens[field_index + 2].tag == .identifier) return context.tokenText(field_index + 2),
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+fn structFieldHasLength(context: RuleRun, type_name: []const u8, field_name: []const u8) bool {
+    for (context.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .identifier or !context.tokenIs(declaration_index, type_name) or declaration_index == 0 or
+            context.tokens[declaration_index - 1].tag != .keyword_const) continue;
+        var struct_index = declaration_index + 1;
+        while (struct_index < context.tokens.len and struct_index < declaration_index + 5 and
+            context.tokens[struct_index].tag != .keyword_struct) : (struct_index += 1)
+        {}
+        if (struct_index >= context.tokens.len or context.tokens[struct_index].tag != .keyword_struct or
+            struct_index + 1 >= context.tokens.len or context.tokens[struct_index + 1].tag != .l_brace) continue;
+        const container_end = context.matchingToken(struct_index + 1, .l_brace, .r_brace) orelse continue;
+        var depth: usize = 0;
+        for (context.tokens[struct_index + 2 .. container_end], struct_index + 2..) |field, field_index| {
+            switch (field.tag) {
+                .l_brace => depth += 1,
+                .r_brace => depth -|= 1,
+                .identifier => if (depth == 0 and context.tokenIs(field_index, field_name) and
+                    field_index + 2 < container_end and context.tokens[field_index + 1].tag == .colon)
+                {
+                    return context.tokens[field_index + 2].tag == .l_bracket;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 const Function = struct {
@@ -212,6 +355,24 @@ test "narrowing intCast of a wider declared value is flagged in both cast shapes
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "u16") != null);
 }
 
+test "writeInt result context exposes unchecked slice length narrowing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Message = struct { payload: []const u8 };" ++
+        "fn encode(message: Message, frame: []u8) void {" ++
+        "std.mem.writeInt(u16, frame[0..2], @intCast(message.payload.len), .big); }" ++
+        "fn checked(message: Message, frame: []u8) void {" ++
+        "if (message.payload.len > std.math.maxInt(u16)) return;" ++
+        "std.mem.writeInt(u16, frame[0..2], @intCast(message.payload.len), .big); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "message.payload.len") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "usize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "u16") != null);
+}
+
 test "a guard mentioning the value before the cast keeps it clean" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -268,6 +429,26 @@ test "widening equal-width and usize-u64 casts stay clean" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "signed C length fields require a nonnegative guard before unsigned casts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Buffer = extern struct { length: c_int };\n" ++
+        "fn unchecked(source: Buffer) void {\n" ++
+        "    const length: usize = @intCast(source.length);\n" ++
+        "    _ = length;\n" ++
+        "}\n" ++
+        "fn checked(source: Buffer) void {\n" ++
+        "    if (source.length < 0) return;\n" ++
+        "    const length: usize = @intCast(source.length);\n" ++
+        "    _ = length;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "c_int") != null);
 }
 
 test "unknown ambiguous or shadowed value types stay clean" {

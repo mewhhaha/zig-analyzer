@@ -159,20 +159,18 @@ fn runWithWriter(
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     var concurrency_available = true;
-    if (loaded_files.len > 1 or configuration.level(.import_boundary) != .off) {
-        group.concurrent(io, checkProjectTask, .{
-            io,
-            allocator,
-            root,
-            loaded_files,
-            configuration,
-            cache,
-            &project_result,
-        }) catch {
-            concurrency_available = false;
-            checkProjectTask(io, allocator, root, loaded_files, configuration, cache, &project_result);
-        };
-    }
+    group.concurrent(io, checkProjectTask, .{
+        io,
+        allocator,
+        root,
+        loaded_files,
+        configuration,
+        cache,
+        &project_result,
+    }) catch {
+        concurrency_available = false;
+        checkProjectTask(io, allocator, root, loaded_files, configuration, cache, &project_result);
+    };
     for (loaded_files, file_results) |loaded_file, *result| {
         if (concurrency_available) {
             group.concurrent(io, checkFileTask, .{ io, allocator, root, loaded_file, configuration, options.fix, cache, result }) catch {
@@ -273,6 +271,7 @@ fn reportProjectFindings(
                 source_locators[finding.file_index] = try SourceLocator.init(allocator, file.source);
             }
             const display_path = try displayPath(allocator, root, file.path);
+            errdefer if (!std.mem.eql(u8, root.display_path, ".")) allocator.free(display_path);
             const location = source_locators[finding.file_index].?.location(finding.start);
             try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
                 display_path,
@@ -306,6 +305,7 @@ fn reportProjectFindings(
             source_locators[finding.file_index] = try SourceLocator.init(allocator, file.source);
         }
         const display_path = try displayPath(allocator, root, file.path);
+        errdefer if (!std.mem.eql(u8, root.display_path, ".")) allocator.free(display_path);
         const location = source_locators[finding.file_index].?.location(finding.span.start);
         try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
             display_path,

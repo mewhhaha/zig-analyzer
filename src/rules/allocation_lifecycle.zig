@@ -95,17 +95,18 @@ pub fn warningsWithSummaries(
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
         const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
-        if (allocation.allocator_source) |allocator_name| {
-            if (std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null) continue;
-            if (allocatorIsArenaBacked(source, tokens, allocator_name)) continue;
-            if (privateAllocatorParameterIsAlwaysArenaBacked(
-                source,
-                tokens,
-                declaration_index,
-                allocator_name,
-                summary_index,
-            )) continue;
-        }
+        const arena_backed = if (allocation.allocator_source) |allocator_name|
+            std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null or
+                allocatorIsArenaBacked(source, tokens, allocator_name) or
+                privateAllocatorParameterIsAlwaysArenaBacked(
+                    source,
+                    tokens,
+                    declaration_index,
+                    allocator_name,
+                    summary_index,
+                )
+        else
+            false;
         const scope_end = scope_index.enclosingScopeEnd(declaration_index) orelse continue;
         if (statement_end >= scope_end) continue;
         const mismatched_release = try findMismatchedRelease(
@@ -120,6 +121,7 @@ pub fn warningsWithSummaries(
             allocation,
             &found,
         );
+        if (arena_backed) continue;
         try findReleaseOrderingIssues(
             allocator,
             source,
@@ -226,9 +228,6 @@ fn allocationFromCall(
 ) ?Allocation {
     var buffer: [1]std.zig.Ast.Node.Index = undefined;
     const call = tree.fullCall(&buffer, node) orelse return null;
-    for (call.ast.params) |parameter| {
-        if (expressionReferencesField(tree, parameter, "arena")) return null;
-    }
     if (tree.nodeTag(call.ast.fn_expr) == .identifier) {
         const function_name = tree.tokenSlice(tree.nodeMainToken(call.ast.fn_expr));
         const owned = summary_index.ownedReturnCall(source, null, function_name) orelse return null;
@@ -236,7 +235,6 @@ fn allocationFromCall(
             if (parameter < call.ast.params.len) call.ast.params[parameter] else null
         else
             null;
-        if (allocator_argument) |argument| if (expressionReferencesField(tree, argument, "arena")) return null;
         return .{
             .method = function_name,
             .release = owned.release,
@@ -244,7 +242,7 @@ fn allocationFromCall(
                 if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
             else
                 null,
-            .allocator_source = if (allocator_argument) |argument| allocatorSourceName(tree, argument) else null,
+            .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
         };
     }
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
@@ -255,7 +253,6 @@ fn allocationFromCall(
     if (owned_call.standardAllocatorArgument(callable)) |parameter| {
         if (parameter >= call.ast.params.len) return null;
         const allocator_argument = call.ast.params[parameter];
-        if (expressionReferencesField(tree, allocator_argument, "arena")) return null;
         return .{
             .method = method,
             .release = "free",
@@ -263,18 +260,17 @@ fn allocationFromCall(
                 tree.tokenSlice(tree.nodeMainToken(allocator_argument))
             else
                 null,
-            .allocator_source = allocatorSourceName(tree, allocator_argument),
+            .allocator_source = allocatorSourceName(source, tokens, tree, allocator_argument),
         };
     }
     if (allocationRelease(method)) |release| {
-        if (expressionReferencesField(tree, receiver, "arena")) return null;
         if (std.mem.eql(u8, method, "create") and !expressionLooksLikeAllocationOwner(source, tokens, tree, receiver)) return null;
         if (std.mem.eql(u8, release, "free") and !expressionLooksLikeAllocator(source, tokens, tree, receiver)) return null;
         return .{
             .method = method,
             .release = release,
             .receiver = receiver_name,
-            .allocator_source = allocatorSourceName(tree, receiver),
+            .allocator_source = allocatorSourceName(source, tokens, tree, receiver),
         };
     }
     const owned = if (receiver_name) |name|
@@ -285,7 +281,6 @@ fn allocationFromCall(
         if (parameter < call.ast.params.len) call.ast.params[parameter] else null
     else
         null;
-    if (allocator_argument) |argument| if (expressionReferencesField(tree, argument, "arena")) return null;
     return .{
         .method = method,
         .release = owned.release,
@@ -293,7 +288,7 @@ fn allocationFromCall(
             if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
         else
             receiver_name,
-        .allocator_source = if (allocator_argument) |argument| allocatorSourceName(tree, argument) else null,
+        .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
     };
 }
 
@@ -365,24 +360,22 @@ fn identifierHasAllocatorType(source: []const u8, tokens: []const std.zig.Token,
     return false;
 }
 
-fn allocatorSourceName(tree: *const std.zig.Ast, receiver: std.zig.Ast.Node.Index) ?[]const u8 {
+fn allocatorSourceName(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
+    receiver: std.zig.Ast.Node.Index,
+) ?[]const u8 {
     switch (tree.nodeTag(receiver)) {
         .identifier => return tree.tokenSlice(tree.nodeMainToken(receiver)),
-        .field_access => {
-            const base, const field_token = tree.nodeData(receiver).node_and_token;
-            if (!std.mem.eql(u8, tree.tokenSlice(field_token), "allocator") and
-                !std.mem.eql(u8, tree.tokenSlice(field_token), "gpa")) return null;
-            if (tree.nodeTag(base) != .identifier) return null;
-            return tree.tokenSlice(tree.nodeMainToken(base));
-        },
+        .field_access => return source[tokens[tree.firstToken(receiver)].loc.start..tokens[tree.lastToken(receiver)].loc.end],
         .call, .call_comma, .call_one, .call_one_comma => {
             var buffer: [1]std.zig.Ast.Node.Index = undefined;
             const call = tree.fullCall(&buffer, receiver) orelse return null;
             if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
-            const base, const field_token = tree.nodeData(call.ast.fn_expr).node_and_token;
+            _, const field_token = tree.nodeData(call.ast.fn_expr).node_and_token;
             if (!std.mem.eql(u8, tree.tokenSlice(field_token), "allocator")) return null;
-            if (tree.nodeTag(base) != .identifier) return null;
-            return tree.tokenSlice(tree.nodeMainToken(base));
+            return source[tokens[tree.firstToken(receiver)].loc.start..tokens[tree.lastToken(receiver)].loc.end];
         },
         else => return null,
     }
@@ -529,28 +522,6 @@ fn allocatorCallReceiver(source: []const u8, tokens: []const std.zig.Token, rang
     return null;
 }
 
-fn expressionReferencesField(
-    tree: *const std.zig.Ast,
-    expression: std.zig.Ast.Node.Index,
-    field_name: []const u8,
-) bool {
-    return switch (tree.nodeTag(expression)) {
-        .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(expression)), field_name),
-        .field_access => field: {
-            const receiver, const field_token = tree.nodeData(expression).node_and_token;
-            if (std.mem.eql(u8, tree.tokenSlice(field_token), field_name)) break :field true;
-            break :field expressionReferencesField(tree, receiver, field_name);
-        },
-        .call, .call_comma, .call_one, .call_one_comma => call: {
-            var buffer: [1]std.zig.Ast.Node.Index = undefined;
-            const call = tree.fullCall(&buffer, expression) orelse break :call false;
-            break :call expressionReferencesField(tree, call.ast.fn_expr, field_name);
-        },
-        .grouped_expression => expressionReferencesField(tree, tree.nodeData(expression).node_and_token[0], field_name),
-        else => false,
-    };
-}
-
 fn allocationRelease(method: []const u8) ?[]const u8 {
     return owned_call.releaseForMethod(method);
 }
@@ -576,13 +547,11 @@ fn findMismatchedRelease(
         const receiver_is_binding = method_index >= 2 and
             tokenIsIdentifier(source, tokens[method_index - 2], binding_name) and
             identifierRefersToBinding(scope_index, binding_index, method_index - 2);
-        const receiver_name = if (method_index >= 2 and tokens[method_index - 2].tag == .identifier)
-            source[tokens[method_index - 2].loc.start..tokens[method_index - 2].loc.end]
-        else
-            null;
+        const receiver_name = releaseReceiverPath(source, tokens, method_index);
         const wrong_method = !std.mem.eql(u8, actual_release, allocation.release);
-        const wrong_allocator = !receiver_is_binding and allocation.receiver != null and receiver_name != null and
-            !std.mem.eql(u8, allocation.receiver.?, receiver_name.?);
+        const expected_allocator = allocation.receiver orelse allocation.allocator_source;
+        const wrong_allocator = !receiver_is_binding and expected_allocator != null and receiver_name != null and
+            !std.mem.eql(u8, expected_allocator.?, receiver_name.?);
         if (!wrong_method and !wrong_allocator) continue;
         mismatched = true;
         const message = if (wrong_method)
@@ -595,7 +564,7 @@ fn findMismatchedRelease(
             try std.fmt.allocPrint(
                 allocator,
                 "allocation '{s}' created by allocator '{s}' is released through different allocator '{s}'",
-                .{ binding_name, allocation.receiver.?, receiver_name.? },
+                .{ binding_name, expected_allocator.?, receiver_name.? },
             );
         try found.append(allocator, .{
             .rule = .mismatched_allocation_release,
@@ -604,6 +573,14 @@ fn findMismatchedRelease(
         });
     }
     return mismatched;
+}
+
+fn releaseReceiverPath(source: []const u8, tokens: []const std.zig.Token, method_index: usize) ?[]const u8 {
+    if (method_index < 2 or tokens[method_index - 1].tag != .period or
+        tokens[method_index - 2].tag != .identifier) return null;
+    var start = method_index - 2;
+    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
+    return source[tokens[start].loc.start..tokens[method_index - 2].loc.end];
 }
 
 fn findReleaseOrderingIssues(
@@ -1184,11 +1161,20 @@ fn localCallOwnership(
     else
         call_open - 1;
     const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
+    if (conventionalBorrowingCall(callable)) return .borrowed;
     return switch (summary_index.parameterEffectForCall(source, callable, argument_index)) {
         .borrowed => .borrowed,
         .released => .released,
         .escaped, .unknown => .unknown,
     };
+}
+
+fn conventionalBorrowingCall(callable: []const u8) bool {
+    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const method = if (separator) |index| callable[index + 1 ..] else callable;
+    const methods = [_][]const u8{ "appendSlice", "write", "writeAll", "print" };
+    for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
+    return false;
 }
 
 fn bareBindingArgumentIndex(
@@ -1492,6 +1478,18 @@ test "passing an allocation to a proven borrowing helper does not transfer owner
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
 }
 
+test "copying allocation bytes into a container does not transfer ownership" {
+    const source =
+        "fn append(allocator: std.mem.Allocator, output: *List) !void {" ++
+        "const line = try std.fmt.allocPrint(allocator, \"value\", .{});" ++
+        "try output.appendSlice(allocator, line);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
 test "a proven releasing helper discharges caller ownership" {
     const source =
         "fn release(allocator: std.mem.Allocator, bytes: []u8) void { allocator.free(bytes); }" ++
@@ -1595,6 +1593,16 @@ test "arena allocations inherit the arena lifetime" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "arena allocations cannot be released through an unrelated allocator" {
+    const source =
+        "fn bad(other: std.mem.Allocator, arena: *std.heap.ArenaAllocator) !void {" ++
+        "const bytes = try arena.allocator().dupe(u8, \"x\"); other.free(bytes); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.mismatched_allocation_release, found[0].rule);
 }
 
 test "cleanup of a shadowing binding does not release the allocation" {
@@ -1742,6 +1750,31 @@ test "standard allocation helpers use their allocator argument" {
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "allocator fields preserve provenance through standard helpers" {
+    const source =
+        "fn run(self: *State) !void {" ++
+        "const path = try std.fs.path.resolve(self.alloc, &.{\"a\", \"b\"});" ++
+        "defer self.alloc.free(path);" ++
+        "const text = try std.fmt.allocPrint(self.alloc, \"{s}\", .{path});" ++
+        "defer self.alloc.free(text);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "different allocator fields remain distinct provenance" {
+    const source =
+        "fn run(self: *State, other: *State) !void {" ++
+        "const text = try std.fmt.allocPrint(self.alloc, \"value\", .{});" ++
+        "defer other.alloc.free(text);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.mismatched_allocation_release, found[0].rule);
 }
 
 test "double release and use after release are reported in straight line code" {

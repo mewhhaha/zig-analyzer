@@ -9,4 +9,5 @@ before the function finishes returning.
 from it, so the returned value immediately dangles.
 
 **When it matters.** It applies to locally created arenas with visible deferred
-deinitialization and recognizable allocation provenance.
+deinitialization and recognizable allocation provenance, including arena-owned
+values embedded in a returned aggregate.

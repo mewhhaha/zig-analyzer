@@ -83,8 +83,11 @@ compiler nor a syntax-based server reports:
 | Pattern | Rule |
 | --- | --- |
 | An allocation, then another `try`, no `errdefer` between | `missing-errdefer`, with a fix |
+| Partially constructing an owning aggregate before another fallible step | `missing-errdefer` |
 | `defer list.deinit();` then `return list.items;` | `returning-deinitialized-view` |
 | Keeping `&list.items[i]` across an `append` | `invalidated-element-pointer` |
+| Returning a view retained across `realloc` | `invalidated-container-view` |
+| Clearing a container without releasing its proven owned element fields | `incomplete-owned-field-cleanup` |
 | `@memcpy` between overlapping slices of one buffer | `aliased-memcpy` |
 | `while (i >= 0) : (i -= 1)` on an unsigned index | `unsigned-reverse-loop` |
 | `count * size` passed straight to `alloc` | `allocation-size-overflow` |
@@ -95,7 +98,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 140 rules with stable codes, organized into five named profiles,
+There are 156 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings

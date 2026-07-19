@@ -14,7 +14,7 @@ full reanalysis.
 
 ## Rules, tiers, and profiles
 
-There are 140 rules. Each has a stable kebab-case code, such as
+There are 156 rules. Each has a stable kebab-case code, such as
 `missing-errdefer` or `discarded-error`, used consistently in configuration,
 diagnostics, and suppression directives. The full index, with one document
 per rule explaining why it exists and when it fires, is

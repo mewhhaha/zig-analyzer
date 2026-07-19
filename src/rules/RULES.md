@@ -68,7 +68,7 @@ Compiler-backed project rules are opt-in.
   that points into a local array.
 - [`invalidated-container-view`](invalidated-container-view.md) — Reports a
   slice or iterator used after an operation that may move or invalidate its
-  container's backing storage.
+  container's backing storage, including `realloc` of the source allocation.
 - [`returning-deinitialized-view`](returning-deinitialized-view.md) — Reports a
   returned view whose backing container is deinitialized by a deferred cleanup
   during return.
@@ -94,20 +94,54 @@ Compiler-backed project rules are opt-in.
 - [`unsigned-reverse-loop`](unsigned-reverse-loop.md) — Reports a descending
   unsigned loop whose condition remains true at zero and whose update then
   underflows.
-- [`missing-errdefer`](missing-errdefer.md) — Reports an allocation followed by
-  another fallible operation without an intervening error-path release.
+- [`missing-errdefer`](missing-errdefer.md) — Reports an owning acquisition or
+  partial construction followed by another fallible operation without an
+  intervening error-path release.
 - [`copied-io-interface`](copied-io-interface.md) — Reports a standard I/O
   interface copied away from implementation state used by its callbacks.
 - [`directory-iteration-not-enabled`](directory-iteration-not-enabled.md) —
   Reports iteration of a directory opened without enabling iteration.
 - [`discarded-read-count`](discarded-read-count.md) — Reports discarded byte
   counts from partial-read methods.
+- [`discarded-realloc-result`](discarded-realloc-result.md) — Reports a
+  discarded replacement slice returned by `realloc`.
 - [`discarded-write-count`](discarded-write-count.md) — Reports a discarded
   partial-write count when `writeAll` is required for complete output.
 - [`unchecked-first-element`](unchecked-first-element.md) — Reports a public
   function indexing a plain-slice parameter without a visible non-empty proof.
+- [`unchecked-slice-reinterpretation`](unchecked-slice-reinterpretation.md) —
+  Reports a plain slice reinterpreted as an aligned typed pointer.
 - [`undefined-readvec-destination`](undefined-readvec-destination.md) — Reports
   `readVec` calls whose destination slice descriptors remain undefined.
+- [`local-storage-escape`](local-storage-escape.md) — Reports a local array view
+  retained through a callee beyond the array's safe lifetime.
+- [`incomplete-owned-field-cleanup`](incomplete-owned-field-cleanup.md) —
+  Reports cleanup that drops proven owned aggregate or container-element
+  fields.
+- [`partial-ownership-transfer`](partial-ownership-transfer.md) — Reports
+  transfer of one owned field while the owner's remaining resources are dropped.
+- [`stale-index-map`](stale-index-map.md) — Reports sequence removal without
+  updating a sibling map or element field that stores sequence indices.
+- [`lock-order-cycle`](lock-order-cycle.md) — Reports opposite nested lock
+  acquisition orders across visible functions.
+- [`wait-while-holding-lock`](wait-while-holding-lock.md) — Reports waiting for
+  state while holding the lock required to signal it.
+- [`silent-buffer-truncation`](silent-buffer-truncation.md) — Reports fixed-buffer
+  writes that silently drop input beyond available capacity.
+- [`pointer-only-free`](pointer-only-free.md) — Reports allocator frees whose
+  allocation length was reconstructed from only a pointer.
+- [`nullable-pointer-length`](nullable-pointer-length.md) — Reports nullable C
+  pointers that can leave positive-length output uninitialized.
+- [`discarded-resource`](discarded-resource.md) — Reports discarded OS handles
+  returned by resource-acquiring calls.
+- [`child-pipe-double-close`](child-pipe-double-close.md) — Reports a child pipe
+  closed manually before a wait operation that also owns it.
+- [`unwaited-child-process`](unwaited-child-process.md) — Reports a spawned
+  child that leaves scope without wait, kill, or ownership transfer.
+- [`overflow-before-clamp`](overflow-before-clamp.md) — Reports direct checked
+  integer arithmetic that can overflow before `@min` or `@max` applies its bound.
+- [`quadratic-front-removal`](quadratic-front-removal.md) — Reports repeated
+  `orderedRemove(0)` calls while draining an array list.
 - [`aliased-memcpy`](aliased-memcpy.md) — Reports `@memcpy` source and
   destination slices derived from the same base value.
 - [`usize-in-packed-struct`](usize-in-packed-struct.md) — Reports pointer-sized

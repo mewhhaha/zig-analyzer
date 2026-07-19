@@ -45,6 +45,7 @@ fn findRangeLoops(context: RuleRun) !void {
         if (findIdentifier(context, body_end + 1, scope_end, name) != null) continue;
         const bound = context.source[context.tokens[while_index + 4].loc.start..context.tokens[condition_end - 1].loc.end];
         const replacement = try std.fmt.allocPrint(context.allocator, "for (0..{s}) |{s}| {{", .{ bound, name });
+        errdefer context.allocator.free(replacement);
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[continue_end + 1].loc.end },

@@ -168,12 +168,13 @@ pub fn declaredRootSources(
         const literal = tokenText(build_source, tokens[path_builtin + 1]);
         if (literal.len < 2) continue;
         const relative_path = literal[1 .. literal.len - 1];
+        try roots.ensureUnusedCapacity(allocator, 1);
         const resolved = try std.fs.path.resolve(allocator, &.{ build_directory, relative_path });
         if (containsString(roots.items, resolved)) {
             allocator.free(resolved);
             continue;
         }
-        try roots.append(allocator, resolved);
+        roots.appendAssumeCapacity(resolved);
     }
     return try roots.toOwnedSlice(allocator);
 }

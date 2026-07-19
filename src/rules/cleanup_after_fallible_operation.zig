@@ -1,5 +1,6 @@
 const std = @import("std");
 const RuleRun = @import("context.zig").RuleRun;
+const types = @import("types.zig");
 
 const Resource = struct {
     acquisition: []const u8,
@@ -10,6 +11,7 @@ const resources = [_]Resource{
     .{ .acquisition = "openFile", .release = "close" },
     .{ .acquisition = "createFile", .release = "close" },
     .{ .acquisition = "openDir", .release = "close" },
+    .{ .acquisition = "openDirAbsolute", .release = "close" },
     .{ .acquisition = "openIterableDir", .release = "close" },
     .{ .acquisition = "spawn", .release = "join" },
     .{ .acquisition = "init", .release = "deinit" },
@@ -46,6 +48,32 @@ pub fn run(context: RuleRun) !void {
             .message = try std.fmt.allocPrint(
                 context.allocator,
                 "cleanup for resource '{s}' is registered after a fallible operation; an earlier error can skip {s}",
+                .{ binding_name, resource.release },
+            ),
+        });
+    }
+
+    try findLateDirectCleanup(context, level);
+}
+
+fn findLateDirectCleanup(context: RuleRun, level: types.Level) !void {
+    for (context.tokens, 0..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
+            context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
+        const declaration_end = context.statementEnd(declaration_index) orelse continue;
+        const resource = acquiredResource(context, declaration_index + 3, declaration_end) orelse continue;
+        const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
+        const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
+        const binding_name = context.tokenText(declaration_index + 1);
+        const cleanup_index = directCleanup(context, binding_name, resource.release, declaration_end + 1, scope_end) orelse continue;
+        if (!fallibleOperationBetween(context, declaration_end + 1, cleanup_index, scope_opening)) continue;
+        try context.emit(.{
+            .rule = .cleanup_after_fallible_operation,
+            .level = level,
+            .span = context.tokens[declaration_index + 1].loc,
+            .message = try std.fmt.allocPrint(
+                context.allocator,
+                "resource '{s}' is closed only after a fallible operation; an earlier error can skip {s}",
                 .{ binding_name, resource.release },
             ),
         });
@@ -117,9 +145,23 @@ fn deferredCleanup(
     return null;
 }
 
+fn directCleanup(context: RuleRun, binding_name: []const u8, release: []const u8, start: usize, end: usize) ?usize {
+    var index = start;
+    while (index + 3 < end) : (index += 1) {
+        if (!context.tokenIs(index, binding_name) or context.tokens[index + 1].tag != .period or
+            !context.tokenIs(index + 2, release) or context.tokens[index + 3].tag != .l_paren) continue;
+        const statement_start = index -| 4;
+        for (context.tokens[statement_start..index]) |token| if (token.tag == .keyword_defer) return null;
+        return index;
+    }
+    return null;
+}
+
 fn fallibleOperationBetween(context: RuleRun, start: usize, end: usize, scope_opening: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .keyword_try) continue;
+        const fallible = token.tag == .keyword_try or
+            (token.tag == .keyword_return and index + 1 < end and context.tokens[index + 1].tag == .keyword_error);
+        if (!fallible) continue;
         const enclosing = context.enclosingOpeningBrace(index) orelse continue;
         if (enclosing == scope_opening) return true;
         if (context.enclosingOpeningBrace(enclosing) == scope_opening) return true;
@@ -130,7 +172,6 @@ fn fallibleOperationBetween(context: RuleRun, start: usize, end: usize, scope_op
 test "resource cleanup registered after try can be skipped" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn load(dir: std.fs.Dir) !void {\n" ++
         "    var file = try dir.openFile(\"input\", .{});\n" ++
@@ -152,7 +193,6 @@ test "resource cleanup registered after try can be skipped" {
 test "a fallible operation one block deep can still skip the cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn load(dir: std.fs.Dir, flag: bool) !void {\n" ++
         "    var file = try dir.openFile(\"input\", .{});\n" ++
@@ -174,7 +214,6 @@ test "a fallible operation one block deep can still skip the cleanup" {
 test "resource cleanup immediately after acquisition is safe" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn load(dir: std.fs.Dir) !void {\n" ++
         "    var file = try dir.openFile(\"input\", .{});\n" ++
@@ -196,7 +235,6 @@ test "resource cleanup immediately after acquisition is safe" {
 test "resource transferred by pointer before a fallible operation stays opaque" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn load(allocator: std.mem.Allocator) !void {\n" ++
         "    var buffer = try std.ArrayList(u8).initCapacity(allocator, 16);\n" ++
@@ -216,6 +254,41 @@ test "resource transferred by pointer before a fallible operation stays opaque" 
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "direct directory close after a fallible operation can be skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn scan(path: []const u8) !void { var dir = try std.fs.openDirAbsolute(path, .{}); try inspect(dir); dir.close(); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+}
+
+test "direct cleanup after an explicit error path can be skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn scan(dir: std.fs.Dir, fail: bool) !void { var child = try dir.openDir(\".\", .{});" ++
+        "if (fail) return error.Failed; child.close(); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {

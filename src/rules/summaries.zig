@@ -13,6 +13,22 @@ pub const Source = struct {
 
 pub const ParameterEffect = enum { borrowed, released, escaped, unknown };
 
+pub const BorrowKind = enum { pointer, slice };
+
+pub const BorrowedReturn = struct {
+    parameter: usize,
+    field: []const u8,
+    kind: BorrowKind,
+};
+
+pub const PartialIo = enum { none, read, write };
+
+pub const ContainerMutation = struct {
+    parameter: usize,
+    field: []const u8,
+    method: []const u8,
+};
+
 const TokenRange = struct { start: usize, end: usize };
 
 pub const FunctionSummary = struct {
@@ -20,12 +36,17 @@ pub const FunctionSummary = struct {
     name: []const u8,
     parameter_names: []const []const u8,
     parameter_effects: []ParameterEffect,
+    parameter_escapes: []bool,
     returns_owned: bool = false,
     return_release: ?[]const u8 = null,
     allocator_parameter: ?usize = null,
+    borrowed_return: ?BorrowedReturn = null,
+    partial_io: PartialIo = .none,
+    container_mutation: ?ContainerMutation = null,
     unresolved: bool = false,
     source: [:0]const u8,
     tokens: []const std.zig.Token,
+    return_type_start: usize,
     body_start: usize,
     body_end: usize,
     parent_function: ?usize = null,
@@ -63,6 +84,7 @@ pub const Index = struct {
         for (index.functions) |function| {
             allocator.free(function.parameter_names);
             allocator.free(function.parameter_effects);
+            allocator.free(function.parameter_escapes);
             allocator.free(function.nested_function_ranges);
         }
         allocator.free(index.functions);
@@ -107,6 +129,24 @@ pub const Index = struct {
         return function.parameter_effects[parameter];
     }
 
+    pub fn parameterEscapesForCall(
+        index: Index,
+        source: []const u8,
+        callable: []const u8,
+        parameter: usize,
+    ) bool {
+        const separator = std.mem.indexOfScalar(u8, callable, '.') orelse {
+            if (index.sourceHasLocalBinding(source, callable)) return false;
+            const file_index = index.fileIndexForSource(source) orelse return false;
+            const function = index.uniqueFunctionInFile(file_index, callable) orelse return false;
+            return !function.unresolved and parameter < function.parameter_escapes.len and function.parameter_escapes[parameter];
+        };
+        if (std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') != null) return false;
+        const target_file = index.importedFile(source, callable[0..separator]) orelse return false;
+        const function = index.uniqueFunctionInFile(target_file, callable[separator + 1 ..]) orelse return false;
+        return !function.unresolved and parameter < function.parameter_escapes.len and function.parameter_escapes[parameter];
+    }
+
     pub fn ownedReturn(index: Index, callable: []const u8) ?OwnedReturn {
         if (index.acquireContract(callable)) |contract| return .{ .release = callableBaseName(contract.release) };
         const function = index.uniqueFunction(callable) orelse return null;
@@ -136,6 +176,39 @@ pub const Index = struct {
         const file_index = index.fileIndexForSource(source) orelse return null;
         const function = index.uniqueFunctionInFile(file_index, name) orelse return null;
         return ownedReturnFromFunction(function);
+    }
+
+    pub fn borrowedReturnCall(
+        index: Index,
+        source: []const u8,
+        receiver: ?[]const u8,
+        name: []const u8,
+    ) ?BorrowedReturn {
+        const function = index.functionForCall(source, receiver, name) orelse return null;
+        if (function.unresolved) return null;
+        return function.borrowed_return;
+    }
+
+    pub fn partialIoReturnCall(
+        index: Index,
+        source: []const u8,
+        receiver: ?[]const u8,
+        name: []const u8,
+    ) PartialIo {
+        const function = index.functionForCall(source, receiver, name) orelse return .none;
+        if (function.unresolved) return .none;
+        return function.partial_io;
+    }
+
+    pub fn containerMutationCall(
+        index: Index,
+        source: []const u8,
+        receiver: ?[]const u8,
+        name: []const u8,
+    ) ?ContainerMutation {
+        const function = index.functionForCall(source, receiver, name) orelse return null;
+        if (function.unresolved) return null;
+        return function.container_mutation;
     }
 
     pub fn hasImportedLifecycleFacts(index: Index, source: []const u8) bool {
@@ -196,6 +269,21 @@ pub const Index = struct {
             selected = function;
         }
         return selected;
+    }
+
+    fn functionForCall(index: Index, source: []const u8, receiver: ?[]const u8, name: []const u8) ?FunctionSummary {
+        if (receiver) |call_receiver| {
+            if (index.importedFile(source, call_receiver)) |target_file| {
+                return index.uniqueFunctionInFile(target_file, name);
+            }
+            const file_index = index.fileIndexForSource(source) orelse return null;
+            const function = index.uniqueFunctionInFile(file_index, name) orelse return null;
+            if (function.parameter_names.len == 0) return null;
+            return function;
+        }
+        if (index.sourceHasLocalBinding(source, name)) return null;
+        const file_index = index.fileIndexForSource(source) orelse return null;
+        return index.uniqueFunctionInFile(file_index, name);
     }
 
     fn uniqueFunctionInFile(index: Index, file_index: usize, name: []const u8) ?FunctionSummary {
@@ -344,6 +432,8 @@ fn collectFunctions(
         );
         const effects = try allocator.alloc(ParameterEffect, parameters.len);
         @memset(effects, .borrowed);
+        const escapes = try allocator.alloc(bool, parameters.len);
+        @memset(escapes, false);
         while (function_stack.getLastOrNull()) |candidate| {
             if (functions.items[candidate].body_end > fn_index) break;
             _ = function_stack.pop();
@@ -355,8 +445,10 @@ fn collectFunctions(
             .name = tokenText(source_file.source, tokens[fn_index + 1]),
             .parameter_names = parameters,
             .parameter_effects = effects,
+            .parameter_escapes = escapes,
             .source = source_file.source,
             .tokens = tokens,
+            .return_type_start = parameters_end + 1,
             .body_start = body_start,
             .body_end = body_end,
             .parent_function = parent_function,
@@ -469,8 +561,14 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
                 if (statementStartsWith(function.tokens, use_index, .keyword_return) or
                     useIsStored(function.*, use_index))
                 {
+                    if (parameterUseDefinitelyEscapes(function.*, use_index)) {
+                        function.parameter_escapes[parameter] = true;
+                    }
                     mergeEffect(&function.parameter_effects[parameter], .escaped);
                 }
+            }
+            if (borrowedAliasEscapes(function.*, parameter_name)) {
+                function.parameter_escapes[parameter] = true;
             }
         }
         if (directOwnedReturn(function.*, configuration.resource_contracts)) |owned| {
@@ -478,7 +576,170 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
             function.return_release = owned.release;
             function.allocator_parameter = owned.allocator_parameter;
         }
+        function.borrowed_return = directBorrowedReturn(function.*);
+        function.partial_io = directPartialIoReturn(function.*);
+        function.container_mutation = directContainerMutation(function.*);
     }
+}
+
+fn directContainerMutation(function: FunctionSummary) ?ContainerMutation {
+    const methods = [_][]const u8{
+        "append",
+        "appendNTimes",
+        "appendSlice",
+        "insert",
+        "resize",
+        "ensureTotalCapacity",
+        "ensureUnusedCapacity",
+        "addOne",
+        "addManyAsArray",
+        "orderedRemove",
+        "swapRemove",
+        "clearAndFree",
+        "clearRetainingCapacity",
+        "put",
+        "putNoClobber",
+        "fetchPut",
+        "getOrPut",
+        "rehash",
+    };
+    for (function.parameter_names, 0..) |parameter_name, parameter| {
+        for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
+            if (tokenBelongsToNestedFunction(function, use_index) or token.tag != .identifier or
+                !std.mem.eql(u8, tokenText(function.source, token), parameter_name) or use_index + 3 >= function.body_end or
+                function.tokens[use_index + 1].tag != .period or function.tokens[use_index + 2].tag != .identifier) continue;
+            const direct_method = function.tokens[use_index + 3].tag == .l_paren;
+            if (!direct_method and (use_index + 5 >= function.body_end or function.tokens[use_index + 3].tag != .period or
+                function.tokens[use_index + 4].tag != .identifier or function.tokens[use_index + 5].tag != .l_paren)) continue;
+            const method_index = use_index + @as(usize, if (direct_method) 2 else 4);
+            const method = tokenText(function.source, function.tokens[method_index]);
+            for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) {
+                return .{
+                    .parameter = parameter,
+                    .field = if (direct_method) "" else tokenText(function.source, function.tokens[use_index + 2]),
+                    .method = method,
+                };
+            };
+        }
+    }
+    return null;
+}
+
+fn borrowedAliasEscapes(function: FunctionSummary, parameter_name: []const u8) bool {
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= function.body_end or
+            function.tokens[declaration_index + 1].tag != .identifier) continue;
+        const declaration_end = statementEnd(function.tokens, declaration_index, function.body_end);
+        var equal_index = declaration_index + 2;
+        while (equal_index < declaration_end and function.tokens[equal_index].tag != .equal) : (equal_index += 1) {}
+        if (equal_index == declaration_end or !knownBorrowingAlias(function, parameter_name, equal_index + 1, declaration_end)) continue;
+        const alias = tokenText(function.source, function.tokens[declaration_index + 1]);
+        for (function.tokens[declaration_end + 1 .. function.body_end], declaration_end + 1..) |use, use_index| {
+            if (use.tag == .identifier and std.mem.eql(u8, tokenText(function.source, use), alias) and
+                parameterUseDefinitelyEscapes(function, use_index)) return true;
+        }
+    }
+    return false;
+}
+
+fn knownBorrowingAlias(function: FunctionSummary, parameter_name: []const u8, start: usize, end: usize) bool {
+    var parameter_use: ?usize = null;
+    for (function.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and std.mem.eql(u8, tokenText(function.source, token), parameter_name)) {
+            parameter_use = index;
+        }
+    }
+    const use_index = parameter_use orelse return false;
+    if (start + 1 == end and use_index == start) return true;
+    for (function.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and index + 1 < end and function.tokens[index + 1].tag == .l_paren) {
+            const callable = callableBefore(function.source, function.tokens, index + 1) orelse continue;
+            if (std.mem.eql(u8, callable, "std.mem.trim") or std.mem.eql(u8, callable, "std.mem.trimLeft") or
+                std.mem.eql(u8, callable, "std.mem.trimRight")) return true;
+        }
+        if (index > use_index and std.mem.eql(u8, tokenText(function.source, token), "..")) return true;
+    }
+    return false;
+}
+
+fn parameterUseDefinitelyEscapes(function: FunctionSummary, use_index: usize) bool {
+    if (statementStartsWith(function.tokens, use_index, .keyword_return)) {
+        return use_index + 2 >= function.body_end or function.tokens[use_index + 1].tag != .period or
+            !std.mem.eql(u8, tokenText(function.source, function.tokens[use_index + 2]), "len");
+    }
+    var equal_index = use_index;
+    while (equal_index > function.body_start + 1) {
+        equal_index -= 1;
+        switch (function.tokens[equal_index].tag) {
+            .equal => break,
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    }
+    if (function.tokens[equal_index].tag != .equal) return false;
+    var cursor = equal_index;
+    while (cursor > function.body_start + 1) {
+        cursor -= 1;
+        switch (function.tokens[cursor].tag) {
+            .period, .l_bracket => return true,
+            .keyword_const, .keyword_var, .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn directBorrowedReturn(function: FunctionSummary) ?BorrowedReturn {
+    const kind = declaredBorrowKind(function) orelse return null;
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, return_index| {
+        if (tokenBelongsToNestedFunction(function, return_index) or token.tag != .keyword_return) continue;
+        const return_end = statementEnd(function.tokens, return_index, function.body_end);
+        for (function.parameter_names, 0..) |parameter_name, parameter| {
+            for (function.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, use_index| {
+                if (candidate.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, candidate), parameter_name) or
+                    use_index + 2 >= return_end or function.tokens[use_index + 1].tag != .period or
+                    function.tokens[use_index + 2].tag != .identifier) continue;
+                const first_field = tokenText(function.source, function.tokens[use_index + 2]);
+                const field = if (std.mem.eql(u8, first_field, "items")) "" else first_field;
+                return .{ .parameter = parameter, .field = field, .kind = kind };
+            }
+        }
+    }
+    return null;
+}
+
+fn declaredBorrowKind(function: FunctionSummary) ?BorrowKind {
+    var pointer = false;
+    var index = function.return_type_start;
+    while (index < function.body_start) : (index += 1) {
+        if (function.tokens[index].tag == .l_bracket and index + 1 < function.body_start and
+            function.tokens[index + 1].tag == .r_bracket) return .slice;
+        if (function.tokens[index].tag == .asterisk) pointer = true;
+    }
+    return if (pointer) .pointer else null;
+}
+
+fn directPartialIoReturn(function: FunctionSummary) PartialIo {
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, return_index| {
+        if (tokenBelongsToNestedFunction(function, return_index) or token.tag != .keyword_return) continue;
+        const return_end = statementEnd(function.tokens, return_index, function.body_end);
+        for (function.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, method_index| {
+            if (candidate.tag != .identifier or method_index == 0 or method_index + 1 >= return_end or
+                function.tokens[method_index - 1].tag != .period or function.tokens[method_index + 1].tag != .l_paren) continue;
+            const call_end = matchingToken(function.tokens, method_index + 1) orelse continue;
+            if (call_end + 1 != return_end) continue;
+            const method = tokenText(function.source, candidate);
+            if (partialReadMethod(method)) return .read;
+            if (std.mem.eql(u8, method, "write")) return .write;
+        }
+    }
+    return .none;
+}
+
+fn partialReadMethod(method: []const u8) bool {
+    const methods = [_][]const u8{ "read", "readVec", "readSliceShort", "pread", "readv", "preadv" };
+    for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
+    return false;
 }
 
 const DirectOwnedReturn = struct { release: []const u8, allocator_parameter: ?usize = null };
@@ -586,6 +847,10 @@ fn propagateCallEffects(index: Index) bool {
             for (caller.parameter_names, 0..) |parameter_name, caller_parameter| {
                 const argument = exactArgumentIndex(caller.source, caller.tokens, parameter_name, call_open + 1, call_end) orelse continue;
                 const effect = index.parameterEffectForCall(caller.source, callable, argument);
+                if (index.parameterEscapesForCall(caller.source, callable, argument)) {
+                    changed = changed or !caller.parameter_escapes[caller_parameter];
+                    caller.parameter_escapes[caller_parameter] = true;
+                }
                 const before = caller.parameter_effects[caller_parameter];
                 mergeEffect(&caller.parameter_effects[caller_parameter], effect);
                 changed = changed or before != caller.parameter_effects[caller_parameter];
@@ -672,6 +937,7 @@ fn visitFunction(
                 for (stack.items[cycle_start..]) |recursive_function| {
                     index.functions[recursive_function].unresolved = true;
                     @memset(index.functions[recursive_function].parameter_effects, .unknown);
+                    @memset(index.functions[recursive_function].parameter_escapes, false);
                 }
             },
             .complete => {},
@@ -978,4 +1244,79 @@ test "owned return summaries do not apply to unrelated object methods" {
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     try std.testing.expect(index.ownedReturnCall(caller, "creation", "make") != null);
     try std.testing.expect(index.ownedReturnCall(caller, "object", "make") == null);
+}
+
+test "summaries retain receiver field borrows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Catalog = struct { records: List, " ++
+        "fn find(self: *Catalog, index: usize) *Record { return &self.records.items[index]; } " ++
+        "fn view(self: *Catalog) []Record { return self.records.items[0..]; } " ++
+        "fn remove(self: *Catalog) void { _ = self.records.orderedRemove(0); } };";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const pointer = index.borrowedReturnCall(source, "catalog", "find").?;
+    const view = index.borrowedReturnCall(source, "catalog", "view").?;
+    try std.testing.expectEqual(BorrowKind.pointer, pointer.kind);
+    try std.testing.expectEqualStrings("records", pointer.field);
+    try std.testing.expectEqual(BorrowKind.slice, view.kind);
+    try std.testing.expectEqualStrings("records", view.field);
+    const mutation = index.containerMutationCall(source, "catalog", "remove").?;
+    try std.testing.expectEqual(@as(usize, 0), mutation.parameter);
+    try std.testing.expectEqualStrings("records", mutation.field);
+}
+
+test "summaries retain direct container mutations through pointer parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn grow(values: *List) !void { try values.ensureTotalCapacity(a, 64); }" ++
+        "fn add(map: *Map) !void { try map.put(2, 2); }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const growth = index.containerMutationCall(source, null, "grow").?;
+    const insertion = index.containerMutationCall(source, null, "add").?;
+    try std.testing.expectEqual(@as(usize, 0), growth.parameter);
+    try std.testing.expectEqualStrings("", growth.field);
+    try std.testing.expectEqual(@as(usize, 0), insertion.parameter);
+    try std.testing.expectEqualStrings("", insertion.field);
+}
+
+test "summaries identify partial IO wrappers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Socket = struct { stream: Stream, fn send(self: *Socket, bytes: []const u8) !usize { return self.stream.write(bytes); } };";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(PartialIo.write, index.partialIoReturnCall(source, "socket", "send"));
+}
+
+test "value getters and transformed IO results do not become borrow or partial IO contracts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Catalog = struct { records: List, " ++
+        "fn count(self: *Catalog) usize { return self.records.items.len; } };" ++
+        "const Socket = struct { stream: Stream, " ++
+        "fn paddedSend(self: *Socket, bytes: []const u8) !usize { return try self.stream.write(bytes) + 1; } };";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.borrowedReturnCall(source, "catalog", "count") == null);
+    try std.testing.expectEqual(PartialIo.none, index.partialIoReturnCall(source, "socket", "paddedSend"));
+}
+
+test "definite parameter escapes survive unrelated opaque uses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Entry = struct { text: []const u8 };" ++
+        "fn parse(line: []const u8) Entry { const raw = std.mem.trim(u8, line, \" \" ); " ++
+        "_ = std.mem.eql(u8, raw, \"x\"); return .{ .text = raw }; }" ++
+        "fn length(raw: []const u8) usize { return raw.len; }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.parameterEscapesForCall(source, "parse", 0));
+    try std.testing.expect(!index.parameterEscapesForCall(source, "length", 0));
 }

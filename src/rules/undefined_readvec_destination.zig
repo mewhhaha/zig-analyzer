@@ -31,6 +31,7 @@ pub fn run(context: RuleRun) !void {
 fn undefinedSliceDescriptorCount(context: RuleRun, start: usize, end: usize) ?usize {
     var equal_index: ?usize = null;
     var descriptor_count: ?usize = null;
+    var descriptor_type: ?[]const u8 = null;
     var bracket_pairs: usize = 0;
     var index = start + 2;
     while (index < end) : (index += 1) {
@@ -44,12 +45,38 @@ fn undefinedSliceDescriptorCount(context: RuleRun, start: usize, end: usize) ?us
             context.tokens[index + 1].tag == .number_literal and context.tokens[index + 2].tag == .r_bracket)
         {
             descriptor_count = std.fmt.parseInt(usize, context.tokenText(index + 1), 10) catch null;
+            if (index + 3 < end and context.tokens[index + 3].tag == .identifier) {
+                descriptor_type = context.tokenText(index + 3);
+            }
         }
     }
     const equal = equal_index orelse return null;
-    if (bracket_pairs < 2 or equal + 1 >= end or
+    const contains_slice = bracket_pairs >= 2 or if (descriptor_type) |type_name|
+        descriptorTypeContainsSlice(context, type_name)
+    else
+        false;
+    if (!contains_slice or equal + 1 >= end or
         context.tokens[equal + 1].tag != .identifier or !context.tokenIs(equal + 1, "undefined")) return null;
     return descriptor_count;
+}
+
+fn descriptorTypeContainsSlice(context: RuleRun, type_name: []const u8) bool {
+    for (context.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .identifier or !context.tokenIs(declaration_index, type_name) or declaration_index == 0 or
+            context.tokens[declaration_index - 1].tag != .keyword_const) continue;
+        var struct_index = declaration_index + 1;
+        while (struct_index < context.tokens.len and struct_index < declaration_index + 4 and
+            context.tokens[struct_index].tag != .keyword_struct) : (struct_index += 1)
+        {}
+        if (struct_index >= context.tokens.len or context.tokens[struct_index].tag != .keyword_struct or
+            struct_index + 1 >= context.tokens.len or context.tokens[struct_index + 1].tag != .l_brace) continue;
+        const container_end = context.matchingToken(struct_index + 1, .l_brace, .r_brace) orelse continue;
+        for (context.tokens[struct_index + 2 .. container_end], struct_index + 2..) |field, field_index| {
+            if (field.tag == .l_bracket and field_index + 1 < container_end and
+                context.tokens[field_index + 1].tag == .r_bracket) return true;
+        }
+    }
+    return false;
 }
 
 fn readVecCallWithDestination(context: RuleRun, binding: []const u8, start: usize, end: usize) ?usize {
@@ -121,6 +148,20 @@ test "partially initialized descriptor arrays report" {
         "    var storage: [16]u8 = undefined;\n" ++
         "    var buffers: [2][]u8 = undefined;\n" ++
         "    buffers[0] = &storage;\n" ++
+        "    _ = try reader.readVec(&buffers);\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "undefined custom slice descriptor structs report" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Buffer = struct { ptr: []u8 };\n" ++
+        "fn receive(reader: anytype) !void {\n" ++
+        "    var buffers: [2]Buffer = undefined;\n" ++
         "    _ = try reader.readVec(&buffers);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);

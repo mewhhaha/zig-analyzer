@@ -80,13 +80,7 @@ fn findArenaReturns(context: RuleRun) !void {
             const return_end = context.statementEnd(index) orelse continue;
             var value_start = index + 1;
             if (value_start < return_end and context.tokens[value_start].tag == .keyword_try) value_start += 1;
-            const returned_binding: ?[]const u8 = if (value_start < return_end and
-                context.tokens[value_start].tag == .identifier and
-                allocations.contains(context.tokenText(value_start)) and
-                (value_start + 1 == return_end or context.tokens[value_start + 1].tag == .l_bracket))
-                context.tokenText(value_start)
-            else
-                null;
+            const returned_binding = returnedAllocationBinding(context, allocations, value_start, return_end);
             const direct_allocation = expressionUsesArenaAllocation(context, arena_name, index + 1, return_end) or
                 expressionUsesDerivedAllocation(context, allocator_bindings, index + 1, return_end);
             if (returned_binding == null and !direct_allocation) continue;
@@ -109,6 +103,42 @@ fn findArenaReturns(context: RuleRun) !void {
             });
         }
     }
+}
+
+fn returnedAllocationBinding(
+    context: RuleRun,
+    allocations: std.StringHashMapUnmanaged(void),
+    start: usize,
+    end: usize,
+) ?[]const u8 {
+    var parenthesis_depth: usize = 0;
+    for (context.tokens[start..end], start..) |token, index| {
+        switch (token.tag) {
+            .l_paren => {
+                parenthesis_depth += 1;
+                continue;
+            },
+            .r_paren => {
+                parenthesis_depth -|= 1;
+                continue;
+            },
+            else => {},
+        }
+        if (parenthesis_depth != 0) continue;
+        if (token.tag != .identifier or !allocations.contains(context.tokenText(index)) or
+            (index > start and context.tokens[index - 1].tag == .period)) continue;
+        if (index + 2 < end and context.tokens[index + 1].tag == .period and context.tokenIs(index + 2, "len")) continue;
+        if (index + 1 < end and context.tokens[index + 1].tag == .l_bracket) {
+            const slice_end = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
+            var returns_view = false;
+            for (context.tokens[index + 2 .. @min(slice_end, end)]) |slice_token| {
+                if (slice_token.tag == .ellipsis2) returns_view = true;
+            }
+            if (!returns_view) continue;
+        }
+        return context.tokenText(index);
+    }
+    return null;
 }
 
 fn containsManagedContainer(context: RuleRun, start: usize, end: usize) bool {
@@ -230,6 +260,22 @@ test "allocations through a binding derived from the arena are arena returns" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+}
+
+test "arena allocations embedded in returned aggregates expire with the arena" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "const Packet = struct { bytes: []u8, length: usize };" ++
+        "fn packet(parent: anytype) !Packet { var local_arena = std.heap.ArenaAllocator.init(parent);" ++
+        "defer local_arena.deinit(); const bytes = try local_arena.allocator().alloc(u8, 8);" ++
+        "return .{ .bytes = bytes, .length = bytes.len }; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqual(types.Rule.returning_arena_allocation, findings.items[0].rule);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {

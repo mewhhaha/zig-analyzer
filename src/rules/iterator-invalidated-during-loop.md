@@ -8,4 +8,5 @@ Reports mutation of a map while an iterator over that map is active.
 next iteration observe stale internal state.
 
 **When it matters.** It applies to recognized iterator bindings and invalidating
-methods on the same map inside the loop.
+methods on the same map inside the loop, including mutations proven by a helper
+function summary.

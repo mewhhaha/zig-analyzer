@@ -8,5 +8,6 @@ its container's backing storage.
 **Why it matters.** Growth and structural mutation can leave previously obtained
 views pointing at stale memory or state.
 
-**When it matters.** It applies to recognized container view methods followed by
-known invalidating operations on the same container.
+**When it matters.** It applies to recognized local containers and container
+fields followed by known invalidating operations on the same container, and to
+a view retained across `realloc` of its source allocation.

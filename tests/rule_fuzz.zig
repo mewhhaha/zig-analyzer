@@ -32,6 +32,7 @@ const ProgramBuilder = struct {
 
     fn append(builder: *ProgramBuilder, comptime format: []const u8, arguments: anytype) !void {
         const piece = try std.fmt.allocPrint(builder.allocator, format, arguments);
+        defer builder.allocator.free(piece);
         try builder.text.appendSlice(builder.allocator, piece);
     }
 
@@ -252,6 +253,8 @@ fn sortedRules(allocator: std.mem.Allocator, found: []const analysis.Finding) ![
     return rules;
 }
 
+/// The allocator should be an arena because comparison allocations share the
+/// caller's per-iteration lifetime and are reclaimed together.
 fn expectSameRules(
     allocator: std.mem.Allocator,
     original_source: []const u8,

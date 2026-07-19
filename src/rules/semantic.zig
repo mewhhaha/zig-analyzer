@@ -1024,6 +1024,7 @@ fn findMissingResourceCleanup(
             }
             if (tokens[acquisition_index].tag != .identifier or acquisition_index + 1 >= statement_end or
                 tokens[acquisition_index + 1].tag != .l_paren) continue;
+            if (!initializerCallIsTopLevel(tokens, declaration_index + 3, acquisition_index)) continue;
             const name = tokenText(source, tokens[acquisition_index]);
             for (resource_pairs) |candidate| if (std.mem.eql(u8, name, candidate.acquisition)) {
                 if (std.mem.eql(u8, name, "spawn") and !tokensBeforeContain(source, tokens, declaration_index + 3, acquisition_index, "Thread")) continue;
@@ -1086,9 +1087,23 @@ fn findMissingResourceCleanup(
             tokens[receiver_start - 2].tag == .identifier) receiver_start -= 2;
         if (receiver_start > 0 and tokens[receiver_start - 1].tag == .equal) continue;
         const scope_end = enclosingScopeEnd(tokens, lock_index) orelse continue;
-        const receiver = tokenText(source, tokens[lock_index - 2]);
-        if (bindingHasRelease(source, tokens, receiver, lock_index + 3, scope_end, "unlock", null)) continue;
         const scope_opening = matchingOpeningToken(tokens, scope_end, .l_brace, .r_brace) orelse continue;
+        const receiver = tokenText(source, tokens[lock_index - 2]);
+        if (bindingReleaseIndex(source, tokens, receiver, lock_index + 3, scope_end, "unlock", null)) |unlock_index| {
+            if (explicitErrorReturnBetween(tokens, lock_index + 3, unlock_index, scope_opening)) |return_index| {
+                try addFinding(allocator, source, configuration, found, .{
+                    .rule = .missing_resource_cleanup,
+                    .level = level,
+                    .span = tokens[return_index].loc,
+                    .message = try std.fmt.allocPrint(
+                        allocator,
+                        "mutex '{s}' remains locked when this error path leaves the scope before unlock",
+                        .{receiver},
+                    ),
+                });
+            }
+            continue;
+        }
         if (bindingHasRelease(source, tokens, receiver, scope_opening + 1, lock_index, "unlock", null)) continue;
         if (lockCleanupIsPublicContract(source, tokens, lock_index, scope_end)) continue;
         try addFinding(allocator, source, configuration, found, .{
@@ -1100,6 +1115,47 @@ fn findMissingResourceCleanup(
     }
 }
 
+fn explicitErrorReturnBetween(
+    tokens: []const std.zig.Token,
+    start: usize,
+    end: usize,
+    scope_opening: usize,
+) ?usize {
+    for (tokens[start..end], start..) |token, index| {
+        if (token.tag != .keyword_return or index + 1 >= end or tokens[index + 1].tag != .keyword_error) continue;
+        const enclosing = enclosingOpeningBrace(tokens, index) orelse continue;
+        if (enclosing == scope_opening or enclosingOpeningBrace(tokens, enclosing) == scope_opening) return index;
+    }
+    return null;
+}
+
+fn enclosingOpeningBrace(tokens: []const std.zig.Token, index: usize) ?usize {
+    var depth: usize = 0;
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) return cursor;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn initializerCallIsTopLevel(tokens: []const std.zig.Token, start: usize, call_index: usize) bool {
+    var brace_depth: usize = 0;
+    for (tokens[start..call_index]) |token| switch (token.tag) {
+        .l_brace => brace_depth += 1,
+        .r_brace => brace_depth -|= 1,
+        else => {},
+    };
+    return brace_depth == 0;
+}
+
 fn lockCleanupIsPublicContract(source: []const u8, tokens: []const std.zig.Token, index: usize, scope_end: usize) bool {
     const closing = enclosingScopeEnd(tokens, index) orelse return false;
     const opening = matchingOpeningToken(tokens, closing, .l_brace, .r_brace) orelse return false;
@@ -1108,9 +1164,15 @@ fn lockCleanupIsPublicContract(source: []const u8, tokens: []const std.zig.Token
         cursor -= 1;
         switch (tokens[cursor].tag) {
             .keyword_fn => {
-                if (cursor == 0 or tokens[cursor - 1].tag != .keyword_pub or cursor + 1 >= tokens.len or
-                    tokens[cursor + 1].tag != .identifier) return false;
+                if (cursor + 1 >= tokens.len or tokens[cursor + 1].tag != .identifier) return false;
                 const function_name = tokenText(source, tokens[cursor + 1]);
+                var receiver_start = index - 2;
+                while (receiver_start >= 2 and tokens[receiver_start - 1].tag == .period and
+                    tokens[receiver_start - 2].tag == .identifier) receiver_start -= 2;
+                const private_wrapper = std.mem.eql(u8, function_name, "lock") and
+                    tokenIs(source, tokens[receiver_start], "self");
+                if (private_wrapper) return true;
+                if (cursor == 0 or tokens[cursor - 1].tag != .keyword_pub) return false;
                 if (std.mem.startsWith(u8, function_name, "lock")) return true;
                 for (tokens[index + 1 .. scope_end]) |token| if (token.tag == .keyword_return) return true;
                 return false;
@@ -1162,15 +1224,27 @@ fn bindingHasRelease(
     release: []const u8,
     alternative_release: ?[]const u8,
 ) bool {
+    return bindingReleaseIndex(source, tokens, binding_name, start, end, release, alternative_release) != null;
+}
+
+fn bindingReleaseIndex(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    binding_name: []const u8,
+    start: usize,
+    end: usize,
+    release: []const u8,
+    alternative_release: ?[]const u8,
+) ?usize {
     var index = start;
     while (index + 3 < @min(end, tokens.len)) : (index += 1) {
         if (!tokenIs(source, tokens[index], binding_name) or tokens[index + 1].tag != .period or
             tokens[index + 2].tag != .identifier or tokens[index + 3].tag != .l_paren) continue;
         const method = tokenText(source, tokens[index + 2]);
-        if (std.mem.eql(u8, method, release)) return true;
-        if (alternative_release) |alternative| if (std.mem.eql(u8, method, alternative)) return true;
+        if (std.mem.eql(u8, method, release)) return index + 2;
+        if (alternative_release) |alternative| if (std.mem.eql(u8, method, alternative)) return index + 2;
     }
-    return false;
+    return null;
 }
 
 fn bindingObviouslyEscapes(
@@ -1198,9 +1272,17 @@ fn bindingObviouslyEscapes(
     while (index < @min(end, tokens.len)) : (index += 1) {
         if (!tokenIs(source, tokens[index], binding_name)) continue;
         if (index > 0 and tokens[index - 1].tag == .keyword_return) return true;
-        if (index > 0 and tokens[index - 1].tag == .equal) return true;
+        if (index > 0 and tokens[index - 1].tag == .equal and bindingIsWholeAssignedValue(tokens, index, end)) return true;
     }
     return false;
+}
+
+fn bindingIsWholeAssignedValue(tokens: []const std.zig.Token, index: usize, end: usize) bool {
+    if (index + 1 >= end) return true;
+    return switch (tokens[index + 1].tag) {
+        .semicolon, .comma, .r_brace, .r_paren => true,
+        else => false,
+    };
 }
 
 fn findUndefinedValueEscapes(
@@ -3281,6 +3363,7 @@ fn findOptionalCaptureIdioms(
         }
         if (unsafe or unwraps.items.len == 0) continue;
         const capture_name = try collisionFreeCaptureName(allocator, source, optional_name);
+        errdefer allocator.free(capture_name);
         const edits = try allocator.alloc(Edit, unwraps.items.len + 1);
         edits[0] = .{
             .span = .{ .start = tokens[if_index + 2].loc.start, .end = tokens[if_index + 5].loc.end },
@@ -3307,10 +3390,12 @@ fn collisionFreeCaptureName(allocator: std.mem.Allocator, source: []const u8, op
     if (!identifierAppears(source, "value")) return try allocator.dupe(u8, "value");
     const candidate = try std.fmt.allocPrint(allocator, "{s}_value", .{optional_name});
     if (!identifierAppears(source, candidate)) return candidate;
+    allocator.free(candidate);
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
         const numbered = try std.fmt.allocPrint(allocator, "{s}_value_{d}", .{ optional_name, suffix });
         if (!identifierAppears(source, numbered)) return numbered;
+        allocator.free(numbered);
     }
 }
 
@@ -4938,6 +5023,32 @@ test "resource ownership can leave a nested block through break" {
     for (found) |finding| try std.testing.expect(finding.rule != .missing_resource_cleanup);
 }
 
+test "field cleanup satisfies aggregate resource ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(allocator: anytype) void { var owner = Owner{ .values = .empty, .positions = Map.init(allocator) };" ++
+        "defer owner.values.deinit(allocator); defer owner.positions.deinit(); }";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .missing_resource_cleanup);
+}
+
+test "error return before unlock leaves the mutex locked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn consume(mutex: anytype, fail: bool) !void { mutex.lock();" ++
+        "if (fail) return error.NotReady; mutex.unlock(); }" ++
+        "fn safe(mutex: anytype, fail: bool) !void { mutex.lock(); defer mutex.unlock();" ++
+        "if (fail) return error.NotReady; }";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var warning_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        warning_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), warning_count);
+}
+
 test "public lock APIs and temporary unlock restoration do not require local cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4945,6 +5056,8 @@ test "public lock APIs and temporary unlock restoration do not require local cle
         "pub fn lockDemand(self: *State) void { self.mutex.lock(); }\n" ++
         "pub fn drain(self: *State) Iterator { self.mutex.lock(); return .{ .state = self }; }\n" ++
         "pub fn run(mutex: anytype) void { mutex.lock(); }\n" ++
+        "fn lock(self: *State) void { self.writer.lock(); }\n" ++
+        "fn lockAndWork(self: *State) void { self.writer.lock(); work(); }\n" ++
         "fn restore(self: *State) void { self.mutex.unlock(); defer self.mutex.lock(); work(); }\n" ++
         "fn leak(mutex: anytype) void { mutex.lock(); }\n";
     const found = try findings(arena.allocator(), source, Configuration.defaults());
@@ -4952,7 +5065,7 @@ test "public lock APIs and temporary unlock restoration do not require local cle
     for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
         warning_count += 1;
     };
-    try std.testing.expectEqual(@as(usize, 2), warning_count);
+    try std.testing.expectEqual(@as(usize, 3), warning_count);
 }
 
 test "undefined escape warns only before whole-value initialization" {

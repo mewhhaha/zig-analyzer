@@ -3,7 +3,7 @@
 [Rule index](RULES.md)
 
 Reports `readVec` calls passed an array of slice descriptors that is still
-undefined.
+undefined, including locally declared descriptor structs containing slices.
 
 **Why it matters.** `readVec` reads each destination descriptor before writing
 bytes. Undefined slice pointers and lengths can cause invalid memory access.
