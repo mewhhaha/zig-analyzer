@@ -433,6 +433,8 @@ fn findBorrowedReturnInvalidations(
     summary_index: summaries.Index,
     found: *std.ArrayList(Finding),
 ) !void {
+    if (configuration.level(.invalidated_element_pointer) == .off and
+        configuration.level(.invalidated_container_view) == .off) return;
     for (file.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
