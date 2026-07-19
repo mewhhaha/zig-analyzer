@@ -241,6 +241,7 @@ fn bindingIsProcessChild(context: RuleRun, child_name: []const u8, before: usize
             function.parameters_start,
             function.parameters_end,
         )) return true;
+        if (parameterNamed(context, child_name, function.parameters_start, function.parameters_end)) return false;
     }
     var index = before;
     while (index > 0) {
@@ -250,7 +251,19 @@ fn bindingIsProcessChild(context: RuleRun, child_name: []const u8, before: usize
             index + 1 >= before or context.tokens[index + 1].tag != .equal) continue;
         const declaration_end = context.statementEnd(index - 1) orelse continue;
         if (declaration_end > before) continue;
+        if (context.enclosingOpeningBrace(index)) |opening| {
+            const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+            if (before >= closing) continue;
+        }
         if (rangeNamesProcessChild(context, index + 2, declaration_end)) return true;
+    }
+    return false;
+}
+
+fn parameterNamed(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start + 1 .. end], start + 1..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, name) and index + 1 < end and
+            context.tokens[index + 1].tag == .colon) return true;
     }
     return false;
 }
@@ -834,6 +847,18 @@ test "clearing a manually closed child pipe transfers the closed state" {
     const source: [:0]const u8 =
         "const Child = std.process.Child; fn childRun() !void { var child = Child.init(args, a); child.stdin.?.close(); child.stdin = null; _ = try child.wait(); }";
     const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "child bindings do not lend process provenance across functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn standard(args: anytype, allocator: anytype) void { " ++
+        "var child = std.process.Child.init(args, allocator); _ = &child; } " ++
+        "fn custom(child: *CustomChild) !void { child.stdout.?.close(); _ = try child.wait(); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
