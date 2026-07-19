@@ -131,10 +131,11 @@ fn findUnwaitedChildProcesses(context: RuleRun) !void {
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (processSpawnInRange(context, declaration_index + 2, declaration_end) == null) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
+        const declaration_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const child_name = context.tokenText(declaration_index + 1);
-        if (pathMethod(context, child_name, "wait", declaration_end + 1, scope_end) != null or
-            pathMethod(context, child_name, "kill", declaration_end + 1, scope_end) != null or
-            childOwnershipEscapes(context, child_name, declaration_end + 1, scope_end)) continue;
+        if (pathMethodInScope(context, child_name, "wait", declaration_scope, declaration_end + 1, scope_end) != null or
+            pathMethodInScope(context, child_name, "kill", declaration_scope, declaration_end + 1, scope_end) != null or
+            childOwnershipEscapes(context, child_name, declaration_scope, declaration_end + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .unwaited_child_process,
             .level = level,
@@ -170,9 +171,15 @@ fn processSpawnInRange(context: RuleRun, start: usize, end: usize) ?usize {
     return null;
 }
 
-fn childOwnershipEscapes(context: RuleRun, child_name: []const u8, start: usize, end: usize) bool {
+fn childOwnershipEscapes(
+    context: RuleRun,
+    child_name: []const u8,
+    declaration_scope: usize,
+    start: usize,
+    end: usize,
+) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (!context.tokenIs(index, child_name)) continue;
+        if (!context.tokenIs(index, child_name) or context.enclosingOpeningBrace(index) != declaration_scope) continue;
         if (index > start and context.tokens[index - 1].tag == .keyword_return) return true;
         if (index > start and context.tokens[index - 1].tag == .equal and
             (index < 2 or !context.tokenIs(index - 2, "_")) and
@@ -454,6 +461,23 @@ fn pathMethod(context: RuleRun, receiver: []const u8, method: []const u8, start:
     while (index + 3 < end) : (index += 1) {
         if (context.tokenIs(index, receiver) and context.tokens[index + 1].tag == .period and
             context.tokenIs(index + 2, method) and context.tokens[index + 3].tag == .l_paren) return index + 2;
+    }
+    return null;
+}
+
+fn pathMethodInScope(
+    context: RuleRun,
+    receiver: []const u8,
+    method: []const u8,
+    scope: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    var index = start;
+    while (index + 3 < end) : (index += 1) {
+        if (context.enclosingOpeningBrace(index) == scope and context.tokenIs(index, receiver) and
+            context.tokens[index + 1].tag == .period and context.tokenIs(index + 2, method) and
+            context.tokens[index + 3].tag == .l_paren) return index + 2;
     }
     return null;
 }
@@ -787,6 +811,18 @@ test "directories and spawned children retain their terminal cleanup contracts" 
     };
     try std.testing.expectEqual(@as(usize, 1), discarded_count);
     try std.testing.expectEqual(@as(usize, 2), child_count);
+}
+
+test "conditional waits do not prove child cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(io: std.Io, should_wait: bool) !void { " ++
+        "var child = try std.process.spawn(io, .{ .argv = &.{\"true\"} }); " ++
+        "if (should_wait) { _ = try child.wait(io); } }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(types.Rule.unwaited_child_process, findings[0].rule);
 }
 
 test "checked addition is not made safe by a later minimum" {
