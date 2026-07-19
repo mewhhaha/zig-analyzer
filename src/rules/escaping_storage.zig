@@ -19,21 +19,24 @@ fn findDeinitializedViews(context: RuleRun) !void {
         const container_name = context.tokenText(declaration_index + 1);
         if (!hasDeferredMethod(context, container_name, "deinit", declaration_end + 1, scope_end, scope_opening)) continue;
 
-        var borrowed_name: ?[]const u8 = null;
+        var borrowed_names: std.StringHashMapUnmanaged(void) = .empty;
         for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, index| {
             if ((candidate.tag == .keyword_const or candidate.tag == .keyword_var) and index + 6 < scope_end and
                 context.tokens[index + 1].tag == .identifier and context.tokens[index + 2].tag == .equal and
                 context.tokenIs(index + 3, container_name) and context.tokens[index + 4].tag == .period and
                 context.tokenIs(index + 5, "items") and
-                context.tokens[index + 6].tag == .semicolon) borrowed_name = context.tokenText(index + 1);
+                context.tokens[index + 6].tag == .semicolon)
+            {
+                try borrowed_names.put(context.allocator, context.tokenText(index + 1), {});
+            }
             if (candidate.tag != .keyword_return or context.enclosingOpeningBrace(index) != scope_opening or index + 1 >= scope_end) continue;
             const returns_direct_view = context.tokenIs(index + 1, container_name) and index + 4 < scope_end and
                 context.tokens[index + 2].tag == .period and context.tokenIs(index + 3, "items") and
                 context.tokens[index + 4].tag == .semicolon;
-            const returns_borrow = borrowed_name != null and context.tokenIs(index + 1, borrowed_name.?) and
+            const returns_borrow = borrowed_names.contains(context.tokenText(index + 1)) and
                 index + 2 < scope_end and context.tokens[index + 2].tag == .semicolon;
             if (!returns_direct_view and !returns_borrow) continue;
-            const returned_name = if (returns_borrow) borrowed_name.? else container_name;
+            const returned_name = if (returns_borrow) context.tokenText(index + 1) else container_name;
             try context.emit(.{
                 .rule = .returning_deinitialized_view,
                 .level = level,
@@ -222,6 +225,20 @@ test "returned views and arena allocations cannot outlive local owners" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
+}
+
+test "every alias of a deinitialized container remains borrowed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn items(allocator: anytype) []u8 { var list = std.ArrayList(u8).empty; " ++
+        "defer list.deinit(allocator); const first = list.items; const second = list.items; " ++
+        "_ = second; return first; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
 }
 
 test "returning a value read out of a container view is not a dangling view" {
