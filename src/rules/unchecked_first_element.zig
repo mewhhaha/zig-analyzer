@@ -98,6 +98,23 @@ fn conditionBeforeUseProvesNonEmpty(context: RuleRun, name: []const u8, start: u
             context.tokens[index + 7].tag != .r_paren) continue;
         const terminator = context.tokens[index + 8].tag;
         if (terminator == .keyword_return or terminator == .keyword_continue or terminator == .keyword_break) return true;
+        if (terminator == .l_brace) {
+            const closing = context.matchingToken(index + 8, .l_brace, .r_brace) orelse continue;
+            if (closing < use_index and blockTerminates(context, index + 8, closing)) return true;
+        }
+    }
+    return false;
+}
+
+fn blockTerminates(context: RuleRun, opening: usize, closing: usize) bool {
+    for (context.tokens[opening + 1 .. closing], opening + 1..) |token, index| {
+        switch (token.tag) {
+            .keyword_return, .keyword_continue, .keyword_break, .keyword_unreachable => {},
+            else => continue,
+        }
+        if (context.enclosingOpeningBrace(index) != opening) continue;
+        const statement_end = context.statementEnd(index) orelse continue;
+        if (statement_end + 1 == closing) return true;
     }
     return false;
 }
@@ -157,6 +174,16 @@ test "non-dominating length checks do not prove a first element" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "braced empty guards prove a first element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn first(bytes: []const u8) ?u8 { if (bytes.len == 0) { return null; } return bytes[0]; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
