@@ -150,6 +150,10 @@ fn bindingDeclaration(context: RuleRun, binding: []const u8, before: usize) ?Dec
             (context.tokens[index - 1].tag != .keyword_const and context.tokens[index - 1].tag != .keyword_var)) continue;
         const end = context.statementEnd(index - 1) orelse continue;
         if (end >= before) continue;
+        if (context.enclosingOpeningBrace(index)) |opening| {
+            const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+            if (before >= closing) continue;
+        }
         return .{ .start = index - 1, .end = end };
     }
     return null;
@@ -233,6 +237,18 @@ test "interface pointers and explicit state transfers stay clean" {
         "    _ = reader;\n" ++
         "    _ = buffered;\n" ++
         "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "I/O implementations do not lend provenance across functions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn standard(file: std.Io.File, io: std.Io, buffer: []u8) void { " ++
+        "var implementation: std.Io.File.Reader = file.reader(io, buffer); _ = implementation; } " ++
+        "fn custom(implementation: *Custom) void { const reader = implementation.interface; _ = reader; }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
