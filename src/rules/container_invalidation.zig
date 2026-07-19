@@ -296,7 +296,7 @@ fn findStaleIndexMaps(context: RuleRun) !void {
         if (!fieldHasType(context, sequence_field, "ArrayList", type_body + 1, type_end)) continue;
         const function_end = context.matchingToken(function_body, .l_brace, .r_brace) orelse continue;
         if (indexMapField(context, sequence_field, type_body + 1, type_end)) |index_field| {
-            if (pathMutated(context, index_field, function_body + 1, function_end)) continue;
+            if (pathMutated(context, index_field, removal_index + 1, function_end)) continue;
             try context.emit(.{
                 .rule = .stale_index_map,
                 .level = level,
@@ -932,6 +932,21 @@ test "removing from an unrelated list does not repair stored indices" {
         if (finding.rule == .stale_index_map) stale_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), stale_count);
+}
+
+test "index map writes before removal do not repair changed indices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Store = struct { rows: std.ArrayList(Row), by_key: std.AutoHashMap(Key, usize), " ++
+        "fn replace(self: *Store, allocator: anytype, key: Key, index: usize) !void { " ++
+        "try self.by_key.put(allocator, key, self.rows.items.len); _ = self.rows.swapRemove(index); } };";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(rule_types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &findings });
+
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqual(rule_types.Rule.stale_index_map, findings.items[0].rule);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
