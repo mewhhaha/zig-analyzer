@@ -73,6 +73,7 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
             !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
+        if (declarationStoresPointer(context, declaration_index, declaration_end)) continue;
         const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
@@ -184,6 +185,7 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
             !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
+        if (declarationStoresPointer(context, declaration_index, declaration_end)) continue;
         const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const local_name = context.tokenText(declaration_index + 1);
@@ -191,6 +193,7 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
             if (candidate.tag != .identifier or !retainingMethod(context, method_index) or
                 method_index < 2 or context.tokens[method_index - 1].tag != .period or
                 context.tokens[method_index + 1].tag != .l_paren) continue;
+            if (context.tokenIs(method_index - 2, "self")) continue;
             const receiver_root = callReceiverRoot(context, method_index) orelse continue;
             const retained_outside_scope = functionParameterExists(context, function_scope, receiver_root) or
                 (moduleBindingExists(context, receiver_root) and
@@ -198,6 +201,7 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
             if (!retained_outside_scope) continue;
             const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
             const address_index = addressOfBinding(context, local_name, method_index + 2, call_end) orelse continue;
+            if (deferredRemovalOfBinding(context, local_name, function_scope, call_end + 1, function_end)) continue;
             try context.emit(.{
                 .rule = .local_storage_escape,
                 .level = level,
@@ -211,6 +215,47 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn declarationStoresPointer(context: RuleRun, declaration_index: usize, declaration_end: usize) bool {
+    if (declaration_index + 2 < declaration_end and context.tokens[declaration_index + 2].tag == .colon) {
+        for (context.tokens[declaration_index + 3 .. declaration_end]) |token| {
+            if (token.tag == .equal) break;
+            if (token.tag == .asterisk or token.tag == .asterisk_asterisk) return true;
+        }
+    }
+    return initializedByAllocatorCreate(context, declaration_index, declaration_end);
+}
+
+fn initializedByAllocatorCreate(context: RuleRun, declaration_index: usize, declaration_end: usize) bool {
+    for (context.tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |token, create_index| {
+        if (token.tag == .identifier and context.tokenIs(create_index, "create") and
+            create_index > declaration_index + 2 and context.tokens[create_index - 1].tag == .period and
+            context.tokens[create_index - 2].tag == .identifier and create_index + 1 < declaration_end and
+            context.tokens[create_index + 1].tag == .l_paren)
+        {
+            const receiver = context.tokenText(create_index - 2);
+            if (std.ascii.indexOfIgnoreCase(receiver, "alloc") != null or
+                std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+                std.mem.eql(u8, receiver, "gpa")) return true;
+        }
+    }
+    return false;
+}
+
+fn deferredRemovalOfBinding(context: RuleRun, name: []const u8, scope: usize, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, defer_index| {
+        if (token.tag != .keyword_defer or context.enclosingOpeningBrace(defer_index) != scope) continue;
+        const statement_end = context.statementEnd(defer_index) orelse continue;
+        if (statement_end > end) continue;
+        for (context.tokens[defer_index + 1 .. statement_end], defer_index + 1..) |candidate, remove_index| {
+            if (candidate.tag != .identifier or !context.tokenIs(remove_index, "remove") or
+                remove_index + 1 >= statement_end or context.tokens[remove_index + 1].tag != .l_paren) continue;
+            const call_end = context.matchingToken(remove_index + 1, .l_paren, .r_paren) orelse continue;
+            if (call_end <= statement_end and addressOfBinding(context, name, remove_index + 2, call_end) != null) return true;
+        }
+    }
+    return false;
 }
 
 fn retainingMethod(context: RuleRun, method_index: usize) bool {
@@ -546,6 +591,51 @@ test "retaining a local pointer in a parameter container expires its storage" {
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.local_storage_escape, findings.items[0].rule);
+}
+
+test "fields of heap pointers and direct methods stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn field(self: *Owner, allocator: anytype) !*Value { var value: *Value = try allocator.create(Value); self.nodes.append(&value.node); return &value.payload; }" ++
+        "fn inferred(allocator: anytype) !*Pragma { var pragma = try allocator.create(Owner); return &pragma.value; }" ++
+        "fn edit(self: *Editor) !void { var cursor: Cursor = .{}; _ = try self.insert(self.root, &cursor, \"x\"); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .local_storage_escape);
+}
+
+test "deferred removal keeps an intrusive local node within its lifetime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn wait(queue: *Queue) void { var pending: Pending = .{}; queue.append(&pending.node);" ++
+        "defer if (pending.active) queue.remove(&pending.node); suspendUntilReady(&pending); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .local_storage_escape);
+}
+
+test "conditional deferred removal and custom create calls do not prove heap lifetime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn retained(queue: *Queue, remove: bool) void { var pending: Pending = .{}; queue.append(&pending.node);" ++
+        "if (remove) { defer queue.remove(&pending.node); } }" ++
+        "fn custom(factory: *Factory) !*Value { var value = try factory.create(); return &value.payload; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var escape_count: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .local_storage_escape) {
+        escape_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), escape_count);
 }
 
 test "dereferencing the slice returns the array by value" {

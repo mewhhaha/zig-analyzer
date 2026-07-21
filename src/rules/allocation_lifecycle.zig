@@ -95,7 +95,7 @@ pub fn warningsWithSummaries(
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
         const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
-        const arena_backed = if (allocation.allocator_source) |allocator_name|
+        const arena_backed = valueReceivesBuildArena(tree, tokens, scope_index, initializer) or if (allocation.allocator_source) |allocator_name|
             std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null or
                 allocatorIsArenaBacked(source, tokens, allocator_name) or
                 privateAllocatorParameterIsAlwaysArenaBacked(
@@ -173,7 +173,212 @@ pub fn warningsWithSummaries(
             .message = message,
         });
     }
+    try findOverlappingAggregateErrdefers(allocator, source, tokens, scope_index, &found);
     return try found.toOwnedSlice(allocator);
+}
+
+fn valueReceivesBuildArena(
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    value: std.zig.Ast.Node.Index,
+) bool {
+    const call_node = switch (tree.nodeTag(value)) {
+        .@"try", .@"nosuspend", .@"comptime" => tree.nodeData(value).node,
+        .grouped_expression => tree.nodeData(value).node_and_token[0],
+        .@"catch", .@"orelse" => tree.nodeData(value).node_and_node[0],
+        else => value,
+    };
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buffer, call_node) orelse return false;
+    for (call.ast.params) |argument| {
+        if (tree.nodeTag(argument) != .identifier) continue;
+        const argument_index: usize = tree.nodeMainToken(argument);
+        const binding = scope_index.findBinding(argument_index) orelse continue;
+        var type_index = binding.token_index + 1;
+        if (type_index >= tokens.len or tokens[type_index].tag != .colon) continue;
+        type_index += 1;
+        while (type_index < tokens.len) : (type_index += 1) {
+            switch (tokens[type_index].tag) {
+                .comma, .r_paren => break,
+                .identifier => if (std.mem.eql(u8, scope_index.source[tokens[type_index].loc.start..tokens[type_index].loc.end], "Build")) return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+fn findOverlappingAggregateErrdefers(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    found: *std.ArrayList(Warning),
+) !void {
+    for (tokens, 0..) |token, equal_index| {
+        if (token.tag != .equal or equal_index < 2 or tokens[equal_index - 1].tag != .period_asterisk or
+            tokens[equal_index - 2].tag != .identifier) continue;
+        const owner_name = source[tokens[equal_index - 2].loc.start..tokens[equal_index - 2].loc.end];
+        const owner_binding = scope_index.findBinding(equal_index - 2) orelse continue;
+        const owner_type = createdPointerType(source, tokens, scope_index, owner_binding.token_index) orelse continue;
+        const assignment_end = scope_index.statementEnd(equal_index) orelse continue;
+        const scope = enclosingScope(tokens, equal_index) orelse continue;
+        var field_index = equal_index + 1;
+        while (field_index + 3 < assignment_end) : (field_index += 1) {
+            if (tokens[field_index].tag != .period or tokens[field_index + 1].tag != .identifier or
+                tokens[field_index + 2].tag != .equal or tokens[field_index + 3].tag != .identifier) continue;
+            const field_name = source[tokens[field_index + 1].loc.start..tokens[field_index + 1].loc.end];
+            const binding_name = source[tokens[field_index + 3].loc.start..tokens[field_index + 3].loc.end];
+            const field_binding = scope_index.findBinding(field_index + 3) orelse continue;
+            if (!typeDeinitReleasesField(source, tokens, scope_index, owner_type, field_name)) continue;
+            if (errdeferReleasingBinding(
+                source,
+                tokens,
+                scope_index,
+                binding_name,
+                field_binding.token_index,
+                scope.opening + 1,
+                assignment_end,
+            ) == null) continue;
+            const aggregate_cleanup = errdeferDeinitializingOwner(
+                source,
+                tokens,
+                scope_index,
+                owner_name,
+                owner_binding.token_index,
+                assignment_end + 1,
+                scope.closing,
+            ) orelse continue;
+            try found.append(allocator, .{
+                .rule = .double_release,
+                .span = tokens[aggregate_cleanup].loc,
+                .message = try std.fmt.allocPrint(
+                    allocator,
+                    "errdefer cleanup for '{s}' releases owned field '{s}' after an earlier errdefer already releases '{s}'",
+                    .{ owner_name, field_name, binding_name },
+                ),
+            });
+        }
+    }
+}
+
+fn createdPointerType(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    owner_binding: usize,
+) ?usize {
+    if (owner_binding == 0 or
+        (tokens[owner_binding - 1].tag != .keyword_const and tokens[owner_binding - 1].tag != .keyword_var) or
+        owner_binding + 2 >= tokens.len or tokens[owner_binding + 1].tag != .equal) return null;
+    const declaration_end = scope_index.statementEnd(owner_binding - 1) orelse return null;
+    for (tokens[owner_binding + 2 .. declaration_end], owner_binding + 2..) |candidate, create_index| {
+        if (!tokenIsIdentifier(source, candidate, "create") or create_index + 3 >= declaration_end or
+            tokens[create_index + 1].tag != .l_paren or tokens[create_index + 2].tag != .identifier or
+            tokens[create_index + 3].tag != .r_paren) continue;
+        return create_index + 2;
+    }
+    return null;
+}
+
+fn typeDeinitReleasesField(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    type_use: usize,
+    field_name: []const u8,
+) bool {
+    const type_binding = scope_index.findBinding(type_use) orelse return false;
+    const type_name = type_binding.token_index;
+    if (type_name == 0 or tokens[type_name - 1].tag != .keyword_const or type_name + 3 >= tokens.len or
+        tokens[type_name + 1].tag != .equal or tokens[type_name + 2].tag != .keyword_struct or
+        tokens[type_name + 3].tag != .l_brace) return false;
+    const type_end = matchingToken(tokens, type_name + 3, .l_brace, .r_brace) orelse return false;
+    for (tokens[type_name + 4 .. type_end], type_name + 4..) |candidate, function_index| {
+        if (candidate.tag != .keyword_fn or function_index + 3 >= type_end or
+            !tokenIsIdentifier(source, tokens[function_index + 1], "deinit") or
+            tokens[function_index + 2].tag != .l_paren) continue;
+        const parameters_end = matchingToken(tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        var receiver: ?[]const u8 = null;
+        for (tokens[function_index + 3 .. parameters_end], function_index + 3..) |parameter, parameter_index| {
+            if (parameter.tag == .identifier and parameter_index + 1 < parameters_end and
+                tokens[parameter_index + 1].tag == .colon)
+            {
+                receiver = source[parameter.loc.start..parameter.loc.end];
+                break;
+            }
+        }
+        const receiver_name = receiver orelse continue;
+        var body_start = parameters_end + 1;
+        while (body_start < type_end and tokens[body_start].tag != .l_brace) : (body_start += 1) {}
+        if (body_start == type_end) continue;
+        const body_end = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse continue;
+        for (tokens[body_start + 1 .. body_end], body_start + 1..) |body_token, method_index| {
+            if ((!tokenIsIdentifier(source, body_token, "free") and
+                !tokenIsIdentifier(source, body_token, "destroy")) or method_index + 1 >= body_end or
+                tokens[method_index + 1].tag != .l_paren) continue;
+            const call_end = matchingToken(tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+            var index = method_index + 2;
+            while (index + 2 < call_end) : (index += 1) {
+                if (tokenIsIdentifier(source, tokens[index], receiver_name) and tokens[index + 1].tag == .period and
+                    tokenIsIdentifier(source, tokens[index + 2], field_name)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn errdeferReleasingBinding(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    for (tokens[start..end], start..) |token, defer_index| {
+        if (token.tag != .keyword_errdefer) continue;
+        const defer_end = scope_index.statementEnd(defer_index) orelse continue;
+        if (defer_end >= end) continue;
+        var saw_binding = false;
+        var saw_release = false;
+        var conditional = false;
+        for (tokens[defer_index + 1 .. defer_end], defer_index + 1..) |candidate, candidate_index| {
+            if (candidate.tag == .keyword_if or candidate.tag == .keyword_switch) conditional = true;
+            if (tokenIsIdentifier(source, candidate, binding_name) and
+                identifierRefersToBinding(scope_index, binding_index, candidate_index)) saw_binding = true;
+            if (tokenIsIdentifier(source, candidate, "free") or tokenIsIdentifier(source, candidate, "destroy")) {
+                saw_release = true;
+            }
+        }
+        if (!conditional and saw_binding and saw_release) return defer_index;
+    }
+    return null;
+}
+
+fn errdeferDeinitializingOwner(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    owner_name: []const u8,
+    owner_binding: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    for (tokens[start..end], start..) |token, defer_index| {
+        if (token.tag != .keyword_errdefer) continue;
+        const defer_end = scope_index.statementEnd(defer_index) orelse continue;
+        if (defer_end >= end) continue;
+        var index = defer_index + 1;
+        while (index + 2 < defer_end) : (index += 1) {
+            if (tokenIsIdentifier(source, tokens[index], owner_name) and tokens[index + 1].tag == .period and
+                identifierRefersToBinding(scope_index, owner_binding, index) and
+                tokenIsIdentifier(source, tokens[index + 2], "deinit")) return index + 2;
+        }
+    }
+    return null;
 }
 
 const Allocation = struct {
@@ -287,7 +492,7 @@ fn allocationFromCall(
         .receiver = if (allocator_argument) |argument|
             if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
         else
-            receiver_name,
+            null,
         .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
     };
 }
@@ -983,8 +1188,11 @@ fn releaseArgumentContainsOptionalCapture(
         while (capture_index + 3 < release_index) : (capture_index += 1) {
             if (tokens[capture_index].tag != .pipe or tokens[capture_index + 1].tag != .identifier or
                 !tokenIsIdentifier(source, tokens[capture_index + 1], capture_name) or
-                tokens[capture_index + 2].tag != .pipe or tokens[capture_index + 3].tag != .l_brace) continue;
-            const body_end = scope_index.matchingToken(capture_index + 3) orelse continue;
+                tokens[capture_index + 2].tag != .pipe) continue;
+            const body_end = if (tokens[capture_index + 3].tag == .l_brace)
+                scope_index.matchingToken(capture_index + 3) orelse continue
+            else
+                scope_index.statementEnd(capture_index + 3) orelse continue;
             if (body_end < release_index) continue;
             var if_index = search_start;
             while (if_index + 1 < capture_index) : (if_index += 1) {
@@ -1066,6 +1274,15 @@ fn bindingEscapes(
         {
             const closing = scope_index.matchingToken(index) orelse continue;
             if (closing >= end or !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, closing)) continue;
+            if (callOnlyUsesScalarProjections(
+                source,
+                tokens,
+                scope_index,
+                binding_name,
+                binding_index,
+                index + 1,
+                closing,
+            )) continue;
             const method = source[tokens[index - 1].loc.start..tokens[index - 1].loc.end];
             if (std.mem.eql(u8, method, release_method)) {
                 const method_call = index >= 2 and tokens[index - 2].tag == .period;
@@ -1086,6 +1303,7 @@ fn bindingEscapes(
                     .unknown => {},
                 }
             }
+            if (tokens[index - 1].tag == .builtin and builtinBorrowsMemory(method)) continue;
             return true;
         }
         if (token.tag != .equal) continue;
@@ -1093,9 +1311,87 @@ fn bindingEscapes(
         if (statement_end >= end or
             !containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 1, statement_end) or
             assignmentDiscards(source, tokens, start, index)) continue;
+        if (index >= 2 and (tokens[index - 2].tag == .keyword_const or tokens[index - 2].tag == .keyword_var) and
+            localDeclarationCreatesBorrowingView(
+                source,
+                tokens,
+                scope_index,
+                binding_name,
+                binding_index,
+                index + 1,
+                statement_end,
+            )) continue;
         return true;
     }
     return false;
+}
+
+fn callOnlyUsesScalarProjections(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+) bool {
+    var found = false;
+    for (tokens[start..end], start..) |token, index| {
+        if (!tokenIsIdentifier(source, token, binding_name) or
+            !identifierRefersToBinding(scope_index, binding_index, index)) continue;
+        found = true;
+        if (index + 2 < end and tokens[index + 1].tag == .period and
+            tokenIsIdentifier(source, tokens[index + 2], "len")) continue;
+        if (index + 1 < end and tokens[index + 1].tag == .l_bracket) {
+            const bracket_end = scope_index.matchingToken(index + 1) orelse return false;
+            if (bracket_end >= end) return false;
+            var is_slice = false;
+            for (tokens[index + 2 .. bracket_end]) |part| {
+                if (part.tag == .ellipsis2 or part.tag == .ellipsis3) {
+                    is_slice = true;
+                    break;
+                }
+            }
+            if (!is_slice) continue;
+        }
+        return false;
+    }
+    return found;
+}
+
+fn localDeclarationCreatesBorrowingView(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+) bool {
+    for (tokens[start..end], start..) |token, call_open| {
+        if (token.tag != .l_paren or call_open == 0 or tokens[call_open - 1].tag != .identifier) continue;
+        const call_close = scope_index.matchingToken(call_open) orelse continue;
+        if (call_close >= end) continue;
+        const argument_index = bareBindingArgumentIndex(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            call_open + 1,
+            call_close,
+        ) orelse continue;
+        var callable_start = call_open - 1;
+        while (callable_start >= 2 and tokens[callable_start - 1].tag == .period and
+            tokens[callable_start - 2].tag == .identifier) callable_start -= 2;
+        const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
+        if (conventionalBorrowingCall(callable, argument_index, callArgumentCount(tokens, call_open + 1, call_close))) return true;
+    }
+    return false;
+}
+
+fn builtinBorrowsMemory(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memset");
 }
 
 const CallOwnership = enum { borrowed, released, unknown };
@@ -1146,6 +1442,25 @@ fn localCallOwnership(
 ) CallOwnership {
     if (call_open == 0 or tokens[call_open - 1].tag != .identifier) return .unknown;
     const call_close = scope_index.matchingToken(call_open) orelse return .unknown;
+    const containing_argument = bindingArgumentIndex(
+        source,
+        tokens,
+        scope_index,
+        binding_name,
+        binding_index,
+        call_open + 1,
+        call_close,
+    ) orelse return .unknown;
+    var callable_start = call_open - 1;
+    while (callable_start >= 2 and tokens[callable_start - 1].tag == .period and
+        tokens[callable_start - 2].tag == .identifier) callable_start -= 2;
+    const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
+    const argument_count = callArgumentCount(tokens, call_open + 1, call_close);
+    const method = if (std.mem.lastIndexOfScalar(u8, callable, '.')) |separator| callable[separator + 1 ..] else callable;
+    if (containing_argument == 2 and argument_count >= 6 and
+        std.mem.eql(u8, method, "write") and
+        asyncWriteCallbackReleasesBuffer(source, tokens, scope_index, call_open, call_close)) return .released;
+    if (conventionalBorrowingCall(callable, containing_argument, argument_count)) return .borrowed;
     const argument_index = bareBindingArgumentIndex(
         source,
         tokens,
@@ -1155,13 +1470,6 @@ fn localCallOwnership(
         call_open + 1,
         call_close,
     ) orelse return .unknown;
-    const callable_start = if (call_open >= 3 and tokens[call_open - 2].tag == .period and
-        tokens[call_open - 3].tag == .identifier)
-        call_open - 3
-    else
-        call_open - 1;
-    const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
-    if (conventionalBorrowingCall(callable)) return .borrowed;
     return switch (summary_index.parameterEffectForCall(source, callable, argument_index)) {
         .borrowed => .borrowed,
         .released => .released,
@@ -1169,12 +1477,129 @@ fn localCallOwnership(
     };
 }
 
-fn conventionalBorrowingCall(callable: []const u8) bool {
+fn asyncWriteCallbackReleasesBuffer(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    call_open: usize,
+    call_close: usize,
+) bool {
+    const callback_start = lastCallArgumentStart(tokens, call_open, call_close);
+    if (callback_start + 1 != call_close or tokens[callback_start].tag != .identifier) return false;
+    const callback_binding = scope_index.findBinding(callback_start) orelse return false;
+    if (callback_binding.token_index == 0 or tokens[callback_binding.token_index - 1].tag != .keyword_fn) return false;
+    const function_index = callback_binding.token_index - 1;
+    if (function_index + 2 >= tokens.len or tokens[function_index + 2].tag != .l_paren) return false;
+    const parameters_end = scope_index.matchingToken(function_index + 2) orelse return false;
+    var parameter_index: usize = 0;
+    var segment_start = function_index + 3;
+    var depth: usize = 0;
+    var buffer_parameter: ?[]const u8 = null;
+    var index = segment_start;
+    while (index <= parameters_end) : (index += 1) {
+        const at_end = index == parameters_end;
+        if (!at_end) switch (tokens[index].tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -|= 1,
+            else => {},
+        };
+        if (!at_end and (tokens[index].tag != .comma or depth != 0)) continue;
+        if (parameter_index == 4) {
+            for (tokens[segment_start..index], segment_start..) |parameter, name_index| {
+                if (parameter.tag == .identifier and name_index + 1 < index and tokens[name_index + 1].tag == .colon) {
+                    buffer_parameter = source[parameter.loc.start..parameter.loc.end];
+                    break;
+                }
+            }
+            break;
+        }
+        parameter_index += 1;
+        segment_start = index + 1;
+    }
+    const buffer_name = buffer_parameter orelse return false;
+    const body_start = syntax_scope.functionBodyAfterParameters(tokens, parameters_end) orelse return false;
+    const body_end = scope_index.matchingToken(body_start) orelse return false;
+    for (tokens[body_start + 1 .. body_end], body_start + 1..) |token, method_index| {
+        if (token.tag != .identifier or method_index + 1 >= body_end or tokens[method_index + 1].tag != .l_paren) continue;
+        const method = source[token.loc.start..token.loc.end];
+        if (!std.mem.eql(u8, method, "destroy") and !std.mem.eql(u8, method, "free") and
+            !std.mem.eql(u8, method, "deinit") and !std.mem.eql(u8, method, "release")) continue;
+        const cleanup_end = scope_index.matchingToken(method_index + 1) orelse continue;
+        for (tokens[method_index + 2 .. @min(cleanup_end, body_end)]) |argument| {
+            if (tokenIsIdentifier(source, argument, buffer_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn bindingArgumentIndex(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    var argument_index: usize = 0;
+    var segment_start = start;
+    var depth: usize = 0;
+    var index = start;
+    while (index <= end) : (index += 1) {
+        const at_end = index == end;
+        if (!at_end) switch (tokens[index].tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -|= 1,
+            else => {},
+        };
+        if (!at_end and (tokens[index].tag != .comma or depth != 0)) continue;
+        if (containsBinding(source, tokens, scope_index, binding_name, binding_index, segment_start, index)) return argument_index;
+        argument_index += 1;
+        segment_start = index + 1;
+    }
+    return null;
+}
+
+fn conventionalBorrowingCall(callable: []const u8, argument_index: usize, argument_count: usize) bool {
     const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
     const method = if (separator) |index| callable[index + 1 ..] else callable;
-    const methods = [_][]const u8{ "appendSlice", "write", "writeAll", "print" };
-    for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
+    const methods = [_][]const u8{ "appendSlice", "writeAll", "writeStreamingAll", "print" };
+    for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return argument_index + 1 == argument_count;
+    if (std.mem.eql(u8, method, "write")) {
+        if (argument_count >= 6) return argument_index == 2;
+        return argument_index + 1 == argument_count;
+    }
+    const slice_iterators = [_][]const u8{
+        "splitAny",
+        "splitBackwardsAny",
+        "splitBackwardsScalar",
+        "splitBackwardsSequence",
+        "splitScalar",
+        "splitSequence",
+        "tokenizeAny",
+        "tokenizeScalar",
+        "tokenizeSequence",
+        "window",
+    };
+    for (slice_iterators) |candidate| {
+        if (std.mem.eql(u8, method, candidate)) return argument_index == 1;
+    }
     return false;
+}
+
+fn callArgumentCount(tokens: []const std.zig.Token, start: usize, end: usize) usize {
+    if (start >= end) return 0;
+    var count: usize = 1;
+    var depth: usize = 0;
+    for (tokens[start..end]) |token| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .comma => if (depth == 0) {
+            count += 1;
+        },
+        else => {},
+    };
+    return count;
 }
 
 fn bareBindingArgumentIndex(
@@ -1454,6 +1879,18 @@ test "storing an allocation in an owner transfers ownership" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "field insertion is not confused with a same named owner method" {
+    const source =
+        "const Table = struct { names: List, allocator: std.mem.Allocator," ++
+        "fn append(self: *Table, name: []const u8) !void {" ++
+        "const owned_name = try self.allocator.dupe(u8, name);" ++
+        "errdefer self.allocator.free(owned_name);" ++
+        "try self.names.append(self.allocator, owned_name); } };";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "passing an allocation to an unknown call is treated as an escape" {
     const source =
         "fn attach(allocator: std.mem.Allocator) !void {" ++
@@ -1702,6 +2139,53 @@ test "opaque methods may take ownership of pool allocations" {
         "fn run(self: *Server, allocator: std.mem.Allocator) !void {" ++
         "const socket = try self.socket_pool.create(allocator);" ++
         "socket.read();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "async operations take ownership of non-buffer pool arguments" {
+    const source =
+        "fn run(self: *Client, allocator: std.mem.Allocator, socket: anytype, loop: anytype) void {" ++
+        "const completion = self.completion_pool.create(allocator) catch unreachable;" ++
+        "socket.write(loop, completion, .{ .slice = \"ping\" }, Client, self, callback);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "async writes continue borrowing their buffer argument" {
+    const source =
+        "fn run(self: *Client, allocator: std.mem.Allocator, socket: anytype, loop: anytype) void {" ++
+        "const bytes = allocator.alloc(u8, 4) catch unreachable;" ++
+        "socket.write(loop, completion, bytes, Client, self, callback);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+}
+
+test "async write callbacks can release the submitted buffer" {
+    const source =
+        "const Client = struct { fn writeCallback(self: *Client, loop: anytype, completion: anytype, socket: anytype, buffer: anytype, result: anytype) void {" ++
+        "_ = self; _ = loop; _ = completion; _ = socket; _ = buffer; _ = result; } };" ++
+        "const Server = struct { buffer_pool: Pool, fn send(self: *Server, allocator: std.mem.Allocator, socket: anytype, loop: anytype) void {" ++
+        "_ = allocator; const bytes = self.buffer_pool.create(allocator) catch unreachable; socket.write(loop, completion, .{ .slice = bytes[0..4] }, Server, self, writeCallback); }" ++
+        "fn writeCallback(self: *Server, loop: anytype, completion: anytype, socket: anytype, buffer: anytype, result: anytype) void {" ++
+        "_ = loop; _ = completion; _ = socket; _ = result; self.buffer_pool.destroy(@alignCast(@as(*[4096]u8, @ptrFromInt(@intFromPtr(buffer.slice.ptr))))); } };";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "inline optional defer releases an optional allocation" {
+    const source =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const maybe_bytes: ?[]u8 = try allocator.alloc(u8, 4);" ++
+        "defer if (maybe_bytes) |bytes| allocator.free(bytes);" ++
+        "try consume(maybe_bytes);" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
@@ -2051,7 +2535,7 @@ test "realloc of the binding itself does not overwrite the owning value" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
-test "passing an allocation to a builtin call is treated as an escape" {
+test "memory builtins borrow allocations" {
     const source =
         "fn zero(a: std.mem.Allocator) !void {" ++
         "const counts = try a.alloc(u8, 4);" ++
@@ -2059,7 +2543,41 @@ test "passing an allocation to a builtin call is treated as an escape" {
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
-    try std.testing.expectEqual(@as(usize, 0), found.len);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "formatting allocation metadata does not transfer ownership" {
+    const source =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 4); std.debug.print(\"{d}\", .{bytes.len}); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "formatting an allocation does not transfer ownership" {
+    const source =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 4); std.debug.print(\"{s}\", .{bytes}); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "reader allocRemaining returns memory owned by its allocator argument" {
+    const source =
+        "fn readAll(reader: *Reader, allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try reader.interface.allocRemaining(allocator, .unlimited);" ++
+        "var tokens = std.mem.tokenizeAny(u8, bytes, \" \");" ++
+        "_ = tokens.next();" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
 }
 
 test "double release offers deletion of the duplicate statement" {
@@ -2081,6 +2599,78 @@ test "double release offers deletion of the duplicate statement" {
     const edit = double.?.fixes[0].edits[0];
     try std.testing.expectEqualStrings("", edit.replacement);
     try std.testing.expectEqualStrings("allocator.free(buffer);", source[edit.span.start..edit.span.end]);
+}
+
+test "aggregate errdefer cannot overlap direct field cleanup" {
+    const source =
+        "const Frame = struct { payload: []u8, fn deinit(self: *Frame, allocator: std.mem.Allocator) void {" ++
+        "allocator.free(self.payload); allocator.destroy(self); } };" ++
+        "fn decode(allocator: std.mem.Allocator) !*Frame {" ++
+        "const payload = try allocator.dupe(u8, \"frame\");" ++
+        "const frame = try allocator.create(Frame);" ++
+        "errdefer allocator.free(payload); errdefer allocator.destroy(frame);" ++
+        "frame.* = .{ .payload = payload }; errdefer frame.deinit(allocator);" ++
+        "try decodeChildren(); return frame; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    var double_release_count: usize = 0;
+    for (found) |warning| if (warning.rule == .double_release) {
+        double_release_count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, warning.message, "owned field 'payload'") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), double_release_count);
+}
+
+test "aggregate errdefer without earlier field cleanup stays clean" {
+    const source =
+        "const Frame = struct { payload: []u8, fn deinit(self: *Frame, allocator: std.mem.Allocator) void {" ++
+        "allocator.free(self.payload); allocator.destroy(self); } };" ++
+        "fn decode(allocator: std.mem.Allocator) !*Frame {" ++
+        "const payload = try allocator.dupe(u8, \"frame\");" ++
+        "const frame = try allocator.create(Frame); errdefer allocator.destroy(frame);" ++
+        "frame.* = .{ .payload = payload }; errdefer frame.deinit(allocator);" ++
+        "try decodeChildren(); return frame; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .double_release);
+}
+
+test "aggregate errdefer ignores field cleanup from a closed sibling scope" {
+    const source =
+        "const Frame = struct { payload: []u8, fn deinit(self: *Frame, allocator: std.mem.Allocator) void {" ++
+        "allocator.free(self.payload); allocator.destroy(self); } };" ++
+        "fn decode(allocator: std.mem.Allocator, alternate: bool) !*Frame {" ++
+        "if (alternate) { const payload = try allocator.dupe(u8, \"old\"); errdefer allocator.free(payload); allocator.free(payload); }" ++
+        "const payload = try allocator.dupe(u8, \"frame\"); const frame = try allocator.create(Frame);" ++
+        "errdefer allocator.destroy(frame); frame.* = .{ .payload = payload }; errdefer frame.deinit(allocator); return frame; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .double_release);
+}
+
+test "aggregate cleanup only overlaps fields released from its receiver" {
+    const source =
+        "const Frame = struct { payload: []u8, other: *Frame, fn deinit(self: *Frame, allocator: std.mem.Allocator) void {" ++
+        "allocator.free(self.other.payload); allocator.destroy(self); } };" ++
+        "fn decode(allocator: std.mem.Allocator) !*Frame { const payload = try allocator.dupe(u8, \"frame\");" ++
+        "errdefer allocator.free(payload); const frame = try allocator.create(Frame); errdefer allocator.destroy(frame);" ++
+        "frame.* = .{ .payload = payload, .other = undefined }; errdefer frame.deinit(allocator); return frame; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .double_release);
+}
+
+test "conditional errdefer cleanup does not prove an aggregate double release" {
+    const source =
+        "const Frame = struct { payload: []u8, fn deinit(self: *Frame, allocator: std.mem.Allocator) void {" ++
+        "allocator.free(self.payload); allocator.destroy(self); } };" ++
+        "fn decode(allocator: std.mem.Allocator) !*Frame { var transferred = false;" ++
+        "const payload = try allocator.dupe(u8, \"frame\"); errdefer if (!transferred) allocator.free(payload);" ++
+        "const frame = try allocator.create(Frame); errdefer allocator.destroy(frame);" ++
+        "frame.* = .{ .payload = payload }; transferred = true; errdefer frame.deinit(allocator); return frame; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    for (found) |warning| try std.testing.expect(warning.rule != .double_release);
 }
 
 test "declared resource pairs participate in allocation lifecycle proof" {
@@ -2122,6 +2712,81 @@ test "inferred owned returns participate in allocation lifecycle proof" {
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "owned helper returns backed by a Build parameter use its arena" {
+    const source: [:0]const u8 =
+        "fn make(b: *std.Build) ![]u8 { return b.allocator.alloc(u8, 4); }" ++
+        "fn build(b: *std.Build) !void { const bytes = try make(b); _ = bytes.len; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "local method owned returns participate in allocation lifecycle proof" {
+    const source: [:0]const u8 =
+        "const Packet = struct { fn encode(self: *const Packet, allocator: std.mem.Allocator) ![]u8 { _ = self; return allocator.alloc(u8, 4); } };" ++
+        "fn send(allocator: std.mem.Allocator, packet: *const Packet) !void { const bytes = try packet.encode(allocator); _ = bytes.len; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "passing a local method allocation to a borrowing method does not transfer ownership" {
+    const source: [:0]const u8 =
+        "const Packet = struct { fn encode(self: *const Packet, allocator: std.mem.Allocator) ![]u8 { _ = self; return allocator.alloc(u8, 4); } };" ++
+        "const Queue = struct { fn decodeAndEnqueue(self: *Queue, bytes: []const u8) !void { _ = self; _ = bytes.len; } };" ++
+        "fn send(allocator: std.mem.Allocator, packet: *const Packet, queue: *Queue) !void {" ++
+        "const bytes = try packet.encode(allocator); try queue.decodeAndEnqueue(bytes); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "writing an owned slice does not transfer its ownership" {
+    const source: [:0]const u8 =
+        "fn render(allocator: std.mem.Allocator, output: *List) ![]u8 { return output.toOwnedSlice(allocator); }" ++
+        "fn write(io: Io, allocator: std.mem.Allocator, output: *List, file: File) !void {" ++
+        "const html = try render(allocator, output); try file.writeStreamingAll(io, html); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "encoded buffers remain owned after decoder calls" {
+    const source: [:0]const u8 =
+        "const Packet = struct { payload: []u8, fn encode(self: *const Packet, allocator: std.mem.Allocator) ![]u8 { " ++
+        "const encoded = try allocator.alloc(u8, self.payload.len); @memcpy(encoded, self.payload); return encoded; } " ++
+        "fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Packet { return .{ .payload = try allocator.dupe(u8, bytes) }; } };" ++
+        "const Queue = struct { allocator: std.mem.Allocator, fn decodeAndEnqueue(self: *Queue, bytes: []const u8) !void { " ++
+        "_ = try Packet.decode(self.allocator, bytes); } };" ++
+        "pub fn main() !void { var debug_allocator = std.heap.DebugAllocator(.{}){}; const allocator = debug_allocator.allocator(); " ++
+        "var queue: Queue = undefined; const first: Packet = undefined; const serialized = try first.encode(allocator); " ++
+        "try queue.decodeAndEnqueue(serialized); }";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source }};
+    const summary_index = try summaries.build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(summary_index.ownedReturnCall(source, "first", "encode") != null);
+    try std.testing.expectEqual(summaries.ParameterEffect.borrowed, summary_index.parameterEffectForCall(source, "queue.decodeAndEnqueue", 0));
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "owned method returns without allocator provenance accept visible cleanup" {
+    const source: [:0]const u8 =
+        "const Renderer = struct { fn render(renderer: Renderer, allocator: std.mem.Allocator) ![]u8 { " ++
+        "_ = renderer; var writer: Writer = .init(allocator); return writer.toOwnedSlice(); } };" ++
+        "fn show(renderer: Renderer) !void { const rendered = try renderer.render(std.testing.allocator); " ++
+        "defer std.testing.allocator.free(rendered); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 fn freeWarning(allocator: std.mem.Allocator, warning: Warning) void {

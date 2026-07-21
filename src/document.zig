@@ -82,7 +82,16 @@ pub const Document = struct {
                 return error.InvalidRange;
             }
             const changed_span = lsp.offsets.rangeToLoc(next_source, replacement.range, .@"utf-16");
-            const replaced_length = changed_span.start + replacement.text.len + next_source.len - changed_span.end;
+            const prefix_length = std.math.add(
+                usize,
+                changed_span.start,
+                replacement.text.len,
+            ) catch return error.InvalidRange;
+            const replaced_length = std.math.add(
+                usize,
+                prefix_length,
+                next_source.len - changed_span.end,
+            ) catch return error.InvalidRange;
             const replaced_source = try document.allocator.allocSentinel(u8, replaced_length, 0);
             @memcpy(replaced_source[0..changed_span.start], next_source[0..changed_span.start]);
             @memcpy(

@@ -332,6 +332,7 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
 fn topLevelAndOperands(context: ActionRun, start: usize, end: usize) !?[]const []const u8 {
     if (start >= end) return null;
     var operands: std.ArrayList([]const u8) = .empty;
+    errdefer operands.deinit(context.allocator);
     var operand_start = start;
     var depth: usize = 0;
     for (context.tokens[start..end], start..) |token, index| switch (token.tag) {

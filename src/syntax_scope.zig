@@ -611,6 +611,7 @@ fn tokenText(source: []const u8, token: std.zig.Token) []const u8 {
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    errdefer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

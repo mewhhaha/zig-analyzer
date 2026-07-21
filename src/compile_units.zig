@@ -65,7 +65,11 @@ fn documentReachableFromRoot(
         for (visited.keys()) |path| allocator.free(path);
         visited.deinit(allocator);
     }
-    try visited.put(allocator, try std.fs.path.resolve(allocator, &.{root_path}), {});
+    const normalized_root = try std.fs.path.resolve(allocator, &.{root_path});
+    visited.put(allocator, normalized_root, {}) catch |err| {
+        allocator.free(normalized_root);
+        return err;
+    };
 
     const maximum_imported_files = 512;
     var scan_index: usize = 0;
@@ -109,7 +113,10 @@ fn documentReachableFromRoot(
                 allocator.free(resolved);
                 continue;
             }
-            const entry = try visited.getOrPut(allocator, resolved);
+            const entry = visited.getOrPut(allocator, resolved) catch |err| {
+                allocator.free(resolved);
+                return err;
+            };
             if (entry.found_existing) allocator.free(resolved);
         }
     }
@@ -252,7 +259,11 @@ fn nearestBuildFile(io: std.Io, allocator: std.mem.Allocator, document_path: []c
     var directory = std.fs.path.dirname(document_path) orelse return null;
     while (true) {
         const candidate = try std.fs.path.join(allocator, &.{ directory, "build.zig" });
-        if (try pathExists(io, candidate)) return candidate;
+        const exists = pathExists(io, candidate) catch |err| {
+            allocator.free(candidate);
+            return err;
+        };
+        if (exists) return candidate;
         allocator.free(candidate);
         const parent = std.fs.path.dirname(directory) orelse return null;
         if (std.mem.eql(u8, parent, directory)) return null;
@@ -283,6 +294,7 @@ fn containsString(strings: []const []const u8, candidate: []const u8) bool {
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    errdefer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

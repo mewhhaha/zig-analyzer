@@ -232,12 +232,26 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
     for (context.tokens, 0..) |token, equal_index| {
         if (token.tag != .equal or equal_index == 0 or !context.tokenIs(equal_index - 1, "_")) continue;
         const statement_end = context.statementEnd(equal_index) orelse continue;
-        const removal = methodCallInRange(context, &.{ "swapRemove", "orderedRemove" }, equal_index + 1, statement_end) orelse continue;
+        const removal = methodCallInRange(context, &.{ "swapRemove", "orderedRemove", "pop" }, equal_index + 1, statement_end) orelse continue;
         const field = receiverFieldBeforeMethod(context, removal) orelse continue;
-        const element_type = arrayListElementType(context, removal, field) orelse continue;
+        const element_type = arrayListElementType(context, removal, field) orelse {
+            if (!localArrayListOwnsSliceElements(context, field, removal) or
+                localSliceElementReleasedBefore(context, field, removal)) continue;
+            try context.emit(.{
+                .rule = .unreleased_allocation,
+                .level = level,
+                .span = context.tokens[removal].loc,
+                .message = try std.fmt.allocPrint(
+                    context.allocator,
+                    "discarding {s}'s removed slice from '{s}' leaks its allocation",
+                    .{ context.tokenText(removal), field },
+                ),
+            });
+            continue;
+        };
         const owned_field = sliceFieldOfType(context, element_type) orelse continue;
-        if (!containerCleansElementField(context, removal, owned_field)) continue;
-        if (removedFieldReleasedBefore(context, field, owned_field, removal)) continue;
+        if (!containerCleansElementField(context, removal, owned_field) or
+            removedFieldReleasedBefore(context, field, owned_field, removal)) continue;
         try context.emit(.{
             .rule = .unreleased_allocation,
             .level = level,
@@ -249,6 +263,76 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn localArrayListOwnsSliceElements(context: RuleRun, binding: []const u8, removal_index: usize) bool {
+    const function_body = context.enclosingOpeningBrace(removal_index) orelse return false;
+    if (!localArrayListStoresSlices(context, binding, function_body + 1, removal_index)) return false;
+    for (context.tokens[function_body + 1 .. removal_index], function_body + 1..) |token, defer_index| {
+        if (token.tag != .keyword_defer) continue;
+        const cleanup_end = if (defer_index + 1 < removal_index and context.tokens[defer_index + 1].tag == .l_brace)
+            context.matchingToken(defer_index + 1, .l_brace, .r_brace) orelse continue
+        else
+            context.statementEnd(defer_index) orelse continue;
+        if (cleanup_end >= removal_index) continue;
+        const element = sequenceElementCapture(context, binding, defer_index + 1, cleanup_end) orelse continue;
+        if (rangeReleasesBinding(context, element, defer_index + 1, cleanup_end)) return true;
+    }
+    return false;
+}
+
+fn localArrayListStoresSlices(context: RuleRun, binding: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 8 >= end or
+            !context.tokenIs(declaration_index + 1, binding)) continue;
+        const declaration_end = context.statementEnd(declaration_index) orelse continue;
+        if (declaration_end > end) continue;
+        for (context.tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |_, array_list_index| {
+            if (!context.tokenIs(array_list_index, "ArrayList") or array_list_index + 5 >= declaration_end or
+                context.tokens[array_list_index + 1].tag != .l_paren or
+                context.tokens[array_list_index + 2].tag != .l_bracket or
+                context.tokens[array_list_index + 3].tag != .r_bracket or
+                context.tokens[array_list_index + 4].tag != .identifier or
+                context.tokens[array_list_index + 5].tag != .r_paren) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sequenceElementCapture(
+    context: RuleRun,
+    binding: []const u8,
+    start: usize,
+    end: usize,
+) ?[]const u8 {
+    var index = start;
+    while (index + 6 < end) : (index += 1) {
+        if (!context.tokenIs(index, binding) or context.tokens[index + 1].tag != .period or
+            !context.tokenIs(index + 2, "items") or context.tokens[index + 3].tag != .r_paren or
+            context.tokens[index + 4].tag != .pipe or context.tokens[index + 5].tag != .identifier or
+            context.tokens[index + 6].tag != .pipe) continue;
+        return context.tokenText(index + 5);
+    }
+    return null;
+}
+
+fn localSliceElementReleasedBefore(context: RuleRun, binding: []const u8, removal_index: usize) bool {
+    const removal_scope = context.enclosingOpeningBrace(removal_index) orelse return false;
+    for (context.tokens[removal_scope + 1 .. removal_index], removal_scope + 1..) |_, free_index| {
+        if (!context.tokenIs(free_index, "free") or free_index + 1 >= removal_index or
+            context.tokens[free_index + 1].tag != .l_paren) continue;
+        const free_end = context.matchingToken(free_index + 1, .l_paren, .r_paren) orelse continue;
+        if (free_end >= removal_index) continue;
+        var saw_binding = false;
+        var saw_items = false;
+        for (context.tokens[free_index + 2 .. free_end], free_index + 2..) |_, argument_index| {
+            if (context.tokenIs(argument_index, binding)) saw_binding = true;
+            if (context.tokenIs(argument_index, "items")) saw_items = true;
+        }
+        if (saw_binding and saw_items) return true;
+    }
+    return false;
 }
 
 fn removedFieldReleasedBefore(context: RuleRun, sequence_field: []const u8, owned_field: []const u8, removal_index: usize) bool {
@@ -690,6 +774,34 @@ test "discarded removals use their containing type's field" {
         "fn remove(self: *Registry, i: usize) void { _ = self.rows.swapRemove(i); } };";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "discarded local slice removals leak elements proven owned by cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(a: anytype) !void { var names: std.ArrayList([]u8) = .empty;" ++
+        "defer { for (names.items) |name| a.free(name); names.deinit(a); }" ++
+        "try names.append(a, try a.dupe(u8, \"first\")); try names.append(a, try a.dupe(u8, \"second\"));" ++
+        "_ = names.swapRemove(0); _ = names.pop(); }";
+    const findings = try findingsFor(arena.allocator(), source);
+    var warning_count: usize = 0;
+    for (findings) |finding| if (finding.rule == .unreleased_allocation) {
+        warning_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), warning_count);
+}
+
+test "discarded local value slices and explicitly released elements stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn values() void { var names: std.ArrayList([]const u8) = .empty; defer names.deinit(a); _ = names.pop(); }" ++
+        "fn owned(a: anytype) !void { var names: std.ArrayList([]u8) = .empty;" ++
+        "defer { for (names.items) |name| a.free(name); names.deinit(a); }" ++
+        "try names.append(a, try a.dupe(u8, \"first\")); a.free(names.items[0]); _ = names.swapRemove(0); }";
+    const findings = try findingsFor(arena.allocator(), source);
+    for (findings) |finding| try std.testing.expect(finding.rule != .unreleased_allocation);
 }
 
 test "discarded removal cleanup must dominate in the same scope" {

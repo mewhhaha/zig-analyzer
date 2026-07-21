@@ -16,7 +16,8 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[method_index - 1].tag != .period or
                 context.tokens[method_index + 1].tag != .l_paren) continue;
             if (context.tokens[method_index - 2].tag != .identifier or
-                !ioReceiver(context.tokenText(method_index - 2))) continue;
+                !ioReceiver(context.tokenText(method_index - 2)) or
+                receiverIsAllocatingWriter(context, context.tokenText(method_index - 2), method_index)) continue;
             try context.emit(.{
                 .rule = .discarded_write_count,
                 .level = level,
@@ -29,6 +30,29 @@ pub fn run(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn receiverIsAllocatingWriter(context: RuleRun, receiver: []const u8, before: usize) bool {
+    var candidate = before;
+    while (candidate > 0) {
+        candidate -= 1;
+        if (!context.tokenIs(candidate, receiver) or candidate == 0 or
+            (context.tokens[candidate - 1].tag != .keyword_const and context.tokens[candidate - 1].tag != .keyword_var)) continue;
+        const declaration_end = context.statementEnd(candidate - 1) orelse continue;
+        if (declaration_end >= before) continue;
+        const scope_end = context.enclosingScopeEnd(candidate - 1) orelse continue;
+        if (scope_end < before) continue;
+        const declaration = context.source[context.tokens[candidate - 1].loc.start..context.tokens[declaration_end].loc.end];
+        if (std.mem.indexOf(u8, declaration, "Writer.Allocating") != null) return true;
+
+        var equal_index = candidate + 1;
+        while (equal_index < declaration_end and context.tokens[equal_index].tag != .equal) : (equal_index += 1) {}
+        if (equal_index + 4 >= declaration_end or context.tokens[equal_index + 1].tag != .ampersand or
+            context.tokens[equal_index + 2].tag != .identifier or context.tokens[equal_index + 3].tag != .period or
+            !context.tokenIs(equal_index + 4, "writer")) return false;
+        return receiverIsAllocatingWriter(context, context.tokenText(equal_index + 2), candidate - 1);
+    }
+    return false;
 }
 
 fn ioReceiver(name: []const u8) bool {
@@ -82,6 +106,18 @@ test "profile writes do not look like file output" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn update(profile: *Profile, value: Value) !void { _ = try profile.write(value); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "allocating writers cannot return partial writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn render(allocator: std.mem.Allocator, bytes: []const u8) !void {" ++
+        "var output: std.Io.Writer.Allocating = .init(allocator); defer output.deinit();" ++
+        "const writer = &output.writer; _ = try writer.write(bytes); }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);

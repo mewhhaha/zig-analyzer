@@ -31,6 +31,9 @@ pub fn standardAllocatorArgument(callable: []const u8) ?usize {
     for (callables) |candidate| {
         if (std.mem.eql(u8, callable, candidate)) return 0;
     }
+    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const method = if (separator) |position| callable[position + 1 ..] else callable;
+    if (std.mem.eql(u8, method, "allocRemaining") or std.mem.eql(u8, method, "toOwnedSlice")) return 0;
     return null;
 }
 
@@ -53,6 +56,8 @@ pub fn releaseForCallable(callable: []const u8) ?[]const u8 {
 
 test "standard allocator functions return memory released with free" {
     try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("std.mem.concat"));
+    try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("reader.interface.allocRemaining"));
+    try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("items.toOwnedSlice"));
     try std.testing.expectEqualStrings("free", releaseForCallable("std.fs.path.resolve").?);
     try std.testing.expect(standardAllocatorArgument("project.mem.concat") == null);
 }

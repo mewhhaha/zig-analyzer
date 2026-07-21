@@ -69,7 +69,10 @@ fn releaseForAcquisition(context: RuleRun, start: usize, end: usize) ?[]const u8
         .{ .name = "create", .release = "destroy" },
         .{ .name = "openFile", .release = "close" },
         .{ .name = "createFile", .release = "close" },
+        .{ .name = "openFileAbsolute", .release = "close" },
+        .{ .name = "createFileAbsolute", .release = "close" },
         .{ .name = "openDir", .release = "close" },
+        .{ .name = "openDirAbsolute", .release = "close" },
         .{ .name = "openIterableDir", .release = "close" },
         .{ .name = "spawn", .release = "join" },
     };

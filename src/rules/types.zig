@@ -146,6 +146,7 @@ pub const Rule = enum {
     discarded_realloc_result,
     discarded_write_count,
     unchecked_first_element,
+    unsequenced_state_access,
     unchecked_slice_reinterpretation,
     undefined_readvec_destination,
     local_storage_escape,
@@ -164,6 +165,7 @@ pub const Rule = enum {
     unreachable_public_declaration,
     invariant_loop_condition,
     overflow_before_clamp,
+    unchecked_range_end,
     quadratic_front_removal,
 
     pub fn code(rule: Rule) []const u8 {
@@ -220,6 +222,7 @@ pub const Rule = enum {
             .discarded_realloc_result,
             .discarded_write_count,
             .unchecked_first_element,
+            .unsequenced_state_access,
             .unchecked_slice_reinterpretation,
             .undefined_readvec_destination,
             .local_storage_escape,
@@ -235,6 +238,7 @@ pub const Rule = enum {
             .child_pipe_double_close,
             .unwaited_child_process,
             .overflow_before_clamp,
+            .unchecked_range_end,
             => .correctness,
             else => .style,
         };
