@@ -41,6 +41,11 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                 },
             };
             var paths: std.ArrayList([]const u8) = .empty;
+            var paths_transferred = false;
+            defer if (!paths_transferred) {
+                for (paths.items) |path| allocator.free(path);
+                paths.deinit(allocator);
+            };
             for (excludes.items) |value| {
                 const path = switch (value) {
                     .string => |string| string,
@@ -57,9 +62,12 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                     );
                     return configuration;
                 }
-                try paths.append(allocator, try allocator.dupe(u8, std.mem.trimEnd(u8, path, "/")));
+                const owned_path = try allocator.dupe(u8, std.mem.trimEnd(u8, path, "/"));
+                errdefer allocator.free(owned_path);
+                try paths.append(allocator, owned_path);
             }
             configuration.check_excludes = try paths.toOwnedSlice(allocator);
+            paths_transferred = true;
         }
     }
 
@@ -954,6 +962,18 @@ test "configuration parses banned identifiers and activates the rule" {
     try std.testing.expectEqualStrings("use stdx.BoundedArrayType", configuration.banned[0].hint.?);
     try std.testing.expectEqual(@as(?[]const u8, null), configuration.banned[1].hint);
     try std.testing.expectEqual(Level.warning, configuration.level(.banned_identifier));
+}
+
+test "invalid check exclusion releases earlier owned paths" {
+    const configuration = try parse(std.testing.allocator,
+        \\{"check":{"exclude":["zig-cache",42]}}
+    );
+    defer std.testing.allocator.free(configuration.warning.?);
+
+    try std.testing.expectEqualStrings(
+        "zig-analyzer.json key 'check.exclude' must contain only relative path strings",
+        configuration.warning.?,
+    );
 }
 
 test "configuration parses project contracts and activates contract rules" {

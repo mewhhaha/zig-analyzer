@@ -842,15 +842,22 @@ fn findReleaseOrderingIssues(
             });
         }
         for (releases.items[1..]) |release_index| {
+            const fixes = try releaseDeletionFix(allocator, tokens, scope_index, release_index);
+            errdefer {
+                for (fixes) |fix| allocator.free(fix.edits);
+                allocator.free(fixes);
+            }
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "allocation '{s}' has more than one visible {s} in the same control-flow scope",
+                .{ binding_name, allocation.release },
+            );
+            errdefer allocator.free(message);
             try found.append(allocator, .{
                 .rule = .double_release,
                 .span = tokens[release_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
-                    "allocation '{s}' has more than one visible {s} in the same control-flow scope",
-                    .{ binding_name, allocation.release },
-                ),
-                .fixes = try releaseDeletionFix(allocator, tokens, scope_index, release_index),
+                .message = message,
+                .fixes = fixes,
             });
         }
         if (!statementStartsWith(tokens, first_release, .keyword_defer) and

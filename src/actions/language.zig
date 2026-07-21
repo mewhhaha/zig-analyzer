@@ -226,6 +226,7 @@ fn mutablePointerBinding(context: ActionRun, name: []const u8, before: usize) bo
 
 fn captureMutations(context: ActionRun, name: []const u8, start: usize, end: usize) !?[]const usize {
     var mutations: std.ArrayList(usize) = .empty;
+    errdefer mutations.deinit(context.allocator);
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index + 1 >= end) continue;
         if (isAssignment(context.tokens[index + 1].tag)) {

@@ -3815,6 +3815,7 @@ fn findConflictingBuildOptions(
 
 fn collectImports(allocator: std.mem.Allocator, files: []const IndexedSourceFile) ![]const Import {
     var imports: std.ArrayList(Import) = .empty;
+    errdefer imports.deinit(allocator);
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         var brace_depth: usize = 0;
@@ -4223,6 +4224,7 @@ fn collectCalledFunctions(
     body_end: usize,
 ) ![]const []const u8 {
     var calls: std.ArrayList([]const u8) = .empty;
+    errdefer calls.deinit(allocator);
     var index = body_start;
     while (index < body_end) : (index += 1) {
         const token = tokens[index];

@@ -1440,6 +1440,10 @@ pub const Server = struct {
             else => return err,
         };
         const members = try publicModuleMembers(allocator, source);
+        defer {
+            for (members) |member| allocator.free(member.name);
+            allocator.free(members);
+        }
         for (members) |member| {
             if (!std.mem.eql(u8, member.name, name)) continue;
             return try describeBinding(allocator, source, member.span);
@@ -1830,12 +1834,18 @@ pub const Server = struct {
         if (level == .off) return &.{};
         const tokens = document.tokens;
         var candidate_receivers: std.StringHashMapUnmanaged(void) = .empty;
+        defer candidate_receivers.deinit(allocator);
         for (document.declarations) |declaration| {
             if (declaration.brace_depth != 0 or declaration.kind != .constant) continue;
             try candidate_receivers.put(allocator, declaration.name, {});
         }
         var resolved_views: std.StringHashMapUnmanaged(?ModuleView) = .empty;
+        defer resolved_views.deinit(allocator);
         var findings: std.ArrayList(analysis.Finding) = .empty;
+        errdefer {
+            for (findings.items) |finding| allocator.free(finding.message);
+            findings.deinit(allocator);
+        }
         for (tokens, 0..) |member_token, member_index| {
             if (member_token.tag != .identifier or member_index < 2 or
                 tokens[member_index - 1].tag != .period or tokens[member_index - 2].tag != .identifier) continue;
@@ -1855,15 +1865,17 @@ pub const Server = struct {
                 break;
             }
             if (exists or analysis.isSuppressed(document.source, .unresolved_member, member_token.loc.start)) continue;
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "module '{s}' has no public member named '{s}'",
+                .{ receiver, member_name },
+            );
+            errdefer allocator.free(message);
             try findings.append(allocator, .{
                 .rule = .unresolved_member,
                 .level = level,
                 .span = member_token.loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
-                    "module '{s}' has no public member named '{s}'",
-                    .{ receiver, member_name },
-                ),
+                .message = message,
             });
         }
         return try findings.toOwnedSlice(allocator);
@@ -1891,7 +1903,9 @@ pub const Server = struct {
         };
         const tokens = document.tokens;
         var candidate_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer candidate_names.deinit(allocator);
         var shapes: std.ArrayList(analysis.ResolvedShape) = .empty;
+        errdefer shapes.deinit(allocator);
         for (tokens, 0..) |token, index| {
             if (token.tag != .identifier) continue;
             var follows_colon = index > 0 and tokens[index - 1].tag == .colon;
@@ -2389,7 +2403,10 @@ fn siteMembers(
     include_private: bool,
 ) ![]SyntaxMember {
     var members: std.ArrayList(SyntaxMember) = .empty;
-    errdefer members.deinit(allocator);
+    errdefer {
+        for (members.items) |member| allocator.free(member.name);
+        members.deinit(allocator);
+    }
     var brace_depth: usize = 0;
     var parenthesis_depth: usize = 0;
     var public_pending = false;
@@ -2527,6 +2544,7 @@ const DeclarationDescent = union(enum) {
 
 fn dottedPathSegments(allocator: std.mem.Allocator, type_expression: []const u8) !?[]const []const u8 {
     var segments: std.ArrayList([]const u8) = .empty;
+    errdefer segments.deinit(allocator);
     var rest = std.mem.trim(u8, type_expression, " \t\r\n");
     while (true) {
         const boundary = std.mem.indexOfAny(u8, rest, ".(") orelse rest.len;
@@ -2658,6 +2676,7 @@ fn constantTarget(
         if (cursor < tokens.len and tokens[cursor].tag == .period) {
             const last = pathEndIndex(tokens, cursor + 1, tokens.len) orelse return null;
             var tail: std.ArrayList([]const u8) = .empty;
+            errdefer tail.deinit(allocator);
             var member_index = cursor + 1;
             while (member_index <= last) : (member_index += 2) {
                 if (tokens[member_index].tag != .identifier) return null;
@@ -3589,11 +3608,14 @@ fn allocationCleanupEdit(
         if (character != ' ' and character != '\t') break offset;
     } else statement_start;
     const indentation = source[statement_start..indentation_end];
+    const title = try std.fmt.allocPrint(allocator, "Insert defer {s}.{s}({s})", .{ receiver, release, binding_name });
+    errdefer allocator.free(title);
+    const replacement = try std.fmt.allocPrint(allocator, "\n{s}defer {s}.{s}({s});", .{ indentation, receiver, release, binding_name });
     return .{
-        .title = try std.fmt.allocPrint(allocator, "Insert defer {s}.{s}({s})", .{ receiver, release, binding_name }),
+        .title = title,
         .edit = .{
             .span = .{ .start = statement_end, .end = statement_end },
-            .replacement = try std.fmt.allocPrint(allocator, "\n{s}defer {s}.{s}({s});", .{ indentation, receiver, release, binding_name }),
+            .replacement = replacement,
         },
     };
 }
@@ -4099,6 +4121,11 @@ fn deduplicateAndSortDiagnostics(diagnostics: []lsp.types.Diagnostic) usize {
 
 fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![]lsp.types.Diagnostic {
     const diagnostics = try allocator.alloc(lsp.types.Diagnostic, document.tree.errors.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (diagnostics[0..initialized]) |diagnostic| allocator.free(diagnostic.message);
+        allocator.free(diagnostics);
+    }
     for (document.tree.errors, diagnostics) |parse_error, *diagnostic| {
         var message: std.Io.Writer.Allocating = .init(allocator);
         defer message.deinit();
@@ -4113,6 +4140,7 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
             .source = "zig-analyzer parser",
             .message = try message.toOwnedSlice(),
         };
+        initialized += 1;
     }
     return diagnostics;
 }
@@ -4128,6 +4156,19 @@ pub fn compilerDiagnostics(
     const absolute_document_path = try std.fs.path.resolve(allocator, &.{document_path});
     defer allocator.free(absolute_document_path);
     var diagnostics: std.ArrayList(lsp.types.Diagnostic) = .empty;
+    errdefer {
+        for (diagnostics.items) |diagnostic| {
+            allocator.free(diagnostic.message);
+            if (diagnostic.relatedInformation) |related_information| {
+                for (related_information) |information| {
+                    allocator.free(information.location.uri);
+                    allocator.free(information.message);
+                }
+                allocator.free(related_information);
+            }
+        }
+        diagnostics.deinit(allocator);
+    }
     for (bundle.getMessages()) |message_index| {
         const error_message = bundle.getErrorMessage(message_index);
         if (error_message.src_loc == .none) continue;
@@ -4142,6 +4183,13 @@ pub fn compilerDiagnostics(
         const start = @min(line_start + start_column, document.source.len);
         const end = @min(start + span_length, document.source.len);
         var related: std.ArrayList(lsp.types.Diagnostic.RelatedInformation) = .empty;
+        errdefer {
+            for (related.items) |information| {
+                allocator.free(information.location.uri);
+                allocator.free(information.message);
+            }
+            related.deinit(allocator);
+        }
         for (bundle.getNotes(message_index)) |note_index| {
             const note = bundle.getErrorMessage(note_index);
             if (note.src_loc == .none) continue;
@@ -4164,18 +4212,31 @@ pub fn compilerDiagnostics(
                 },
                 try std.fmt.allocPrint(allocator, "file://{s}", .{note_path}),
             };
+            errdefer allocator.free(note_uri);
+            const note_message = try allocator.dupe(u8, bundle.nullTerminatedString(note.msg));
+            errdefer allocator.free(note_message);
             try related.append(allocator, .{
                 .location = .{ .uri = note_uri, .range = note_range },
-                .message = try allocator.dupe(u8, bundle.nullTerminatedString(note.msg)),
+                .message = note_message,
             });
         }
+        const diagnostic_message = try allocator.dupe(u8, bundle.nullTerminatedString(error_message.msg));
+        errdefer allocator.free(diagnostic_message);
+        const related_information = if (related.items.len == 0) null else try related.toOwnedSlice(allocator);
+        errdefer if (related_information) |information_items| {
+            for (information_items) |information| {
+                allocator.free(information.location.uri);
+                allocator.free(information.message);
+            }
+            allocator.free(information_items);
+        };
         try diagnostics.append(allocator, .{
             .range = document.range(.{ .start = start, .end = end }),
             .severity = .Error,
             .code = .{ .string = "compiler-error" },
             .source = "zig compiler",
-            .message = try allocator.dupe(u8, bundle.nullTerminatedString(error_message.msg)),
-            .relatedInformation = if (related.items.len == 0) null else try related.toOwnedSlice(allocator),
+            .message = diagnostic_message,
+            .relatedInformation = related_information,
         });
     }
     return try diagnostics.toOwnedSlice(allocator);
@@ -4253,6 +4314,7 @@ fn semanticTokens(
     requested_range: ?lsp.types.Range,
 ) ![]u32 {
     var encoded: std.ArrayList(u32) = .empty;
+    errdefer encoded.deinit(allocator);
     var previous_line: u32 = 0;
     var previous_character: u32 = 0;
     var tokenizer = std.zig.Tokenizer.init(document.source);

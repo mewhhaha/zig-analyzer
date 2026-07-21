@@ -22,6 +22,7 @@ pub fn run(context: RuleRun) !void {
         if (bindingIsMutatedThroughUnwrap(context, optional_name, condition_index + 8, body_end)) continue;
 
         var edits: std.ArrayList(types.Edit) = .empty;
+        errdefer edits.deinit(context.allocator);
         for (context.tokens[condition_index + 8 .. body_end], condition_index + 8..) |body_token, index| {
             if (body_token.tag != .identifier or !context.refersToBinding(index, optional_name) or index + 2 >= body_end or
                 context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .question_mark) continue;

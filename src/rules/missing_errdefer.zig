@@ -555,20 +555,23 @@ fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level)
             statementStart(context.tokens, fallible_index),
             fallible_end,
         )) continue;
+        const related = try singleRelatedSpan(
+            context,
+            fallible_index,
+            "this fallible insertion leaves the value with the caller on failure",
+        );
+        const message = try std.fmt.allocPrint(
+            context.allocator,
+            "cleanup-capable value '{s}' is not released if its container insertion fails",
+            .{binding},
+        );
+        errdefer context.allocator.free(message);
         try context.emit(.{
             .rule = .missing_errdefer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
-                "cleanup-capable value '{s}' is not released if its container insertion fails",
-                .{binding},
-            ),
-            .related = try singleRelatedSpan(
-                context,
-                fallible_index,
-                "this fallible insertion leaves the value with the caller on failure",
-            ),
+            .message = message,
+            .related = related,
         });
     }
 }

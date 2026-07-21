@@ -138,16 +138,19 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             const rule: types.Rule = if (declaration.error_set) .exposed_private_error_set else .exposed_private_type;
             const level = if (declaration.error_set) error_level else type_level;
             if (level == .off) continue;
+            const related = try relatedDeclaration(context, declaration);
+            const message = try std.fmt.allocPrint(
+                context.allocator,
+                "public declaration exposes private {s} '{s}', which callers cannot name",
+                .{ if (declaration.error_set) "error set" else "type", declaration.name },
+            );
+            errdefer context.allocator.free(message);
             try context.emit(.{
                 .rule = rule,
                 .level = level,
                 .span = context.tokens[reference].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
-                    "public declaration exposes private {s} '{s}', which callers cannot name",
-                    .{ if (declaration.error_set) "error set" else "type", declaration.name },
-                ),
-                .related = try relatedDeclaration(context, declaration),
+                .message = message,
+                .related = related,
             });
         }
     }

@@ -192,12 +192,14 @@ fn cImportAction(
         }
         occurrence.edit.replacement = try std.fmt.allocPrint(allocator, "@import(\"{s}\").c", .{relative_path});
     }
+    const created_source = try std.fmt.allocPrint(allocator, "pub const c = {s};\n", .{c_import_source});
+    errdefer allocator.free(created_source);
     return .{
         .title = "Extract repeated @cImport into c_imports.zig",
         .edits = try occurrences.toOwnedSlice(allocator),
         .created_file = .{
             .uri = wrapper_uri,
-            .source = try std.fmt.allocPrint(allocator, "pub const c = {s};\n", .{c_import_source}),
+            .source = created_source,
         },
     };
 }
@@ -227,6 +229,7 @@ fn matchingCImports(
     const tokens = try action_context.tokenize(allocator, source);
     defer allocator.free(tokens);
     var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
+    errdefer spans.deinit(allocator);
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or !tokenIs(source, token, "@cImport") or index + 1 >= tokens.len or
             tokens[index + 1].tag != .l_paren) continue;

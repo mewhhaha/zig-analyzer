@@ -1721,16 +1721,19 @@ fn findUnusedPrivateDeclarations(
         if (std.mem.eql(u8, name, "_") or std.mem.startsWith(u8, name, "@\"") or
             isImplicitDeclarationName(name) or (occurrence_counts.get(name) orelse 0) != 1 or
             reflected_names.names.contains(name)) continue;
+        const fixes = try unusedDeclarationFixes(allocator, source, tokens, declaration);
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "private {s} '{s}' is never referenced",
+            .{ @tagName(declaration.kind), name },
+        );
+        errdefer allocator.free(message);
         try addFinding(allocator, source, configuration, found, .{
             .rule = .unused_private_declaration,
             .level = level,
             .span = name_token.loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
-                "private {s} '{s}' is never referenced",
-                .{ @tagName(declaration.kind), name },
-            ),
-            .fixes = try unusedDeclarationFixes(allocator, source, tokens, declaration),
+            .message = message,
+            .fixes = fixes,
         });
     }
 }
@@ -1869,6 +1872,10 @@ fn collectContainers(
     tokens: []const std.zig.Token,
 ) ![]Container {
     var containers: std.ArrayList(Container) = .empty;
+    errdefer {
+        for (containers.items) |container| allocator.free(container.fields);
+        containers.deinit(allocator);
+    }
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_const or index + 4 >= tokens.len or tokens[index + 1].tag != .identifier or
             tokens[index + 2].tag != .equal)
@@ -1895,6 +1902,7 @@ fn collectContainers(
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
         const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
         const fields = try collectContainerFields(allocator, source, tokens, opening, closing, kind);
+        errdefer allocator.free(fields);
         try containers.append(allocator, .{
             .name = tokenText(source, tokens[index + 1]),
             .kind = kind,

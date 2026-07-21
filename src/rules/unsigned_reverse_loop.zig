@@ -35,16 +35,19 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[update_opening].tag != .l_paren) continue;
             const update_end = context.matchingToken(update_opening, .l_paren, .r_paren) orelse continue;
             if (!decrementsByOne(context, index_name, update_opening + 1, update_end)) continue;
+            const fixes = try reverseLoopFix(context, index_name, declaration_end, while_index, update_end);
+            const message = try std.fmt.allocPrint(
+                context.allocator,
+                "unsigned loop index '{s}' is always greater than or equal to zero; decrementing it in the loop update underflows after zero",
+                .{index_name},
+            );
+            errdefer context.allocator.free(message);
             try context.emit(.{
                 .rule = .unsigned_reverse_loop,
                 .level = level,
                 .span = context.tokens[while_index + 3].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
-                    "unsigned loop index '{s}' is always greater than or equal to zero; decrementing it in the loop update underflows after zero",
-                    .{index_name},
-                ),
-                .fixes = try reverseLoopFix(context, index_name, declaration_end, while_index, update_end),
+                .message = message,
+                .fixes = fixes,
             });
         }
     }
