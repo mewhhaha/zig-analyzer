@@ -5,12 +5,14 @@ const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catc
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = optimize != .Debug;
 
     const build_options = b.addOptions();
     build_options.addOption(std.SemanticVersion, "version", version);
     build_options.addOption([]const u8, "version_string", @import("build.zig.zon").version);
     build_options.addOption([]const u8, "zig_version", "0.16.0");
     build_options.addOption([]const u8, "zig_commit", "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8");
+    build_options.addOption([]const u8, "compiler_patch_sha256", "bc9111e57720fe54ec086f5cd723c63adf74a3c0212f1946c54f609b5b28485f");
     build_options.addOption(u16, "compiler_protocol_version", 5);
 
     const lsp_module = b.dependency("lsp_kit", .{
@@ -34,6 +36,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{.{ .name = "zig_analyzer", .module = analyzer_module }},
         }),
     });

@@ -112,7 +112,10 @@ Worst-case single-file analysis time on that corpus is 39 ms.
 
 ## Installation
 
-Building requires Zig 0.16.0 exactly:
+The `0.16.0-1` release provides a relocatable x86_64 Linux archive containing
+both zig-analyzer and its patched compiler backend. Verify the published
+SHA-256 checksum before installing it. Building from source requires Zig
+0.16.0 exactly:
 
 ```sh
 zig build -Doptimize=ReleaseFast
@@ -133,22 +136,21 @@ meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
 ## Project status
 
-zig-analyzer is an experiment, not a production language server. Most of its
-code was written by LLM agents working against the repository's review
-findings and test suite. The lint rules combine token-level file analysis,
-conservative cross-file summaries, and compiler-backed project facts; they
-stay opaque when a relationship cannot be proven. The compiler backend is
-pinned to exactly Zig 0.16.0 and requires porting work for each new Zig
-release. [TASKS.md](TASKS.md) records which planned work is complete.
+zig-analyzer is pre-1.0 software with a narrow compatibility boundary: each
+release supports exactly one Zig version. The lint rules combine token-level
+file analysis, conservative cross-file summaries, and compiler-backed project
+facts; they stay opaque when a relationship cannot be proven. The compiler
+backend is pinned to exactly Zig 0.16.0 and requires porting work for each new
+Zig release. [TASKS.md](TASKS.md) records which planned work is complete.
 
 The project's claim is narrow: querying the compiler produces better editor
 answers than reimplementing it.
 
 ## Contributing and license
 
-This repository does not accept pull requests; there is no maintenance
-commitment behind it. It is MIT-licensed, so fork freely — the rules, the
-example fixtures, and the backend protocol can all be reused without
-permission. [ARCHITECTURE.md](ARCHITECTURE.md) documents the module
-boundaries, [EXTENDING.md](EXTENDING.md) the extension seams, and
+The project is MIT-licensed; distributed third-party licenses are recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Report security issues using
+the private process in [SECURITY.md](SECURITY.md).
+[ARCHITECTURE.md](ARCHITECTURE.md) documents the module boundaries,
+[EXTENDING.md](EXTENDING.md) the extension seams, and
 [`src/rules/README.md`](src/rules/README.md) the rule contract.

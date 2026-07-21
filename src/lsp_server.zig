@@ -997,7 +997,6 @@ pub const Server = struct {
         if (server.compiler != null or server.compiler_start_attempted) return;
         server.compiler_start_attempted = true;
         if (server.documents.getConst(uri) == null) return;
-        if (!try pathExists(server.io, backend_bootstrap.backend_binary)) return;
         const document_path = try filePathFromUri(allocator, uri) orelse return;
         if (!try pathExists(server.io, document_path)) return;
         const root_source_path = try compile_units.rootSourceForDocument(server.io, allocator, document_path);
@@ -2089,10 +2088,9 @@ pub const Server = struct {
 
     fn zigLibDirectory(server: *Server) ![]const u8 {
         if (server.zig_lib_directory) |directory| return directory;
-        const zig_binary = if (try pathExists(server.io, backend_bootstrap.backend_binary))
-            backend_bootstrap.backend_binary
-        else
-            "zig";
+        var backend = try backend_bootstrap.findBackend(server.io, server.allocator);
+        defer if (backend) |*installed| installed.deinit(server.allocator);
+        const zig_binary = if (backend) |installed| installed.binary_path else "zig";
         const result = try std.process.run(server.allocator, server.io, .{
             .argv = &.{ zig_binary, "env" },
             .stdout_limit = .limited(1024 * 1024),
@@ -4636,10 +4634,9 @@ fn isIdentifier(name: []const u8) bool {
 }
 
 fn formatSource(io: std.Io, allocator: std.mem.Allocator, source: []const u8) ![]u8 {
-    const zig_binary = if (try pathExists(io, backend_bootstrap.backend_binary))
-        backend_bootstrap.backend_binary
-    else
-        "zig";
+    var backend = try backend_bootstrap.findBackend(io, allocator);
+    defer if (backend) |*installed| installed.deinit(allocator);
+    const zig_binary = if (backend) |installed| installed.binary_path else "zig";
     var child = try std.process.spawn(io, .{
         .argv = &.{ zig_binary, "fmt", "--stdin" },
         .stdin = .pipe,

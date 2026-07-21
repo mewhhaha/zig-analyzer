@@ -1,12 +1,8 @@
 # Editor setup
 
-Build zig-analyzer first by following the [source installation guide](installation.md).
+Install zig-analyzer by following the [installation guide](installation.md).
 Every editor must start the executable with the `lsp` argument. Use an absolute
 path unless `zig-analyzer` is already on `PATH`.
-
-For compiler-backed analysis in a Zig 0.16 workspace, also create the backend
-link described in the installation guide. Without it, the language server
-continues with syntax features and lint diagnostics.
 
 ## Helix
 

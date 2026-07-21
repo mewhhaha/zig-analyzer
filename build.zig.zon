@@ -1,6 +1,6 @@
 .{
     .name = .zig_analyzer,
-    .version = "0.16.0-dev",
+    .version = "0.16.0-1",
     .fingerprint = 0xb193caa5a0f3b836, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -24,6 +24,8 @@
         "EXTENDING.md",
         "LICENSE",
         "README.md",
+        "SECURITY.md",
         "TASKS.md",
+        "THIRD_PARTY_NOTICES.md",
     },
 }

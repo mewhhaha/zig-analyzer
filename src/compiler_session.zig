@@ -24,6 +24,8 @@ pub const Session = struct {
         environ: std.process.Environ,
         root_source_path: []const u8,
     ) !Session {
+        var backend = (try backend_bootstrap.findBackend(io, allocator)) orelse return error.CompilerBackendNotFound;
+        defer backend.deinit(allocator);
         try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/analysis-cache");
         try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/compiler-global-cache");
         var random_bytes: [18]u8 = undefined;
@@ -40,7 +42,7 @@ pub const Session = struct {
 
         var child = try std.process.spawn(io, .{
             .argv = &.{
-                backend_bootstrap.backend_binary,
+                backend.binary_path,
                 "build-obj",
                 root_source_path,
                 "-fincremental",

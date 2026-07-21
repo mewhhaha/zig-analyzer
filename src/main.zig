@@ -148,45 +148,35 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
 
     try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: Zig 0.16.0 is available\n");
 
-    var manifest = zig_analyzer.backend_bootstrap.readManifest(io, allocator) catch |err| switch (err) {
-        error.FileNotFound => {
-            try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: compiler backend is not bootstrapped\n");
-            return 1;
-        },
-        else => {
-            var buffer: [512]u8 = undefined;
-            var file_writer = std.Io.File.stderr().writer(io, &buffer);
-            try file_writer.interface.print("zig-analyzer doctor: backend manifest {s} is unreadable ({t}); rerun 'zig build backend'\n", .{
-                zig_analyzer.backend_bootstrap.manifest_path,
-                err,
-            });
-            try file_writer.interface.flush();
-            return 1;
-        },
+    var backend = (try zig_analyzer.backend_bootstrap.findBackend(io, allocator)) orelse {
+        try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend is missing; install a release archive or run 'zig build backend'\n");
+        return 1;
+    };
+    defer backend.deinit(allocator);
+    var manifest = zig_analyzer.backend_bootstrap.readManifestAt(io, allocator, backend.manifest_path) catch |err| {
+        var buffer: [512]u8 = undefined;
+        var file_writer = std.Io.File.stderr().writer(io, &buffer);
+        try file_writer.interface.print("zig-analyzer doctor: backend manifest {s} is unreadable ({t})\n", .{ backend.manifest_path, err });
+        try file_writer.interface.flush();
+        return 1;
     };
     defer manifest.deinit();
 
     const expected_patch_sha256 = try zig_analyzer.backend_bootstrap.expectedPatchSha256(io, allocator);
     defer allocator.free(expected_patch_sha256);
     const expected = zig_analyzer.build_options;
-    if (!std.mem.eql(u8, manifest.value.zig_version, expected.zig_version) or
+    if (!std.mem.eql(u8, manifest.value.analyzer_version, expected.version_string) or
+        !std.mem.eql(u8, manifest.value.zig_version, expected.zig_version) or
         !std.mem.eql(u8, manifest.value.zig_commit, expected.zig_commit) or
         !std.mem.eql(u8, manifest.value.patch_sha256, expected_patch_sha256) or
         manifest.value.compiler_protocol_version != expected.compiler_protocol_version)
     {
-        try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend manifest is incompatible; rerun 'zig build backend'\n");
+        try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend manifest is incompatible with this executable\n");
         return 1;
     }
-    std.Io.Dir.cwd().access(io, zig_analyzer.backend_bootstrap.backend_binary, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend binary is missing\n");
-            return 1;
-        },
-        else => return err,
-    };
 
     const backend_version = try std.process.run(allocator, io, .{
-        .argv = &.{ zig_analyzer.backend_bootstrap.backend_binary, "version" },
+        .argv = &.{ backend.binary_path, "version" },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(1024),
     });

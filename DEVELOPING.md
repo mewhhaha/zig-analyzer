@@ -136,3 +136,23 @@ compiler-backend manifest. If the patch or protocol changes, rerun
 `zig build backend`, followed by `zig build install` for an existing
 installation. A backend using any protocol version other than the one printed
 by `zig-analyzer version` is not compatible with the current analyzer.
+
+## Publishing a release
+
+Update `build.zig.zon` to the next version described in
+[`docs/versioning.md`](docs/versioning.md), update the release version in the
+installation documentation, and merge only after CI passes on `main`. Then
+create and push an annotated tag with the same version:
+
+```sh
+git switch main
+git pull --ff-only
+git tag -a v0.16.0-1 -m "zig-analyzer 0.16.0-1"
+git push origin v0.16.0-1
+```
+
+The Release workflow rejects a tag that differs from `build.zig.zon`, reruns
+formatting and the complete test suite, builds the analyzer and patched
+compiler from pinned inputs, exercises the assembled installation from a
+temporary workspace, and publishes the archive with its SHA-256 checksum.
+Never replace an existing release tag; increment the release suffix instead.

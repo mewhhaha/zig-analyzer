@@ -42,6 +42,6 @@ deliberately falls back to syntax features and lint diagnostics; the
 
 ## Current status
 
-There is no packaged release yet; build from source as described in the
-[installation guide](installation.md). Tagged releases will follow the scheme
-above, beginning with `0.16.0-1`.
+The first packaged release is `0.16.0-1`. The
+[installation guide](installation.md) describes the release archive and source
+build.
