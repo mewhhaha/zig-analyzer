@@ -17,6 +17,11 @@ pub fn run(context: RuleRun) !void {
             const partial_read = partialRead(method) orelse continue;
             if (method_index < 2 or context.tokens[method_index - 2].tag != .identifier or
                 !ioReceiver(context.tokenText(method_index - 2))) continue;
+            const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
+            if (readDestination(context, method_index + 2, call_end)) |destination| {
+                const scope_end = context.enclosingScopeEnd(equal_index) orelse continue;
+                if (!bindingUsedAfter(context, destination, statement_end + 1, scope_end)) continue;
+            }
             try context.emit(.{
                 .rule = .discarded_read_count,
                 .level = level,
@@ -37,6 +42,28 @@ pub fn run(context: RuleRun) !void {
             break;
         }
     }
+}
+
+fn readDestination(context: RuleRun, start: usize, end: usize) ?[]const u8 {
+    var depth: usize = 0;
+    for (context.tokens[start..end], start..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .comma => if (depth == 0) return null,
+        .identifier => if (depth <= 1 and (index == start or context.tokens[index - 1].tag != .period)) {
+            return context.tokenText(index);
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn bindingUsedAfter(context: RuleRun, binding: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, binding) and
+            (index == 0 or context.tokens[index - 1].tag != .period)) return true;
+    }
+    return false;
 }
 
 fn ioReceiver(name: []const u8) bool {
@@ -74,12 +101,32 @@ test "discarded partial read counts report" {
         "    _ = try reader.readVec(buffers);\n" ++
         "    _ = try reader.readSliceShort(bytes);\n" ++
         "    _ = try reader.read(bytes);\n" ++
+        "    consume(buffers, bytes);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "readVecAll") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "readSliceAll") != null);
+}
+
+test "discarded reads used only for their side effect stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn consumeEvent(fd: anytype) void { var bytes: [8]u8 = undefined; _ = std.posix.read(fd, &bytes) catch {}; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "discarded reads track a sliced destination instead of its bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn receive(reader: anytype, limit: usize) !void { var bytes: [8]u8 = undefined; " ++
+        "_ = try reader.read(bytes[0..limit]); consume(bytes); }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 test "complete reads and handled counts stay clean" {

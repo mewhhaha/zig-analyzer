@@ -29,6 +29,7 @@ const rule_modules = .{
     @import("unbraced_multiline_if.zig"),
     @import("unconditional_busy_loop.zig"),
     @import("unchecked_first_element.zig"),
+    @import("unsequenced_state_access.zig"),
     @import("unchecked_slice_reinterpretation.zig"),
     @import("undefined_readvec_destination.zig"),
     @import("unsigned_reverse_loop.zig"),

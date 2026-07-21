@@ -140,6 +140,10 @@ Compiler-backed project rules are opt-in.
   child that leaves scope without wait, kill, or ownership transfer.
 - [`overflow-before-clamp`](overflow-before-clamp.md) — Reports direct checked
   integer arithmetic that can overflow before `@min` or `@max` applies its bound.
+- [`unchecked-range-end`](unchecked-range-end.md) — Reports runtime range-end
+  addition that can overflow before a comparison validates the range.
+- [`unsequenced-state-access`](unsequenced-state-access.md) — Reports aggregate
+  literals that copy a mutable local in one field and advance it in another.
 - [`quadratic-front-removal`](quadratic-front-removal.md) — Reports repeated
   `orderedRemove(0)` calls while draining an array list.
 - [`aliased-memcpy`](aliased-memcpy.md) — Reports `@memcpy` source and

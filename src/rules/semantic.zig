@@ -157,6 +157,7 @@ pub fn findingsWithShapesAndTokens(
             &scope_index,
             configuration,
         );
+        defer allocator.free(allocation_findings);
         for (allocation_findings) |finding| try addFinding(allocator, source, configuration, &found, .{
             .rule = finding.rule,
             .level = configuration.level(finding.rule),
@@ -1001,7 +1002,10 @@ fn findMissingResourceCleanup(
     const resource_pairs = [_]ResourcePair{
         .{ .acquisition = "openFile", .release = "close" },
         .{ .acquisition = "createFile", .release = "close" },
+        .{ .acquisition = "openFileAbsolute", .release = "close" },
+        .{ .acquisition = "createFileAbsolute", .release = "close" },
         .{ .acquisition = "openDir", .release = "close" },
+        .{ .acquisition = "openDirAbsolute", .release = "close" },
         .{ .acquisition = "openIterableDir", .release = "close" },
         .{ .acquisition = "spawn", .release = "join", .alternative_release = "detach" },
         .{ .acquisition = "init", .release = "deinit" },
@@ -1014,6 +1018,7 @@ fn findMissingResourceCleanup(
         if (!insideFunctionOrTestBody(tokens, declaration_index)) continue;
         const statement_end = statementEnd(tokens, declaration_index) orelse continue;
         var pair: ?ResourcePair = null;
+        var resource_acquisition_index: ?usize = null;
         var acquisition_index: usize = declaration_index + 3;
         while (acquisition_index < statement_end) : (acquisition_index += 1) {
             switch (tokens[acquisition_index].tag) {
@@ -1031,11 +1036,17 @@ fn findMissingResourceCleanup(
                 if ((std.mem.eql(u8, name, "init") or std.mem.eql(u8, name, "initCapacity")) and
                     !initializerNamesManagedResource(source, tokens, declaration_index + 3, acquisition_index)) continue;
                 pair = candidate;
+                resource_acquisition_index = acquisition_index;
                 break;
             };
             if (pair != null) break;
         }
         const resource = pair orelse continue;
+        const release_uses_first_argument = absoluteIoDirectoryCall(source, tokens, resource_acquisition_index.?);
+        const release_argument = if (release_uses_first_argument)
+            firstSimpleCallArgument(source, tokens, resource_acquisition_index.?)
+        else
+            null;
         const scope_end = enclosingScopeEnd(tokens, declaration_index) orelse continue;
         const binding_name = tokenText(source, tokens[declaration_index + 1]);
         if (bindingHasRelease(source, tokens, binding_name, statement_end + 1, scope_end, resource.release, resource.alternative_release) or
@@ -1043,22 +1054,30 @@ fn findMissingResourceCleanup(
         const line_start = lineStart(source, tokens[declaration_index].loc.start);
         var indentation_end = line_start;
         while (indentation_end < source.len and (source[indentation_end] == ' ' or source[indentation_end] == '\t')) indentation_end += 1;
-        const edits = try allocator.alloc(Edit, 1);
-        edits[0] = .{
-            .span = .{ .start = tokens[statement_end].loc.end, .end = tokens[statement_end].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                allocator,
-                "\n{s}defer {s}.{s}();",
-                .{ source[line_start..indentation_end], binding_name, resource.release },
-            ),
-        };
-        const fixes = try allocator.alloc(Fix, 1);
-        fixes[0] = .{
-            .title = try std.fmt.allocPrint(allocator, "Insert 'defer {s}.{s}()'", .{ binding_name, resource.release }),
-            .kind = .quickfix,
-            .edits = edits,
-            .preferred = true,
-        };
+        var fixes: []const Fix = &.{};
+        if (!release_uses_first_argument or release_argument != null) {
+            const edits = try allocator.alloc(Edit, 1);
+            edits[0] = .{
+                .span = .{ .start = tokens[statement_end].loc.end, .end = tokens[statement_end].loc.end },
+                .replacement = try std.fmt.allocPrint(
+                    allocator,
+                    "\n{s}defer {s}.{s}({s});",
+                    .{ source[line_start..indentation_end], binding_name, resource.release, release_argument orelse "" },
+                ),
+            };
+            const allocated_fixes = try allocator.alloc(Fix, 1);
+            allocated_fixes[0] = .{
+                .title = try std.fmt.allocPrint(
+                    allocator,
+                    "Insert 'defer {s}.{s}({s})'",
+                    .{ binding_name, resource.release, release_argument orelse "" },
+                ),
+                .kind = .quickfix,
+                .edits = edits,
+                .preferred = true,
+            };
+            fixes = allocated_fixes;
+        }
         try addFinding(allocator, source, configuration, found, .{
             .rule = .missing_resource_cleanup,
             .level = level,
@@ -1113,6 +1132,24 @@ fn findMissingResourceCleanup(
             .message = try std.fmt.allocPrint(allocator, "mutex '{s}' is locked without a visible unlock before leaving this scope", .{receiver}),
         });
     }
+}
+
+fn firstSimpleCallArgument(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    call_index: usize,
+) ?[]const u8 {
+    if (call_index + 3 >= tokens.len or tokens[call_index + 1].tag != .l_paren or
+        tokens[call_index + 2].tag != .identifier or
+        (tokens[call_index + 3].tag != .comma and tokens[call_index + 3].tag != .r_paren)) return null;
+    return tokenText(source, tokens[call_index + 2]);
+}
+
+fn absoluteIoDirectoryCall(source: []const u8, tokens: []const std.zig.Token, call_index: usize) bool {
+    return call_index >= 6 and tokens[call_index - 1].tag == .period and
+        tokenIs(source, tokens[call_index - 2], "Dir") and tokens[call_index - 3].tag == .period and
+        tokenIs(source, tokens[call_index - 4], "Io") and tokens[call_index - 5].tag == .period and
+        tokenIs(source, tokens[call_index - 6], "std");
 }
 
 fn explicitErrorReturnBetween(
@@ -1879,6 +1916,7 @@ fn collectContainerFields(
     kind: ContainerKind,
 ) ![]Field {
     var fields: std.ArrayList(Field) = .empty;
+    errdefer fields.deinit(allocator);
     var brace_depth: usize = 1;
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;
@@ -3283,6 +3321,7 @@ fn findOfficialStyleIssues(
             if (pub_index > 0 and tokens[pub_index - 1].tag == .doc_comment) continue;
             const declaration_name = tokenText(source, tokens[pub_index + 2]);
             if (declaration_tag == .keyword_fn and std.mem.eql(u8, declaration_name, "main")) continue;
+            if (declaration_tag == .keyword_fn and isBuildEntryPoint(source, tokens, pub_index + 2)) continue;
             try addFinding(allocator, source, configuration, found, .{
                 .rule = .public_declaration_docs,
                 .level = public_docs_level,
@@ -3291,6 +3330,18 @@ fn findOfficialStyleIssues(
             });
         }
     }
+}
+
+fn isBuildEntryPoint(source: []const u8, tokens: []const std.zig.Token, name_index: usize) bool {
+    if (!tokenIs(source, tokens[name_index], "build") or name_index + 1 >= tokens.len or
+        tokens[name_index + 1].tag != .l_paren) return false;
+    const parameters_end = matchingToken(tokens, name_index + 1, .l_paren, .r_paren) orelse return false;
+    for (tokens[name_index + 2 .. parameters_end], name_index + 2..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(source, token, "Build") or index < 2) continue;
+        if (tokens[index - 1].tag == .period and tokens[index - 2].tag == .identifier and
+            tokenIs(source, tokens[index - 2], "std")) return true;
+    }
+    return false;
 }
 
 fn vagueTypeWord(name: []const u8) ?[]const u8 {
@@ -4126,6 +4177,7 @@ fn enclosingScopeEnd(tokens: []const std.zig.Token, index: usize) ?usize {
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    errdefer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
@@ -5360,6 +5412,22 @@ test "main entry points do not require API documentation" {
     for (found) |finding| try std.testing.expect(finding.rule != .public_declaration_docs);
 }
 
+test "build entry points do not require API documentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn build(builder: *std.Build) void { _ = builder; }\n" ++
+        "pub fn buildCache() void {}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.public_declaration_docs)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var docs_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == .public_declaration_docs) docs_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), docs_count);
+}
+
 test "needless cast proof stays within the enclosing function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5680,6 +5748,71 @@ test "missing resource cleanup offers inserting a defer after the acquisition" {
         try std.testing.expectEqual(edit.span.start, edit.span.end);
         try std.testing.expectEqual(std.mem.indexOfScalar(u8, source, ';').? + 1, edit.span.start);
         try std.testing.expectEqualStrings("\n    defer file.close();", edit.replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "absolute file cleanup preserves the IO argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load(io: std.Io) !void {\n" ++
+        "    const file = try std.Io.Dir.openFileAbsolute(io, \"/tmp/state\", .{});\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        cleanup_count += 1;
+        try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+        try std.testing.expectEqualStrings("\n    defer file.close(io);", finding.fixes[0].edits[0].replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "absolute directory cleanup preserves the IO argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load(io: std.Io) !void {\n" ++
+        "    const directory = try std.Io.Dir.openDirAbsolute(io, \"/tmp/state\", .{});\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        cleanup_count += 1;
+        try std.testing.expectEqualStrings("\n    defer directory.close(io);", finding.fixes[0].edits[0].replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "legacy absolute directory cleanup does not pass the path to close" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load(path: []const u8) !void {\n" ++
+        "    const directory = try std.fs.openDirAbsolute(path, .{});\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        cleanup_count += 1;
+        try std.testing.expectEqualStrings("\n    defer directory.close();", finding.fixes[0].edits[0].replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "absolute file cleanup still reports when the IO argument is not a simple binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn load(threaded: *Threaded) !void {\n" ++
+        "    const file = try std.Io.Dir.openFileAbsolute(threaded.io(), \"/tmp/state\", .{});\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
+        cleanup_count += 1;
+        try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
     };
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }

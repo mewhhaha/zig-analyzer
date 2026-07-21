@@ -681,7 +681,9 @@ pub const Server = struct {
                 try reflectionStringSpans(arena, origin.source, name)
             else
                 &.{};
-            const edits = try arena.alloc(lsp.types.TextEdit, spans.len + reflected_spans.len);
+            const edit_count = std.math.add(usize, spans.len, reflected_spans.len) catch
+                return error.RequestFailed;
+            const edits = try arena.alloc(lsp.types.TextEdit, edit_count);
             for (spans, edits[0..spans.len]) |span, *edit| {
                 edit.* = .{ .range = origin.range(span), .newText = new_name };
             }
@@ -1201,7 +1203,9 @@ pub const Server = struct {
         identifier_span: std.zig.Token.Loc,
     ) !?lsp.types.Location {
         const tokens = try tokenize(allocator, document.source);
+        defer allocator.free(tokens);
         const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
+        defer allocator.free(document_path);
         for (tokens, 0..) |token, import_index| {
             if (token.tag != .builtin or import_index + 5 >= tokens.len or
                 !std.mem.eql(u8, document.source[token.loc.start..token.loc.end], "@import") or
@@ -1212,6 +1216,7 @@ pub const Server = struct {
                 continue;
             }
             var preceding_members: std.ArrayList([]const u8) = .empty;
+            defer preceding_members.deinit(allocator);
             var member_index = import_index + 4;
             while (member_index + 1 < tokens.len and
                 tokens[member_index].tag == .period and
@@ -1788,6 +1793,7 @@ pub const Server = struct {
     ) ![]analysis.Finding {
         const resolved_shapes = try server.compilerTypeShapes(allocator, document);
         var document_findings: std.ArrayList(analysis.Finding) = .empty;
+        errdefer document_findings.deinit(allocator);
         try document_findings.appendSlice(
             allocator,
             try analysis.findingsWithShapesAndTokens(
@@ -2033,6 +2039,7 @@ pub const Server = struct {
         prefix: []const u8,
     ) ![]const lsp.types.completion.Item {
         var completions: std.ArrayList(lsp.types.completion.Item) = .empty;
+        errdefer completions.deinit(allocator);
         if (std.mem.indexOfScalar(u8, prefix, '/') == null) {
             for ([_][]const u8{ "std", "builtin", "root" }) |name| {
                 if (!std.mem.startsWith(u8, name, prefix)) continue;
@@ -2382,6 +2389,7 @@ fn siteMembers(
     include_private: bool,
 ) ![]SyntaxMember {
     var members: std.ArrayList(SyntaxMember) = .empty;
+    errdefer members.deinit(allocator);
     var brace_depth: usize = 0;
     var parenthesis_depth: usize = 0;
     var public_pending = false;
@@ -4283,6 +4291,7 @@ fn typeInlayHints(
     requested_range: lsp.types.Range,
 ) ![]const lsp.types.InlayHint {
     var hints: std.ArrayList(lsp.types.InlayHint) = .empty;
+    errdefer hints.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(document.source);
     while (true) {
         const declaration_token = tokenizer.next();

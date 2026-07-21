@@ -98,7 +98,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 156 rules with stable codes, organized into five named profiles,
+There are 158 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings

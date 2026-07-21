@@ -32,6 +32,7 @@ pub fn actions(
     documents: []const OpenDocument,
 ) ![]const Candidate {
     var candidates: std.ArrayList(Candidate) = .empty;
+    errdefer candidates.deinit(allocator);
     if (try buildImportAction(allocator, current_uri, current_source, selection, documents)) |candidate| {
         try candidates.append(allocator, candidate);
     }
@@ -168,8 +169,10 @@ fn cImportAction(
     const selected = try selectedCImport(allocator, current_source, selection) orelse return null;
     const c_import_source = current_source[selected.start..selected.end];
     var occurrences: std.ArrayList(FileEdit) = .empty;
+    defer occurrences.deinit(allocator);
     for (documents) |document| {
         const spans = try matchingCImports(allocator, document.source, c_import_source);
+        defer allocator.free(spans);
         for (spans) |span| {
             try occurrences.append(allocator, .{ .uri = document.uri, .edit = .{ .span = span, .replacement = "" } });
         }
@@ -205,6 +208,7 @@ fn selectedCImport(
     selection: std.zig.Token.Loc,
 ) !?std.zig.Token.Loc {
     const tokens = try action_context.tokenize(allocator, source);
+    defer allocator.free(tokens);
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or !tokenIs(source, token, "@cImport") or index + 1 >= tokens.len or
             tokens[index + 1].tag != .l_paren) continue;
@@ -221,6 +225,7 @@ fn matchingCImports(
     expected: []const u8,
 ) ![]const std.zig.Token.Loc {
     const tokens = try action_context.tokenize(allocator, source);
+    defer allocator.free(tokens);
     var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or !tokenIs(source, token, "@cImport") or index + 1 >= tokens.len or

@@ -512,13 +512,27 @@ fn arrayLengthMatchesPath(
     if (array_end != array_start + 1) return false;
     const path_length = path_end - path_start;
     for (context.tokens[0..before], 0..) |token, declaration| {
-        if ((token.tag != .keyword_var and token.tag != .keyword_const) or declaration + path_length + 7 >= before or
-            !context.tokenIs(declaration + 1, context.tokenText(array_start)) or
-            context.tokens[declaration + 2].tag != .colon or context.tokens[declaration + 3].tag != .l_bracket or
-            !dottedPathsEqual(context, declaration + 4, declaration + 4 + path_length, path_start, path_end)) continue;
-        const suffix = declaration + 4 + path_length;
-        if (context.tokens[suffix].tag == .period and context.tokenIs(suffix + 1, "len") and
-            context.tokens[suffix + 2].tag == .r_bracket) return true;
+        if ((token.tag != .keyword_var and token.tag != .keyword_const) or declaration + 3 >= before or
+            !context.tokenIs(declaration + 1, context.tokenText(array_start))) continue;
+        if (declaration + path_length + 7 < before and context.tokens[declaration + 2].tag == .colon and
+            context.tokens[declaration + 3].tag == .l_bracket and
+            dottedPathsEqual(context, declaration + 4, declaration + 4 + path_length, path_start, path_end))
+        {
+            const suffix = declaration + 4 + path_length;
+            if (context.tokens[suffix].tag == .period and context.tokenIs(suffix + 1, "len") and
+                context.tokens[suffix + 2].tag == .r_bracket) return true;
+        }
+        const declaration_end = context.statementEnd(declaration) orelse continue;
+        if (declaration_end >= before) continue;
+        for (context.tokens[declaration + 2 .. declaration_end], declaration + 2..) |candidate, method_index| {
+            if (candidate.tag != .identifier or !context.tokenIs(method_index, "alloc") or
+                method_index + 1 >= declaration_end or context.tokens[method_index + 1].tag != .l_paren) continue;
+            const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
+            if (call_end > declaration_end or call_end < method_index + 5 or
+                context.tokens[call_end - 2].tag != .period or !context.tokenIs(call_end - 1, "len")) continue;
+            const comma = topLevelComma(context.tokens, method_index + 2, call_end) orelse continue;
+            if (dottedPathsEqual(context, comma + 1, call_end - 2, path_start, path_end)) return true;
+        }
     }
     return false;
 }
@@ -553,7 +567,10 @@ fn mayMutateBeforeIndex(context: RuleRun, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
         switch (token.tag) {
             .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal, .semicolon => return true,
-            .identifier, .builtin => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren) return true,
+            .identifier, .builtin => if (index + 1 < end and context.tokens[index + 1].tag == .l_paren) {
+                const call_end = context.matchingToken(index + 1, .l_paren, .r_paren) orelse return true;
+                if (call_end < end) return true;
+            },
             else => {},
         }
     }
@@ -639,11 +656,18 @@ fn conditionStatesExhaustion(context: RuleRun, start: usize, end: usize, body_op
         if (token.tag != .identifier or index + 1 >= end or context.tokens[index + 1].tag != .l_paren) continue;
         const name = context.tokenText(index);
         if (std.mem.eql(u8, name, "next") or std.mem.endsWith(u8, name, "_next") or
-            std.mem.eql(u8, name, "iteration")) return true;
+            consumingNextCall(name) or std.mem.eql(u8, name, "iteration")) return true;
         if (std.mem.eql(u8, name, "isClosed") or std.mem.eql(u8, name, "isRunning") or
             std.mem.eql(u8, name, "shouldStop") or std.mem.eql(u8, name, "isShutdown")) return true;
         if (std.mem.eql(u8, name, "eof") and bodyCalls(context, body_open + 1, body_end, "advance")) return true;
     }
+    return false;
+}
+
+fn consumingNextCall(name: []const u8) bool {
+    if (!std.mem.endsWith(u8, name, "Next")) return false;
+    const verbs = [_][]const u8{ "consume", "parse", "poll", "process", "read", "remove", "run", "take" };
+    for (verbs) |verb| if (std.mem.startsWith(u8, name, verb)) return true;
     return false;
 }
 
@@ -1076,6 +1100,22 @@ test "boolean next calls and orelse exits state iterator exhaustion" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "consuming camel case next calls state exhaustion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn drain(scheduler: *Scheduler, cursor: *Cursor) void {\n" ++
+        "while (scheduler.runNext()) {}\n" ++
+        "while (cursor.hasNext()) {}\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+}
+
 test "optional traversal must visibly advance its condition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1221,6 +1261,25 @@ test "a matching while condition establishes the bound for its first indexed acc
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "a matching while bound remains visible inside a borrowing call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn remove(catalog: *Catalog, path: []const u8) void {\n" ++
+        "var index: usize = 0;\n" ++
+        "while (index < catalog.items.len) : (index += 1) {\n" ++
+        "if (std.mem.eql(u8, catalog.items[index].path, path)) return;\n" ++
+        "}\n" ++
+        "_ = one; _ = two; _ = three;\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "a fixed array length establishes a literal while bound" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1303,6 +1362,24 @@ test "an index capture establishes the bound for an equally sized array" {
         "_ = two;\n" ++
         "_ = three;\n" ++
         "return result;\n" ++
+        "}\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+
+    const found = try findingsFor(arena.allocator(), source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "an allocation sized from the iterated slice establishes its index bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn clone(allocator: std.mem.Allocator, source: []const Note) ![]Note {\n" ++
+        "const copy = try allocator.alloc(Note, source.len);\n" ++
+        "for (source, 0..) |note, index| copy[index] = note;\n" ++
+        "_ = one; _ = two; _ = three;\n" ++
+        "return copy;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
     configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;

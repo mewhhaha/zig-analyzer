@@ -14,21 +14,20 @@ pub fn run(context: RuleRun) !void {
         const target = intType(target_type) orelse continue;
         const value_name = context.tokenText(value.binding_index);
         const function = enclosingFunction(context, cast_index) orelse continue;
-        const declaration = soleDeclaration(context, function, value_name, cast_index) orelse continue;
-        const source_type = if (value.field_index) |field_index|
-            if (value.is_length)
-                if (structFieldHasLength(context, declaration.type_text, context.tokenText(field_index)))
-                    "usize"
-                else
-                    continue
+        const declaration = soleDeclaration(context, function, value_name, cast_index);
+        const source_type = if (value.is_length)
+            "usize"
+        else if (value.field_index) |field_index|
+            if (declaration) |known|
+                structFieldType(context, known.type_text, context.tokenText(field_index)) orelse continue
             else
-                structFieldType(context, declaration.type_text, context.tokenText(field_index)) orelse continue
-        else
-            declaration.type_text;
+                continue
+        else if (declaration) |known| known.type_text else continue;
         const source = intType(source_type) orelse continue;
         if (target.width >= source.width and (target.signed or !source.signed)) continue;
-        if (capturedName(context, function.body_start + 1, cast_index, value_name)) continue;
-        if (guardMentions(context, declaration.guard_scan_start, cast_index, value_name)) continue;
+        if (!value.is_length and capturedName(context, function.body_start + 1, cast_index, value_name)) continue;
+        const guard_scan_start = if (declaration) |known| known.guard_scan_start else function.body_start + 1;
+        if (guardMentions(context, guard_scan_start, cast_index, value_name)) continue;
         try context.emit(.{
             .rule = .truncating_intcast,
             .level = level,
@@ -172,34 +171,6 @@ fn structFieldType(context: RuleRun, type_name: []const u8, field_name: []const 
         }
     }
     return null;
-}
-
-fn structFieldHasLength(context: RuleRun, type_name: []const u8, field_name: []const u8) bool {
-    for (context.tokens, 0..) |token, declaration_index| {
-        if (token.tag != .identifier or !context.tokenIs(declaration_index, type_name) or declaration_index == 0 or
-            context.tokens[declaration_index - 1].tag != .keyword_const) continue;
-        var struct_index = declaration_index + 1;
-        while (struct_index < context.tokens.len and struct_index < declaration_index + 5 and
-            context.tokens[struct_index].tag != .keyword_struct) : (struct_index += 1)
-        {}
-        if (struct_index >= context.tokens.len or context.tokens[struct_index].tag != .keyword_struct or
-            struct_index + 1 >= context.tokens.len or context.tokens[struct_index + 1].tag != .l_brace) continue;
-        const container_end = context.matchingToken(struct_index + 1, .l_brace, .r_brace) orelse continue;
-        var depth: usize = 0;
-        for (context.tokens[struct_index + 2 .. container_end], struct_index + 2..) |field, field_index| {
-            switch (field.tag) {
-                .l_brace => depth += 1,
-                .r_brace => depth -|= 1,
-                .identifier => if (depth == 0 and context.tokenIs(field_index, field_name) and
-                    field_index + 2 < container_end and context.tokens[field_index + 1].tag == .colon)
-                {
-                    return context.tokens[field_index + 2].tag == .l_bracket;
-                },
-                else => {},
-            }
-        }
-    }
-    return false;
 }
 
 const Function = struct {
@@ -371,6 +342,20 @@ test "writeInt result context exposes unchecked slice length narrowing" {
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "message.payload.len") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "usize") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "u16") != null);
+}
+
+test "captured slice lengths retain usize narrowing evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn encode(records: []const Record) void { for (records) |record| {" ++
+        "const length: u16 = @intCast(record.payload.len); _ = length; } }" ++
+        "fn checked(records: []const Record) void { for (records) |record| {" ++
+        "if (record.payload.len > std.math.maxInt(u16)) continue;" ++
+        "const length: u16 = @intCast(record.payload.len); _ = length; } }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "record.payload.len") != null);
 }
 
 test "a guard mentioning the value before the cast keeps it clean" {

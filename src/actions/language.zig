@@ -72,6 +72,7 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
 
 fn simpleTupleArguments(context: ActionRun, start: usize, end: usize) !?[]const std.zig.Token.Loc {
     var arguments: std.ArrayList(std.zig.Token.Loc) = .empty;
+    errdefer arguments.deinit(context.allocator);
     if (start == end) return try arguments.toOwnedSlice(context.allocator);
     var argument_start = start;
     var depth: usize = 0;

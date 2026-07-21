@@ -6,7 +6,10 @@ const Resource = struct { acquisition: []const u8, release: []const u8 };
 const resources = [_]Resource{
     .{ .acquisition = "openFile", .release = "close" },
     .{ .acquisition = "createFile", .release = "close" },
+    .{ .acquisition = "openFileAbsolute", .release = "close" },
+    .{ .acquisition = "createFileAbsolute", .release = "close" },
     .{ .acquisition = "openDir", .release = "close" },
+    .{ .acquisition = "openDirAbsolute", .release = "close" },
     .{ .acquisition = "openIterableDir", .release = "close" },
     .{ .acquisition = "spawn", .release = "join" },
     .{ .acquisition = "init", .release = "deinit" },
@@ -301,27 +304,138 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
         }
         const method = allocation_method orelse continue;
         const closing = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
-        const length = argumentFromEnd(context.tokens, method_index + 2, closing, method.length_from_end) orelse continue;
-        var has_multiplication = false;
+        const length_argument = argumentFromEnd(context.tokens, method_index + 2, closing, method.length_from_end) orelse continue;
+        if (uncheckedCapacityGrowth(context, length_argument, method_index)) |growth_index| {
+            try context.emit(.{
+                .rule = .allocation_size_overflow,
+                .level = level,
+                .span = context.tokens[growth_index].loc,
+                .message = try std.fmt.allocPrint(
+                    context.allocator,
+                    "allocation capacity passed to {s} is grown with unchecked multiplication; validate overflow before growing",
+                    .{context.tokenText(method_index)},
+                ),
+            });
+            continue;
+        }
+        const length = declaredAllocationLength(context, length_argument, method_index) orelse length_argument;
+        var multiplication_index: ?usize = null;
+        var addition_index: ?usize = null;
         var has_runtime_name = false;
         for (context.tokens[length.start..length.end], length.start..) |argument_token, argument_index| {
-            if (argument_token.tag == .asterisk) has_multiplication = true;
+            if (argument_token.tag == .asterisk) multiplication_index = argument_index;
+            if (argument_token.tag == .plus) addition_index = argument_index;
             if (argument_token.tag == .identifier and identifierIsRuntimeBound(context, argument_index, method_index)) {
                 has_runtime_name = true;
             }
         }
-        if (!has_multiplication or !has_runtime_name) continue;
+        const operation = if (multiplication_index != null and has_runtime_name)
+            "multiplication"
+        else if (addition_index) |operator_index|
+            if (rangeHasRuntimeName(context, length.start, operator_index, method_index) and
+                rangeHasRuntimeName(context, operator_index + 1, length.end, method_index))
+                "addition"
+            else
+                continue
+        else
+            continue;
+        if (multiplication_index != null and multiplicationFitsMinimumUsize(context, length, method_index)) continue;
         try context.emit(.{
             .rule = .allocation_size_overflow,
             .level = level,
             .span = context.tokens[length.start].loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "allocation length passed to {s} uses unchecked runtime multiplication; validate overflow before allocating",
-                .{context.tokenText(method_index)},
+                "allocation length passed to {s} uses unchecked runtime {s}; validate overflow before allocating",
+                .{ context.tokenText(method_index), operation },
             ),
         });
     }
+}
+
+fn uncheckedCapacityGrowth(context: RuleRun, argument: ArgumentRange, before: usize) ?usize {
+    if (argument.start + 1 != argument.end or context.tokens[argument.start].tag != .identifier) return null;
+    const body_start = containingRuntimeBodyStart(context, before) orelse return null;
+    const capacity = context.tokenText(argument.start);
+    var growth_index: ?usize = null;
+    for (context.tokens[body_start + 1 .. before], body_start + 1..) |_, index| {
+        if (context.tokenIs(index, "@mulWithOverflow") or context.tokenIs(index, "maxInt")) return null;
+        if (index + 2 >= before or !context.tokenIs(index, capacity) or
+            context.tokens[index + 1].tag != .asterisk_equal) continue;
+        const factor = context.tokenText(index + 2);
+        const value = std.fmt.parseInt(usize, factor, 0) catch continue;
+        if (value > 1) growth_index = index;
+    }
+    return growth_index;
+}
+
+fn declaredAllocationLength(context: RuleRun, argument: ArgumentRange, before: usize) ?ArgumentRange {
+    if (argument.start + 1 != argument.end or context.tokens[argument.start].tag != .identifier) return null;
+    const name = context.tokenText(argument.start);
+    var index = before;
+    while (index > 1) {
+        index -= 1;
+        if (!context.tokenIs(index, name) or context.tokens[index - 1].tag != .keyword_const or
+            index + 1 >= before or context.tokens[index + 1].tag != .equal) continue;
+        const declaration_scope_end = context.enclosingScopeEnd(index) orelse continue;
+        if (declaration_scope_end < before) continue;
+        const declaration_end = context.statementEnd(index - 1) orelse continue;
+        if (declaration_end >= before or index + 2 >= declaration_end) continue;
+        return .{ .start = index + 2, .end = declaration_end };
+    }
+    return null;
+}
+
+fn rangeHasRuntimeName(context: RuleRun, start: usize, end: usize, before: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag == .identifier and identifierIsRuntimeBound(context, index, before)) return true;
+    }
+    return false;
+}
+
+fn multiplicationFitsMinimumUsize(context: RuleRun, expression: ArgumentRange, before: usize) bool {
+    const text = context.source[context.tokens[expression.start].loc.start..context.tokens[expression.end - 1].loc.end];
+    if (std.mem.indexOf(u8, text, "@as(usize") == null and
+        std.mem.indexOf(u8, text, "@as( usize") == null) return false;
+
+    var total_bits: usize = 0;
+    var factor_count: usize = 0;
+    for (context.tokens[expression.start..expression.end], expression.start..) |token, index| {
+        if (token.tag != .identifier or !identifierIsRuntimeBound(context, index, before)) continue;
+        const bits = unsignedBindingBits(context, context.tokenText(index), before) orelse return false;
+        total_bits += bits;
+        factor_count += 1;
+    }
+    return factor_count >= 2 and total_bits <= 32;
+}
+
+fn unsignedBindingBits(context: RuleRun, name: []const u8, before: usize) ?usize {
+    var index = before;
+    while (index > 0) {
+        index -= 1;
+        if (!context.tokenIs(index, name)) continue;
+        if (index + 2 < before and context.tokens[index + 1].tag == .colon) {
+            return unsignedTypeBits(context.tokenText(index + 2));
+        }
+        if (index == 0 or (context.tokens[index - 1].tag != .keyword_const and
+            context.tokens[index - 1].tag != .keyword_var) or index + 1 >= before or
+            context.tokens[index + 1].tag != .equal) continue;
+        const declaration_end = context.statementEnd(index - 1) orelse continue;
+        var value_index = index + 2;
+        while (value_index + 2 < declaration_end) : (value_index += 1) {
+            if (context.tokens[value_index].tag == .builtin and context.tokenIs(value_index, "@as") and
+                context.tokens[value_index + 1].tag == .l_paren)
+            {
+                return unsignedTypeBits(context.tokenText(value_index + 2));
+            }
+        }
+    }
+    return null;
+}
+
+fn unsignedTypeBits(name: []const u8) ?usize {
+    if (name.len < 2 or name[0] != 'u') return null;
+    return std.fmt.parseInt(usize, name[1..], 10) catch null;
 }
 
 const ArgumentRange = struct { start: usize, end: usize };
@@ -646,6 +760,115 @@ test "runtime const values and mutable literals still require checked allocation
         allocation_findings += 1;
     };
     try std.testing.expectEqual(@as(usize, 2), allocation_findings);
+}
+
+test "realloc checks a locally declared runtime length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn grow(a: anytype, bytes: []u8) ![]u8 { const new_len = bytes.len * 2; return a.realloc(bytes, new_len); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var allocation_findings: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .allocation_size_overflow) {
+        allocation_findings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), allocation_findings);
+}
+
+test "realloc does not chase mutable or constant declared lengths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn grow(a: anytype, first: []u8, second: []u8) !void {" ++
+        "var runtime_len = first.len * 2; first = try a.realloc(first, runtime_len);" ++
+        "const fixed_len = 16 * 2; second = try a.realloc(second, fixed_len); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .allocation_size_overflow);
+}
+
+test "allocation lengths ignore declarations from closed sibling scopes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn grow(a: anytype, bytes: []u8, new_len: usize, inspect: bool) ![]u8 {" ++
+        "if (inspect) { const new_len = loadWidth() * 2; consume(new_len); }" ++
+        "return a.realloc(bytes, new_len); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .allocation_size_overflow);
+}
+
+test "realloc capacity loops require checked growth" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn ensure(a: anytype, bytes: []u8, needed: usize) ![]u8 {" ++
+        "var capacity = if (bytes.len == 0) 8 else bytes.len * 2;" ++
+        "while (capacity < needed) capacity *= 2; return a.realloc(bytes, capacity); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var allocation_findings: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .allocation_size_overflow) {
+        allocation_findings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), allocation_findings);
+}
+
+test "guarded realloc capacity growth stays clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn ensure(a: anytype, bytes: []u8, needed: usize) ![]u8 { var capacity = bytes.len;" ++
+        "while (capacity < needed) { if (capacity > std.math.maxInt(usize) / 2) return error.Overflow; capacity *= 2; }" ++
+        "return a.realloc(bytes, capacity); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .allocation_size_overflow);
+}
+
+test "adding independent runtime lengths before allocation reports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn join(allocator: std.mem.Allocator, left: []const u8, right: []const u8) !void {" ++
+        "const combined = try allocator.alloc(u8, left.len + right.len); defer allocator.free(combined); }" ++
+        "fn extend(allocator: std.mem.Allocator, bytes: []const u8) !void {" ++
+        "const extended = try allocator.alloc(u8, bytes.len + 1); defer allocator.free(extended); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var allocation_findings: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .allocation_size_overflow) {
+        allocation_findings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), allocation_findings);
+}
+
+test "widened narrow factors that fit usize do not report overflow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn run(a: anytype, raw_width: usize, raw_height: usize) !void {" ++
+        "const width = @as(u16, @intCast(raw_width)); const height = @as(u16, @intCast(raw_height));" ++
+        "const bytes = try a.alloc(u8, @as(usize, @intCast(width)) * height); defer a.free(bytes); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    for (findings.items) |finding| try std.testing.expect(finding.rule != .allocation_size_overflow);
 }
 
 test "comptime parameters do not make allocation sizes runtime" {
