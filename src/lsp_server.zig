@@ -14,6 +14,7 @@ const document_module = @import("document.zig");
 const hover = @import("hover.zig");
 const language_hover = @import("language_hover.zig");
 const syntax_types = @import("syntax_types.zig");
+const zig_environment = @import("zig_environment.zig");
 
 const Document = document_module.Document;
 const Declaration = document_module.Declaration;
@@ -2136,31 +2137,7 @@ pub const Server = struct {
 
     fn zigLibDirectory(server: *Server) ![]const u8 {
         if (server.zig_lib_directory) |directory| return directory;
-        var backend = try backend_bootstrap.findBackend(server.io, server.allocator);
-        defer if (backend) |*installed| installed.deinit(server.allocator);
-        const zig_binary = if (backend) |installed| installed.binary_path else "zig";
-        const result = try std.process.run(server.allocator, server.io, .{
-            .argv = &.{ zig_binary, "env" },
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-        });
-        defer server.allocator.free(result.stdout);
-        defer server.allocator.free(result.stderr);
-        const succeeded = switch (result.term) {
-            .exited => |exit_code| exit_code == 0,
-            else => false,
-        };
-        if (!succeeded) {
-            std.log.err("'{s} env' failed: {s}", .{ zig_binary, result.stderr });
-            return error.ZigEnvironmentUnavailable;
-        }
-        const prefix = ".lib_dir = \"";
-        const start = std.mem.indexOf(u8, result.stdout, prefix) orelse return error.ZigEnvironmentMalformed;
-        const value_start = start + prefix.len;
-        const value_end = std.mem.indexOfScalarPos(u8, result.stdout, value_start, '"') orelse {
-            return error.ZigEnvironmentMalformed;
-        };
-        server.zig_lib_directory = try server.allocator.dupe(u8, result.stdout[value_start..value_end]);
+        server.zig_lib_directory = try zig_environment.libDirectory(server.io, server.allocator);
         return server.zig_lib_directory.?;
     }
 };

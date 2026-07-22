@@ -83,6 +83,10 @@ jobs:
           cd "${temporary_workspace}"
           "${release_root}/bin/zig-analyzer" version
           "${release_root}/bin/zig-analyzer" doctor
+          zig_lib_directory="$(zig env | sed -n 's/^[[:space:]]*\.lib_dir = "\([^"]*\)",/\1/p')"
+          printf 'pub const smoke_test = true;\n' > smoke-test.zig
+          "${release_root}/libexec/zig-analyzer/zig" build-obj smoke-test.zig \
+            --zig-lib-dir "${zig_lib_directory}" -fno-emit-bin
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -12,6 +12,7 @@ pub const allocation_lifecycle = @import("rules/allocation_lifecycle.zig");
 pub const summaries = @import("rules/summaries.zig");
 pub const memory_lint = allocation_lifecycle;
 pub const project_check = @import("project_check.zig");
+pub const zig_environment = @import("zig_environment.zig");
 
 test {
     _ = analysis;
@@ -27,4 +28,5 @@ test {
     _ = summaries;
     _ = memory_lint;
     _ = project_check;
+    _ = zig_environment;
 }

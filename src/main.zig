@@ -145,6 +145,14 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
         try file_writer.interface.flush();
         return 1;
     }
+    const zig_lib_directory = zig_analyzer.zig_environment.libDirectory(io, allocator) catch |err| {
+        var buffer: [256]u8 = undefined;
+        var file_writer = std.Io.File.stderr().writer(io, &buffer);
+        try file_writer.interface.print("zig-analyzer doctor: could not locate the Zig standard library ({t})\n", .{err});
+        try file_writer.interface.flush();
+        return 1;
+    };
+    defer allocator.free(zig_lib_directory);
 
     try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: Zig 0.16.0 is available\n");
 

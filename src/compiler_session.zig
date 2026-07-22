@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const backend_bootstrap = @import("backend_bootstrap.zig");
 const compiler_client = @import("compiler_client.zig");
 const protocol = @import("compiler_protocol.zig");
+const zig_environment = @import("zig_environment.zig");
 const DrainResult = @typeInfo(@TypeOf(drainCompilerStdout)).@"fn".return_type.?;
 
 pub const Session = struct {
@@ -26,6 +27,8 @@ pub const Session = struct {
     ) !Session {
         var backend = (try backend_bootstrap.findBackend(io, allocator)) orelse return error.CompilerBackendNotFound;
         defer backend.deinit(allocator);
+        const zig_lib_directory = try zig_environment.libDirectory(io, allocator);
+        defer allocator.free(zig_lib_directory);
         try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/analysis-cache");
         try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer/compiler-global-cache");
         var random_bytes: [18]u8 = undefined;
@@ -45,6 +48,8 @@ pub const Session = struct {
                 backend.binary_path,
                 "build-obj",
                 root_source_path,
+                "--zig-lib-dir",
+                zig_lib_directory,
                 "-fincremental",
                 "--debug-incremental",
                 "-fno-emit-bin",
