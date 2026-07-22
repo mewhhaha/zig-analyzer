@@ -37,6 +37,8 @@ jobs:
         run: git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
       - name: Run tests
         run: zig build test --summary all
+      - name: Run compiler-backed tests
+        run: zig build backend-test --summary all
       - name: Build release analyzer
         run: zig build -Doptimize=ReleaseFast
       - name: Check analyzer sources

@@ -211,9 +211,7 @@ pub const Server = struct {
             try worker.schedule(document, .update);
             return;
         }
-        if (server.compiler == null and server.compiler_restart_available) {
-            server.compiler_restart_available = false;
-            server.compiler_start_attempted = false;
+        if (server.compiler == null and !server.compiler_start_attempted) {
             try server.ensureCompiler(arena, params.textDocument.uri);
         }
         try server.syncCompilerOverlay(params.textDocument.uri);
@@ -227,7 +225,7 @@ pub const Server = struct {
     ) !void {
         if (server.compiler_worker) |worker| worker.cancel(params.textDocument.uri);
         if (server.compiler) |*compiler| {
-            compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err);
+            compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err, params.textDocument.uri);
         }
         if (server.compiler_root_uri) |root_uri| {
             if (std.mem.eql(u8, root_uri, params.textDocument.uri)) {
@@ -251,8 +249,8 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didSave"),
     ) !void {
+        const document = server.analysisDocumentAfterSave(params.textDocument.uri) orelse return;
         if (server.compiler_worker) |worker| {
-            const document = server.documents.getConst(params.textDocument.uri) orelse return;
             try worker.schedule(document, .restart);
             return;
         }
@@ -263,9 +261,9 @@ pub const Server = struct {
         server.compiler_root_uri = null;
         server.compiler_start_attempted = false;
         server.compiler_restart_available = true;
-        try server.ensureCompiler(arena, params.textDocument.uri);
-        try server.syncCompilerOverlay(params.textDocument.uri);
-        try server.publishDiagnostics(arena, params.textDocument.uri);
+        try server.ensureCompiler(arena, document.uri);
+        try server.syncCompilerOverlay(document.uri);
+        try server.publishDiagnostics(arena, document.uri);
     }
 
     pub fn @"textDocument/completion"(
@@ -396,6 +394,23 @@ pub const Server = struct {
         if (memberReceiver(document.source, identifier_span.start)) |receiver| {
             if (try server.importedDefinition(arena, document, receiver, document.source[identifier_span.start..identifier_span.end])) |location| {
                 return .{ .definition = .{ .location = location } };
+            }
+            const member_name = document.source[identifier_span.start..identifier_span.end];
+            if (try server.compilerTypeMembers(arena, document, receiver)) |member_names| {
+                const resolved = for (member_names) |name| {
+                    if (std.mem.eql(u8, name, member_name)) break true;
+                } else false;
+                if (resolved) {
+                    const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+                    const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
+                    const type_name = try declaredTypeName(arena, document.source, receiver_name) orelse receiver_name;
+                    if (document.declarationNamed(type_name)) |declaration| {
+                        return .{ .definition = .{ .location = .{
+                            .uri = document.uri,
+                            .range = document.range(declaration.span),
+                        } } };
+                    }
+                }
             }
         }
         if (try server.aliasTargetDefinition(arena, document, identifier_span)) |location| {
@@ -940,7 +955,7 @@ pub const Server = struct {
         if (server.compilerAnalysisCurrent(document)) {
             if (server.compiler) |*compiler| {
                 var bundle = compiler.diagnostics(arena) catch |err| {
-                    server.recordCompilerFailure(err);
+                    server.recordCompilerFailure(err, document.uri);
                     const diagnostic_count = deduplicateAndSortDiagnostics(diagnostics.items);
                     return server.publishDiagnosticSlice(arena, document, diagnostics.items[0..diagnostic_count]);
                 };
@@ -1006,7 +1021,7 @@ pub const Server = struct {
             server.environ,
             root_source_path,
         ) catch |err| {
-            std.log.err("compiler backend failed to start for '{s}': {t}", .{ root_source_path, err });
+            server.recordCompilerFailure(err, uri);
             return;
         };
     }
@@ -1025,7 +1040,7 @@ pub const Server = struct {
                 return;
             },
             else => {
-                server.recordCompilerFailure(err);
+                server.recordCompilerFailure(err, uri);
                 return;
             },
         };
@@ -1034,13 +1049,42 @@ pub const Server = struct {
         server.compiler_root_version = document.version;
     }
 
-    fn recordCompilerFailure(server: *Server, err: anyerror) void {
-        std.log.err("compiler backend request failed: {t}; syntax service remains active", .{err});
+    fn recordCompilerFailure(server: *Server, err: anyerror, document_uri: []const u8) void {
+        std.log.warn("compiler backend request failed for '{s}': {t}; syntax service remains active", .{ document_uri, err });
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
         server.clearCompilerTypeShapes();
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         server.compiler_root_uri = null;
+        const restart_available = server.compiler_restart_available;
+        server.compiler_restart_available = false;
+        server.compiler_start_attempted = !restart_available;
+    }
+
+    fn analysisDocumentAfterSave(server: *const Server, saved_uri: []const u8) ?*const Document {
+        if (!std.mem.endsWith(u8, saved_uri, "/build.zig")) return server.documents.getConst(saved_uri);
+        const directory_end = (std.mem.lastIndexOfScalar(u8, saved_uri, '/') orelse return null) + 1;
+        const directory_uri = saved_uri[0..directory_end];
+        if (server.compiler_worker) |worker| {
+            worker.analysis_mutex.lockUncancelable(server.io);
+            defer worker.analysis_mutex.unlock(server.io);
+            if (worker.server.compiler_root_uri) |root_uri| {
+                if (std.mem.startsWith(u8, root_uri, directory_uri)) {
+                    if (server.documents.getConst(root_uri)) |document| return document;
+                }
+            }
+        }
+        if (server.compiler_root_uri) |root_uri| {
+            if (std.mem.startsWith(u8, root_uri, directory_uri)) {
+                if (server.documents.getConst(root_uri)) |document| return document;
+            }
+        }
+        var documents = server.documents.documents.valueIterator();
+        while (documents.next()) |document| {
+            if (std.mem.startsWith(u8, document.uri, directory_uri) and
+                !std.mem.endsWith(u8, document.uri, "/build.zig")) return document;
+        }
+        return null;
     }
 
     fn compilerAnalysisCurrent(server: *const Server, document: *const Document) bool {
@@ -1666,7 +1710,7 @@ pub const Server = struct {
         if (!server.compilerAnalysisCurrent(document)) return &.{};
         const compiler = if (server.compiler) |*active| active else return &.{};
         return compiler.workspaceDeclarations(allocator) catch |err| {
-            server.recordCompilerFailure(err);
+            server.recordCompilerFailure(err, document.uri);
             return &.{};
         };
     }
@@ -1688,7 +1732,7 @@ pub const Server = struct {
         const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
         const type_name = try declaredTypeName(allocator, document.source, receiver_name) orelse receiver_name;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
-            server.recordCompilerFailure(err);
+            server.recordCompilerFailure(err, document.uri);
             return null;
         };
         const qualified_type_name = for (declarations) |declaration_name| {
@@ -1698,7 +1742,7 @@ pub const Server = struct {
         return compiler.typeMembers(allocator, qualified_type_name) catch |err| switch (err) {
             error.SemanticsUnavailable => null,
             else => {
-                server.recordCompilerFailure(err);
+                server.recordCompilerFailure(err, document.uri);
                 return null;
             },
         };
@@ -1731,7 +1775,7 @@ pub const Server = struct {
         if (!server.compilerAnalysisCurrent(document)) return null;
         const compiler = if (server.compiler) |*active| active else return null;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
-            server.recordCompilerFailure(err);
+            server.recordCompilerFailure(err, document.uri);
             return null;
         };
         const qualified_name = for (declarations) |declaration| {
@@ -1742,7 +1786,7 @@ pub const Server = struct {
         const shape = compiler.typeShape(allocator, qualified_name) catch |err| switch (err) {
             error.SemanticsUnavailable => return null,
             else => {
-                server.recordCompilerFailure(err);
+                server.recordCompilerFailure(err, document.uri);
                 return null;
             },
         };
@@ -1773,7 +1817,7 @@ pub const Server = struct {
         if (!server.compilerAnalysisCurrent(document)) return null;
         const compiler = if (server.compiler) |*active| active else return null;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
-            server.recordCompilerFailure(err);
+            server.recordCompilerFailure(err, document.uri);
             return null;
         };
         const qualified_name = for (declarations) |declaration| {
@@ -1784,7 +1828,7 @@ pub const Server = struct {
         return compiler.resolvedValue(allocator, qualified_name) catch |err| switch (err) {
             error.SemanticsUnavailable => null,
             else => {
-                server.recordCompilerFailure(err);
+                server.recordCompilerFailure(err, document.uri);
                 return null;
             },
         };
@@ -1899,7 +1943,7 @@ pub const Server = struct {
             return cached;
         }
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
-            server.recordCompilerFailure(err);
+            server.recordCompilerFailure(err, document.uri);
             return &.{};
         };
         const tokens = document.tokens;
@@ -1937,7 +1981,7 @@ pub const Server = struct {
             const shape = compiler.typeShape(allocator, qualified_name) catch |err| switch (err) {
                 error.SemanticsUnavailable => continue,
                 else => {
-                    server.recordCompilerFailure(err);
+                    server.recordCompilerFailure(err, document.uri);
                     return try shapes.toOwnedSlice(allocator);
                 },
             };
@@ -2254,7 +2298,9 @@ const CompilerWorker = struct {
             defer job.deinit(worker.allocator);
 
             worker.process(&job) catch |err| {
-                std.log.err("background compiler update failed for '{s}': {t}", .{ job.uri, err });
+                worker.analysis_mutex.lockUncancelable(worker.io);
+                defer worker.analysis_mutex.unlock(worker.io);
+                worker.server.recordCompilerFailure(err, job.uri);
             };
         }
     }
@@ -5021,6 +5067,63 @@ test "compiler type shapes stay cached for the analyzed document generation" {
     try std.testing.expect(try server.cachedCompilerTypeShapes(arena_state.allocator(), changed_document, 7) == null);
 }
 
+test "compiler-generated member definitions return the generating type declaration" {
+    const fixture_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        "examples/compiler/comptime_pipeline.zig",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(fixture_path);
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture_path,
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(source);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    defer std.testing.allocator.free(uri);
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open(uri, 1, source);
+    server.compiler = compiler_session.Session.start(
+        std.testing.io,
+        std.testing.allocator,
+        .empty,
+        fixture_path,
+    ) catch |err| switch (err) {
+        error.CompilerBackendNotFound => return,
+        else => return err,
+    };
+    _ = try server.compiler.?.replaceOverlay(uri, 1, source);
+    server.compiler_root_uri = try std.testing.allocator.dupe(u8, uri);
+    server.compiler_root_version = 1;
+    const document = server.documents.getConst(uri).?;
+    const member_start = std.mem.lastIndexOf(u8, source, "trace();").?;
+    const member_position = document.range(.{ .start = member_start, .end = member_start + "trace".len }).start;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const response = (try server.@"textDocument/definition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = member_position,
+    })).?;
+    const definition = switch (response) {
+        .definition => |value| value,
+        .definition_links => return error.ExpectedDefinitionLocation,
+    };
+    const location = switch (definition) {
+        .location => |value| value,
+        .locations => return error.ExpectedSingleDefinition,
+    };
+    const declaration = document.declarationNamed("ActivePipeline").?;
+
+    try std.testing.expectEqualStrings(uri, location.uri);
+    try std.testing.expectEqualDeep(document.range(declaration.span), location.range);
+}
+
 test "member resolution finds explicit struct fields" {
     const source: [:0]const u8 =
         "const Profile = struct { display_name: []const u8, login_count: u32 };\n" ++
@@ -5898,6 +6001,48 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"result\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":[]") != null);
+}
+
+test "saving a build script reanalyzes the active source document" {
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.startCompilerWorker();
+    try server.documents.open("file:///workspace/build.zig", 2, "pub fn build() void {}\n");
+    try server.documents.open("file:///workspace/src/main.zig", 4, "pub fn main() void {}\n");
+    try server.documents.open("file:///other/src/main.zig", 7, "pub fn main() void {}\n");
+    const worker = server.compiler_worker.?;
+    const compiler_root_uri = try std.testing.allocator.dupe(u8, "file:///workspace/src/main.zig");
+    worker.analysis_mutex.lockUncancelable(std.testing.io);
+    worker.server.compiler_root_uri = compiler_root_uri;
+    worker.analysis_mutex.unlock(std.testing.io);
+
+    const document = server.analysisDocumentAfterSave("file:///workspace/build.zig").?;
+
+    try std.testing.expectEqualStrings("file:///workspace/src/main.zig", document.uri);
+    try std.testing.expectEqual(@as(i32, 4), document.version);
+}
+
+test "compiler failures preserve syntax and allow one controlled restart" {
+    std.testing.log_level = .err;
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open("file:///workspace/src/main.zig", 1, "const answer = 42;\n");
+
+    server.compiler_start_attempted = true;
+    server.compiler_restart_available = true;
+    server.recordCompilerFailure(error.CompilerConnectionLost, "file:///workspace/src/main.zig");
+    try std.testing.expect(server.documents.getConst("file:///workspace/src/main.zig") != null);
+    try std.testing.expect(!server.compiler_restart_available);
+    try std.testing.expect(!server.compiler_start_attempted);
+
+    server.compiler_start_attempted = true;
+    server.recordCompilerFailure(error.CompilerConnectionLost, "file:///workspace/src/main.zig");
+    try std.testing.expect(!server.compiler_restart_available);
+    try std.testing.expect(server.compiler_start_attempted);
 }
 
 test "LSP answers from current syntax while the compiler worker is busy" {

@@ -199,6 +199,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_compiler_integration_tests = b.addRunArtifact(compiler_integration_tests);
     run_compiler_integration_tests.step.dependOn(&backend_command.step);
+    const backend_module_tests = b.addTest(.{ .root_module = analyzer_module });
+    const run_backend_module_tests = b.addRunArtifact(backend_module_tests);
+    run_backend_module_tests.step.dependOn(&backend_command.step);
     const backend_test_step = b.step("backend-test", "Run tests against the patched compiler backend");
     backend_test_step.dependOn(&run_compiler_integration_tests.step);
+    backend_test_step.dependOn(&run_backend_module_tests.step);
 }

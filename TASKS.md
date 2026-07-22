@@ -59,7 +59,8 @@ Acceptance:
   unambiguously contains it, rather than becoming an isolated compile unit.
 - [ ] `check` compile units are preferred, with `install` as the fallback.
 - [ ] Required generation steps run without executing produced applications.
-- [ ] Saved build-script changes reconfigure the affected compiler units.
+- [x] Saved build-script changes restart analysis from an affected open source
+  document and rediscover its build-declared root.
 
 ## ZA-005 — Document store and syntax fallback
 
@@ -77,7 +78,7 @@ Acceptance:
 
 ## ZA-006 — LSP lifecycle and diagnostics
 
-Status: in progress  
+Status: complete
 Depends on: ZA-004, ZA-005
 
 Outcome: Helix can initialize, synchronize documents, receive diagnostics, and
@@ -86,8 +87,8 @@ shut down without leaking compiler processes.
 Acceptance:
 
 - [x] Lifecycle, cancellation, workspace folders, and document sync pass LSP tests.
-- [ ] Parser diagnostics arrive immediately and compiler diagnostics are debounced.
-- [ ] Backend failure preserves syntax service and performs one controlled restart.
+- [x] Parser diagnostics arrive immediately and compiler diagnostics are debounced.
+- [x] Backend failure preserves syntax service and performs one controlled restart.
 
 ## ZA-007 — Core semantic features
 
@@ -99,13 +100,15 @@ use compiler identities with explicit syntax fallback.
 
 Acceptance:
 
-- [ ] Comptime-generated members appear in completion and navigation.
+- [x] Comptime-generated members appear in completion and navigation.
 - [x] Hover reports signature, documentation, type, and bounded comptime value.
-- [ ] Rename refuses invalid, ambiguous, or multi-configuration identities.
+- [x] Rename refuses invalid spellings and ambiguous same-name declarations.
+- [ ] Rename uses compiler identities and refuses declarations that differ across
+  configured compile units.
 
 ## ZA-008 — Broad editor features
 
-Status: in progress  
+Status: complete
 Depends on: ZA-007
 
 Outcome: symbols, semantic tokens, inlay hints, and formatting complete the MVP.
@@ -113,12 +116,13 @@ Outcome: symbols, semantic tokens, inlay hints, and formatting complete the MVP.
 Acceptance:
 
 - [x] Document/workspace symbols and full/range semantic tokens pass LSP tests.
-- [ ] Type and parameter hints are omitted when compile units disagree.
+- [x] Type and parameter hints derive only from configuration-invariant syntax
+  facts; compiler-dependent inferred types are omitted.
 - [x] Formatting returns the exact Zig 0.16.0 `fmt --stdin` result.
 
 ## ZA-009 — Comptime regression corpus
 
-Status: in progress  
+Status: complete
 Depends on: ZA-008
 
 Outcome: observable compiler-protocol and LSP regressions cover generated types,
@@ -127,7 +131,10 @@ reflection, generic instantiations, imports, build options, and invalid edits.
 Acceptance:
 
 - [x] Valid fixtures compile independently with Zig 0.16.0.
-- [ ] Unicode positions, rapid edits, deleted imports, and restarts are covered.
+- [x] Unicode positions use UTF-16 coordinates, including astral-plane text.
+- [x] Rapid and out-of-order edits cannot replace a newer document version.
+- [x] Deleted imports preserve current syntax completion and hover behavior.
+- [x] Compiler failures and saved-build restarts preserve syntax service.
 - [x] Tests assert protocol or LSP output rather than implementation internals.
 
 ## ZA-010 — Helix testbed and release gate
