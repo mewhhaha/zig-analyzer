@@ -98,7 +98,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 158 rules with stable codes, organized into five named profiles,
+There are 162 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings
@@ -112,7 +112,7 @@ Worst-case single-file analysis time on that corpus is 39 ms.
 
 ## Installation
 
-The `0.16.0-1` release provides a relocatable x86_64 Linux archive containing
+The `0.16.0-2` release provides a relocatable x86_64 Linux archive containing
 both zig-analyzer and its patched compiler backend. Verify the published
 SHA-256 checksum before installing it. Building from source requires Zig
 0.16.0 exactly:
