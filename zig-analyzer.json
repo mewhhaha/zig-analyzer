@@ -3,6 +3,14 @@
     "exclude": [".claude", "examples/diagnostics", "tmp"]
   },
   "contracts": {
+    "arena-allocators": [
+      "RuleRun.allocator",
+      "ActionRun.allocator",
+      "findingsWithShapesAndTokens.allocator",
+      "parse.allocator",
+      "hoverDescription.allocator",
+      "cachedCompilerTypeShapes.allocator"
+    ],
     "imports": [
       {
         "from": "src/rules",

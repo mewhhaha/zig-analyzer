@@ -59,7 +59,9 @@ const ProgramBuilder = struct {
 
 fn emitReleasedBuffer(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
     try builder.append(
         \\fn {s}(allocator: std.mem.Allocator) !u8 {{
         \\    const {s} = try allocator.alloc(u8, {d});
@@ -76,8 +78,11 @@ fn emitReleasedBuffer(builder: *ProgramBuilder) !void {
 
 fn emitOwnershipReturn(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     const gate = try builder.functionName();
+    defer builder.allocator.free(gate);
     const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
     try builder.append(
         \\fn {s}(flag: bool) !void {{
         \\    if (flag) return error.Rejected;
@@ -94,8 +99,11 @@ fn emitOwnershipReturn(builder: *ProgramBuilder) !void {
 
 fn emitHelperRelease(builder: *ProgramBuilder) !void {
     const helper = try builder.functionName();
+    defer builder.allocator.free(helper);
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
     try builder.append(
         \\fn {s}(allocator: std.mem.Allocator, {s}: []u8) void {{
         \\    allocator.free({s});
@@ -115,7 +123,9 @@ fn emitHelperRelease(builder: *ProgramBuilder) !void {
 
 fn emitArenaScratch(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     const scratch = try builder.localName();
+    defer builder.allocator.free(scratch);
     try builder.append(
         \\fn {s}(allocator: std.mem.Allocator) !usize {{
         \\    var arena = std.heap.ArenaAllocator.init(allocator);
@@ -133,6 +143,7 @@ fn emitArenaScratch(builder: *ProgramBuilder) !void {
 
 fn emitBoundedSum(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     try builder.append(
         \\fn {s}(values: []const u32) u64 {{
         \\    var total: u64 = 0;
@@ -148,6 +159,7 @@ fn emitBoundedSum(builder: *ProgramBuilder) !void {
 
 fn emitExhaustiveSwitch(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     const first = builder.random.intRangeAtMost(u8, 1, 100);
     try builder.append(
         \\const Phase{d} = enum {{ idle, busy, done }};
@@ -164,6 +176,7 @@ fn emitExhaustiveSwitch(builder: *ProgramBuilder) !void {
 
 fn emitOptionalGuard(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     try builder.append(
         \\fn {s}(values: []const u32) u32 {{
         \\    if (values.len == 0) return {d};
@@ -175,6 +188,7 @@ fn emitOptionalGuard(builder: *ProgramBuilder) !void {
 
 fn emitListAppend(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     try builder.append(
         \\fn {s}(allocator: std.mem.Allocator, count: usize) !usize {{
         \\    var entries: std.ArrayList(u32) = .empty;
@@ -191,6 +205,7 @@ fn emitListAppend(builder: *ProgramBuilder) !void {
 
 fn emitPureCompute(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     try builder.append(
         \\fn {s}(left: u32, right: u32) u32 {{
         \\    const wider = left +| right;
@@ -203,6 +218,7 @@ fn emitPureCompute(builder: *ProgramBuilder) !void {
 
 fn emitEarlyReturn(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
+    defer builder.allocator.free(function);
     try builder.append(
         \\fn {s}(message: []const u8) error{{Empty}}!usize {{
         \\    if (message.len == 0) return error.Empty;

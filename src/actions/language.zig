@@ -595,6 +595,7 @@ fn addMaterializedType(context: ActionRun) !void {
         if (type_index == 0 or context.tokens[type_index - 1].tag != .keyword_const) continue;
         const declaration_end = context.statementEnd(type_index - 1) orelse continue;
         const explicit_name = try collisionFreeTypeName(context, shape.type_name);
+        defer context.allocator.free(explicit_name);
         const declaration = try materializedDeclaration(context, shape, explicit_name);
         try context.oneEdit(
             try std.fmt.allocPrint(context.allocator, "Materialize resolved type as '{s}'", .{explicit_name}),
@@ -610,7 +611,9 @@ fn collisionFreeTypeName(context: ActionRun, type_name: []const u8) ![]const u8 
     var candidate = try std.fmt.allocPrint(context.allocator, "Resolved{s}", .{type_name});
     var suffix: usize = 2;
     while (std.mem.indexOf(u8, context.source, candidate) != null) : (suffix += 1) {
-        candidate = try std.fmt.allocPrint(context.allocator, "Resolved{s}{d}", .{ type_name, suffix });
+        const next_candidate = try std.fmt.allocPrint(context.allocator, "Resolved{s}{d}", .{ type_name, suffix });
+        context.allocator.free(candidate);
+        candidate = next_candidate;
     }
     return candidate;
 }

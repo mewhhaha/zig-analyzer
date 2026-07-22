@@ -12,7 +12,8 @@ and leaks the owning value.
 standard network streams before the next visible fallible operation in the same
 scope. Arena provenance is scoped to the function that establishes it; an
 explicit function contract stating that its allocator should be an arena also
-satisfies the lifetime proof. The rule also follows ownership assigned into a
+satisfies the lifetime proof, as does the `contracts.arena-allocators` project
+setting. The rule also follows ownership assigned into a
 partially initialized local aggregate or heap object, and cleanup-capable values
 awaiting a fallible container insertion. Known borrowing I/O and filesystem
 operations do not erase the acquisition's ownership provenance.

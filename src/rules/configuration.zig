@@ -246,7 +246,7 @@ fn parseContracts(
     while (keys.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "imports") or std.mem.eql(u8, key, "resources") or
-            std.mem.eql(u8, key, "must-use")) continue;
+            std.mem.eql(u8, key, "arena-allocators") or std.mem.eql(u8, key, "must-use")) continue;
         return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts' contains unknown key '{s}'", .{key});
     }
 
@@ -331,6 +331,25 @@ fn parseContracts(
             resource.* = .{ .acquire = acquire, .release = release };
         }
         configuration.resource_contracts = resources;
+    }
+
+    if (contracts.get("arena-allocators")) |arena_allocators_value| {
+        const entries = switch (arena_allocators_value) {
+            .array => |array| array.items,
+            else => return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.arena-allocators' must contain an array of owner-member strings"),
+        };
+        const arena_allocators = try allocator.alloc([]const u8, entries.len);
+        for (entries, arena_allocators) |entry, *arena_allocator| {
+            const contract_result = try callableContract(allocator, entry, "contracts.arena-allocators");
+            arena_allocator.* = switch (contract_result) {
+                .value => |name| if (std.mem.indexOfScalar(u8, name, '.') != null)
+                    name
+                else
+                    return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.arena-allocators' entries must name an owner and allocator member"),
+                .warning => |warning| return warning,
+            };
+        }
+        configuration.arena_allocator_contracts = arena_allocators;
     }
 
     if (contracts.get("must-use")) |must_use_value| {
@@ -984,6 +1003,7 @@ test "configuration parses project contracts and activates contract rules" {
         \\  "contracts": {
         \\    "imports": [{"from":"src/rules","deny":["src/lsp_server.zig"]}],
         \\    "resources": [{"acquire":"Db.open","release":"Db.close"}],
+        \\    "arena-allocators": ["RequestContext.allocator"],
         \\    "must-use": ["Builder.finish"]
         \\  }
         \\}
@@ -993,6 +1013,7 @@ test "configuration parses project contracts and activates contract rules" {
     try std.testing.expectEqualStrings("src/lsp_server.zig", configuration.import_boundaries[0].denied[0]);
     try std.testing.expectEqualStrings("Db.open", configuration.resource_contracts[0].acquire);
     try std.testing.expectEqualStrings("Db.close", configuration.resource_contracts[0].release);
+    try std.testing.expectEqualStrings("RequestContext.allocator", configuration.arena_allocator_contracts[0]);
     try std.testing.expectEqualStrings("Builder.finish", configuration.must_use_contracts[0]);
     try std.testing.expectEqual(Level.warning, configuration.level(.import_boundary));
     try std.testing.expectEqual(Level.warning, configuration.level(.discarded_must_use));
@@ -1013,6 +1034,10 @@ test "malformed project contracts identify the invalid contract field" {
         .{
             .source = "{\"contracts\":{\"must-use\":[3]}}",
             .expected = "contracts.must-use",
+        },
+        .{
+            .source = "{\"contracts\":{\"arena-allocators\":[\"allocator\"]}}",
+            .expected = "owner and allocator member",
         },
     };
     for (cases) |case| {

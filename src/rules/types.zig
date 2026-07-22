@@ -349,6 +349,7 @@ pub const Configuration = struct {
     banned: []const BannedIdentifier = &.{},
     import_boundaries: []const ImportBoundary = &.{},
     resource_contracts: []const ResourceContract = &.{},
+    arena_allocator_contracts: []const []const u8 = &.{},
     must_use_contracts: []const []const u8 = &.{},
     check_excludes: []const []const u8 = &.{},
     function_length_limit: usize = 70,

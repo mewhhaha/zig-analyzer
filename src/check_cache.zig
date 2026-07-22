@@ -93,6 +93,11 @@ pub const Cache = struct {
             hasher.update(std.mem.asBytes(&contract.release.len));
             hasher.update(contract.release);
         }
+        hasher.update(std.mem.asBytes(&configuration.arena_allocator_contracts.len));
+        for (configuration.arena_allocator_contracts) |contract| {
+            hasher.update(std.mem.asBytes(&contract.len));
+            hasher.update(contract);
+        }
         hasher.update(std.mem.asBytes(&configuration.must_use_contracts.len));
         for (configuration.must_use_contracts) |contract| {
             hasher.update(std.mem.asBytes(&contract.len));

@@ -18,6 +18,7 @@ pub fn actions(
     shapes: []const analysis.ResolvedShape,
 ) ![]const Candidate {
     const tokens = try action_context.tokenize(allocator, source);
+    defer allocator.free(tokens);
     var candidates: std.ArrayList(Candidate) = .empty;
     const context: action_context.ActionRun = .{
         .allocator = allocator,

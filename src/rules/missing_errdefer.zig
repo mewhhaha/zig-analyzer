@@ -32,7 +32,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only
         const callable = context.source[context.tokens[acquisition.callable_start].loc.start..context.tokens[acquisition.method_index].loc.end];
         const method = context.tokenText(acquisition.method_index);
         if (acquisition.kind == .allocation and std.mem.eql(u8, callable, "std.Build.create")) continue;
-        if (acquisition.kind == .allocation and std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
+        if (acquisition.kind == .allocation and acquisitionUsesNamedArena(receiver, acquisition)) continue;
         if (acquisition.kind == .allocation and std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
         if (acquisition.kind == .allocation and declarationLooksArenaBacked(
             context,
@@ -57,6 +57,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only
             acquisition.release_owner_start,
             acquisition.release_owner_end,
         )) continue;
+        if (acquisition.kind == .allocation and acquisitionUsesArenaContract(context, function_scope, acquisition)) continue;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out,
         // error path included.
         if (acquisition.kind == .allocation and scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end))) continue;
@@ -76,7 +77,10 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only
         if (scopeHasErrorPathCleanup(context, binding_name, declaration_end + 1, fallible_index)) continue;
 
         const release_statement = switch (acquisition.kind) {
-            .allocation => try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, acquisition.release, binding_name }),
+            .allocation => if (acquisition.release_owner_member) |member|
+                try std.fmt.allocPrint(context.allocator, "{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, binding_name })
+            else
+                try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, acquisition.release, binding_name }),
             .network_stream => try std.fmt.allocPrint(
                 context.allocator,
                 "{s}.close({s})",
@@ -377,8 +381,10 @@ fn findFallibleAggregateFieldInitializers(
                 summaries_only,
             ) orelse continue;
             if (acquisition.kind != .allocation or !rangeContainsTry(context.tokens, value_end + 1, aggregate_end)) continue;
+            const function_scope = functionScopeContaining(context, equal_index) orelse continue;
+            if (acquisitionUsesArenaContract(context, function_scope, acquisition)) continue;
             const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
-            if (std.ascii.indexOfIgnoreCase(receiver, "arena") != null) continue;
+            if (acquisitionUsesNamedArena(receiver, acquisition)) continue;
             const field = context.tokenText(equal_index - 1);
             const message = if (binding) |name|
                 try std.fmt.allocPrint(
@@ -452,21 +458,21 @@ fn findPartiallyInitializedOwnedFields(
         const function_scope = functionScopeContaining(context, equal_index) orelse continue;
         const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
         const method = context.tokenText(acquisition.method_index);
-        if (std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+        if (acquisitionUsesNamedArena(receiver, acquisition) or
             declarationLooksArenaBacked(context, context.tokenText(acquisition.release_owner_start), function_scope.opening, function_scope.closing) or
             functionDocumentsArenaAllocator(context, function_scope, context.tokenText(acquisition.release_owner_start)) or
             allocatorPathIsBuildArena(context, function_scope, acquisition.release_owner_start, acquisition.release_owner_end) or
+            acquisitionUsesArenaContract(context, function_scope, acquisition) or
             scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end)) or
             scopeDeinitializesReceiver(context, scope_opening, scope_end, owner)) continue;
         if (std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
         const fallible_index = fallibleBeforeBindingUse(context, statement_end + 1, scope_end, owner, false) orelse continue;
         const field = context.tokenText(equal_index - 1);
         const owned_path = context.source[context.tokens[owner_index].loc.start..context.tokens[equal_index - 1].loc.end];
-        const release_statement = try std.fmt.allocPrint(
-            context.allocator,
-            "{s}.{s}({s})",
-            .{ receiver, acquisition.release, owned_path },
-        );
+        const release_statement = if (acquisition.release_owner_member) |member|
+            try std.fmt.allocPrint(context.allocator, "{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, owned_path })
+        else
+            try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, acquisition.release, owned_path });
         defer context.allocator.free(release_statement);
         const indent = lineIndent(context.source, context.tokens[owner_index].loc.start);
         const semicolon_end = context.tokens[statement_end].loc.end;
@@ -772,10 +778,17 @@ const Acquisition = struct {
     callable_start: usize,
     release_owner_start: usize,
     release_owner_end: usize,
+    release_owner_member: ?[]const u8 = null,
     method_index: usize,
     release: []const u8 = "free",
     close_argument: ?TokenRange = null,
 };
+
+fn acquisitionUsesNamedArena(receiver: []const u8, acquisition: Acquisition) bool {
+    return std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+        (acquisition.release_owner_member != null and
+            std.ascii.indexOfIgnoreCase(acquisition.release_owner_member.?, "arena") != null);
+}
 
 fn owningAcquisition(
     context: RuleRun,
@@ -831,13 +844,19 @@ fn owningAcquisitionAfterEqual(
         if (known_summaries.ownedReturnCall(context.source, receiver, name)) |owned| {
             if (std.mem.eql(u8, name, "alloc") and receiver != null and
                 !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
-            const allocator_parameter = owned.allocator_parameter orelse return null;
-            const argument = callArgument(context, path_end + 2, call_close, allocator_parameter) orelse return null;
-            if (!identifierPathArgument(context, argument)) return null;
+            const owner = if (owned.allocator_parameter) |allocator_parameter| owner: {
+                const argument = callArgument(context, path_end + 2, call_close, allocator_parameter) orelse return null;
+                if (!identifierPathArgument(context, argument)) return null;
+                break :owner argument;
+            } else owner: {
+                if (owned.allocator_parameter_member == null or receiver == null or path_end < equal + 4) return null;
+                break :owner TokenRange{ .start = equal + 2, .end = path_end - 1 };
+            };
             return .{
                 .callable_start = equal + 2,
-                .release_owner_start = argument.start,
-                .release_owner_end = argument.end - 1,
+                .release_owner_start = owner.start,
+                .release_owner_end = owner.end - 1,
+                .release_owner_member = owned.allocator_parameter_member,
                 .method_index = path_end,
                 .release = owned.release,
             };
@@ -1033,11 +1052,20 @@ fn functionDocumentsArenaAllocator(context: RuleRun, function: ScopeRange, alloc
             context.tokens[parameter_index + 1].tag == .colon) break;
     } else return false;
 
-    var first_doc = function.declaration;
-    while (first_doc > 0 and (context.tokens[first_doc - 1].tag == .doc_comment or
-        context.tokens[first_doc - 1].tag == .container_doc_comment)) first_doc -= 1;
-    if (first_doc == function.declaration) return false;
-    const documentation = context.source[context.tokens[first_doc].loc.start..context.tokens[function.declaration].loc.start];
+    var modifier_start = function.declaration;
+    while (modifier_start > 0) switch (context.tokens[modifier_start - 1].tag) {
+        .keyword_pub,
+        .keyword_export,
+        .keyword_extern,
+        .keyword_inline,
+        .keyword_noinline,
+        => modifier_start -= 1,
+        else => break,
+    };
+    var first_doc = modifier_start;
+    while (first_doc > 0 and context.tokens[first_doc - 1].tag == .doc_comment) first_doc -= 1;
+    if (first_doc == modifier_start) return false;
+    const documentation = context.source[context.tokens[first_doc].loc.start..context.tokens[modifier_start].loc.start];
     return std.ascii.indexOfIgnoreCase(documentation, "allocator should be an arena") != null;
 }
 
@@ -1062,6 +1090,7 @@ fn functionParameterReceivesOnlyArena(
     parameter_name: []const u8,
     depth: usize,
 ) bool {
+    if (functionParameterMatchesArenaContract(context, function, parameter_name)) return true;
     if (depth == 8 or function.declaration + 2 >= function.opening or
         context.tokens[function.declaration + 1].tag != .identifier) return false;
     if (function.declaration > 0 and context.tokens[function.declaration - 1].tag == .keyword_pub) return false;
@@ -1079,6 +1108,24 @@ fn functionParameterReceivesOnlyArena(
         found_call = true;
     }
     return found_call;
+}
+
+fn functionParameterMatchesArenaContract(
+    context: RuleRun,
+    function: ScopeRange,
+    parameter_name: []const u8,
+) bool {
+    if (function.declaration + 1 >= function.opening or
+        context.tokens[function.declaration].tag != .keyword_fn or
+        context.tokens[function.declaration + 1].tag != .identifier) return false;
+    const function_name = context.tokenText(function.declaration + 1);
+    for (context.configuration.arena_allocator_contracts) |contract| {
+        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        if (!std.mem.eql(u8, parameter_name, contract[separator + 1 ..])) continue;
+        const owner_name = contract[0..separator];
+        if (std.mem.eql(u8, function_name, owner_name)) return true;
+    }
+    return false;
 }
 
 fn functionParameterIndex(context: RuleRun, function: ScopeRange, parameter_name: []const u8) ?usize {
@@ -1124,6 +1171,60 @@ fn allocatorPathIsBuildArena(
         return false;
     }
     return false;
+}
+
+fn acquisitionUsesArenaContract(context: RuleRun, function: ScopeRange, acquisition: Acquisition) bool {
+    const receiver_index, const member_name = if (acquisition.release_owner_member) |member|
+        .{ acquisition.release_owner_start, member }
+    else if (acquisition.release_owner_end > acquisition.release_owner_start and
+        context.tokens[acquisition.release_owner_start].tag == .identifier and
+        identifierPathArgument(context, .{
+            .start = acquisition.release_owner_start,
+            .end = acquisition.release_owner_end + 1,
+        }))
+        .{
+            acquisition.release_owner_start,
+            context.source[context.tokens[acquisition.release_owner_start + 2].loc.start..context.tokens[acquisition.release_owner_end].loc.end],
+        }
+    else
+        .{ acquisition.release_owner_start, context.tokenText(acquisition.release_owner_start) };
+    if (context.tokens[receiver_index].tag != .identifier) return false;
+    const receiver_name = context.tokenText(receiver_index);
+    const owner_type = functionParameterTypeName(context, function, receiver_name);
+    const function_name = if (function.declaration + 1 < context.tokens.len and
+        context.tokens[function.declaration].tag == .keyword_fn and
+        context.tokens[function.declaration + 1].tag == .identifier)
+        context.tokenText(function.declaration + 1)
+    else
+        null;
+
+    for (context.configuration.arena_allocator_contracts) |contract| {
+        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        if (!std.mem.eql(u8, member_name, contract[separator + 1 ..])) continue;
+        const owner_name = contract[0..separator];
+        if (owner_type) |type_name| if (std.mem.eql(u8, owner_name, type_name)) return true;
+        if (function_name) |name| if (std.mem.eql(u8, owner_name, name) and
+            std.mem.eql(u8, receiver_name, member_name)) return true;
+    }
+    return false;
+}
+
+fn functionParameterTypeName(context: RuleRun, function: ScopeRange, parameter_name: []const u8) ?[]const u8 {
+    var parameter_index = function.declaration + 1;
+    while (parameter_index + 2 < function.opening) : (parameter_index += 1) {
+        if (!context.tokenIs(parameter_index, parameter_name) or context.tokens[parameter_index + 1].tag != .colon) continue;
+        var type_name: ?[]const u8 = null;
+        var type_index = parameter_index + 2;
+        while (type_index < function.opening) : (type_index += 1) {
+            switch (context.tokens[type_index].tag) {
+                .comma, .r_paren => break,
+                .identifier => type_name = context.tokenText(type_index),
+                else => {},
+            }
+        }
+        return type_name;
+    }
+    return null;
 }
 
 fn scopeDeinitializesReceiver(context: RuleRun, scope_opening: usize, scope_end: usize, receiver_segment: []const u8) bool {
@@ -1265,9 +1366,11 @@ fn fallibleBeforeBindingUse(
         for (context.tokens[cursor .. end + 1], cursor..) |chunk_token, chunk_index| {
             if (chunk_token.tag != .identifier or !context.tokenIs(chunk_index, binding)) continue;
             if (error_return_index != null) continue;
+            const borrowed_use = bindingUseIsBorrowed(context, chunk_index, end);
             if (fallible_index != null and (borrowing_call or
                 callsFallibleContainerInsertion(context, cursor, end) or
-                bindingUseIsBorrowed(context, chunk_index, end))) return fallible_index;
+                borrowed_use)) return fallible_index;
+            if (fallible_index == null and borrowed_use) continue;
             if (allow_writer_view and callsMethod(context, cursor, end, "writer")) continue;
             if (borrowing_call) continue;
             return null;
@@ -1285,7 +1388,8 @@ fn returnsExplicitError(context: RuleRun, return_index: usize, end: usize) bool 
 
 fn bindingUseIsBorrowed(context: RuleRun, index: usize, end: usize) bool {
     return index + 2 < end and context.tokens[index + 1].tag == .period and
-        context.tokens[index + 2].tag == .identifier;
+        context.tokens[index + 2].tag == .identifier and
+        (index + 3 >= end or context.tokens[index + 3].tag != .l_paren);
 }
 
 fn callsMethod(context: RuleRun, start: usize, end: usize, expected: []const u8) bool {
@@ -1597,6 +1701,139 @@ test "a deferred cleanup block protects summarized owned returns" {
         .configuration = types.Configuration.defaults(),
         .findings = &findings,
     }, summary_index);
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "implicit method receiver allocators produce correct errdefer fixes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Store = struct { allocator: std.mem.Allocator, fn make(self: *Store) ![]u8 { return self.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void {\n    const bytes = try store.make();\n    _ = bytes.len;\n    try finish();\n}";
+    const tokens = try tokenize(arena.allocator(), source);
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source, .tokens = tokens }};
+    var summary_index = try summaries.build(arena.allocator(), &sources, types.Configuration.defaults());
+    defer summary_index.deinit(arena.allocator());
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try runWithSummaries(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    }, summary_index);
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqualStrings("    errdefer store.allocator.free(bytes);\n", findings.items[0].fixes[0].edits[0].replacement);
+}
+
+test "nested implicit receiver allocators produce correct errdefer fixes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Store = struct { state: State, fn make(self: *Store) ![]u8 { return self.state.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void {\n    const bytes = try store.make();\n    _ = bytes.len;\n    try finish();\n}";
+    const tokens = try tokenize(arena.allocator(), source);
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source, .tokens = tokens }};
+    var summary_index = try summaries.build(arena.allocator(), &sources, types.Configuration.defaults());
+    defer summary_index.deinit(arena.allocator());
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try runWithSummaries(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    }, summary_index);
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqualStrings("    errdefer store.state.allocator.free(bytes);\n", findings.items[0].fixes[0].edits[0].replacement);
+}
+
+test "owned return wrappers compose allocator paths in errdefer fixes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn allocate(context: Context) ![]u8 { return context.allocator.alloc(u8, 4); }" ++
+        "fn make(state: State) ![]u8 { return allocate(state.context); }" ++
+        "fn load(state: State) !void {\n    const bytes = try make(state);\n    _ = bytes.len;\n    try finish();\n}";
+    const tokens = try tokenize(arena.allocator(), source);
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source, .tokens = tokens }};
+    var summary_index = try summaries.build(arena.allocator(), &sources, types.Configuration.defaults());
+    defer summary_index.deinit(arena.allocator());
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try runWithSummaries(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    }, summary_index);
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    try std.testing.expectEqualStrings("    errdefer state.context.allocator.free(bytes);\n", findings.items[0].fixes[0].edits[0].replacement);
+}
+
+test "arena field contracts protect summarized owned returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const RuleRun = struct { allocator: std.mem.Allocator };" ++
+        "fn related(context: RuleRun) ![]u8 { return context.allocator.alloc(u8, 4); }" ++
+        "fn run(context: RuleRun) !void { const spans = try related(context); try emit(spans); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"RuleRun.allocator"};
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source, .tokens = tokens }};
+    var summary_index = try summaries.build(arena.allocator(), &sources, configuration);
+    defer summary_index.deinit(arena.allocator());
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try runWithSummaries(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = configuration,
+        .findings = &findings,
+    }, summary_index);
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "named arena fields protect summarized owned returns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Builder = struct { arena: std.mem.Allocator };" ++
+        "fn createText(builder: *Builder) ![]u8 { return builder.arena.alloc(u8, 4); }" ++
+        "fn run(builder: *Builder) !void { const text = try createText(builder); try emit(text); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    const sources = [_]summaries.Source{.{ .file_index = 0, .source = source, .tokens = tokens }};
+    var summary_index = try summaries.build(arena.allocator(), &sources, types.Configuration.defaults());
+    defer summary_index.deinit(arena.allocator());
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try runWithSummaries(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    }, summary_index);
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "arena parameter contracts propagate into private allocation checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn buildLabel(allocator: std.mem.Allocator) !void { const text = try allocator.alloc(u8, 4); try emit(text); }" ++
+        "pub fn render(allocator: std.mem.Allocator) !void { try buildLabel(allocator); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"render.allocator"};
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = configuration,
+        .findings = &findings,
+    });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
 
@@ -1980,15 +2217,27 @@ test "standard build creation is owned by the build graph arena" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
-test "documented arena allocator contracts do not require individual error cleanup" {
+test "documented arena allocator contracts survive public function modifiers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
         "/// The allocator should be an arena because returned pointers share its lifetime.\n" ++
-        "fn build(alloc: std.mem.Allocator) ![]u8 { const bytes = try alloc.alloc(u8, 8);" ++
-        "try consume(bytes); return bytes; }";
+        "pub fn build(alloc: std.mem.Allocator) ![]u8 { const bytes = try alloc.alloc(u8, 8);" ++
+        "_ = bytes.len; try finish(); return bytes; }";
     const found = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "container documentation does not suppress function error cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "//! The allocator should be an arena for module-owned scratch functions.\n" ++
+        "pub fn build(alloc: std.mem.Allocator) ![]u8 { const bytes = try alloc.alloc(u8, 8);" ++
+        "_ = bytes.len; try finish(); return bytes; }";
+    const found = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.missing_errdefer, found[0].rule);
 }
 
 test "missing errdefer diagnostics honor suppression" {

@@ -1625,7 +1625,9 @@ pub const Server = struct {
             error.FileNotFound => return null,
             else => return err,
         };
+        defer allocator.free(bytes);
         const source = try allocator.dupeZ(u8, bytes);
+        errdefer allocator.free(source);
         return .{ .path = path, .source = source, .tokens = try tokenize(allocator, source) };
     }
 
@@ -2060,10 +2062,12 @@ pub const Server = struct {
             }
         }
         const document_path = try filePathFromUri(allocator, document.uri) orelse return try completions.toOwnedSlice(allocator);
+        defer allocator.free(document_path);
         const document_directory = std.fs.path.dirname(document_path) orelse return try completions.toOwnedSlice(allocator);
         const prefix_directory = std.fs.path.dirname(prefix) orelse "";
         if (std.fs.path.isAbsolute(prefix_directory)) return try completions.toOwnedSlice(allocator);
         const directory_path = try std.fs.path.join(allocator, &.{ document_directory, prefix_directory });
+        defer allocator.free(directory_path);
         var directory = std.Io.Dir.openDirAbsolute(server.io, directory_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return try completions.toOwnedSlice(allocator),
             else => return err,
@@ -3213,6 +3217,7 @@ fn importPathAt(
     byte_offset: usize,
 ) !?[]const u8 {
     const tokens = try tokenize(allocator, source);
+    defer allocator.free(tokens);
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or index + 3 >= tokens.len or
             !std.mem.eql(u8, source[token.loc.start..token.loc.end], "@import") or

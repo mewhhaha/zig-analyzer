@@ -97,8 +97,19 @@ pub fn warningsWithSummaries(
         const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
         const arena_backed = valueReceivesBuildArena(tree, tokens, scope_index, initializer) or if (allocation.allocator_source) |allocator_name|
             std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null or
+                (allocation.allocator_member != null and
+                    std.ascii.indexOfIgnoreCase(allocation.allocator_member.?, "arena") != null) or
                 allocatorIsArenaBacked(source, tokens, allocator_name) or
-                privateAllocatorParameterIsAlwaysArenaBacked(
+                allocatorMatchesArenaContract(
+                    source,
+                    tokens,
+                    scope_index,
+                    declaration_index,
+                    allocator_name,
+                    allocation.allocator_member,
+                    summary_index.arena_allocator_contracts,
+                ) or
+                allocatorParameterIsAlwaysArenaBacked(
                     source,
                     tokens,
                     declaration_index,
@@ -122,7 +133,7 @@ pub fn warningsWithSummaries(
             &found,
         );
         if (arena_backed) continue;
-        try findReleaseOrderingIssues(
+        const cleanup_registered_after_fallible_operation = try findReleaseOrderingIssues(
             allocator,
             source,
             tokens,
@@ -136,7 +147,7 @@ pub fn warningsWithSummaries(
             summary_index,
             &found,
         );
-        const cleanup = ownershipLeavesScope(
+        const lexical_cleanup = ownershipLeavesScope(
             source,
             tokens,
             scope_index,
@@ -147,7 +158,29 @@ pub fn warningsWithSummaries(
             allocation.release,
             summary_index,
         );
+        const path_cleanup = ownershipLeavesAllPaths(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            node,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            ownership_live,
+        );
+        const cleanup = if (path_cleanup) |proven|
+            if (proven == .missing and lexical_cleanup == .errdefer_only)
+                .errdefer_only
+            else if (proven == .missing and lexical_cleanup == .released and cleanup_registered_after_fallible_operation)
+                .released
+            else
+                proven
+        else
+            lexical_cleanup;
         if (cleanup == .released or mismatched_release) continue;
+        const ownership_is_path_incomplete = path_cleanup == .missing and lexical_cleanup == .released;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out.
         if (allocation.receiver) |receiver_name| {
             if (deferDeinitializesReceiver(source, tokens, scope_index, receiver_name, declaration_index, scope_end)) continue;
@@ -160,11 +193,18 @@ pub fn warningsWithSummaries(
                 "allocation '{s}' from {s} is released by errdefer only; the success path has no visible {s} or ownership return",
                 .{ binding_name, allocation.method, allocation.release },
             ),
-            .missing => try std.fmt.allocPrint(
-                allocator,
-                "allocation '{s}' from {s} has no visible {s} or ownership return before leaving this scope",
-                .{ binding_name, allocation.method, allocation.release },
-            ),
+            .missing => if (ownership_is_path_incomplete)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "allocation '{s}' from {s} is not released or transferred on every path before leaving this scope",
+                    .{ binding_name, allocation.method },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "allocation '{s}' from {s} has no visible {s} or ownership return before leaving this scope",
+                    .{ binding_name, allocation.method, allocation.release },
+                ),
         };
         errdefer allocator.free(message);
         try found.append(allocator, .{
@@ -386,6 +426,7 @@ const Allocation = struct {
     release: []const u8,
     receiver: ?[]const u8,
     allocator_source: ?[]const u8,
+    allocator_member: ?[]const u8 = null,
 };
 
 fn allocationFromValue(
@@ -443,11 +484,15 @@ fn allocationFromCall(
         return .{
             .method = function_name,
             .release = owned.release,
-            .receiver = if (allocator_argument) |argument|
-                if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+            .receiver = if (owned.allocator_parameter_member == null)
+                if (allocator_argument) |argument|
+                    if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+                else
+                    null
             else
                 null,
             .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
+            .allocator_member = owned.allocator_parameter_member,
         };
     }
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
@@ -486,14 +531,19 @@ fn allocationFromCall(
         if (parameter < call.ast.params.len) call.ast.params[parameter] else null
     else
         null;
+    const allocator_expression = allocator_argument orelse if (owned.allocator_parameter_member != null) receiver else null;
     return .{
         .method = method,
         .release = owned.release,
-        .receiver = if (allocator_argument) |argument|
-            if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+        .receiver = if (owned.allocator_parameter_member == null)
+            if (allocator_expression) |argument|
+                if (tree.nodeTag(argument) == .identifier) tree.tokenSlice(tree.nodeMainToken(argument)) else null
+            else
+                null
         else
             null,
-        .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
+        .allocator_source = if (allocator_expression) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
+        .allocator_member = owned.allocator_parameter_member,
     };
 }
 
@@ -589,7 +639,11 @@ fn allocatorSourceName(
 const arena_backed_types = [_][]const u8{ "ArenaAllocator", "FixedBufferAllocator" };
 
 fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, allocator_name: []const u8) bool {
-    var name = allocator_name;
+    const allocator_method = ".allocator()";
+    var name = if (std.mem.endsWith(u8, allocator_name, allocator_method))
+        allocator_name[0 .. allocator_name.len - allocator_method.len]
+    else
+        allocator_name;
     for (0..4) |_| {
         const declaration = bindingDeclarationValue(source, tokens, name) orelse return false;
         for (tokens[declaration.start..declaration.end]) |token| {
@@ -602,20 +656,74 @@ fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, all
     return false;
 }
 
-fn privateAllocatorParameterIsAlwaysArenaBacked(
+fn allocatorMatchesArenaContract(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    use_index: usize,
+    allocator_source: []const u8,
+    allocator_member: ?[]const u8,
+    contracts: []const []const u8,
+) bool {
+    const receiver_name, const field_name = if (allocator_member) |member|
+        .{ allocator_source, member }
+    else provider: {
+        const provider = std.mem.trimEnd(u8, allocator_source, "()");
+        const separator = std.mem.indexOfScalar(u8, provider, '.') orelse return false;
+        break :provider .{ provider[0..separator], provider[separator + 1 ..] };
+    };
+    const binding = scope_index.findBindingNamed(receiver_name, use_index) orelse return false;
+    const type_name = declaredBindingTypeName(source, tokens, binding.token_index) orelse return false;
+
+    for (contracts) |contract| {
+        const contract_separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        if (!std.mem.eql(u8, field_name, contract[contract_separator + 1 ..])) continue;
+        const owner_type = contract[0..contract_separator];
+        if (std.mem.eql(u8, type_name, owner_type)) return true;
+    }
+    return false;
+}
+
+fn declaredBindingTypeName(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    binding_index: usize,
+) ?[]const u8 {
+    if (binding_index + 2 >= tokens.len or tokens[binding_index + 1].tag != .colon) return null;
+    var type_name: ?[]const u8 = null;
+    var parenthesis_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    for (tokens[binding_index + 2 ..]) |token| {
+        switch (token.tag) {
+            .l_paren => parenthesis_depth += 1,
+            .r_paren => {
+                if (parenthesis_depth == 0 and bracket_depth == 0) break;
+                parenthesis_depth -|= 1;
+            },
+            .l_bracket => bracket_depth += 1,
+            .r_bracket => bracket_depth -|= 1,
+            .equal, .comma => if (parenthesis_depth == 0 and bracket_depth == 0) break,
+            .identifier => type_name = source[token.loc.start..token.loc.end],
+            else => {},
+        }
+    }
+    return type_name;
+}
+
+fn allocatorParameterIsAlwaysArenaBacked(
     source: []const u8,
     tokens: []const std.zig.Token,
     declaration_index: usize,
     allocator_name: []const u8,
     summary_index: summaries.Index,
 ) bool {
-    const function = summary_index.privateFunctionContaining(source, declaration_index) orelse return false;
+    const function = summary_index.functionContaining(source, declaration_index) orelse return false;
     const parameter_index = for (function.parameter_names, 0..) |parameter, index| {
         if (std.mem.eql(u8, parameter, allocator_name)) break index;
     } else return false;
 
     var call_chain: [16]usize = undefined;
-    return privateParameterIsAlwaysArenaBacked(
+    return parameterIsAlwaysArenaBacked(
         source,
         tokens,
         function,
@@ -626,7 +734,7 @@ fn privateAllocatorParameterIsAlwaysArenaBacked(
     );
 }
 
-fn privateParameterIsAlwaysArenaBacked(
+fn parameterIsAlwaysArenaBacked(
     source: []const u8,
     tokens: []const std.zig.Token,
     function: summaries.FunctionSummary,
@@ -635,6 +743,13 @@ fn privateParameterIsAlwaysArenaBacked(
     call_chain: *[16]usize,
     call_depth: usize,
 ) bool {
+    if (summaries.parameterDocumentsArena(function, function.parameter_names[parameter_index])) return true;
+    if (functionParameterMatchesArenaContract(
+        function,
+        function.parameter_names[parameter_index],
+        summary_index.arena_allocator_contracts,
+    )) return true;
+    if (function.externally_visible) return false;
     if (call_depth == call_chain.len) return false;
     for (call_chain[0..call_depth]) |body_start| if (body_start == function.body_start) return false;
     call_chain[call_depth] = function.body_start;
@@ -683,12 +798,12 @@ fn privateParameterIsAlwaysArenaBacked(
         };
         if (!arena_backed) {
             if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) return false;
-            const caller = summary_index.privateFunctionContaining(source, index) orelse return false;
+            const caller = summary_index.functionContaining(source, index) orelse return false;
             const argument_name = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
             const caller_parameter = for (caller.parameter_names, 0..) |parameter, caller_index| {
                 if (std.mem.eql(u8, parameter, argument_name)) break caller_index;
             } else return false;
-            if (!privateParameterIsAlwaysArenaBacked(
+            if (!parameterIsAlwaysArenaBacked(
                 source,
                 tokens,
                 caller,
@@ -701,6 +816,20 @@ fn privateParameterIsAlwaysArenaBacked(
         found_call = true;
     }
     return found_call;
+}
+
+fn functionParameterMatchesArenaContract(
+    function: summaries.FunctionSummary,
+    parameter_name: []const u8,
+    contracts: []const []const u8,
+) bool {
+    for (contracts) |contract| {
+        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        if (!std.mem.eql(u8, parameter_name, contract[separator + 1 ..])) continue;
+        const function_name = contract[0..separator];
+        if (std.mem.eql(u8, function.name, function_name)) return true;
+    }
+    return false;
 }
 
 const TokenRange = struct { start: usize, end: usize };
@@ -756,7 +885,7 @@ fn findMismatchedRelease(
         const wrong_method = !std.mem.eql(u8, actual_release, allocation.release);
         const expected_allocator = allocation.receiver orelse allocation.allocator_source;
         const wrong_allocator = !receiver_is_binding and expected_allocator != null and receiver_name != null and
-            !std.mem.eql(u8, expected_allocator.?, receiver_name.?);
+            !allocatorPathMatches(expected_allocator.?, allocation.allocator_member, receiver_name.?);
         if (!wrong_method and !wrong_allocator) continue;
         mismatched = true;
         const message = if (wrong_method)
@@ -764,6 +893,12 @@ fn findMismatchedRelease(
                 allocator,
                 "allocation '{s}' from {s} must use {s}, not {s}",
                 .{ binding_name, allocation.method, allocation.release, actual_release },
+            )
+        else if (allocation.allocator_member) |member|
+            try std.fmt.allocPrint(
+                allocator,
+                "allocation '{s}' created by allocator '{s}.{s}' is released through different allocator '{s}'",
+                .{ binding_name, expected_allocator.?, member, receiver_name.? },
             )
         else
             try std.fmt.allocPrint(
@@ -778,6 +913,13 @@ fn findMismatchedRelease(
         });
     }
     return mismatched;
+}
+
+fn allocatorPathMatches(base: []const u8, member: ?[]const u8, actual: []const u8) bool {
+    const field = member orelse return std.mem.eql(u8, base, actual);
+    return actual.len == base.len + 1 + field.len and
+        std.mem.startsWith(u8, actual, base) and actual[base.len] == '.' and
+        std.mem.endsWith(u8, actual, field);
 }
 
 fn releaseReceiverPath(source: []const u8, tokens: []const std.zig.Token, method_index: usize) ?[]const u8 {
@@ -801,8 +943,9 @@ fn findReleaseOrderingIssues(
     allocation: Allocation,
     summary_index: summaries.Index,
     found: *std.ArrayList(Warning),
-) !void {
-    const declaration_scope = enclosingScope(tokens, declaration_index) orelse return;
+) !bool {
+    const declaration_scope = enclosingScope(tokens, declaration_index) orelse return false;
+    var cleanup_registered_after_fallible_operation = false;
     var releases: std.ArrayList(usize) = .empty;
     defer releases.deinit(allocator);
     for (tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |token, method_index| {
@@ -831,6 +974,7 @@ fn findReleaseOrderingIssues(
         if (statementStartsWith(tokens, first_release, .keyword_defer) and
             fallibleOperationBetween(tokens, declaration_end + 1, first_release, declaration_scope.opening))
         {
+            cleanup_registered_after_fallible_operation = true;
             try found.append(allocator, .{
                 .rule = .cleanup_after_fallible_operation,
                 .span = tokens[binding_index].loc,
@@ -890,6 +1034,7 @@ fn findReleaseOrderingIssues(
             ),
         });
     }
+    return cleanup_registered_after_fallible_operation;
 }
 
 fn releaseDeletionFix(
@@ -1111,6 +1256,909 @@ fn owningAssignment(
 }
 
 const Cleanup = enum { released, errdefer_only, missing };
+
+const ownership_live: u3 = 1 << 0;
+const ownership_live_with_errdefer: u3 = 1 << 1;
+const ownership_safe: u3 = 1 << 2;
+const ownership_live_states = ownership_live | ownership_live_with_errdefer;
+
+const OwnershipFlow = struct {
+    continuing: u3,
+    exiting: u3 = 0,
+    breaking: u3 = 0,
+    repeating: u3 = 0,
+};
+
+const OwnershipLoop = struct {
+    label: ?[]const u8,
+};
+
+fn ownershipLeavesAllPaths(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    declaration_node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    initial_states: u3,
+) ?Cleanup {
+    const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
+    const block = blockNodeForOpening(tree, declaration_scope.opening) orelse return null;
+    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+    const statements = tree.blockStatements(&buffer, block) orelse return null;
+    const declaration_position = for (statements, 0..) |statement, index| {
+        if (statement == declaration_node) break index;
+    } else return null;
+    const flow = analyzeOwnershipStatements(
+        source,
+        tree,
+        tokens,
+        scope_index,
+        statements[declaration_position + 1 ..],
+        initial_states,
+        binding_name,
+        binding_index,
+        allocation,
+        summary_index,
+        null,
+    ) orelse return null;
+    const terminal_states = flow.continuing | flow.exiting;
+    if (terminal_states == 0) return null;
+    return if (terminal_states & ownership_live_states == 0) .released else .missing;
+}
+
+fn blockNodeForOpening(tree: *const std.zig.Ast, opening: usize) ?std.zig.Ast.Node.Index {
+    for (0..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        if (tree.nodeMainToken(node) != opening) continue;
+        switch (tree.nodeTag(node)) {
+            .block_two, .block_two_semicolon, .block, .block_semicolon => return node,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn analyzeOwnershipStatements(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    statements: []const std.zig.Ast.Node.Index,
+    initial_states: u3,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    active_loop: ?OwnershipLoop,
+) ?OwnershipFlow {
+    var flow = OwnershipFlow{ .continuing = initial_states };
+    for (statements) |statement| {
+        if (flow.continuing == 0) break;
+        const statement_flow = analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            statement,
+            flow.continuing,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            active_loop,
+        ) orelse return null;
+        flow.continuing = statement_flow.continuing;
+        flow.exiting |= statement_flow.exiting;
+        flow.breaking |= statement_flow.breaking;
+        flow.repeating |= statement_flow.repeating;
+    }
+    return flow;
+}
+
+fn analyzeOwnershipNode(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    initial_states: u3,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    active_loop: ?OwnershipLoop,
+) ?OwnershipFlow {
+    switch (tree.nodeTag(node)) {
+        .block_two, .block_two_semicolon, .block, .block_semicolon => {
+            var buffer: [2]std.zig.Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buffer, node) orelse unreachable;
+            return analyzeOwnershipStatements(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                statements,
+                initial_states,
+                binding_name,
+                binding_index,
+                allocation,
+                summary_index,
+                active_loop,
+            );
+        },
+        else => {},
+    }
+
+    if (tree.fullIf(node)) |conditional| {
+        if (conditional.payload_token != null and nodeContainsBinding(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            conditional.ast.cond_expr,
+            binding_name,
+            binding_index,
+        )) return null;
+        if (nodeHasAmbiguousOwnershipEffect(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            conditional.ast.cond_expr,
+            binding_name,
+            binding_index,
+            allocation.release,
+            summary_index,
+        )) return null;
+        const then_flow = analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            conditional.ast.then_expr,
+            initial_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            active_loop,
+        ) orelse return null;
+        const else_flow = if (conditional.ast.else_expr.unwrap()) |else_node|
+            analyzeOwnershipNode(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                else_node,
+                initial_states,
+                binding_name,
+                binding_index,
+                allocation,
+                summary_index,
+                active_loop,
+            ) orelse return null
+        else
+            OwnershipFlow{ .continuing = initial_states };
+        var flow = OwnershipFlow{
+            .continuing = then_flow.continuing | else_flow.continuing,
+            .exiting = then_flow.exiting | else_flow.exiting,
+            .breaking = then_flow.breaking | else_flow.breaking,
+            .repeating = then_flow.repeating | else_flow.repeating,
+        };
+        if (nodeContainsTry(tree, tokens, conditional.ast.cond_expr)) flow.exiting |= statesAfterErrorExit(initial_states);
+        return flow;
+    }
+
+    if (tree.fullSwitch(node)) |selection| {
+        if (nodeHasAmbiguousOwnershipEffect(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            selection.ast.condition,
+            binding_name,
+            binding_index,
+            allocation.release,
+            summary_index,
+        ) or selection.ast.cases.len == 0) return null;
+        var flow = OwnershipFlow{ .continuing = 0 };
+        var has_else_case = false;
+        for (selection.ast.cases) |case_node| {
+            const case = tree.fullSwitchCase(case_node) orelse return null;
+            has_else_case = has_else_case or case.ast.values.len == 0;
+            const case_flow = analyzeOwnershipNode(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                case.ast.target_expr,
+                initial_states,
+                binding_name,
+                binding_index,
+                allocation,
+                summary_index,
+                active_loop,
+            ) orelse return null;
+            flow.continuing |= case_flow.continuing;
+            flow.exiting |= case_flow.exiting;
+            flow.breaking |= case_flow.breaking;
+            flow.repeating |= case_flow.repeating;
+        }
+        if (!has_else_case) return null;
+        if (nodeContainsTry(tree, tokens, selection.ast.condition)) flow.exiting |= statesAfterErrorExit(initial_states);
+        return flow;
+    }
+
+    if (tree.fullWhile(node)) |loop| {
+        return analyzeWhileOwnership(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            loop,
+            initial_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            active_loop,
+        );
+    }
+
+    if (tree.fullFor(node)) |loop| {
+        return analyzeForOwnership(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            loop,
+            initial_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            active_loop,
+        );
+    }
+
+    switch (tree.nodeTag(node)) {
+        .@"break", .@"continue" => {
+            const loop = active_loop orelse return null;
+            const label_token, const value_node = tree.nodeData(node).opt_token_and_opt_node;
+            if (label_token.unwrap()) |label| {
+                const active_label = loop.label orelse return null;
+                if (!tokenIsIdentifier(source, tokens[label], active_label)) return null;
+            }
+            if (tree.nodeTag(node) == .@"continue") {
+                if (value_node != .none) return null;
+                return .{ .continuing = 0, .repeating = initial_states };
+            }
+            const states = if (value_node.unwrap()) |value|
+                if (nodeContainsBinding(source, tree, tokens, scope_index, value, binding_name, binding_index))
+                    statesAfterOwnershipTransfer(initial_states)
+                else
+                    initial_states
+            else
+                initial_states;
+            return .{ .continuing = 0, .breaking = states };
+        },
+        .@"return" => {
+            const value = tree.nodeData(node).opt_node.unwrap();
+            if (value) |return_value| {
+                const contains_try = nodeContainsTry(tree, tokens, return_value);
+                const transfers_binding = nodeContainsBinding(
+                    source,
+                    tree,
+                    tokens,
+                    scope_index,
+                    return_value,
+                    binding_name,
+                    binding_index,
+                );
+                if (contains_try and transfers_binding and aggregateMoveInInitializer(
+                    source,
+                    tree,
+                    tokens,
+                    scope_index,
+                    return_value,
+                    binding_name,
+                    binding_index,
+                ) != .all_paths) return null;
+                if (tree.nodeTag(return_value) == .error_value) {
+                    return .{ .continuing = 0, .exiting = statesAfterErrorExit(initial_states) };
+                }
+                var exits = if (transfers_binding) statesAfterOwnershipTransfer(initial_states) else initial_states;
+                if (contains_try) exits |= statesAfterErrorExit(initial_states);
+                return .{ .continuing = 0, .exiting = exits };
+            }
+            return .{ .continuing = 0, .exiting = initial_states };
+        },
+        .@"defer", .@"errdefer" => {
+            const deferred = if (tree.nodeTag(node) == .@"defer")
+                tree.nodeData(node).node
+            else
+                tree.nodeData(node).opt_token_and_node[1];
+            if (!nodeMakesOwnershipSafe(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                deferred,
+                binding_name,
+                binding_index,
+                allocation,
+                summary_index,
+                initial_states,
+            )) return .{ .continuing = initial_states };
+            return .{ .continuing = if (tree.nodeTag(node) == .@"defer")
+                statesAfterOwnershipTransfer(initial_states)
+            else
+                statesAfterErrdeferRegistration(initial_states) };
+        },
+        else => {},
+    }
+
+    if (nodeContainsReallocationOfBinding(
+        source,
+        tree,
+        tokens,
+        scope_index,
+        node,
+        binding_name,
+        binding_index,
+    )) return null;
+
+    var flow = OwnershipFlow{ .continuing = initial_states };
+    if (nodeContainsTry(tree, tokens, node)) {
+        const ownership_escapes = nodeHasAmbiguousOwnershipEffect(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            node,
+            binding_name,
+            binding_index,
+            allocation.release,
+            summary_index,
+        );
+        flow.exiting |= if (ownership_escapes)
+            statesAfterOwnershipTransfer(initial_states)
+        else
+            statesAfterErrorExit(initial_states);
+    }
+    if (nodeMakesOwnershipSafe(
+        source,
+        tree,
+        tokens,
+        scope_index,
+        node,
+        binding_name,
+        binding_index,
+        allocation,
+        summary_index,
+        initial_states,
+    )) flow.continuing = statesAfterOwnershipTransfer(initial_states);
+    return flow;
+}
+
+fn analyzeWhileOwnership(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    loop: std.zig.Ast.full.While,
+    initial_states: u3,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    outer_loop: ?OwnershipLoop,
+) ?OwnershipFlow {
+    if (loop.payload_token != null and nodeContainsBinding(
+        source,
+        tree,
+        tokens,
+        scope_index,
+        loop.ast.cond_expr,
+        binding_name,
+        binding_index,
+    )) return null;
+    if (nodeHasAmbiguousOwnershipEffect(
+        source,
+        tree,
+        tokens,
+        scope_index,
+        loop.ast.cond_expr,
+        binding_name,
+        binding_index,
+        allocation.release,
+        summary_index,
+    )) return null;
+
+    const current_loop = OwnershipLoop{ .label = if (loop.label_token) |label|
+        source[tokens[label].loc.start..tokens[label].loc.end]
+    else
+        null };
+    var header_states = initial_states;
+    var exiting_states: u3 = 0;
+    var breaking_states: u3 = 0;
+    while (true) {
+        const body_flow = analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            loop.ast.then_expr,
+            header_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            current_loop,
+        ) orelse return null;
+        exiting_states |= body_flow.exiting;
+        breaking_states |= body_flow.breaking;
+        var repeating_states = body_flow.continuing | body_flow.repeating;
+        if (loop.ast.cont_expr.unwrap()) |continue_expression| {
+            const continue_flow = analyzeOwnershipNode(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                continue_expression,
+                repeating_states,
+                binding_name,
+                binding_index,
+                allocation,
+                summary_index,
+                current_loop,
+            ) orelse return null;
+            exiting_states |= continue_flow.exiting;
+            breaking_states |= continue_flow.breaking;
+            repeating_states = continue_flow.continuing | continue_flow.repeating;
+        }
+        const expanded_header_states = header_states | repeating_states;
+        if (expanded_header_states == header_states) break;
+        header_states = expanded_header_states;
+    }
+
+    if (nodeContainsTry(tree, tokens, loop.ast.cond_expr)) exiting_states |= statesAfterErrorExit(header_states);
+    if (nodeIsTrueLiteral(source, tree, tokens, loop.ast.cond_expr)) {
+        return .{ .continuing = breaking_states, .exiting = exiting_states };
+    }
+
+    const else_flow = if (loop.ast.else_expr.unwrap()) |else_expression|
+        analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            else_expression,
+            header_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            outer_loop,
+        ) orelse return null
+    else
+        OwnershipFlow{ .continuing = header_states };
+    return .{
+        .continuing = breaking_states | else_flow.continuing,
+        .exiting = exiting_states | else_flow.exiting,
+        .breaking = else_flow.breaking,
+        .repeating = else_flow.repeating,
+    };
+}
+
+fn analyzeForOwnership(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    loop: std.zig.Ast.full.For,
+    initial_states: u3,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    outer_loop: ?OwnershipLoop,
+) ?OwnershipFlow {
+    var input_can_fail = false;
+    for (loop.ast.inputs) |input| {
+        if (nodeHasAmbiguousOwnershipEffect(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            input,
+            binding_name,
+            binding_index,
+            allocation.release,
+            summary_index,
+        )) return null;
+        input_can_fail = input_can_fail or nodeContainsTry(tree, tokens, input);
+    }
+
+    const current_loop = OwnershipLoop{ .label = if (loop.label_token) |label|
+        source[tokens[label].loc.start..tokens[label].loc.end]
+    else
+        null };
+    var header_states = initial_states;
+    var exiting_states = if (input_can_fail) statesAfterErrorExit(initial_states) else 0;
+    var breaking_states: u3 = 0;
+    while (true) {
+        const body_flow = analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            loop.ast.then_expr,
+            header_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            current_loop,
+        ) orelse return null;
+        exiting_states |= body_flow.exiting;
+        breaking_states |= body_flow.breaking;
+        const expanded_header_states = header_states | body_flow.continuing | body_flow.repeating;
+        if (expanded_header_states == header_states) break;
+        header_states = expanded_header_states;
+    }
+
+    const else_flow = if (loop.ast.else_expr.unwrap()) |else_expression|
+        analyzeOwnershipNode(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            else_expression,
+            header_states,
+            binding_name,
+            binding_index,
+            allocation,
+            summary_index,
+            outer_loop,
+        ) orelse return null
+    else
+        OwnershipFlow{ .continuing = header_states };
+    return .{
+        .continuing = breaking_states | else_flow.continuing,
+        .exiting = exiting_states | else_flow.exiting,
+        .breaking = else_flow.breaking,
+        .repeating = else_flow.repeating,
+    };
+}
+
+fn nodeIsTrueLiteral(source: []const u8, tree: *const std.zig.Ast, tokens: []const std.zig.Token, node: std.zig.Ast.Node.Index) bool {
+    const token = tree.firstToken(node);
+    return token == tree.lastToken(node) and tokenIsIdentifier(source, tokens[token], "true");
+}
+
+fn nodeMakesOwnershipSafe(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    allocation: Allocation,
+    summary_index: summaries.Index,
+    initial_states: u3,
+) bool {
+    const start: usize = tree.firstToken(node);
+    var end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    if (end < tokens.len and tokens[end].tag == .semicolon) end += 1;
+    for (tokens[start..end], start..) |token, method_index| {
+        if (token.tag != .identifier or method_index + 1 >= end or tokens[method_index + 1].tag != .l_paren) continue;
+        const direct_release = tokenIsIdentifier(source, token, allocation.release) and
+            releaseCallContainsBinding(source, tokens, scope_index, binding_name, binding_index, method_index, end) and
+            releaseUsesAllocationReceiver(source, tokens, scope_index, binding_name, binding_index, method_index, allocation.receiver);
+        const summarized_release = localCallOwnership(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            method_index + 1,
+            summary_index,
+        ) == .released;
+        if (direct_release or summarized_release) return true;
+    }
+    if (!nodeContainsBinding(source, tree, tokens, scope_index, node, binding_name, binding_index)) return false;
+    if (tree.fullVarDecl(node)) |declaration| {
+        const initializer = declaration.ast.init_node.unwrap() orelse return false;
+        if (!nodeContainsBinding(source, tree, tokens, scope_index, initializer, binding_name, binding_index)) return false;
+        switch (aggregateMoveInInitializer(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            initializer,
+            binding_name,
+            binding_index,
+        )) {
+            .all_paths => {
+                const destination_index: usize = declaration.ast.mut_token + 1;
+                if (destination_index >= tokens.len or tokens[destination_index].tag != .identifier) return false;
+                const destination_name = source[tokens[destination_index].loc.start..tokens[destination_index].loc.end];
+                if (std.mem.eql(u8, destination_name, "_")) return false;
+                return ownershipLeavesAllPaths(
+                    source,
+                    tree,
+                    tokens,
+                    scope_index,
+                    node,
+                    destination_name,
+                    destination_index,
+                    allocation,
+                    summary_index,
+                    initial_states,
+                ) == .released;
+            },
+            .some_paths => return false,
+            .none => {},
+        }
+        const initializer_start: usize = tree.firstToken(initializer);
+        const initializer_end = @min(@as(usize, tree.lastToken(initializer)) + 1, tokens.len);
+        return bindingEscapes(
+            source,
+            tokens,
+            scope_index,
+            binding_name,
+            binding_index,
+            initializer_start,
+            initializer_end,
+            allocation.release,
+            summary_index,
+        );
+    }
+    return ownershipLeavesScope(
+        source,
+        tokens,
+        scope_index,
+        binding_name,
+        binding_index,
+        start,
+        end,
+        allocation.release,
+        summary_index,
+    ) == .released;
+}
+
+const AggregateMove = enum { none, some_paths, all_paths };
+
+fn aggregateMoveInInitializer(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+) AggregateMove {
+    switch (tree.nodeTag(node)) {
+        .identifier => {
+            const index: usize = tree.nodeMainToken(node);
+            return if (tokenRefersToBinding(source, tokens, index, binding_name) and
+                identifierRefersToBinding(scope_index, binding_index, index)) .all_paths else .none;
+        },
+        .struct_init,
+        .struct_init_comma,
+        .struct_init_dot,
+        .struct_init_dot_comma,
+        .struct_init_dot_two,
+        .struct_init_dot_two_comma,
+        .struct_init_one,
+        .struct_init_one_comma,
+        => return if (structInitializerStoresBinding(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            node,
+            binding_name,
+            binding_index,
+        )) .all_paths else .none,
+        .@"try", .@"nosuspend", .@"comptime" => return aggregateMoveInInitializer(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            tree.nodeData(node).node,
+            binding_name,
+            binding_index,
+        ),
+        .grouped_expression => return aggregateMoveInInitializer(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            tree.nodeData(node).node_and_token[0],
+            binding_name,
+            binding_index,
+        ),
+        else => {},
+    }
+    if (tree.fullIf(node)) |conditional| {
+        if (nodeContainsBinding(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            conditional.ast.cond_expr,
+            binding_name,
+            binding_index,
+        )) return .some_paths;
+        const then_move = aggregateMoveInInitializer(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            conditional.ast.then_expr,
+            binding_name,
+            binding_index,
+        );
+        const else_node = conditional.ast.else_expr.unwrap() orelse return if (then_move == .none) .none else .some_paths;
+        return mergeAggregateMoves(then_move, aggregateMoveInInitializer(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            else_node,
+            binding_name,
+            binding_index,
+        ));
+    }
+    if (tree.fullSwitch(node)) |selection| {
+        if (selection.ast.cases.len == 0 or nodeContainsBinding(
+            source,
+            tree,
+            tokens,
+            scope_index,
+            selection.ast.condition,
+            binding_name,
+            binding_index,
+        )) return .some_paths;
+        var combined = AggregateMove.all_paths;
+        var has_else_case = false;
+        for (selection.ast.cases) |case_node| {
+            const case = tree.fullSwitchCase(case_node) orelse return .some_paths;
+            has_else_case = has_else_case or case.ast.values.len == 0;
+            combined = mergeAggregateMoves(combined, aggregateMoveInInitializer(
+                source,
+                tree,
+                tokens,
+                scope_index,
+                case.ast.target_expr,
+                binding_name,
+                binding_index,
+            ));
+        }
+        if (!has_else_case and combined != .none) return .some_paths;
+        return combined;
+    }
+    return .none;
+}
+
+fn mergeAggregateMoves(left: AggregateMove, right: AggregateMove) AggregateMove {
+    if (left == right) return left;
+    return .some_paths;
+}
+
+fn structInitializerStoresBinding(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+) bool {
+    const start: usize = tree.firstToken(node);
+    const end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    for (tokens[start..end], start..) |token, index| {
+        if (!tokenIsIdentifier(source, token, binding_name) or
+            !identifierRefersToBinding(scope_index, binding_index, index)) continue;
+        const previous = if (index == start) null else tokens[index - 1].tag;
+        const next = if (index + 1 == end) null else tokens[index + 1].tag;
+        const value_start = previous == null or previous == .equal or previous == .comma or previous == .l_brace;
+        const value_end = next == null or next == .comma or next == .r_brace;
+        if (value_start and value_end) return true;
+    }
+    return false;
+}
+
+fn nodeContainsReallocationOfBinding(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+) bool {
+    const start: usize = tree.firstToken(node);
+    const end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    for (tokens[start..end], start..) |token, index| {
+        if (!tokenIsIdentifier(source, token, "realloc") or index + 1 >= end or tokens[index + 1].tag != .l_paren) continue;
+        const closing = scope_index.matchingToken(index + 1) orelse continue;
+        if (closing >= end) continue;
+        if (containsBinding(source, tokens, scope_index, binding_name, binding_index, index + 2, closing)) return true;
+    }
+    return false;
+}
+
+fn nodeHasAmbiguousOwnershipEffect(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    release_method: []const u8,
+    summary_index: summaries.Index,
+) bool {
+    if (!nodeContainsBinding(source, tree, tokens, scope_index, node, binding_name, binding_index)) return false;
+    const start: usize = tree.firstToken(node);
+    const end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    return bindingEscapes(
+        source,
+        tokens,
+        scope_index,
+        binding_name,
+        binding_index,
+        start,
+        end,
+        release_method,
+        summary_index,
+    );
+}
+
+fn nodeContainsBinding(
+    source: []const u8,
+    tree: *const std.zig.Ast,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    node: std.zig.Ast.Node.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+) bool {
+    const start: usize = tree.firstToken(node);
+    const end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    return containsBinding(source, tokens, scope_index, binding_name, binding_index, start, end);
+}
+
+fn nodeContainsTry(tree: *const std.zig.Ast, tokens: []const std.zig.Token, node: std.zig.Ast.Node.Index) bool {
+    const start: usize = tree.firstToken(node);
+    const end = @min(@as(usize, tree.lastToken(node)) + 1, tokens.len);
+    for (tokens[start..end]) |token| if (token.tag == .keyword_try) return true;
+    return false;
+}
+
+fn statesAfterOwnershipTransfer(states: u3) u3 {
+    return if (states == 0) 0 else ownership_safe;
+}
+
+fn statesAfterErrdeferRegistration(states: u3) u3 {
+    var result = states & ownership_safe;
+    if (states & ownership_live_states != 0) result |= ownership_live_with_errdefer;
+    return result;
+}
+
+fn statesAfterErrorExit(states: u3) u3 {
+    var result = states & (ownership_live | ownership_safe);
+    if (states & ownership_live_with_errdefer != 0) result |= ownership_safe;
+    return result;
+}
 
 fn ownershipLeavesScope(
     source: []const u8,
@@ -1398,7 +2446,7 @@ fn localDeclarationCreatesBorrowingView(
 }
 
 fn builtinBorrowsMemory(name: []const u8) bool {
-    return std.mem.eql(u8, name, "@memcpy") or std.mem.eql(u8, name, "@memset");
+    return !std.mem.eql(u8, name, "@call");
 }
 
 const CallOwnership = enum { borrowed, released, unknown };
@@ -1909,6 +2957,18 @@ test "passing an allocation to an unknown call is treated as an escape" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "conditional container insertion or cleanup transfers an owned aggregate" {
+    const source: [:0]const u8 =
+        "const Link = struct { start: usize, end: usize, source: []u8, fn deinit(self: *Link, allocator: std.mem.Allocator) void { allocator.free(self.source); } };" ++
+        "fn parseLink(allocator: std.mem.Allocator) !Link { return .{ .start = 0, .end = 1, .source = try allocator.dupe(u8, \"link\") }; }" ++
+        "fn parse(allocator: std.mem.Allocator) !List { var links: List = .empty; " ++
+        "const link = try parseLink(allocator); if (link.start <= link.end) links.appendAssumeCapacity(link) else { " ++
+        "var discarded = link; discarded.deinit(allocator); } return links; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "passing an allocation to a proven borrowing helper does not transfer ownership" {
     const source =
         "fn inspect(bytes: []u8) void { _ = bytes.len; }" ++
@@ -1998,6 +3058,36 @@ test "an indirect helper transfer remains conservative" {
         "fn attach(allocator: std.mem.Allocator) !void {" ++
         "const bytes = try allocator.alloc(u8, 16);" ++
         "register(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "an opaque fallible call may take ownership before returning an error" {
+    const source =
+        "const Finding = struct { edits: []Edit };" ++
+        "fn emit(finding: Finding) !void { try findings.append(finding); }" ++
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const edits = try allocator.alloc(Edit, 1);" ++
+        "try emit(.{ .edits = edits });" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a fallible method may take errdefer-protected ownership" {
+    const source =
+        "const Worker = struct { future: Future, state: *State };" ++
+        "fn start(options: Options) !Worker {" ++
+        "const path = try options.allocator.dupe(u8, options.path);" ++
+        "errdefer options.allocator.free(path);" ++
+        "const state = try options.allocator.create(State);" ++
+        "errdefer options.allocator.destroy(state);" ++
+        "const future = try options.io.concurrent(loop, .{ state, path });" ++
+        "errdefer comptime unreachable;" ++
+        "return .{ .future = future, .state = state };" ++
         "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
@@ -2351,6 +3441,139 @@ test "allocations through a binding derived from a local arena are exempt" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "owned-return summaries recognize direct local arena allocator calls" {
+    const source =
+        "const Stored = struct { bytes: []u8 };" ++
+        "fn copy(allocator: std.mem.Allocator) ![]u8 { return allocator.alloc(u8, 4); }" ++
+        "fn store(gpa: std.mem.Allocator) !Stored {" ++
+        "var storage = std.heap.ArenaAllocator.init(gpa);" ++
+        "errdefer storage.deinit();" ++
+        "const bytes = try copy(storage.allocator());" ++
+        "const stored: Stored = .{ .bytes = bytes };" ++
+        "try finish();" ++
+        "return stored;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "declared arena allocator fields inherit their owner lifetime" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"RequestContext.allocator"};
+    const source: [:0]const u8 =
+        "const RequestContext = struct { allocator: std.mem.Allocator };" ++
+        "fn render(context: RequestContext) !void {" ++
+        "const label = try context.allocator.dupe(u8, \"ready\");" ++
+        "_ = label;" ++
+        "}";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "arena allocator fields survive owned-return summaries" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"RequestContext.allocator"};
+    const source: [:0]const u8 =
+        "const RequestContext = struct { allocator: std.mem.Allocator };" ++
+        "fn makeLabel(context: RequestContext) ![]u8 {" ++
+        "return context.allocator.dupe(u8, \"ready\");" ++
+        "}" ++
+        "fn render(context: RequestContext) !void {" ++
+        "const label = try makeLabel(context);" ++
+        "_ = label;" ++
+        "}";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "named arena fields survive owned-return summaries" {
+    const source =
+        "const Builder = struct { arena: std.mem.Allocator };" ++
+        "fn makeLabel(builder: *Builder) ![]u8 { return builder.arena.dupe(u8, \"ready\"); }" ++
+        "fn render(builder: *Builder) !void { const label = try makeLabel(builder); _ = label; }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "arena allocator field contracts require the declared owner type" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"RequestContext.allocator"};
+    const source: [:0]const u8 =
+        "const PersistentContext = struct { allocator: std.mem.Allocator };" ++
+        "fn render(context: PersistentContext) !void {" ++
+        "const label = try context.allocator.dupe(u8, \"ready\");" ++
+        "_ = label;" ++
+        "}";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "declared arena allocator parameters propagate through private calls" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"render.allocator"};
+    const source: [:0]const u8 =
+        "fn label(allocator: std.mem.Allocator) !void {" ++
+        "const text = try allocator.dupe(u8, \"ready\");" ++
+        "_ = text;" ++
+        "}" ++
+        "pub fn render(allocator: std.mem.Allocator) !void {" ++
+        "try label(allocator);" ++
+        "}";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "documented arena allocator parameters propagate through private calls" {
+    const source: [:0]const u8 =
+        "fn makeLabel(allocator: std.mem.Allocator) !void { const text = try allocator.dupe(u8, \"ready\"); _ = text; }\n" ++
+        "/// The allocator should be an arena owned by the request.\n" ++
+        "pub fn render(allocator: std.mem.Allocator) !void { try makeLabel(allocator); }\n";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "ordinary allocator documentation does not imply an arena lifetime" {
+    const source: [:0]const u8 =
+        "/// The caller owns memory returned through this allocator.\n" ++
+        "pub fn render(allocator: std.mem.Allocator) !void { const text = try allocator.dupe(u8, \"ready\"); _ = text; }\n";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "container documentation does not declare a function arena lifetime" {
+    const source: [:0]const u8 =
+        "//! The allocator should be an arena for module-owned scratch functions.\n" ++
+        "pub fn render(allocator: std.mem.Allocator) !void { const text = try allocator.dupe(u8, \"ready\"); _ = text; }\n";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "uncontracted public allocator parameters still require releases" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"preview.allocator"};
+    const source: [:0]const u8 =
+        "pub fn render(allocator: std.mem.Allocator) !void {" ++
+        "const text = try allocator.dupe(u8, \"ready\");" ++
+        "_ = text;" ++
+        "}";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
 }
 
 test "private allocation functions called only with an arena allocator are exempt" {
@@ -2740,6 +3963,56 @@ test "local method owned returns participate in allocation lifecycle proof" {
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
 }
 
+test "implicit method receiver allocators retain release provenance" {
+    const source: [:0]const u8 =
+        "const Store = struct { allocator: std.mem.Allocator, fn make(self: *Store) ![]u8 { return self.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void { const bytes = try store.make(); defer store.allocator.free(bytes); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "implicit method receiver allocator contracts inherit arena lifetime" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"Store.allocator"};
+    const source: [:0]const u8 =
+        "const Store = struct { allocator: std.mem.Allocator, fn make(self: *Store) ![]u8 { return self.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void { const bytes = try store.make(); _ = bytes; }";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "nested allocator field contracts inherit arena lifetime" {
+    var configuration = types.Configuration.defaults();
+    configuration.arena_allocator_contracts = &.{"RequestContext.storage.allocator"};
+    const source: [:0]const u8 =
+        "const RequestContext = struct { storage: Storage };" ++
+        "fn render(context: RequestContext) !void { const bytes = try context.storage.allocator.alloc(u8, 4); _ = bytes; }";
+    const found = try warningsWithConfiguration(std.testing.allocator, source, configuration);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "nested implicit receiver allocators retain release provenance" {
+    const source: [:0]const u8 =
+        "const Store = struct { state: State, fn make(self: *Store) ![]u8 { return self.state.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void { const bytes = try store.make(); defer store.state.allocator.free(bytes); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "owned return wrappers compose allocator release provenance" {
+    const source: [:0]const u8 =
+        "fn allocate(context: Context) ![]u8 { return context.allocator.alloc(u8, 4); }" ++
+        "fn make(state: State) ![]u8 { return allocate(state.context); }" ++
+        "fn load(state: State) !void { const bytes = try make(state); defer state.context.allocator.free(bytes); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
 test "passing a local method allocation to a borrowing method does not transfer ownership" {
     const source: [:0]const u8 =
         "const Packet = struct { fn encode(self: *const Packet, allocator: std.mem.Allocator) ![]u8 { _ = self; return allocator.alloc(u8, 4); } };" ++
@@ -2791,6 +4064,347 @@ test "owned method returns without allocator provenance accept visible cleanup" 
         "_ = renderer; var writer: Writer = .init(allocator); return writer.toOwnedSlice(); } };" ++
         "fn show(renderer: Renderer) !void { const rendered = try renderer.render(std.testing.allocator); " ++
         "defer std.testing.allocator.free(rendered); }";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "cleanup in only one conditional branch leaves an allocation unreleased" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, release: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "if (release) { allocator.free(bytes); }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "not released or transferred on every path") != null);
+}
+
+test "cleanup in every conditional branch releases an allocation" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, first: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "if (first) { allocator.free(bytes); } else { allocator.free(bytes); }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "cleanup in only one switch branch leaves an allocation unreleased" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, choice: u8) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "switch (choice) { 0 => { allocator.free(bytes); }, else => {} }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "cleanup in every switch branch releases an allocation" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, choice: u8) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "switch (choice) { 0 => { allocator.free(bytes); }, else => { allocator.free(bytes); } }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "an early return before cleanup leaves an allocation unreleased" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, stop: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "if (stop) return;" ++
+        "allocator.free(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "ownership return on one branch and cleanup on the other discharge every path" {
+    const source: [:0]const u8 =
+        "fn take(allocator: std.mem.Allocator, transfer: bool) ![]u8 {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "if (transfer) return bytes;" ++
+        "allocator.free(bytes);" ++
+        "return &.{};" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "errdefer covers propagated errors while success cleanup covers fallthrough" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "errdefer allocator.free(bytes);" ++
+        "try fallible();" ++
+        "allocator.free(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "propagated error before success cleanup leaves an allocation unreleased" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "try fallible();" ++
+        "allocator.free(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "a local alias does not transfer allocation ownership" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "const alias = bytes;" ++
+        "_ = alias.len;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "converting an allocation pointer to an integer does not transfer ownership" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "const address = @intFromPtr(bytes.ptr);" ++
+        "_ = address;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "storing ownership in a local aggregate transfers the allocation" {
+    const source: [:0]const u8 =
+        "const Session = struct { event: *Event };" ++
+        "fn open(allocator: std.mem.Allocator) !Session {" ++
+        "const event = try allocator.create(Event);" ++
+        "const session: Session = .{ .event = event };" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a fallible operation after a local aggregate move can leak its allocation" {
+    const source: [:0]const u8 =
+        "const Session = struct { event: *Event };" ++
+        "fn open(allocator: std.mem.Allocator) !Session {" ++
+        "const event = try allocator.create(Event);" ++
+        "const session: Session = .{ .event = event };" ++
+        "try finish();" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "errdefer protects a local aggregate move across later errors" {
+    const source: [:0]const u8 =
+        "const Session = struct { event: *Event };" ++
+        "fn open(allocator: std.mem.Allocator) !Session {" ++
+        "const event = try allocator.create(Event);" ++
+        "errdefer allocator.destroy(event);" ++
+        "const session: Session = .{ .event = event };" ++
+        "try finish();" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "errdefer protects aggregate moves through every conditional branch" {
+    const source: [:0]const u8 =
+        "const Session = struct { event: *Event, mode: u8 };" ++
+        "fn open(allocator: std.mem.Allocator, alternate: bool) !Session {" ++
+        "const event = try allocator.create(Event);" ++
+        "errdefer allocator.destroy(event);" ++
+        "const session: Session = if (alternate) .{ .event = event, .mode = 1 } else .{ .event = event, .mode = 0 };" ++
+        "try finish();" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "errdefer protects a populated slice moved through nested aggregates" {
+    const source: [:0]const u8 =
+        "const Command = struct { argv: [][]u8, mode: u8 };" ++
+        "const Terminal = struct { command: Command, screen: Screen };" ++
+        "fn open(allocator: std.mem.Allocator, argv: []const []const u8, alternate: bool) !Terminal {" ++
+        "const argv_owned = try allocator.alloc([]u8, argv.len);" ++
+        "errdefer { for (argv_owned) |value| allocator.free(value); allocator.free(argv_owned); }" ++
+        "for (argv, argv_owned) |source_value, *destination| destination.* = try allocator.dupe(u8, source_value);" ++
+        "const command: Command = if (alternate) .{ .argv = argv_owned, .mode = 1 } else .{ .argv = argv_owned, .mode = 0 };" ++
+        "try finish();" ++
+        "return .{ .command = command, .screen = try Screen.init(allocator) };" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "fallible nested aggregate return needs error cleanup for a local move" {
+    const source: [:0]const u8 =
+        "const Command = struct { bytes: []u8 };" ++
+        "const Session = struct { command: Command, screen: Screen };" ++
+        "fn open(allocator: std.mem.Allocator) !Session {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "const command: Command = .{ .bytes = bytes };" ++
+        "return .{ .command = command, .screen = try Screen.init(allocator) };" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "an aggregate move in only one conditional branch does not transfer every path" {
+    const source: [:0]const u8 =
+        "const Session = struct { event: ?*Event };" ++
+        "fn open(allocator: std.mem.Allocator, include: bool) !Session {" ++
+        "const event = try allocator.create(Event);" ++
+        "const session: Session = if (include) .{ .event = event } else .{ .event = null };" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "storing allocation metadata does not transfer ownership" {
+    const source: [:0]const u8 =
+        "const Metadata = struct { length: usize };" ++
+        "fn inspect(allocator: std.mem.Allocator) !Metadata {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "const metadata: Metadata = .{ .length = bytes.len };" ++
+        "return metadata;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "errdefer protects setup before ownership moves into a local aggregate" {
+    const source: [:0]const u8 =
+        "const Session = struct { first: *Event, second: *Event, future: Future };" ++
+        "fn open(allocator: std.mem.Allocator) !Session {" ++
+        "const first = try allocator.create(Event);" ++
+        "errdefer allocator.destroy(first);" ++
+        "const second = try allocator.create(Event);" ++
+        "errdefer allocator.destroy(second);" ++
+        "const future = try start(first, second);" ++
+        "const session: Session = .{ .first = first, .second = second, .future = future };" ++
+        "return session;" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "cleanup inside a for loop does not cover zero iterations" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, values: []const u8) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "for (values) |_| { allocator.free(bytes); break; }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "an early return from a loop bypasses trailing cleanup" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, values: []const u8, stop: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "for (values) |_| { if (stop) return; }" ++
+        "allocator.free(bytes);" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "cleanup before leaving an infinite loop releases an allocation" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "while (true) { allocator.free(bytes); break; }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a break before loop cleanup leaves an allocation unreleased" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, skip: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "while (true) { if (skip) break; allocator.free(bytes); break; }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "loop else and break paths may provide their own cleanup" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, keep_going: bool, stop: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "while (keep_going) { if (stop) { allocator.free(bytes); break; } } else { allocator.free(bytes); }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "continue paths reach loop else cleanup" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator, keep_going: bool, skip: bool) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "while (keep_going) { if (skip) continue; allocator.free(bytes); break; } else { allocator.free(bytes); }" ++
+        "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "cleanup before a labeled break releases an allocation" {
+    const source: [:0]const u8 =
+        "fn run(allocator: std.mem.Allocator) !void {" ++
+        "const bytes = try allocator.alloc(u8, 16);" ++
+        "outer: while (true) { allocator.free(bytes); break :outer; }" ++
+        "}";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 0), found.len);

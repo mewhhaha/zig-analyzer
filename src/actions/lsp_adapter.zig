@@ -83,6 +83,14 @@ fn projectEditWithCreatedFile(
     const DocumentChange = @typeInfo(DocumentChanges).pointer.child;
     const EditChanges = @typeInfo(@FieldType(lsp.types.TextDocument.Edit, "edits")).pointer.child;
     const operations = try allocator.alloc(DocumentChange, file_edits.len + 2);
+    var initialized_edits: usize = 0;
+    errdefer {
+        for (operations[1 .. initialized_edits + 1]) |operation| switch (operation) {
+            .text_document_edit => |edit| allocator.free(edit.edits),
+            else => {},
+        };
+        allocator.free(operations);
+    }
     operations[0] = .{ .create_file = .{ .uri = created_file.uri } };
 
     const created_edits = try allocator.alloc(EditChanges, 1);
@@ -97,6 +105,7 @@ fn projectEditWithCreatedFile(
         .textDocument = .{ .uri = created_file.uri, .version = null },
         .edits = created_edits,
     } };
+    initialized_edits += 1;
 
     for (file_edits, 2..) |file_edit, operation_index| {
         const document = documents.getConst(file_edit.uri) orelse return error.DocumentNotOpen;
@@ -109,6 +118,7 @@ fn projectEditWithCreatedFile(
             .textDocument = .{ .uri = file_edit.uri, .version = document.version },
             .edits = edits,
         } };
+        initialized_edits += 1;
     }
     return .{ .documentChanges = operations };
 }
@@ -141,4 +151,21 @@ test "document edits convert byte spans to UTF-16 ranges" {
     }
     const edits = edit.changes.?.map.get(document.uri).?;
     try std.testing.expectEqual(@as(u32, 17), edits[0].range.start.character);
+}
+
+test "created-file edits release partial operations when a document is missing" {
+    var documents = document_module.Store.init(std.testing.allocator);
+    defer documents.deinit();
+    try documents.open("file:///workspace/open.zig", 1, "const value = 1;\n");
+    const edits = [_]project_actions.FileEdit{
+        .{ .uri = "file:///workspace/open.zig", .edit = .{ .span = .{ .start = 0, .end = 0 }, .replacement = "// open\n" } },
+        .{ .uri = "file:///workspace/missing.zig", .edit = .{ .span = .{ .start = 0, .end = 0 }, .replacement = "// missing\n" } },
+    };
+
+    try std.testing.expectError(error.DocumentNotOpen, projectEditWithCreatedFile(
+        std.testing.allocator,
+        &documents,
+        &edits,
+        .{ .uri = "file:///workspace/new.zig", .source = "const created = true;\n" },
+    ));
 }

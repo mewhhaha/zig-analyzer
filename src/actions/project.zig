@@ -53,8 +53,10 @@ fn buildImportAction(
     const module_document = uniqueModuleDocument(import_name, current_uri, documents) orelse return null;
     const build_document = uniqueBuildDocument(documents) orelse return null;
     const existing_import = try std.fmt.allocPrint(allocator, "addImport(\"{s}\"", .{import_name});
+    defer allocator.free(existing_import);
     if (std.mem.indexOf(u8, build_document.source, existing_import) != null) return null;
     const build_tokens = try action_context.tokenize(allocator, build_document.source);
+    defer allocator.free(build_tokens);
     const build_body = buildFunctionBody(build_tokens, build_document.source) orelse return null;
     const artifact_name = firstRootModuleReceiver(
         build_document.source,
@@ -66,6 +68,7 @@ fn buildImportAction(
     const module_path = uriPath(module_document.uri) orelse return null;
     const build_directory = std.fs.path.dirname(build_path) orelse return null;
     const relative_path = try std.fs.path.relative(allocator, "/", null, build_directory, module_path);
+    defer allocator.free(relative_path);
     const insertion = build_tokens[build_body.end].loc.start;
     // Ownership is transferred through the returned Candidate.edits slice.
     // zig-analyzer: disable-next-line unreleased-allocation
@@ -93,6 +96,7 @@ fn selectedPackageImport(
     selection: std.zig.Token.Loc,
 ) !?[]const u8 {
     const tokens = try action_context.tokenize(allocator, source);
+    defer allocator.free(tokens);
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or !tokenIs(source, token, "@import") or index + 2 >= tokens.len or
             tokens[index + 1].tag != .l_paren or tokens[index + 2].tag != .string_literal or
@@ -181,16 +185,20 @@ fn cImportAction(
 
     const current_path = uriPath(current_uri) orelse return null;
     const wrapper_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(current_path) orelse return null, "c_imports.zig" });
+    defer allocator.free(wrapper_path);
     const wrapper_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{wrapper_path});
     for (documents) |document| if (std.mem.eql(u8, document.uri, wrapper_uri)) return null;
     for (occurrences.items) |*occurrence| {
         const document_path = uriPath(occurrence.uri) orelse return null;
         const document_directory = std.fs.path.dirname(document_path) orelse return null;
-        var relative_path = try std.fs.path.relative(allocator, "/", null, document_directory, wrapper_path);
-        if (!std.mem.startsWith(u8, relative_path, ".")) {
-            relative_path = try std.fmt.allocPrint(allocator, "./{s}", .{relative_path});
-        }
-        occurrence.edit.replacement = try std.fmt.allocPrint(allocator, "@import(\"{s}\").c", .{relative_path});
+        const relative_path = try std.fs.path.relative(allocator, "/", null, document_directory, wrapper_path);
+        defer allocator.free(relative_path);
+        const import_path = if (std.mem.startsWith(u8, relative_path, "."))
+            relative_path
+        else
+            try std.fmt.allocPrint(allocator, "./{s}", .{relative_path});
+        defer if (import_path.ptr != relative_path.ptr) allocator.free(import_path);
+        occurrence.edit.replacement = try std.fmt.allocPrint(allocator, "@import(\"{s}\").c", .{import_path});
     }
     const created_source = try std.fmt.allocPrint(allocator, "pub const c = {s};\n", .{c_import_source});
     errdefer allocator.free(created_source);

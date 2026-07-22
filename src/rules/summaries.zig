@@ -33,6 +33,7 @@ const TokenRange = struct { start: usize, end: usize };
 
 pub const FunctionSummary = struct {
     file_index: usize,
+    declaration_start: usize,
     name: []const u8,
     container_name: ?[]const u8 = null,
     parameter_names: []const []const u8,
@@ -41,6 +42,7 @@ pub const FunctionSummary = struct {
     returns_owned: bool = false,
     return_release: ?[]const u8 = null,
     allocator_parameter: ?usize = null,
+    allocator_parameter_member: ?[]const u8 = null,
     borrowed_return: ?BorrowedReturn = null,
     partial_io: PartialIo = .none,
     container_mutation: ?ContainerMutation = null,
@@ -55,9 +57,34 @@ pub const FunctionSummary = struct {
     nested_function_ranges: []const TokenRange = &.{},
 };
 
+pub fn parameterDocumentsArena(function: FunctionSummary, parameter_name: []const u8) bool {
+    for (function.parameter_names) |parameter| {
+        if (std.mem.eql(u8, parameter, parameter_name)) break;
+    } else return false;
+
+    var modifier_start = function.declaration_start;
+    while (modifier_start > 0) switch (function.tokens[modifier_start - 1].tag) {
+        .keyword_pub,
+        .keyword_export,
+        .keyword_extern,
+        .keyword_inline,
+        .keyword_noinline,
+        => modifier_start -= 1,
+        else => break,
+    };
+    var documentation_start = modifier_start;
+    while (documentation_start > 0 and function.tokens[documentation_start - 1].tag == .doc_comment) {
+        documentation_start -= 1;
+    }
+    if (documentation_start == modifier_start) return false;
+    const documentation = function.source[function.tokens[documentation_start].loc.start..function.tokens[modifier_start].loc.start];
+    return std.ascii.indexOfIgnoreCase(documentation, "allocator should be an arena") != null;
+}
+
 pub const OwnedReturn = struct {
     release: []const u8,
     allocator_parameter: ?usize = null,
+    allocator_parameter_member: ?[]const u8 = null,
 };
 
 const ImportAlias = struct {
@@ -78,8 +105,10 @@ pub const Index = struct {
     functions: []FunctionSummary,
     files: []FileSummary,
     resource_contracts: []const types.ResourceContract,
+    arena_allocator_contracts: []const []const u8,
     import_aliases: []const ImportAlias,
     owned_tokens: []const []const std.zig.Token,
+    owned_member_paths: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(index: *Index, allocator: std.mem.Allocator) void {
         for (index.functions) |function| {
@@ -94,6 +123,8 @@ pub const Index = struct {
         allocator.free(index.import_aliases);
         for (index.owned_tokens) |tokens| allocator.free(tokens);
         allocator.free(index.owned_tokens);
+        for (index.owned_member_paths.items) |path| allocator.free(path);
+        index.owned_member_paths.deinit(allocator);
         index.* = undefined;
     }
 
@@ -200,6 +231,7 @@ pub const Index = struct {
             return .{
                 .release = owned.release,
                 .allocator_parameter = if (owned.allocator_parameter.? == 0) null else owned.allocator_parameter.? - 1,
+                .allocator_parameter_member = owned.allocator_parameter_member,
             };
         } else if (index.sourceHasLocalBinding(source, name)) return null;
         const file_index = index.fileIndexForSource(source) orelse return null;
@@ -256,7 +288,7 @@ pub const Index = struct {
         return false;
     }
 
-    pub fn privateFunctionContaining(
+    pub fn functionContaining(
         index: Index,
         source: []const u8,
         token_index: usize,
@@ -264,7 +296,7 @@ pub const Index = struct {
         const file = index.fileForSource(source) orelse return null;
         var selected: ?FunctionSummary = null;
         for (index.functions[file.function_start..file.function_end]) |function| {
-            if (function.externally_visible or token_index <= function.body_start or token_index >= function.body_end) continue;
+            if (token_index <= function.body_start or token_index >= function.body_end) continue;
             if (selected == null or function.body_start > selected.?.body_start) selected = function;
         }
         const function = selected orelse return null;
@@ -524,6 +556,7 @@ pub fn build(
             .functions = owned_functions,
             .files = owned_files,
             .resource_contracts = configuration.resource_contracts,
+            .arena_allocator_contracts = configuration.arena_allocator_contracts,
             .import_aliases = owned_import_aliases,
             .owned_tokens = all_owned_tokens,
         };
@@ -532,7 +565,7 @@ pub fn build(
     try markRecursiveFunctions(allocator, index);
     inferDirectEffects(index, configuration);
     for (0..index.functions.len) |_| {
-        if (!propagateCallEffects(index)) break;
+        if (!try propagateCallEffects(allocator, &index)) break;
     }
     return index;
 }
@@ -588,6 +621,7 @@ fn collectFunctions(
         try function_stack.append(allocator, function_index);
         try functions.append(allocator, .{
             .file_index = source_file.file_index,
+            .declaration_start = fn_index,
             .name = tokenText(source_file.source, tokens[fn_index + 1]),
             .container_name = containerNameContaining(source_file.source, tokens, fn_index),
             .parameter_names = parameters,
@@ -721,7 +755,10 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
                 if (tokenBelongsToNestedFunction(function.*, use_index)) continue;
                 if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), parameter_name)) continue;
                 if (useIsDirectRelease(function.*, use_index, configuration.resource_contracts)) {
-                    mergeEffect(&function.parameter_effects[parameter], .released);
+                    mergeEffect(
+                        &function.parameter_effects[parameter],
+                        if (effectUseIsUnconditional(function.*, use_index)) .released else .unknown,
+                    );
                     continue;
                 }
                 if (parameterUseIsCopied(function.*, use_index)) continue;
@@ -740,6 +777,7 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
             function.returns_owned = true;
             function.return_release = owned.release;
             function.allocator_parameter = owned.allocator_parameter;
+            function.allocator_parameter_member = owned.allocator_parameter_member;
         } else {
             function.borrowed_return = directBorrowedReturn(function.*);
         }
@@ -973,7 +1011,11 @@ fn partialReadMethod(method: []const u8) bool {
     return false;
 }
 
-const DirectOwnedReturn = struct { release: []const u8, allocator_parameter: ?usize = null };
+const DirectOwnedReturn = struct {
+    release: []const u8,
+    allocator_parameter: ?usize = null,
+    allocator_parameter_member: ?[]const u8 = null,
+};
 
 fn directOwnedReturn(function: FunctionSummary, contracts: []const types.ResourceContract) ?DirectOwnedReturn {
     var selected: ?DirectOwnedReturn = null;
@@ -1001,9 +1043,11 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
                     break :owned .{ .release = callableBaseName(contract.release) };
                 };
                 const release = allocationReleaseForCallable(callable) orelse continue;
+                const provenance = allocatorProvenance(function, callable, call_open, call_end);
                 break :owned .{
                     .release = release,
-                    .allocator_parameter = allocatorParameter(function, callable, call_open, call_end),
+                    .allocator_parameter = if (provenance) |known| known.parameter else null,
+                    .allocator_parameter_member = if (provenance) |known| known.member else null,
                 };
             }
             break :owned null;
@@ -1011,7 +1055,8 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
         const owned = possible_owned orelse return null;
         if (selected) |known| {
             if (!std.mem.eql(u8, known.release, owned.release) or
-                known.allocator_parameter != owned.allocator_parameter) return null;
+                known.allocator_parameter != owned.allocator_parameter or
+                !optionalTextEql(known.allocator_parameter_member, owned.allocator_parameter_member)) return null;
         } else {
             selected = owned;
         }
@@ -1025,6 +1070,40 @@ fn directOwnedBinding(
     binding_name: []const u8,
     contracts: []const types.ResourceContract,
 ) ?DirectOwnedReturn {
+    const transferred_before_return = transferred: {
+        const retaining_methods = [_][]const u8{
+            "append",
+            "appendAssumeCapacity",
+            "insert",
+            "put",
+            "putAssumeCapacity",
+        };
+        for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, call_open| {
+            if (tokenBelongsToNestedFunction(function, call_open) or token.tag != .l_paren) continue;
+            const call_end = matchingToken(function.tokens, call_open) orelse continue;
+            if (call_end >= return_index or exactArgumentIndex(
+                function.source,
+                function.tokens,
+                binding_name,
+                call_open + 1,
+                call_end,
+            ) == null) continue;
+            const callable = callableBefore(function.source, function.tokens, call_open) orelse {
+                if (call_open != 0 and function.tokens[call_open - 1].tag == .builtin and
+                    std.mem.eql(u8, tokenText(function.source, function.tokens[call_open - 1]), "@call")) break :transferred true;
+                continue;
+            };
+            const method = callableBaseName(callable);
+            for (retaining_methods) |candidate| if (std.mem.eql(u8, method, candidate)) break :transferred true;
+        }
+        for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, use_index| {
+            if (tokenBelongsToNestedFunction(function, use_index) or token.tag != .identifier or
+                !std.mem.eql(u8, tokenText(function.source, token), binding_name)) continue;
+            if (useIsStored(function, use_index) and parameterUseDefinitelyEscapes(function, use_index)) break :transferred true;
+        }
+        break :transferred false;
+    };
+    if (transferred_before_return) return null;
     if (errdeferReleaseForBinding(function, binding_name, return_index)) |release| {
         return .{ .release = release };
     }
@@ -1052,7 +1131,12 @@ fn directOwnedBinding(
             return .{ .release = callableBaseName(contract.release) };
         };
         const release = allocationReleaseForCallable(callable) orelse continue;
-        return .{ .release = release, .allocator_parameter = allocatorParameter(function, callable, call_open, call_end) };
+        const provenance = allocatorProvenance(function, callable, call_open, call_end);
+        return .{
+            .release = release,
+            .allocator_parameter = if (provenance) |known| known.parameter else null,
+            .allocator_parameter_member = if (provenance) |known| known.member else null,
+        };
     }
     return null;
 }
@@ -1091,30 +1175,75 @@ fn errdeferReleaseForBinding(
     return null;
 }
 
-fn allocatorParameter(function: FunctionSummary, callable: []const u8, call_open: usize, call_end: usize) ?usize {
+const AllocatorProvenance = struct {
+    parameter: usize,
+    member: ?[]const u8 = null,
+};
+
+fn allocatorProvenance(function: FunctionSummary, callable: []const u8, call_open: usize, call_end: usize) ?AllocatorProvenance {
     if (owned_call.standardAllocatorArgument(callable)) |argument_index| {
-        for (function.parameter_names, 0..) |parameter, parameter_index| {
-            const actual_argument = exactArgumentIndex(function.source, function.tokens, parameter, call_open + 1, call_end) orelse continue;
-            if (actual_argument == argument_index) return parameter_index;
+        if (parameterProvenanceAtArgument(function, call_open + 1, call_end, argument_index)) |provenance| {
+            return provenance;
+        }
+        const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
+        if (std.mem.eql(u8, callable[separator + 1 ..], "toOwnedSlice")) {
+            const receiver = callable[0..separator];
+            if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
+                return localAllocatorProvenance(function, receiver, call_open);
+            }
         }
         return null;
     }
     const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
     const receiver = callable[0..separator];
-    if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
-        for (function.parameter_names, 0..) |parameter, index| {
-            if (std.mem.eql(u8, parameter, receiver)) return index;
+    for (function.parameter_names, 0..) |parameter, index| {
+        if (std.mem.eql(u8, parameter, receiver)) return .{ .parameter = index };
+        if (receiver.len > parameter.len + 1 and std.mem.startsWith(u8, receiver, parameter) and
+            receiver[parameter.len] == '.')
+        {
+            return .{ .parameter = index, .member = receiver[parameter.len + 1 ..] };
         }
+    }
+    if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
+        if (localAllocatorProvenance(function, receiver, call_open)) |provenance| return provenance;
     }
     for (function.parameter_names, 0..) |parameter, index| {
         if (std.ascii.indexOfIgnoreCase(parameter, "alloc") == null and
             !std.mem.eql(u8, parameter, "gpa") and !std.mem.eql(u8, parameter, "arena")) continue;
-        if (exactArgumentIndex(function.source, function.tokens, parameter, call_open + 1, call_end) != null) return index;
+        if (exactArgumentIndex(function.source, function.tokens, parameter, call_open + 1, call_end) != null) {
+            return .{ .parameter = index };
+        }
     }
     return null;
 }
 
-fn propagateCallEffects(index: Index) bool {
+fn localAllocatorProvenance(
+    function: FunctionSummary,
+    binding_name: []const u8,
+    before: usize,
+) ?AllocatorProvenance {
+    var declaration_index = before;
+    while (declaration_index > function.body_start + 1) {
+        declaration_index -= 1;
+        if ((function.tokens[declaration_index].tag != .keyword_const and
+            function.tokens[declaration_index].tag != .keyword_var) or
+            declaration_index + 2 >= before or function.tokens[declaration_index + 1].tag != .identifier or
+            !std.mem.eql(u8, tokenText(function.source, function.tokens[declaration_index + 1]), binding_name)) continue;
+        const declaration_end = statementEnd(function.tokens, declaration_index, before);
+        var init_open = declaration_index + 2;
+        while (init_open < declaration_end) : (init_open += 1) {
+            if (function.tokens[init_open].tag != .identifier or
+                !std.mem.eql(u8, tokenText(function.source, function.tokens[init_open]), "init") or
+                init_open + 1 >= declaration_end or function.tokens[init_open + 1].tag != .l_paren) continue;
+            const init_end = matchingToken(function.tokens, init_open + 1) orelse continue;
+            if (init_end > declaration_end) continue;
+            return parameterProvenanceAtArgument(function, init_open + 2, init_end, 0);
+        }
+    }
+    return null;
+}
+
+fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
     var changed = false;
     for (index.functions) |*caller| {
         if (caller.unresolved) continue;
@@ -1135,7 +1264,11 @@ fn propagateCallEffects(index: Index) bool {
                 std.mem.eql(u8, method, "release")) and !imported_call) or index.releaseContract(callable) != null) continue;
             for (caller.parameter_names, 0..) |parameter_name, caller_parameter| {
                 const argument = exactArgumentIndex(caller.source, caller.tokens, parameter_name, call_open + 1, call_end) orelse continue;
-                const effect = index.parameterEffectForCall(caller.source, callable, argument);
+                const reported_effect = index.parameterEffectForCall(caller.source, callable, argument);
+                const effect = if (reported_effect == .released and !effectUseIsUnconditional(caller.*, call_open))
+                    .unknown
+                else
+                    reported_effect;
                 if (index.parameterEscapesForCall(caller.source, callable, argument)) {
                     changed = changed or !caller.parameter_escapes[caller_parameter];
                     caller.parameter_escapes[caller_parameter] = true;
@@ -1159,24 +1292,27 @@ fn propagateCallEffects(index: Index) bool {
                     const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
                     const owned = index.ownedReturnForCall(caller.source, callable) orelse continue;
                     var allocator_parameter: ?usize = null;
+                    var allocator_parameter_member: ?[]const u8 = null;
                     if (owned.allocator_parameter) |callee_allocator_parameter| {
-                        for (caller.parameter_names, 0..) |parameter_name, caller_parameter| {
-                            const argument = exactArgumentIndex(
-                                caller.source,
-                                caller.tokens,
-                                parameter_name,
-                                call_open + 1,
-                                call_end,
-                            ) orelse continue;
-                            if (argument == callee_allocator_parameter) {
-                                allocator_parameter = caller_parameter;
-                                break;
-                            }
+                        if (parameterProvenanceAtArgument(
+                            caller.*,
+                            call_open + 1,
+                            call_end,
+                            callee_allocator_parameter,
+                        )) |provenance| {
+                            allocator_parameter = provenance.parameter;
+                            allocator_parameter_member = try composeAllocatorMemberPath(
+                                allocator,
+                                &index.owned_member_paths,
+                                provenance.member,
+                                owned.allocator_parameter_member,
+                            );
                         }
                     }
                     break :returned DirectOwnedReturn{
                         .release = owned.release,
                         .allocator_parameter = allocator_parameter,
+                        .allocator_parameter_member = allocator_parameter_member,
                     };
                 }
                 break :returned null;
@@ -1187,7 +1323,8 @@ fn propagateCallEffects(index: Index) bool {
             };
             if (selected) |known| {
                 if (!std.mem.eql(u8, known.release, returned.release) or
-                    known.allocator_parameter != returned.allocator_parameter)
+                    known.allocator_parameter != returned.allocator_parameter or
+                    !optionalTextEql(known.allocator_parameter_member, returned.allocator_parameter_member))
                 {
                     selected = null;
                     break;
@@ -1200,10 +1337,25 @@ fn propagateCallEffects(index: Index) bool {
             caller.returns_owned = true;
             caller.return_release = owned.release;
             caller.allocator_parameter = owned.allocator_parameter;
+            caller.allocator_parameter_member = owned.allocator_parameter_member;
             changed = true;
         }
     }
     return changed;
+}
+
+fn composeAllocatorMemberPath(
+    allocator: std.mem.Allocator,
+    owned_paths: *std.ArrayList([]u8),
+    prefix: ?[]const u8,
+    suffix: ?[]const u8,
+) !?[]const u8 {
+    if (prefix == null) return suffix;
+    if (suffix == null) return prefix;
+    const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix.?, suffix.? });
+    errdefer allocator.free(path);
+    try owned_paths.append(allocator, path);
+    return path;
 }
 
 fn ownedReturnFromFunction(function: FunctionSummary) ?OwnedReturn {
@@ -1211,7 +1363,13 @@ fn ownedReturnFromFunction(function: FunctionSummary) ?OwnedReturn {
     return .{
         .release = function.return_release orelse "free",
         .allocator_parameter = function.allocator_parameter,
+        .allocator_parameter_member = function.allocator_parameter_member,
     };
+}
+
+fn optionalTextEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn mergeEffect(current: *ParameterEffect, incoming: ParameterEffect) void {
@@ -1318,6 +1476,66 @@ fn useIsDirectRelease(function: FunctionSummary, use_index: usize, contracts: []
     return false;
 }
 
+fn effectUseIsUnconditional(function: FunctionSummary, use_index: usize) bool {
+    const opening = enclosingOpening(function.tokens, use_index) orelse return false;
+    const registration = if (opening == function.body_start) registration: {
+        const statement_start = statementStart(function.tokens, use_index, function.body_start + 1);
+        if (rangeContainsConditionalEffect(function.tokens, statement_start, use_index)) return false;
+        break :registration statement_start;
+    } else registration: {
+        if (opening == 0 or function.tokens[opening - 1].tag != .keyword_defer or
+            enclosingOpening(function.tokens, opening - 1) != function.body_start or
+            rangeContainsConditionalEffect(function.tokens, opening + 1, use_index)) return false;
+        break :registration opening - 1;
+    };
+    for (function.tokens[function.body_start + 1 .. registration], function.body_start + 1..) |token, index| {
+        if (tokenBelongsToNestedFunction(function, index)) continue;
+        if (token.tag == .keyword_return or token.tag == .keyword_try) return false;
+    }
+    return true;
+}
+
+fn rangeContainsConditionalEffect(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    for (tokens[start..end]) |token| switch (token.tag) {
+        .keyword_if,
+        .keyword_switch,
+        .keyword_while,
+        .keyword_for,
+        .keyword_errdefer,
+        => return true,
+        else => {},
+    };
+    return false;
+}
+
+fn statementStart(tokens: []const std.zig.Token, index: usize, lower_bound: usize) usize {
+    var start = index;
+    while (start > lower_bound) {
+        switch (tokens[start - 1].tag) {
+            .semicolon, .l_brace, .r_brace => break,
+            else => start -= 1,
+        }
+    }
+    return start;
+}
+
+fn enclosingOpening(tokens: []const std.zig.Token, index: usize) ?usize {
+    var depth: usize = 0;
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth == 0) return cursor;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 fn useIsStored(function: FunctionSummary, use_index: usize) bool {
     var cursor = use_index;
     while (cursor > function.body_start + 1) {
@@ -1355,6 +1573,57 @@ fn exactArgumentIndex(
         }
     }
     return if (segmentIsIdentifier(source, tokens, segment_start, end, parameter_name)) argument else null;
+}
+
+fn parameterProvenanceAtArgument(
+    function: FunctionSummary,
+    start: usize,
+    end: usize,
+    target_argument: usize,
+) ?AllocatorProvenance {
+    var argument: usize = 0;
+    var segment_start = start;
+    var depth: usize = 0;
+    for (function.tokens[start..end], start..) |token, index| {
+        switch (token.tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -|= 1,
+            .comma => if (depth == 0) {
+                if (argument == target_argument) return parameterProvenanceInSegment(function, segment_start, index);
+                argument += 1;
+                segment_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    return if (argument == target_argument) parameterProvenanceInSegment(function, segment_start, end) else null;
+}
+
+fn parameterProvenanceInSegment(function: FunctionSummary, start: usize, end: usize) ?AllocatorProvenance {
+    for (function.parameter_names, 0..) |parameter, parameter_index| {
+        if (segmentIsIdentifier(function.source, function.tokens, start, end, parameter)) {
+            return .{ .parameter = parameter_index };
+        }
+        if (end > start + 2 and function.tokens[start].tag == .identifier and
+            std.mem.eql(u8, tokenText(function.source, function.tokens[start]), parameter) and
+            segmentIsMemberPath(function.tokens, start + 1, end))
+        {
+            return .{
+                .parameter = parameter_index,
+                .member = function.source[function.tokens[start + 2].loc.start..function.tokens[end - 1].loc.end],
+            };
+        }
+    }
+    return null;
+}
+
+fn segmentIsMemberPath(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    if ((end - start) % 2 != 0) return false;
+    for (tokens[start..end], start..) |token, index| {
+        const expected: std.zig.Token.Tag = if ((index - start) % 2 == 0) .period else .identifier;
+        if (token.tag != expected) return false;
+    }
+    return true;
 }
 
 fn segmentIsIdentifier(
@@ -1496,6 +1765,55 @@ test "summaries propagate releases and owned returns through direct calls" {
     try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("forwardMake").?.allocator_parameter);
 }
 
+test "conditional releases do not become parameter release proofs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn releaseSometimes(allocator: std.mem.Allocator, bytes: []u8, enabled: bool) void {" ++
+            "if (enabled) allocator.free(bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.unknown, index.parameterEffect("releaseSometimes", 1));
+}
+
+test "release summaries require registration before earlier error exits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn releaseAfterFallible(allocator: std.mem.Allocator, bytes: []u8) !void {" ++
+            "try prepare(); allocator.free(bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.unknown, index.parameterEffect("releaseAfterFallible", 1));
+}
+
+test "top-level defer supplies an unconditional release summary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn releaseOnExit(allocator: std.mem.Allocator, bytes: []u8) void {" ++
+            "defer allocator.free(bytes); _ = bytes.len; }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.released, index.parameterEffect("releaseOnExit", 1));
+}
+
+test "conditional release effects stay opaque through wrappers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn releaseNow(allocator: std.mem.Allocator, bytes: []u8) void { allocator.free(bytes); }" ++
+            "fn releaseSometimes(allocator: std.mem.Allocator, bytes: []u8, enabled: bool) void {" ++
+            "if (enabled) releaseNow(allocator, bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.unknown, index.parameterEffect("releaseSometimes", 1));
+}
+
 test "summaries retain ownership returned through a local binding" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1520,6 +1838,43 @@ test "summaries retain ownership returned through a local binding slice" {
     const owned = index.ownedReturn("encode").?;
     try std.testing.expectEqualStrings("free", owned.release);
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "a stored parameter returned as an alias is not a new owned return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn retain(allocator: std.mem.Allocator, values: *List, value: []u8) ![]u8 {" ++
+            "errdefer allocator.free(value); try values.append(allocator, value); return value; }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.ownedReturn("retain") == null);
+}
+
+test "an allocation stored before return is exposed as a borrowed alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "const Registry = struct { allocator: std.mem.Allocator, entries: List, " ++
+            "fn append(self: *Registry) !*Entry { const entry = try self.allocator.create(Entry); " ++
+            "self.entries.appendAssumeCapacity(entry); return entry; } };",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.ownedReturn("append") == null);
+}
+
+test "an errdefer protected parameter returned directly remains owned" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn passThrough(allocator: std.mem.Allocator, value: []u8) ![]u8 {" ++
+            "errdefer allocator.free(value); return value; }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqualStrings("free", index.ownedReturn("passThrough").?.release);
 }
 
 test "qualified allocation helpers retain allocator provenance" {
@@ -1548,6 +1903,60 @@ test "standard allocation helpers retain allocator provenance" {
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
 }
 
+test "owned returns retain allocator fields on parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn make(context: Context, bytes: []const u8) ![]u8 { return context.allocator.dupe(u8, bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("make").?;
+    try std.testing.expectEqualStrings("free", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+    try std.testing.expectEqualStrings("allocator", owned.allocator_parameter_member.?);
+}
+
+test "owned returns retain nested allocator paths on parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn make(context: Context, bytes: []const u8) ![]u8 { return context.storage.allocator.dupe(u8, bytes); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("make").?;
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+    try std.testing.expectEqualStrings("storage.allocator", owned.allocator_parameter_member.?);
+}
+
+test "owned return wrappers compose allocator member paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn allocate(context: Context) ![]u8 { return context.allocator.alloc(u8, 4); }" ++
+            "fn make(state: State) ![]u8 { return allocate(state.context); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("make").?;
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+    try std.testing.expectEqualStrings("context.allocator", owned.allocator_parameter_member.?);
+}
+
+test "owned writer returns retain their initializer allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn render(allocator: std.mem.Allocator) ![]u8 { var writer: std.Io.Writer.Allocating = .init(allocator); defer writer.deinit(); try writer.writer.writeAll(\"ready\"); return writer.toOwnedSlice(); }",
+    }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("render").?;
+    try std.testing.expectEqualStrings("free", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
 test "owned returns resolve through local method receivers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1559,6 +1968,20 @@ test "owned returns resolve through local method receivers" {
     const owned = index.ownedReturnCall(source, "packet", "encode").?;
     try std.testing.expectEqualStrings("free", owned.release);
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "owned method returns retain implicit receiver allocator fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Store = struct { allocator: std.mem.Allocator, fn make(self: *Store) ![]u8 { return self.allocator.alloc(u8, 4); } };" ++
+        "fn load(store: *Store) !void { _ = try store.make(); }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturnCall(source, "store", "make").?;
+    try std.testing.expectEqualStrings("free", owned.release);
+    try std.testing.expectEqual(@as(?usize, null), owned.allocator_parameter);
+    try std.testing.expectEqualStrings("allocator", owned.allocator_parameter_member.?);
 }
 
 test "owned returns resolve through named receiver parameters" {

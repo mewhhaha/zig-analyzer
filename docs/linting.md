@@ -87,6 +87,7 @@ strongest proofs apply to your own APIs without heuristics:
   "contracts": {
     "imports": [{ "from": "src/rules", "deny": ["src/lsp_server.zig"] }],
     "resources": [{ "acquire": "Db.open", "release": "Db.close" }],
+    "arena-allocators": ["RequestContext.allocator"],
     "must-use": ["Builder.finish"]
   }
 }
@@ -96,6 +97,11 @@ strongest proofs apply to your own APIs without heuristics:
   denied paths.
 - `resources` pairs an acquiring call with its releasing call, so the
   resource-lifecycle analysis reports acquisitions that are never released.
+- `arena-allocators` names allocator fields by their owner type, or allocator
+  parameters by their function. For example, `RequestContext.allocator` and
+  `render.allocator` declare that allocations made through those providers
+  inherit a surrounding arena lifetime and do not require individual releases.
+  Nested member paths such as `RequestContext.storage.allocator` are supported.
 - `must-use` names functions whose return value must not be discarded.
 
 ## Cross-file analysis
@@ -103,8 +109,9 @@ strongest proofs apply to your own APIs without heuristics:
 The CLI builds conservative function summaries across direct calls.
 Borrowing, release, escape, allocator provenance, and owned returns flow
 across files; recursion, function pointers, ambiguous names, and unresolved
-calls stay opaque rather than guessed at. Opt-in compiler-backed project
-rules compare public type shapes across analyzed build roots and report
+calls stay opaque rather than guessed at. A value retained by a container
+before return is not treated as a second owned result. Opt-in compiler-backed
+project rules compare public type shapes across analyzed build roots and report
 public declarations outside every successfully analyzed root's import graph.
 
 ## Suppressing findings
