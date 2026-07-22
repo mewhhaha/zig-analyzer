@@ -42,6 +42,6 @@ deliberately falls back to syntax features and lint diagnostics; the
 
 ## Current status
 
-The current packaged release is `0.16.0-2`. The
+The current packaged release is `0.16.0-3`. The
 [installation guide](installation.md) describes the release archive and source
 build.
