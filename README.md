@@ -112,7 +112,7 @@ Worst-case single-file analysis time on that corpus is 39 ms.
 
 ## Installation
 
-The `0.16.0-3` release provides a relocatable x86_64 Linux archive containing
+The `0.16.0-4` release provides a relocatable x86_64 Linux archive containing
 both zig-analyzer and its patched compiler backend. Verify the published
 SHA-256 checksum before installing it. Building from source requires Zig
 0.16.0 exactly:
