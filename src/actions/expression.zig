@@ -40,7 +40,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 .refactor_rewrite,
                 expression.span,
                 try std.fmt.allocPrint(context.allocator, "try {s}", .{source_expression}),
-                false,
+                .{},
             );
         }
         // A discarded |err| capture is a compile error in Zig 0.16, so the catch stays captureless.
@@ -49,7 +49,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
             .refactor_rewrite,
             expression.span,
             try std.fmt.allocPrint(context.allocator, "{s} catch @panic(\"TODO\")", .{source_expression}),
-            false,
+            .{},
         );
         if (return_kind.errors.len != 0 and !return_kind.merged_error_sets) {
             try context.oneEdit(
@@ -57,7 +57,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 .refactor_rewrite,
                 expression.span,
                 try errorSwitchReplacement(context, source_expression, return_kind.errors, try errorCaptureName(context)),
-                false,
+                .{},
             );
         }
     }
@@ -68,7 +68,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
             .refactor_rewrite,
             expression.span,
             try std.fmt.allocPrint(context.allocator, "{s}.?", .{source_expression}),
-            false,
+            .{},
         );
         if (function != null and function.?.returnsVoid(context)) {
             try context.oneEdit(
@@ -76,7 +76,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 .refactor_rewrite,
                 expression.span,
                 try std.fmt.allocPrint(context.allocator, "({s} orelse return)", .{source_expression}),
-                false,
+                .{},
             );
         }
         if (standaloneStatement(context, expression.span)) |statement_span| {
@@ -90,7 +90,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                     "if ({s}) |value| {{\n{s}    _ = value;\n{s}}}",
                     .{ source_expression, indentation, indentation },
                 ),
-                false,
+                .{},
             );
         }
     }
@@ -258,7 +258,7 @@ fn addPointerCastAction(context: ActionRun) !void {
         "Insert pointer casts including @constCast (removes const — verify writes are safe)"
     else
         "Insert the required pointer casts";
-    try context.oneEdit(title, .quickfix, expression.span, replacement, false);
+    try context.oneEdit(title, .quickfix, expression.span, replacement, .{});
 }
 
 fn constQualified(context: ActionRun, type_text: []const u8) !bool {
@@ -325,7 +325,7 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
             .refactor_rewrite,
             statement_span,
             try writer.toOwnedSlice(),
-            false,
+            .{},
         );
     }
 }
@@ -381,7 +381,7 @@ fn addOrelseUnreachableUnwrap(context: ActionRun) !void {
             try std.fmt.allocPrint(context.allocator, "{s}.?", .{
                 context.source[span.start..context.tokens[orelse_index - 1].loc.end],
             }),
-            false,
+            .{},
         );
     }
 }

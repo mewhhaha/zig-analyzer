@@ -35,7 +35,7 @@ fn addOwnedSliceReturn(context: ActionRun) !void {
                 "{s}{s}.toOwnedSlice({s}){s}",
                 .{ prefix, container, allocator, suffix },
             ),
-            false,
+            .{},
         );
     }
 }
@@ -80,7 +80,7 @@ fn addReturnedOwnershipTransfer(context: ActionRun) !void {
             .refactor_rewrite,
             token.loc,
             "errdefer",
-            false,
+            .{},
         );
     }
 }
@@ -146,7 +146,7 @@ fn addCheckedAllocationSize(context: ActionRun) !void {
                 "(@import(\"std\").math.mul(usize, {s}, {s}) catch @panic(\"allocation size overflow\"))",
                 .{ context.tokenText(multiplication_index - 1), context.tokenText(multiplication_index + 1) },
             ),
-            false,
+            .{},
         );
     }
 }
@@ -200,7 +200,7 @@ fn addPoisonAfterDeinit(context: ActionRun) !void {
             .refactor_rewrite,
             .{ .start = context.tokens[body_end].loc.start, .end = context.tokens[body_end].loc.start },
             try std.fmt.allocPrint(context.allocator, "{s}    self.* = undefined;\n", .{indentation}),
-            false,
+            .{},
         );
     }
 }

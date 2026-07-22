@@ -22,7 +22,8 @@
     "profile": "idiomatic",
     "correctness": "warning",
     "rules": {
-      "discarded-error": "warning"
+      "discarded-error": "warning",
+      "literal-boolean-argument": "information"
     }
   }
 }

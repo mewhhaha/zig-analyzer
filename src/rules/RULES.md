@@ -292,6 +292,12 @@ Compiler-backed project rules are opt-in.
   slice with one value.
 - [`prefer-memcpy`](prefer-memcpy.md) — Reports element loops that only copy
   corresponding elements between distinct slices.
+- [`prefer-map-contains`](prefer-map-contains.md) — Reports proven standard-map
+  lookups used only to test key membership.
+- [`prefer-array-list-last`](prefer-array-list-last.md) — Reports direct indexing
+  of the last element of a proven standard array list.
+- [`prefer-optional-pop`](prefer-optional-pop.md) — Reports redundant non-empty
+  guards around a discarded optional array-list pop.
 - [`prefer-expression-initializer`](prefer-expression-initializer.md) — Reports
   undefined locals assigned exactly once by every branch of an adjacent
   `if` or `switch`.
@@ -341,6 +347,8 @@ Compiler-backed project rules are opt-in.
   comments.
 - [`assertion-free-test`](assertion-free-test.md) — Reports tests with no visible
   assertion or fallible expectation.
+- [`literal-boolean-argument`](literal-boolean-argument.md) — Reports literal
+  boolean mode arguments whose meaning is hidden at the call site.
 - [`line-length`](line-length.md) — Reports source lines over the configured
   display-column limit.
 

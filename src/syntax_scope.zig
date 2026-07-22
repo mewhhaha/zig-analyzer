@@ -65,7 +65,7 @@ pub const Index = struct {
         };
         scope_openings.clearRetainingCapacity();
         for (tokens, 0..) |token, token_index| {
-            if (token.tag == .r_brace and scope_openings.items.len != 0) _ = scope_openings.pop();
+            if (token.tag == .r_brace) _ = scope_openings.pop();
             index.enclosing_braces[token_index] = scope_openings.getLastOrNull();
             if (token.tag == .identifier) {
                 const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|

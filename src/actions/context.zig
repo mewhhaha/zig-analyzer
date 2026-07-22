@@ -8,6 +8,10 @@ pub const Candidate = struct {
     preferred: bool = false,
 };
 
+pub const CandidateOptions = struct {
+    preferred: bool = false,
+};
+
 pub const ActionRun = struct {
     allocator: std.mem.Allocator,
     source: [:0]const u8,
@@ -21,13 +25,13 @@ pub const ActionRun = struct {
         title: []const u8,
         kind: analysis.ActionKind,
         edits: []const analysis.Edit,
-        preferred: bool,
+        options: CandidateOptions,
     ) !void {
         try context.candidates.append(context.allocator, .{
             .title = title,
             .kind = kind,
             .edits = edits,
-            .preferred = preferred,
+            .preferred = options.preferred,
         });
     }
 
@@ -37,11 +41,11 @@ pub const ActionRun = struct {
         kind: analysis.ActionKind,
         span: std.zig.Token.Loc,
         replacement: []const u8,
-        preferred: bool,
+        options: CandidateOptions,
     ) !void {
         const edits = try context.allocator.alloc(analysis.Edit, 1);
         edits[0] = .{ .span = span, .replacement = replacement };
-        try context.add(title, kind, edits, preferred);
+        try context.add(title, kind, edits, options);
     }
 
     pub fn tokenText(context: ActionRun, index: usize) []const u8 {

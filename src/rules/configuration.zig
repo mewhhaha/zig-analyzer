@@ -22,7 +22,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             return configuration;
         },
     };
-    const removed_format = root.get("format") != null;
+    const removed_format = root.contains("format");
 
     if (root.get("check")) |check_value| {
         const check = switch (check_value) {

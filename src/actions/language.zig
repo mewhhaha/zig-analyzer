@@ -41,7 +41,7 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
                 .refactor_rewrite,
                 token.loc,
                 try writer.toOwnedSlice(),
-                false,
+                .{},
             );
             continue;
         }
@@ -65,7 +65,7 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
                 .end = context.tokens[tuple_end].loc.end,
             },
             try writer.toOwnedSlice(),
-            false,
+            .{},
         );
     }
 }
@@ -157,7 +157,7 @@ fn addMutableCapture(context: ActionRun) !void {
             try std.fmt.allocPrint(context.allocator, "Capture '{s}' by pointer", .{context.tokenText(capture_index)}),
             .quickfix,
             edits,
-            false,
+            .{},
         );
     }
 }
@@ -287,7 +287,7 @@ fn addTaggedUnionSwitch(context: ActionRun) !void {
                 "switch ({s}) {{\n{s}    .{s} => |{s}| {{{s}}},\n{s}    else => {{}},\n{s}}}",
                 .{ value_name, indentation, tag_name, capture, rewritten_body, indentation, indentation },
             ),
-            false,
+            .{},
         );
     }
 }
@@ -408,7 +408,7 @@ fn addFormatRepair(context: ActionRun) !void {
             .quickfix,
             token.loc,
             replacement,
-            true,
+            .{ .preferred = true },
         );
     }
 }
@@ -465,7 +465,7 @@ fn addInlineElseRefactor(context: ActionRun) !void {
                 "return switch ({s}) {{\n{s}    inline else => |payload| payload,\n{s}}};",
                 .{ value_name, indentation, indentation },
             ),
-            false,
+            .{},
         );
     }
 }
@@ -602,7 +602,7 @@ fn addMaterializedType(context: ActionRun) !void {
             .refactor_extract,
             .{ .start = context.tokens[declaration_end].loc.end, .end = context.tokens[declaration_end].loc.end },
             declaration,
-            false,
+            .{},
         );
     }
 }
@@ -661,7 +661,7 @@ fn addReflectedDeclaration(context: ActionRun) !void {
             .refactor_rewrite,
             .{ .start = context.tokens[container_end].loc.start, .end = context.tokens[container_end].loc.start },
             declaration,
-            false,
+            .{},
         );
     }
 }

@@ -49,6 +49,7 @@ const rule_modules = .{
     @import("prefer_loop_else.zig"),
     @import("prefer_orelse.zig"),
     @import("memory_idioms.zig"),
+    @import("container_idioms.zig"),
     @import("prefer_multi_sequence_for.zig"),
     @import("prefer_early_return.zig"),
     @import("prefer_switch.zig"),

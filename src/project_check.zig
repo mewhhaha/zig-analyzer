@@ -785,7 +785,7 @@ fn safeFixAllEdits(allocator: std.mem.Allocator, findings: []const analysis.Find
     var accepted: std.ArrayList(analysis.Edit) = .empty;
     for (candidates.items) |edit| {
         if (accepted.items.len != 0) {
-            const previous = accepted.items[accepted.items.len - 1];
+            const previous = accepted.getLast();
             if (edit.span.start < previous.span.end) continue;
             if (std.meta.eql(edit.span, previous.span) and std.mem.eql(u8, edit.replacement, previous.replacement)) continue;
         }

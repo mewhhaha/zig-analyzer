@@ -187,7 +187,7 @@ pub const Server = struct {
         if (server.compiler_worker) |worker| {
             try server.publishDiagnostics(arena, params.textDocument.uri);
             const document = server.documents.getConst(params.textDocument.uri).?;
-            try worker.schedule(document, false);
+            try worker.schedule(document, .update);
             return;
         }
         try server.ensureCompiler(arena, params.textDocument.uri);
@@ -208,7 +208,7 @@ pub const Server = struct {
         if (server.compiler_worker) |worker| {
             try server.publishDiagnostics(arena, params.textDocument.uri);
             const document = server.documents.getConst(params.textDocument.uri).?;
-            try worker.schedule(document, false);
+            try worker.schedule(document, .update);
             return;
         }
         if (server.compiler == null and server.compiler_restart_available) {
@@ -253,7 +253,7 @@ pub const Server = struct {
     ) !void {
         if (server.compiler_worker) |worker| {
             const document = server.documents.getConst(params.textDocument.uri) orelse return;
-            try worker.schedule(document, true);
+            try worker.schedule(document, .restart);
             return;
         }
         if (server.compiler) |*compiler| compiler.deinit();
@@ -2147,6 +2147,8 @@ const CompilerWorker = struct {
         }
     };
 
+    const ScheduleMode = enum { update, restart };
+
     fn create(
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -2181,13 +2183,13 @@ const CompilerWorker = struct {
         allocator.destroy(worker);
     }
 
-    fn schedule(worker: *CompilerWorker, document: *const Document, restart: bool) !void {
+    fn schedule(worker: *CompilerWorker, document: *const Document, mode: ScheduleMode) !void {
         var job: Job = .{
             .uri = try worker.allocator.dupe(u8, document.uri),
             .source = undefined,
             .version = document.version,
             .generation = 0,
-            .restart = restart,
+            .restart = mode == .restart,
         };
         errdefer worker.allocator.free(job.uri);
         job.source = try worker.allocator.dupe(u8, document.source);
@@ -3557,7 +3559,7 @@ fn nonOverlappingEdits(allocator: std.mem.Allocator, edits: []const analysis.Edi
     var accepted: std.ArrayList(analysis.Edit) = .empty;
     for (sorted) |edit| {
         if (accepted.items.len != 0) {
-            const previous = accepted.items[accepted.items.len - 1];
+            const previous = accepted.getLast();
             if (edit.span.start < previous.span.end) continue;
             if (std.meta.eql(edit.span, previous.span) and std.mem.eql(u8, edit.replacement, previous.replacement)) continue;
         }

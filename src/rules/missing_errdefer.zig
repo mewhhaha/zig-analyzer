@@ -6,14 +6,16 @@ const summaries = @import("summaries.zig");
 const types = @import("types.zig");
 
 pub fn run(context: RuleRun) !void {
-    try runInternal(context, null, false);
+    try runInternal(context, null, .local);
 }
 
 pub fn runWithSummaries(context: RuleRun, summary_index: summaries.Index) !void {
-    try runInternal(context, summary_index, true);
+    try runInternal(context, summary_index, .summaries);
 }
 
-fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only: bool) !void {
+const AnalysisPass = enum { local, summaries };
+
+fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: AnalysisPass) !void {
     const level = context.level(.missing_errdefer);
     if (level == .off) return;
 
@@ -23,7 +25,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         if (!startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const acquisition = owningAcquisition(context, declaration_index, declaration_end, summary_index, summaries_only) orelse continue;
+        const acquisition = owningAcquisition(context, declaration_index, declaration_end, summary_index, pass) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const function_scope = functionScopeContaining(context, declaration_index) orelse continue;
@@ -135,9 +137,9 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, summaries_only
             .fixes = fixes,
         });
     }
-    try findPartiallyInitializedOwnedFields(context, summary_index, summaries_only, level);
-    try findFallibleAggregateFieldInitializers(context, summary_index, summaries_only, level);
-    if (!summaries_only) {
+    try findPartiallyInitializedOwnedFields(context, summary_index, pass, level);
+    try findFallibleAggregateFieldInitializers(context, summary_index, pass, level);
+    if (pass == .local) {
         try findCleanupCapableValuesBeforeInsertion(context, level);
         try findFallibleContainerBuilders(context, level);
         try findFallibleSliceBuilders(context, level);
@@ -354,7 +356,7 @@ fn scopeTransfersContainerStorage(context: RuleRun, binding: []const u8, functio
 fn findFallibleAggregateFieldInitializers(
     context: RuleRun,
     summary_index: ?summaries.Index,
-    summaries_only: bool,
+    pass: AnalysisPass,
     level: types.Level,
 ) !void {
     for (context.tokens, 0..) |token, aggregate_open| {
@@ -378,7 +380,7 @@ fn findFallibleAggregateFieldInitializers(
                 equal_index,
                 value_end,
                 summary_index,
-                summaries_only,
+                pass,
             ) orelse continue;
             if (acquisition.kind != .allocation or !rangeContainsTry(context.tokens, value_end + 1, aggregate_end)) continue;
             const function_scope = functionScopeContaining(context, equal_index) orelse continue;
@@ -434,7 +436,7 @@ fn rangeContainsTry(tokens: []const std.zig.Token, start: usize, end: usize) boo
 fn findPartiallyInitializedOwnedFields(
     context: RuleRun,
     summary_index: ?summaries.Index,
-    summaries_only: bool,
+    pass: AnalysisPass,
     level: types.Level,
 ) !void {
     for (context.tokens, 0..) |token, equal_index| {
@@ -450,7 +452,7 @@ fn findPartiallyInitializedOwnedFields(
             equal_index,
             statement_end,
             summary_index,
-            summaries_only,
+            pass,
         ) orelse continue;
         if (acquisition.kind != .allocation) continue;
         const scope_opening = context.enclosingOpeningBrace(equal_index) orelse continue;
@@ -537,7 +539,7 @@ fn locallyCreatedBindingBefore(context: RuleRun, name: []const u8, before: usize
             !context.tokenIs(declaration_index + 1, name)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= before) continue;
-        const acquisition = owningAcquisition(context, declaration_index, declaration_end, null, false) orelse continue;
+        const acquisition = owningAcquisition(context, declaration_index, declaration_end, null, .local) orelse continue;
         if (context.tokenIs(acquisition.method_index, "create")) return true;
     }
     return false;
@@ -795,7 +797,7 @@ fn owningAcquisition(
     declaration_index: usize,
     declaration_end: usize,
     summary_index: ?summaries.Index,
-    summaries_only: bool,
+    pass: AnalysisPass,
 ) ?Acquisition {
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;
@@ -818,7 +820,7 @@ fn owningAcquisition(
         if (equal_index != null) break;
     }
     const equal = equal_index orelse return null;
-    return owningAcquisitionAfterEqual(context, equal, declaration_end, summary_index, summaries_only);
+    return owningAcquisitionAfterEqual(context, equal, declaration_end, summary_index, pass);
 }
 
 fn owningAcquisitionAfterEqual(
@@ -826,7 +828,7 @@ fn owningAcquisitionAfterEqual(
     equal: usize,
     declaration_end: usize,
     summary_index: ?summaries.Index,
-    summaries_only: bool,
+    pass: AnalysisPass,
 ) ?Acquisition {
     if (equal + 4 >= declaration_end or context.tokens[equal + 1].tag != .keyword_try or
         context.tokens[equal + 2].tag != .identifier) return null;
@@ -862,7 +864,7 @@ fn owningAcquisitionAfterEqual(
             };
         }
     }
-    if (summaries_only or path_end == equal + 2) return null;
+    if (pass == .summaries or path_end == equal + 2) return null;
     if (std.mem.eql(u8, callable, "std.Io.net.IpAddress.connect")) {
         const io_argument = callArgument(context, path_end + 2, call_close, 1) orelse return null;
         return .{

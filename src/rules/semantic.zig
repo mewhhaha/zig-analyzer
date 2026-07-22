@@ -4022,13 +4022,13 @@ fn findUnsortedImports(
     if (imports.items.len < 2 or !importsAreContiguous(source, imports.items) or importsAreSorted(imports.items)) return;
     const replacement = try sortedImportText(allocator, source, imports.items);
     const edits = try allocator.alloc(Edit, 1);
-    edits[0] = .{ .span = .{ .start = imports.items[0].start, .end = imports.items[imports.items.len - 1].end }, .replacement = replacement };
+    edits[0] = .{ .span = .{ .start = imports.items[0].start, .end = imports.getLast().end }, .replacement = replacement };
     const fixes = try allocator.alloc(Fix, 1);
     fixes[0] = .{ .title = "Organize imports", .kind = .organize_imports, .edits = edits };
     try addFinding(allocator, source, configuration, found, .{
         .rule = .unsorted_imports,
         .level = level,
-        .span = .{ .start = imports.items[0].start, .end = imports.items[imports.items.len - 1].end },
+        .span = .{ .start = imports.items[0].start, .end = imports.getLast().end },
         .message = try allocator.dupe(u8, "top-level imports are not grouped and sorted by path"),
         .fixes = fixes,
     });

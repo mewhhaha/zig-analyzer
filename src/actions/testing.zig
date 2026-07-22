@@ -15,7 +15,7 @@ pub fn run(context: ActionRun) !void {
             .refactor_rewrite,
             .{ .start = context.source.len, .end = context.source.len },
             try std.fmt.allocPrint(context.allocator, "\n\ntest \"{s}\" {{\n    _ = {s};\n}}\n", .{ name, name }),
-            false,
+            .{},
         );
         return;
     }
@@ -30,7 +30,7 @@ pub fn run(context: ActionRun) !void {
             "\n\ntest \"{s} declarations compile\" {{\n    @import(\"std\").testing.refAllDecls({s});\n}}\n",
             .{ name, name },
         ),
-        false,
+        .{},
     );
 }
 
