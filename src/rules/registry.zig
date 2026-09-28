@@ -84,6 +84,7 @@ const rule_modules = .{
     @import("prefer_ends_with_scalar.zig"),
     @import("prefer_write_byte.zig"),
     @import("prefer_simd_iota.zig"),
+    @import("missing_container_deinit.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

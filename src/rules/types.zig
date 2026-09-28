@@ -198,6 +198,7 @@ pub const Rule = enum {
     prefer_ends_with_scalar,
     prefer_write_byte,
     prefer_simd_iota,
+    missing_container_deinit,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -276,6 +277,7 @@ pub const Rule = enum {
             .identical_conditional_branches,
             .nan_comparison,
             .identical_bitwise_operands,
+            .missing_container_deinit,
             => .correctness,
             else => .style,
         };

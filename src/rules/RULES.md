@@ -61,6 +61,9 @@ Compiler-backed project rules are opt-in.
 - [`missing-resource-cleanup`](missing-resource-cleanup.md) — Reports a
   recognized resource or mutex with no visible cleanup, unlock, or ownership
   transfer.
+- [`missing-container-deinit`](missing-container-deinit.md) — Reports a local
+  unmanaged container that is mutated without visible cleanup or ownership
+  transfer.
 - [`undefined-value-escape`](undefined-value-escape.md) — Reports a value
   initialized with `undefined` that is read or escapes before whole-value
   initialization.

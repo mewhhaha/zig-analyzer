@@ -3552,6 +3552,7 @@ fn findConfigurationDivergentApis(
 ) !void {
     if (configuration.level(.configuration_divergent_api) == .off or compiler_facts.units.len < 2) return;
     var reported: std.StringHashMapUnmanaged(void) = .empty;
+    defer reported.deinit(allocator);
     for (compiler_facts.units, 0..) |left_unit, left_index| {
         for (left_unit.shapes) |left_shape| {
             for (compiler_facts.units[left_index + 1 ..]) |right_unit| {
@@ -3749,6 +3750,11 @@ fn findDuplicateCImports(
 ) !void {
     if (configuration.level(.duplicate_c_import) == .off) return;
     var signatures: std.StringHashMapUnmanaged(struct { file_index: usize, span: std.zig.Token.Loc }) = .empty;
+    defer {
+        var it = signatures.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        signatures.deinit(allocator);
+    }
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, index| {
@@ -3893,7 +3899,20 @@ fn findConflictingBuildOptions(
 ) !void {
     if (configuration.level(.conflicting_build_options) == .off) return;
     var roots: std.StringHashMapUnmanaged(struct { signature: []const u8, file_index: usize }) = .empty;
+    defer {
+        var it = roots.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.signature);
+        }
+        roots.deinit(allocator);
+    }
     var reported: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = reported.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        reported.deinit(allocator);
+    }
     for (files, 0..) |file, file_index| {
         if (!std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig")) continue;
         for (file.tokens, 0..) |token, index| {
@@ -3903,15 +3922,20 @@ fn findConflictingBuildOptions(
             if (string_index >= file.tokens.len or string_index - index >= 12) continue;
             const root_spelling = stringValue(file.source, file.tokens[string_index]) orelse continue;
             if (!std.mem.endsWith(u8, root_spelling, ".zig")) continue;
-            const root_path = try resolveImportPath(allocator, file.path, root_spelling);
             const block = enclosingInitializer(file.tokens, index) orelse continue;
             const signature = try optionSignature(allocator, file.source, file.tokens, block.opening + 1, block.closing);
-            if (std.mem.eql(u8, signature, "target=<default>;optimize=<default>")) continue;
+            if (std.mem.eql(u8, signature, "target=<default>;optimize=<default>")) {
+                allocator.free(signature);
+                continue;
+            }
+            const root_path = try resolveImportPath(allocator, file.path, root_spelling);
             const gop = try roots.getOrPut(allocator, root_path);
             if (gop.found_existing) {
+                allocator.free(root_path);
+                defer allocator.free(signature);
                 const first = gop.value_ptr.*;
                 if (std.mem.eql(u8, first.signature, signature)) continue;
-                const conflict_key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ root_path, signature });
+                const conflict_key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ gop.key_ptr.*, signature });
                 const rep_gop = try reported.getOrPut(allocator, conflict_key);
                 if (rep_gop.found_existing) {
                     allocator.free(conflict_key);
@@ -3925,7 +3949,7 @@ fn findConflictingBuildOptions(
                     .message = try std.fmt.allocPrint(
                         allocator,
                         "root source '{s}' is configured with both '{s}' and '{s}'; semantic results may differ between compile units",
-                        .{ root_path, first.signature, signature },
+                        .{ gop.key_ptr.*, first.signature, signature },
                     ),
                 });
             } else {
@@ -3990,21 +4014,42 @@ fn findInconsistentImportAliases(
     _ = files;
     const AliasGroup = struct { total: usize = 0, dominant_alias: ?[]const u8 = null, dominant_count: usize = 0 };
     var groups: std.StringHashMapUnmanaged(AliasGroup) = .empty;
+    defer groups.deinit(allocator);
     var alias_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer {
+        var it = alias_counts.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        alias_counts.deinit(allocator);
+    }
     for (imports) |current| {
         const alias = current.alias orelse continue;
         const group = try groups.getOrPut(allocator, current.resolved_path);
         if (!group.found_existing) group.value_ptr.* = .{};
         group.value_ptr.total += 1;
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
-        const count = try alias_counts.getOrPut(allocator, key);
-        if (!count.found_existing) count.value_ptr.* = 0;
-        count.value_ptr.* += 1;
+        var stack_buf: [512]u8 = undefined;
+        const lookup_key = if (current.resolved_path.len +| alias.len +| 1 <= stack_buf.len)
+            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
+        else
+            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
+        defer if (lookup_key.ptr != &stack_buf) allocator.free(lookup_key);
+
+        if (alias_counts.getPtr(lookup_key)) |ptr| {
+            ptr.* += 1;
+        } else {
+            const owned_key = try allocator.dupe(u8, lookup_key);
+            errdefer allocator.free(owned_key);
+            try alias_counts.put(allocator, owned_key, 1);
+        }
     }
     for (imports) |current| {
         const alias = current.alias orelse continue;
         const group = groups.getPtr(current.resolved_path).?;
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
+        var stack_buf: [512]u8 = undefined;
+        const key = if (current.resolved_path.len +| alias.len +| 1 <= stack_buf.len)
+            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
+        else
+            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
+        defer if (key.ptr != &stack_buf) allocator.free(key);
         const count = alias_counts.get(key).?;
         if (count > group.dominant_count) {
             group.dominant_alias = alias;
@@ -4047,6 +4092,7 @@ fn findMinorityNamingStyles(
 ) !void {
     if (configuration.level(.minority_naming_style) == .off) return;
     var samples: std.ArrayList(NamingSample) = .empty;
+    defer samples.deinit(allocator);
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         var brace_depth: usize = 0;
@@ -4111,6 +4157,7 @@ fn findInconsistentParameterVocabulary(
 ) !void {
     if (configuration.level(.inconsistent_parameter_vocabulary) == .off) return;
     var samples: std.ArrayList(ParameterSample) = .empty;
+    defer samples.deinit(allocator);
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
@@ -4139,19 +4186,40 @@ fn findInconsistentParameterVocabulary(
     }
     const VocabularyGroup = struct { total: usize = 0, dominant_name: ?[]const u8 = null, dominant_count: usize = 0 };
     var groups: std.StringHashMapUnmanaged(VocabularyGroup) = .empty;
+    defer groups.deinit(allocator);
     var name_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer {
+        var it = name_counts.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        name_counts.deinit(allocator);
+    }
     for (samples.items) |sample| {
         const group = try groups.getOrPut(allocator, sample.type_name);
         if (!group.found_existing) group.value_ptr.* = .{};
         group.value_ptr.total += 1;
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
-        const count = try name_counts.getOrPut(allocator, key);
-        if (!count.found_existing) count.value_ptr.* = 0;
-        count.value_ptr.* += 1;
+        var stack_buf: [512]u8 = undefined;
+        const lookup_key = if (sample.type_name.len +| sample.name.len +| 1 <= stack_buf.len)
+            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
+        else
+            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
+        defer if (lookup_key.ptr != &stack_buf) allocator.free(lookup_key);
+
+        if (name_counts.getPtr(lookup_key)) |ptr| {
+            ptr.* += 1;
+        } else {
+            const owned_key = try allocator.dupe(u8, lookup_key);
+            errdefer allocator.free(owned_key);
+            try name_counts.put(allocator, owned_key, 1);
+        }
     }
     for (samples.items) |sample| {
         const group = groups.getPtr(sample.type_name).?;
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
+        var stack_buf: [512]u8 = undefined;
+        const key = if (sample.type_name.len +| sample.name.len +| 1 <= stack_buf.len)
+            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
+        else
+            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
+        defer if (key.ptr != &stack_buf) allocator.free(key);
         const count = name_counts.get(key).?;
         if (count > group.dominant_count) {
             group.dominant_name = sample.name;
@@ -4191,7 +4259,13 @@ fn findLiteralBooleanArguments(
 ) !void {
     if (configuration.level(.literal_boolean_argument) == .off) return;
     var declaration_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer declaration_counts.deinit(allocator);
     var boolean_functions: std.StringHashMapUnmanaged(BooleanFunction) = .empty;
+    defer {
+        var it = boolean_functions.valueIterator();
+        while (it.next()) |fn_val| allocator.free(fn_val.boolean_parameters);
+        boolean_functions.deinit(allocator);
+    }
     for (files) |file| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {
@@ -4435,6 +4509,10 @@ fn findRecursiveCalls(
 ) !void {
     if (configuration.level(.recursive_call) == .off) return;
     var declarations: std.ArrayList(FunctionDeclaration) = .empty;
+    defer {
+        for (declarations.items) |decl| allocator.free(decl.calls);
+        declarations.deinit(allocator);
+    }
     var declarations_by_name: FunctionDeclarationsByName = .empty;
     defer {
         var declaration_indices = declarations_by_name.valueIterator();

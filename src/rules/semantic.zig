@@ -3981,6 +3981,7 @@ fn findImportIssues(
     const path_level = configuration.level(.redundant_import_path);
     if (duplicate_level == .off and unused_level == .off and path_level == .off) return;
     var seen_paths: std.StringHashMapUnmanaged(std.zig.Token.Loc) = .empty;
+    defer seen_paths.deinit(allocator);
     var brace_depth: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.tag == .l_brace) brace_depth += 1;

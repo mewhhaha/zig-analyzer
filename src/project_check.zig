@@ -797,6 +797,7 @@ fn applyEdits(
     edits: []const analysis.Edit,
 ) ![:0]const u8 {
     var fixed: std.ArrayList(u8) = .empty;
+    try fixed.ensureTotalCapacity(allocator, source.len);
     var source_offset: usize = 0;
     for (edits) |edit| {
         std.debug.assert(source_offset <= edit.span.start);
@@ -841,6 +842,7 @@ test "source locations use indexed UTF-8 line and column positions" {
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    try tokens.ensureTotalCapacity(allocator, @max(16, source.len / 8));
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

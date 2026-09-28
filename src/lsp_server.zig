@@ -1588,9 +1588,10 @@ pub const Server = struct {
                 if (try describeBinding(allocator, document.source, spans[0])) |binding| {
                     var description = binding;
                     if (description.type_summary == null) {
-                        description.type_summary = try syntax_types.inferredBindingType(
+                        description.type_summary = try syntax_types.inferredBindingTypeWithTokens(
                             allocator,
                             document.source,
+                            document.tokens,
                             spans[0],
                         );
                     }
@@ -1623,18 +1624,18 @@ pub const Server = struct {
         if (std.mem.indexOfScalar(u8, type_name, '.')) |separator| {
             const import_alias = type_name[0..separator];
             if (try server.moduleView(allocator, document, import_alias)) |view| {
-                const field_span = try syntax_types.memberSpan(
-                    allocator,
+                const field_span = syntax_types.memberSpanWithTokens(
                     view.source,
+                    view.tokens,
                     type_name[separator + 1 ..],
                     member_name,
                 ) orelse return null;
                 return try describeBinding(allocator, view.source, field_span);
             }
         }
-        const field_span = try syntax_types.memberSpan(
-            allocator,
+        const field_span = syntax_types.memberSpanWithTokens(
             document.source,
+            document.tokens,
             type_name,
             member_name,
         ) orelse return null;
@@ -1843,8 +1844,8 @@ pub const Server = struct {
         document: *const Document,
         binding_span: std.zig.Token.Loc,
     ) !?[]const u8 {
-        if (try syntax_types.inferredBindingType(allocator, document.source, binding_span)) |inferred| return inferred;
-        if (try syntax_types.initializerTypeExpression(allocator, document.source, binding_span)) |constructed| return constructed;
+        if (try syntax_types.inferredBindingTypeWithTokens(allocator, document.source, document.tokens, binding_span)) |inferred| return inferred;
+        if (try syntax_types.initializerTypeExpressionWithTokens(allocator, document.source, document.tokens, binding_span)) |constructed| return constructed;
         const binding = try describeBinding(allocator, document.source, binding_span) orelse return null;
         return binding.type_summary;
     }
@@ -2247,6 +2248,7 @@ pub const Server = struct {
         return .{
             .path = site.file.path,
             .source = site.file.source,
+            .tokens = site.file.tokens,
             .members = try siteMembers(
                 allocator,
                 site,
@@ -2556,6 +2558,7 @@ const SyntaxMember = struct {
 const ModuleView = struct {
     path: []const u8,
     source: []const u8,
+    tokens: []const std.zig.Token,
     members: []const SyntaxMember,
 };
 
@@ -3526,6 +3529,7 @@ fn isDottedIdentifier(source: []const u8) bool {
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
     errdefer tokens.deinit(allocator);
+    try tokens.ensureTotalCapacity(allocator, @max(16, source.len / 8));
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
@@ -3953,8 +3957,16 @@ fn generateFunctionEdit(
     const arguments_source = source[opening + 1 .. closing];
     if (std.mem.indexOfAny(u8, arguments_source, "([{") != null) return null;
     var parameter_names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (parameter_names.items) |name| {
+            if (@intFromPtr(name.ptr) < @intFromPtr(source.ptr) or @intFromPtr(name.ptr) >= @intFromPtr(source.ptr) + source.len) allocator.free(name);
+        }
+        parameter_names.deinit(allocator);
+    }
     var parameter_types: std.ArrayList([]const u8) = .empty;
+    defer parameter_types.deinit(allocator);
     var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_names.deinit(allocator);
     var arguments = std.mem.splitScalar(u8, arguments_source, ',');
     while (arguments.next()) |raw_argument| {
         const argument = std.mem.trim(u8, raw_argument, " \t\r\n");
@@ -3992,12 +4004,14 @@ fn generateFunctionEdit(
 fn insideContainerAt(allocator: std.mem.Allocator, source: [:0]const u8, offset: usize) !bool {
     var tokenizer = std.zig.Tokenizer.init(source);
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    defer tokens.deinit(allocator);
     while (true) {
         const token = tokenizer.next();
         if (token.tag == .eof or token.loc.start >= offset) break;
         try tokens.append(allocator, token);
     }
     var brace_kinds: std.ArrayList(bool) = .empty;
+    defer brace_kinds.deinit(allocator);
     var container_depth: usize = 0;
     for (tokens.items, 0..) |token, index| switch (token.tag) {
         .l_brace => {
@@ -4134,6 +4148,7 @@ fn reflectionStringSpans(
     name: []const u8,
 ) ![]const std.zig.Token.Loc {
     const tokens = try tokenize(allocator, source);
+    defer allocator.free(tokens);
     var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or
@@ -4176,6 +4191,7 @@ fn redundantQualifiedSuggestion(
     declaration_span: std.zig.Token.Loc,
 ) !?[]const u8 {
     const tokens = try tokenize(allocator, source);
+    defer allocator.free(tokens);
     const declaration_index = for (tokens, 0..) |token, index| {
         if (std.meta.eql(token.loc, declaration_span)) break index;
     } else return null;
@@ -4205,6 +4221,7 @@ fn suggestedDeclarationName(
     declaration_span: std.zig.Token.Loc,
 ) !?[]const u8 {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    defer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
