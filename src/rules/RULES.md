@@ -168,6 +168,8 @@ Compiler-backed project rules are opt-in.
   left-hand side and right-hand side evaluate to the same path.
 - [`identical-comparison-operands`](identical-comparison-operands.md) — Reports
   a comparison where both operands evaluate to the same path.
+- [`identical-logical-operands`](identical-logical-operands.md) — Reports a
+  logical `and` or `or` expression whose operands evaluate to the same path.
 
 ## Opt-in style and policy rules
 
@@ -339,6 +341,8 @@ Compiler-backed project rules are opt-in.
   whose upper bound explicitly specifies `<slice>.len`.
 - [`redundant-boolean-negation`](redundant-boolean-negation.md) — Reports
   double boolean negation operations (`!!x` or `!(!x)`).
+- [`prefer-min-max`](prefer-min-max.md) — Reports conditional `if` expressions
+  choosing between two operands that `@min` or `@max` expresses directly.
 - [`inconsistent-import-alias`](inconsistent-import-alias.md) — Reports a module
   alias that differs from the project majority.
 - [`minority-naming-style`](minority-naming-style.md) — Reports declaration

@@ -175,6 +175,8 @@ pub const Rule = enum {
     identical_comparison_operands,
     redundant_slice_end,
     redundant_boolean_negation,
+    prefer_min_max,
+    identical_logical_operands,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -249,6 +251,7 @@ pub const Rule = enum {
             .unchecked_range_end,
             .self_assignment,
             .identical_comparison_operands,
+            .identical_logical_operands,
             => .correctness,
             else => .style,
         };
@@ -315,6 +318,7 @@ pub const Rule = enum {
             .invariant_loop_condition,
             .redundant_slice_end,
             .redundant_boolean_negation,
+            .prefer_min_max,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,
