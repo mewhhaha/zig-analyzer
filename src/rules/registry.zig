@@ -67,6 +67,10 @@ const rule_modules = .{
     @import("nan_comparison.zig"),
     @import("identical_bitwise_operands.zig"),
     @import("prefer_empty_slice_len.zig"),
+    @import("prefer_index_of_scalar.zig"),
+    @import("prefer_split_scalar.zig"),
+    @import("pointer_to_allocator.zig"),
+    @import("expect_equal_argument_order.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

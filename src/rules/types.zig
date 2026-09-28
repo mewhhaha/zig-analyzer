@@ -181,6 +181,10 @@ pub const Rule = enum {
     nan_comparison,
     identical_bitwise_operands,
     prefer_empty_slice_len,
+    prefer_index_of_scalar,
+    prefer_split_scalar,
+    pointer_to_allocator,
+    expect_equal_argument_order,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -327,6 +331,10 @@ pub const Rule = enum {
             .redundant_boolean_negation,
             .prefer_min_max,
             .prefer_empty_slice_len,
+            .prefer_index_of_scalar,
+            .prefer_split_scalar,
+            .pointer_to_allocator,
+            .expect_equal_argument_order,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,

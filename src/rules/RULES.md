@@ -372,6 +372,14 @@ Compiler-backed project rules are opt-in.
   display-column limit.
 - [`prefer-empty-slice-len`](prefer-empty-slice-len.md) — Reports comparing a
   slice with an empty slice literal using `std.mem.eql` instead of checking `.len`.
+- [`prefer-index-of-scalar`](prefer-index-of-scalar.md) — Reports searching
+  for a single character using `indexOf` or `lastIndexOf` instead of `indexOfScalar`.
+- [`prefer-split-scalar`](prefer-split-scalar.md) — Reports splitting by a
+  single character delimiter using sequence iterators instead of `splitScalar`.
+- [`pointer-to-allocator`](pointer-to-allocator.md) — Reports passing or
+  storing `std.mem.Allocator` as a pointer instead of by value.
+- [`expect-equal-argument-order`](expect-equal-argument-order.md) — Reports
+  `std.testing.expectEqual` called with literal expected constants in the second argument.
 
 ## Modernization profile
 
