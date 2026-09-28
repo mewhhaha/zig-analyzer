@@ -175,6 +175,8 @@ Compiler-backed project rules are opt-in.
   have identical bodies.
 - [`nan-comparison`](nan-comparison.md) — Reports comparison with a NaN value,
   which always evaluates to a constant.
+- [`identical-bitwise-operands`](identical-bitwise-operands.md) — Reports a
+  bitwise `&`, `|`, or `^` operation whose operands evaluate to the same path.
 
 ## Opt-in style and policy rules
 
@@ -368,6 +370,8 @@ Compiler-backed project rules are opt-in.
   boolean mode arguments whose meaning is hidden at the call site.
 - [`line-length`](line-length.md) — Reports source lines over the configured
   display-column limit.
+- [`prefer-empty-slice-len`](prefer-empty-slice-len.md) — Reports comparing a
+  slice with an empty slice literal using `std.mem.eql` instead of checking `.len`.
 
 ## Modernization profile
 

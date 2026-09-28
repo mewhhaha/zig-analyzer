@@ -329,7 +329,8 @@ fn collectCompilerFacts(
 ) !project_rules.CompilerFacts {
     if (configuration.level(.configuration_divergent_api) == .off and
         configuration.level(.unreachable_public_declaration) == .off) return .{};
-    const public_type_names = try collectPublicTypeNames(allocator, loaded_files);
+    var public_type_names = try collectPublicTypeNames(allocator, loaded_files);
+    defer public_type_names.deinit(allocator);
     var root_paths: std.ArrayList([]const u8) = .empty;
     var root_declarations_complete = true;
     for (loaded_files) |loaded_file| {
@@ -355,7 +356,7 @@ fn collectCompilerFacts(
         const declarations = session.workspaceDeclarations(allocator) catch continue;
         var shapes: std.ArrayList(project_rules.CompilerShape) = .empty;
         if (configuration.level(.configuration_divergent_api) != .off) for (declarations) |declaration| {
-            if (!containsPublicTypeName(public_type_names, compilerDeclarationBaseName(declaration))) continue;
+            if (!public_type_names.contains(compilerDeclarationBaseName(declaration))) continue;
             const resolved = session.typeShape(allocator, declaration) catch |err| switch (err) {
                 error.SemanticsUnavailable => continue,
                 else => continue,
@@ -393,8 +394,9 @@ fn collectCompilerFacts(
 fn collectPublicTypeNames(
     allocator: std.mem.Allocator,
     loaded_files: []const LoadedFile,
-) ![]const []const u8 {
-    var names: std.ArrayList([]const u8) = .empty;
+) !std.StringHashMapUnmanaged(void) {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer names.deinit(allocator);
     for (loaded_files) |loaded_file| {
         const source = loaded_file.source orelse continue;
         for (loaded_file.tokens, 0..) |token, index| {
@@ -402,16 +404,10 @@ fn collectPublicTypeNames(
                 loaded_file.tokens[index + 1].tag != .keyword_const or
                 loaded_file.tokens[index + 2].tag != .identifier) continue;
             const name = source[loaded_file.tokens[index + 2].loc.start..loaded_file.tokens[index + 2].loc.end];
-            if (containsPublicTypeName(names.items, name)) continue;
-            try names.append(allocator, name);
+            try names.put(allocator, name, {});
         }
     }
-    return try names.toOwnedSlice(allocator);
-}
-
-fn containsPublicTypeName(names: []const []const u8, candidate: []const u8) bool {
-    for (names) |name| if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+    return names;
 }
 
 fn compilerDeclarationBaseName(declaration: []const u8) []const u8 {

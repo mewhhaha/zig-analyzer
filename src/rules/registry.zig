@@ -65,6 +65,8 @@ const rule_modules = .{
     @import("identical_logical_operands.zig"),
     @import("identical_conditional_branches.zig"),
     @import("nan_comparison.zig"),
+    @import("identical_bitwise_operands.zig"),
+    @import("prefer_empty_slice_len.zig"),
 };
 
 pub fn run(context: RuleRun) !void {
