@@ -654,20 +654,32 @@ fn bindingIsMutated(
         if (usedByMutableOptionalCapture(tokens, index)) return true;
         if (usedByMutableSwitchCapture(tokens, index)) return true;
         if (index + 1 >= tokens.len) continue;
-        // '@field(binding, ...)' can be an lvalue, just like 'binding.name'.
-        if (index >= 2 and tokens[index - 1].tag == .l_paren and
-            tokenIs(source, tokens[index - 2], "@field")) return true;
-        if (tokens[index + 1].tag == .period or tokens[index + 1].tag == .l_bracket) return true;
-        if (isAssignment(tokens[index + 1].tag)) return true;
+        if (identifierIsLvalueAssignment(tokens, index)) return true;
         if (identifierIsDestructuredAssignmentTarget(tokens, index)) return true;
-        var mutation_cursor = index + 1;
-        while (mutation_cursor < tokens.len and mutation_cursor < index + 32) : (mutation_cursor += 1) {
-            switch (tokens[mutation_cursor].tag) {
-                .semicolon, .comma => break,
-                else => if (isAssignment(tokens[mutation_cursor].tag)) return true,
-            }
-        }
     }
+    return false;
+}
+
+fn identifierIsLvalueAssignment(tokens: []const std.zig.Token, index: usize) bool {
+    var cursor = index + 1;
+    while (cursor < tokens.len) {
+        if (tokens[cursor].tag == .period) {
+            cursor += 1;
+            if (cursor < tokens.len and (tokens[cursor].tag == .identifier or tokens[cursor].tag == .asterisk or tokens[cursor].tag == .question_mark)) {
+                if (cursor + 1 < tokens.len and tokens[cursor].tag == .identifier and tokens[cursor + 1].tag == .l_paren) {
+                    return true;
+                }
+                cursor += 1;
+                continue;
+            }
+            return false;
+        } else if (tokens[cursor].tag == .l_bracket) {
+            cursor = (matchingToken(tokens, cursor, .l_bracket, .r_bracket) orelse return false) + 1;
+            continue;
+        }
+        break;
+    }
+    if (cursor < tokens.len and isAssignment(tokens[cursor].tag)) return true;
     return false;
 }
 
@@ -735,7 +747,7 @@ fn usedByFieldMutation(source: []const u8, tokens: []const std.zig.Token, use_in
     if (use_index < 2 or tokens[use_index - 1].tag != .l_paren or
         !tokenIs(source, tokens[use_index - 2], "@field")) return false;
     const closing = matchingToken(tokens, use_index - 1, .l_paren, .r_paren) orelse return false;
-    if (closing + 1 < tokens.len and isAssignment(tokens[closing + 1].tag)) return true;
+    if (identifierIsLvalueAssignment(tokens, closing)) return true;
     return use_index >= 3 and tokens[use_index - 3].tag == .ampersand;
 }
 
@@ -2713,11 +2725,21 @@ fn findNeedlessElse(
         if (blockBelongsToElseIf(tokens, preceding_open)) continue;
         if (!blockAlwaysTerminates(tokens, preceding_open, else_index - 1)) continue;
         const else_close = matchingToken(tokens, else_index + 1, .l_brace, .r_brace) orelse continue;
-        const edits = try allocator.alloc(Edit, 2);
-        edits[0] = .{ .span = .{ .start = token.loc.start, .end = tokens[else_index + 1].loc.end }, .replacement = "" };
-        edits[1] = .{ .span = tokens[else_close].loc, .replacement = "" };
-        const fixes = try allocator.alloc(Fix, 1);
-        fixes[0] = .{ .title = "Flatten else after terminating branch", .kind = .quickfix, .edits = edits, .preferred = true };
+        const declares_bindings = blockDeclaresBindings(tokens, else_index + 1, else_close);
+        const fixes = if (declares_bindings) blk: {
+            const edits = try allocator.alloc(Edit, 1);
+            edits[0] = .{ .span = .{ .start = token.loc.start, .end = tokens[else_index + 1].loc.start }, .replacement = "" };
+            const f = try allocator.alloc(Fix, 1);
+            f[0] = .{ .title = "Remove else keyword after terminating branch", .kind = .quickfix, .edits = edits, .preferred = true };
+            break :blk f;
+        } else blk: {
+            const edits = try allocator.alloc(Edit, 2);
+            edits[0] = .{ .span = .{ .start = token.loc.start, .end = tokens[else_index + 1].loc.end }, .replacement = "" };
+            edits[1] = .{ .span = tokens[else_close].loc, .replacement = "" };
+            const f = try allocator.alloc(Fix, 1);
+            f[0] = .{ .title = "Flatten else after terminating branch", .kind = .quickfix, .edits = edits, .preferred = true };
+            break :blk f;
+        };
         try addFinding(allocator, source, configuration, found, .{
             .rule = .needless_else_after_terminator,
             .level = level,
@@ -2726,6 +2748,21 @@ fn findNeedlessElse(
             .fixes = fixes,
         });
     }
+}
+
+fn blockDeclaresBindings(tokens: []const std.zig.Token, opening: usize, closing: usize) bool {
+    var depth: usize = 0;
+    for (tokens[opening + 1 .. closing]) |tok| {
+        switch (tok.tag) {
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => if (depth > 0) {
+                depth -= 1;
+            },
+            .keyword_const, .keyword_var => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn precedingBlockIsIfStatement(tokens: []const std.zig.Token, opening: usize) bool {
@@ -4626,6 +4663,27 @@ test "never-mutated analysis recognizes mutable optional captures and nested ass
     for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
 }
 
+test "never-mutated analysis identifies variables only read via field or array index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() void {\n" ++
+        "    var s = Point{ .x = 1 };\n" ++
+        "    _ = s.x;\n" ++
+        "    var arr = [_]u8{ 1, 2, 3 };\n" ++
+        "    _ = arr[0];\n" ++
+        "    var index: usize = 0;\n" ++
+        "    var target = [_]u8{ 4, 5 };\n" ++
+        "    target[index] = 9;\n" ++
+        "}\n";
+    const found = try findings(arena.allocator(), source, Configuration.defaults());
+    var never_mutated_count: usize = 0;
+    for (found) |finding| if (finding.rule == .never_mutated_var) {
+        never_mutated_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), never_mutated_count);
+}
+
 test "scope-sensitive quick fixes are excluded from fix all" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4666,6 +4724,29 @@ test "else after one terminating branch stays inside an else-if chain" {
         try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn simple").?);
     };
     try std.testing.expectEqual(@as(usize, 1), warning_count);
+}
+
+test "needless else after terminator preserves braces when bindings are declared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn testBindings(first: bool) void {\n" ++
+        "    if (first) { return; } else {\n" ++
+        "        const x: u32 = 1;\n" ++
+        "        consume(x);\n" ++
+        "    }\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var matched = false;
+    for (found) |finding| {
+        if (finding.rule == .needless_else_after_terminator) {
+            matched = true;
+            try std.testing.expectEqual(@as(usize, 1), finding.fixes[0].edits.len);
+        }
+    }
+    try std.testing.expect(matched);
 }
 
 test "configuration reports the removed formatting profile and still loads lints" {

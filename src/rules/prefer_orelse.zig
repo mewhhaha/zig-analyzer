@@ -10,13 +10,15 @@ pub fn run(context: RuleRun) !void {
         if (token.tag != .keyword_if or if_index + 9 >= context.tokens.len or
             context.tokens[if_index + 1].tag != .l_paren) continue;
         const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
-        if (condition_end != if_index + 3 or context.tokens[if_index + 2].tag != .identifier or
+        if (!isSimplePath(context.tokens, if_index + 2, condition_end) or
+            condition_end + 5 >= context.tokens.len or
             context.tokens[condition_end + 1].tag != .pipe or context.tokens[condition_end + 2].tag != .identifier or
             context.tokens[condition_end + 3].tag != .pipe or context.tokens[condition_end + 4].tag != .identifier or
             context.tokens[condition_end + 5].tag != .keyword_else) continue;
         if (condition_end + 6 < context.tokens.len and context.tokens[condition_end + 6].tag == .pipe) continue;
         const capture = context.tokenText(condition_end + 2);
         if (!context.tokenIs(condition_end + 4, capture)) continue;
+        if (operandIsKnownErrorUnion(context, if_index + 2, condition_end)) continue;
 
         try context.emit(.{
             .rule = .prefer_orelse,
@@ -29,6 +31,34 @@ pub fn run(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn isSimplePath(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    if (start >= end) return false;
+    for (tokens[start..end], 0..) |token, offset| {
+        if (offset % 2 == 0) {
+            if (token.tag != .identifier) return false;
+        } else {
+            if (token.tag != .period) return false;
+        }
+    }
+    return (end - start) % 2 == 1;
+}
+
+fn operandIsKnownErrorUnion(context: RuleRun, start: usize, end: usize) bool {
+    const name = context.tokenText(end - 1);
+    for (context.tokens[0..start], 0..) |tok, idx| {
+        if (tok.tag != .identifier or !context.tokenIs(idx, name) or idx + 1 >= start or
+            context.tokens[idx + 1].tag != .colon) continue;
+        var cursor = idx + 2;
+        while (cursor < start and context.tokens[cursor].tag != .semicolon and
+            context.tokens[cursor].tag != .equal and context.tokens[cursor].tag != .comma and
+            context.tokens[cursor].tag != .r_paren) : (cursor += 1)
+        {
+            if (context.tokens[cursor].tag == .bang) return true;
+        }
+    }
+    return false;
 }
 
 test "unchanged optional captures prefer orelse" {

@@ -18,10 +18,14 @@ pub fn run(context: RuleRun) !void {
         const block_source = context.source[context.tokens[opening_index].loc.end..context.tokens[closing_index].loc.start];
         if (containsComment(block_source)) continue;
         const statement = std.mem.trim(u8, block_source, " \t\r\n");
+        const replacement = if (context.tokens[defer_index].loc.end == context.tokens[opening_index].loc.start)
+            try std.fmt.allocPrint(context.allocator, " {s}", .{statement})
+        else
+            try context.allocator.dupe(u8, statement);
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[opening_index].loc.start, .end = context.tokens[closing_index].loc.end },
-            .replacement = try context.allocator.dupe(u8, statement),
+            .replacement = replacement,
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
@@ -64,6 +68,16 @@ test "single-expression defer blocks use the direct form" {
     try std.testing.expectEqualStrings("allocator.free(memory);", findings[1].fixes[0].edits[0].replacement);
     try std.testing.expectEqual(types.ActionKind.quickfix, findings[0].fixes[0].kind);
     try std.testing.expect(findings[0].fixes[0].fix_all);
+}
+
+test "unspaced defer block prepends space in replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "defer{ file.close(); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings(" file.close();", findings[0].fixes[0].edits[0].replacement);
 }
 
 test "multi-statement commented and declaration defer blocks stay unchanged" {

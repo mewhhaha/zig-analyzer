@@ -164,6 +164,10 @@ Compiler-backed project rules are opt-in.
   declaration marked `Deprecated:` in its doc comment.
 - [`mutated-container-copy`](mutated-container-copy.md) — Reports mutation of a
   by-value container field copy that is not written back.
+- [`self-assignment`](self-assignment.md) — Reports an assignment where the
+  left-hand side and right-hand side evaluate to the same path.
+- [`identical-comparison-operands`](identical-comparison-operands.md) — Reports
+  a comparison where both operands evaluate to the same path.
 
 ## Opt-in style and policy rules
 
@@ -331,6 +335,10 @@ Compiler-backed project rules are opt-in.
   small writes inside a loop.
 - [`prefer-arena`](prefer-arena.md) — Reports scopes whose allocations and
   scope-exit releases already have arena-shaped lifetimes.
+- [`redundant-slice-end`](redundant-slice-end.md) — Reports a slice operation
+  whose upper bound explicitly specifies `<slice>.len`.
+- [`redundant-boolean-negation`](redundant-boolean-negation.md) — Reports
+  double boolean negation operations (`!!x` or `!(!x)`).
 - [`inconsistent-import-alias`](inconsistent-import-alias.md) — Reports a module
   alias that differs from the project majority.
 - [`minority-naming-style`](minority-naming-style.md) — Reports declaration

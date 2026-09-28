@@ -17,12 +17,18 @@ pub fn run(context: RuleRun) !void {
         const first = context.tokenText(for_index + 2);
         const index_name = context.tokenText(for_index + 10);
         const body_start = for_index + 12;
-        if (body_start >= context.tokens.len or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        const second = indexedSequence(context, body_start + 1, body_end, index_name) orelse continue;
+        if (body_start >= context.tokens.len) continue;
+        const is_braced = context.tokens[body_start].tag == .l_brace;
+        const inner_start = if (is_braced) body_start + 1 else body_start;
+        const inner_end = if (is_braced)
+            context.matchingToken(body_start, .l_brace, .r_brace) orelse continue
+        else
+            findUnbracedStatementEnd(context.tokens, body_start) orelse continue;
+
+        const second = indexedSequence(context, inner_start, inner_end, index_name) orelse continue;
         if (std.mem.eql(u8, first, second)) continue;
         if (!hasLengthAssertion(context, for_index, first, second)) continue;
-        if (bindingUseCount(context, body_start + 1, body_end, index_name) != 1) continue;
+        if (bindingUseCount(context, inner_start, inner_end, index_name) != 1) continue;
 
         try context.emit(.{
             .rule = .prefer_multi_sequence_for,
@@ -35,6 +41,32 @@ pub fn run(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn findUnbracedStatementEnd(tokens: []const std.zig.Token, start: usize) ?usize {
+    var parentheses: usize = 0;
+    var brackets: usize = 0;
+    var braces: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        switch (tokens[index].tag) {
+            .l_paren => parentheses += 1,
+            .r_paren => if (parentheses > 0) {
+                parentheses -= 1;
+            } else return null,
+            .l_bracket => brackets += 1,
+            .r_bracket => if (brackets > 0) {
+                brackets -= 1;
+            } else return null,
+            .l_brace => braces += 1,
+            .r_brace => if (braces > 0) {
+                braces -= 1;
+            } else return null,
+            .semicolon => if (parentheses == 0 and brackets == 0 and braces == 0) return index,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn indexedSequence(context: RuleRun, start: usize, end: usize, index_name: []const u8) ?[]const u8 {
@@ -56,20 +88,90 @@ fn bindingUseCount(context: RuleRun, start: usize, end: usize, name: []const u8)
     return count;
 }
 
+fn isAssertCallee(context: RuleRun, assert_index: usize) bool {
+    if (!context.tokenIs(assert_index, "assert")) return false;
+    // Check std.debug.assert
+    if (assert_index >= 4 and
+        context.tokenIs(assert_index - 4, "std") and
+        context.tokens[assert_index - 3].tag == .period and
+        context.tokenIs(assert_index - 2, "debug") and
+        context.tokens[assert_index - 1].tag == .period and
+        (assert_index == 4 or context.tokens[assert_index - 5].tag != .period))
+    {
+        return true;
+    }
+    // Check debug.assert
+    if (assert_index >= 2 and
+        context.tokenIs(assert_index - 2, "debug") and
+        context.tokens[assert_index - 1].tag == .period and
+        (assert_index == 2 or context.tokens[assert_index - 3].tag != .period))
+    {
+        return true;
+    }
+    // Check bare assert
+    if (assert_index == 0 or context.tokens[assert_index - 1].tag != .period) {
+        return true;
+    }
+    return false;
+}
+
+fn sameScopeBetween(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    for (tokens[start..end]) |tok| {
+        switch (tok.tag) {
+            .l_brace => depth += 1,
+            .r_brace => if (depth > 0) {
+                depth -= 1;
+            } else return false,
+            else => {},
+        }
+    }
+    return depth == 0;
+}
+
+fn isAssignedBetween(context: RuleRun, start: usize, end: usize, name: []const u8) bool {
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (context.tokenIs(index, name) and index + 1 < end) {
+            const next_tag = context.tokens[index + 1].tag;
+            switch (next_tag) {
+                .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
 fn hasLengthAssertion(context: RuleRun, before: usize, first: []const u8, second: []const u8) bool {
-    for (context.tokens[0..before], 0..) |token, assert_index| {
-        if (token.tag != .identifier or !context.tokenIs(assert_index, "assert") or assert_index < 4 or
-            assert_index + 10 >= before or !context.tokenIs(assert_index - 4, "std") or
-            context.tokens[assert_index - 3].tag != .period or !context.tokenIs(assert_index - 2, "debug") or
-            context.tokens[assert_index - 1].tag != .period or context.tokens[assert_index + 1].tag != .l_paren or
-            context.tokens[assert_index + 3].tag != .period or !context.tokenIs(assert_index + 4, "len") or
-            context.tokens[assert_index + 5].tag != .equal_equal or context.tokens[assert_index + 7].tag != .period or
-            !context.tokenIs(assert_index + 8, "len") or context.tokens[assert_index + 9].tag != .r_paren or
-            context.tokens[assert_index + 10].tag != .semicolon or assert_index + 11 != before) continue;
+    for (context.tokens[0..before], 0..) |_, assert_index| {
+        if (!isAssertCallee(context, assert_index)) continue;
+        if (assert_index + 10 >= before) continue;
+        if (context.tokens[assert_index + 1].tag != .l_paren or
+            context.tokens[assert_index + 2].tag != .identifier or
+            context.tokens[assert_index + 3].tag != .period or
+            !context.tokenIs(assert_index + 4, "len") or
+            context.tokens[assert_index + 5].tag != .equal_equal or
+            context.tokens[assert_index + 6].tag != .identifier or
+            context.tokens[assert_index + 7].tag != .period or
+            !context.tokenIs(assert_index + 8, "len") or
+            context.tokens[assert_index + 9].tag != .r_paren or
+            context.tokens[assert_index + 10].tag != .semicolon) continue;
+
         const left = context.tokenText(assert_index + 2);
         const right = context.tokenText(assert_index + 6);
-        if (std.mem.eql(u8, left, first) and std.mem.eql(u8, right, second) or
-            std.mem.eql(u8, left, second) and std.mem.eql(u8, right, first)) return true;
+        const matches = (std.mem.eql(u8, left, first) and std.mem.eql(u8, right, second)) or
+            (std.mem.eql(u8, left, second) and std.mem.eql(u8, right, first));
+        if (!matches) continue;
+
+        const assert_end = assert_index + 11;
+        if (assert_end == before) return true;
+        if (sameScopeBetween(context.tokens, assert_end, before) and
+            !isAssignedBetween(context, assert_end, before, first) and
+            !isAssignedBetween(context, assert_end, before, second))
+        {
+            return true;
+        }
     }
     return false;
 }
@@ -106,6 +208,31 @@ test "multi-sequence for preference respects source suppression" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "multi-sequence for supports bare assert and unbraced body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "assert(names.len == values.len);\n" ++
+        "for (names, 0..) |name, index| use(name, values[index]);";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "multi-sequence for supports debug.assert with intervening assertion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "debug.assert(names.len == values.len);\n" ++
+        "debug.assert(names.len > 0);\n" ++
+        "for (names, 0..) |name, index| {\n" ++
+        "    use(name, values[index]);\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

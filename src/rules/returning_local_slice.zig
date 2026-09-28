@@ -14,7 +14,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
     if (level == .off) return;
 
     for (context.tokens, 0..) |token, declaration_index| {
-        if (token.tag != .keyword_var or declaration_index + 3 >= context.tokens.len or
+        if ((token.tag != .keyword_var and token.tag != .keyword_const) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
             !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
         // A 'comptime var' array is interned into the binary; slices of it are
@@ -26,6 +26,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
         const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        if (token.tag == .keyword_const and !constArrayIsStackStorage(context, declaration_index, declaration_end, function_scope)) continue;
         const scope_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const binding_index = declaration_index + 1;
         const binding_name = context.tokenText(binding_index);
@@ -33,7 +34,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
         var return_index = declaration_end + 1;
         while (return_index + 2 < scope_end) : (return_index += 1) {
             if (context.tokens[return_index].tag != .keyword_return or
-                context.enclosingOpeningBrace(return_index) != function_scope) continue;
+                enclosingFunctionScope(context, return_index) != function_scope) continue;
             const return_end = context.statementEnd(return_index) orelse continue;
             const direct_slice = context.tokenIs(return_index + 1, binding_name) and
                 context.tokens[return_index + 2].tag == .l_bracket and
@@ -78,7 +79,7 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
         for (context.tokens[declaration_end + 1 .. function_end], declaration_end + 1..) |candidate, return_index| {
-            if (candidate.tag != .keyword_return or context.enclosingOpeningBrace(return_index) != function_scope) continue;
+            if (candidate.tag != .keyword_return or enclosingFunctionScope(context, return_index) != function_scope) continue;
             const return_end = context.statementEnd(return_index) orelse continue;
             const address_index = returnedAddressOfBinding(context, binding_name, return_index + 1, return_end) orelse continue;
             try context.emit(.{
@@ -430,6 +431,64 @@ fn enclosingFunctionHasOnlyComptimeParameters(context: RuleRun, declaration_inde
     return saw_parameter or segment_has_comptime;
 }
 
+fn constArrayIsStackStorage(
+    context: RuleRun,
+    declaration_index: usize,
+    declaration_end: usize,
+    function_scope: usize,
+) bool {
+    var init_index = declaration_index + 2;
+    while (init_index < declaration_end and context.tokens[init_index].tag != .equal) : (init_index += 1) {}
+    if (init_index >= declaration_end) return false;
+    if (init_index + 1 < declaration_end and context.tokenIs(init_index + 1, "undefined")) return true;
+
+    var brace_open = init_index + 1;
+    while (brace_open < declaration_end and context.tokens[brace_open].tag != .l_brace) : (brace_open += 1) {}
+    if (brace_open >= declaration_end) return false;
+    const brace_close = context.matchingToken(brace_open, .l_brace, .r_brace) orelse return false;
+
+    for (context.tokens[brace_open + 1 .. brace_close], brace_open + 1..) |tok, idx| {
+        if (tok.tag == .l_paren and idx > brace_open + 1 and
+            (context.tokens[idx - 1].tag == .identifier or context.tokens[idx - 1].tag == .r_paren))
+        {
+            return true;
+        }
+        if (tok.tag == .identifier) {
+            const name = context.tokenText(idx);
+            if (context.tokenIs(idx, "undefined")) return true;
+            if (functionParameterExists(context, function_scope, name) and !isComptimeParameter(context, function_scope, name)) {
+                return true;
+            }
+            if (localBindingExists(context, name, function_scope + 1, declaration_index)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isComptimeParameter(context: RuleRun, body_opening: usize, name: []const u8) bool {
+    var function_index = body_opening;
+    while (function_index > 0) {
+        function_index -= 1;
+        switch (context.tokens[function_index].tag) {
+            .keyword_fn => break,
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
+    } else return false;
+    var parameters_opening = function_index + 1;
+    while (parameters_opening < body_opening and context.tokens[parameters_opening].tag != .l_paren) : (parameters_opening += 1) {}
+    if (parameters_opening == body_opening) return false;
+    const parameters_closing = context.matchingToken(parameters_opening, .l_paren, .r_paren) orelse return false;
+    for (context.tokens[parameters_opening + 1 .. parameters_closing], parameters_opening + 1..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, name)) {
+            if (index > parameters_opening + 1 and context.tokens[index - 1].tag == .keyword_comptime) return true;
+        }
+    }
+    return false;
+}
+
 fn declarationStoresArray(context: RuleRun, declaration_index: usize, declaration_end: usize) bool {
     var index = declaration_index + 2;
     while (index < declaration_end) : (index += 1) {
@@ -721,6 +780,24 @@ test "heap-backed slices and local array values do not warn" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "returning a slice of a const stack array or from inside a conditional reports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn constRuntime(val: u8) []const u8 { const local = [_]u8{ val, 1 }; return local[0..]; }\n" ++
+        "fn sliceIf(cond: bool) []u8 { var local: [4]u8 = undefined; if (cond) { return local[0..]; } return local[1..]; }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(@import("types.zig").Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = @import("types.zig").Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 3), findings.items.len);
 }
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {

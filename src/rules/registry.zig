@@ -57,6 +57,10 @@ const rule_modules = .{
     @import("modernize.zig"),
     @import("discipline_policy.zig"),
     @import("invariant_loop_condition.zig"),
+    @import("self_assignment.zig"),
+    @import("identical_comparison_operands.zig"),
+    @import("redundant_slice_end.zig"),
+    @import("redundant_boolean_negation.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

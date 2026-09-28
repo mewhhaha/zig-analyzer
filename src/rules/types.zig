@@ -171,6 +171,10 @@ pub const Rule = enum {
     overflow_before_clamp,
     unchecked_range_end,
     quadratic_front_removal,
+    self_assignment,
+    identical_comparison_operands,
+    redundant_slice_end,
+    redundant_boolean_negation,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -243,6 +247,8 @@ pub const Rule = enum {
             .unwaited_child_process,
             .overflow_before_clamp,
             .unchecked_range_end,
+            .self_assignment,
+            .identical_comparison_operands,
             => .correctness,
             else => .style,
         };
@@ -307,6 +313,8 @@ pub const Rule = enum {
             .prefer_buffered_writer,
             .prefer_arena,
             .invariant_loop_condition,
+            .redundant_slice_end,
+            .redundant_boolean_negation,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,

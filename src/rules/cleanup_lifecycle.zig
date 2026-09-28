@@ -285,9 +285,23 @@ fn releaseReferencesBinding(context: RuleRun, name: []const u8, method_index: us
     return false;
 }
 
+const EmittedSize = struct { start: usize, end: usize, method: []const u8, operation: []const u8 };
+
+fn sizeAlreadyEmitted(emitted: []const EmittedSize, span: std.zig.Token.Loc, method: []const u8, operation: []const u8) bool {
+    for (emitted) |prior| {
+        if (prior.start == span.start and prior.end == span.end and
+            std.mem.eql(u8, prior.method, method) and std.mem.eql(u8, prior.operation, operation)) return true;
+    }
+    return false;
+}
+
 fn findUncheckedAllocationSizes(context: RuleRun) !void {
     const level = context.level(.allocation_size_overflow);
     if (level == .off) return;
+    // Several call sites can share one declared length; the finding points at
+    // that shared declaration, so report it once instead of once per caller.
+    var emitted: std.ArrayList(EmittedSize) = .empty;
+    defer emitted.deinit(context.allocator);
     const Method = struct { name: []const u8, length_from_end: usize = 1 };
     const methods = [_]Method{
         .{ .name = "alloc" },
@@ -306,6 +320,10 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
         const closing = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
         const length_argument = argumentFromEnd(context.tokens, method_index + 2, closing, method.length_from_end) orelse continue;
         if (uncheckedCapacityGrowth(context, length_argument, method_index)) |growth_index| {
+            const growth_span = context.tokens[growth_index].loc;
+            const growth_method = context.tokenText(method_index);
+            if (sizeAlreadyEmitted(emitted.items, growth_span, growth_method, "growth")) continue;
+            try emitted.append(context.allocator, .{ .start = growth_span.start, .end = growth_span.end, .method = growth_method, .operation = "growth" });
             try context.emit(.{
                 .rule = .allocation_size_overflow,
                 .level = level,
@@ -340,10 +358,14 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
         else
             continue;
         if (multiplication_index != null and multiplicationFitsMinimumUsize(context, length, method_index)) continue;
+        const length_span = context.tokens[length.start].loc;
+        const length_method = context.tokenText(method_index);
+        if (sizeAlreadyEmitted(emitted.items, length_span, length_method, operation)) continue;
+        try emitted.append(context.allocator, .{ .start = length_span.start, .end = length_span.end, .method = length_method, .operation = operation });
         try context.emit(.{
             .rule = .allocation_size_overflow,
             .level = level,
-            .span = context.tokens[length.start].loc,
+            .span = length_span,
             .message = try std.fmt.allocPrint(
                 context.allocator,
                 "allocation length passed to {s} uses unchecked runtime {s}; validate overflow before allocating",
@@ -768,6 +790,23 @@ test "realloc checks a locally declared runtime length" {
     const types = @import("types.zig");
     const source: [:0]const u8 =
         "fn grow(a: anytype, bytes: []u8) ![]u8 { const new_len = bytes.len * 2; return a.realloc(bytes, new_len); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
+    var allocation_findings: usize = 0;
+    for (findings.items) |finding| if (finding.rule == .allocation_size_overflow) {
+        allocation_findings += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), allocation_findings);
+}
+
+test "allocation size findings report a shared declared length once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const types = @import("types.zig");
+    const source: [:0]const u8 =
+        "fn run(a: anytype, first: []u8, second: []u8) !void { const total = first.len + second.len;" ++
+        "const x = try a.alloc(u8, total); defer a.free(x); const y = try a.alloc(u8, total); defer a.free(y); }";
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
