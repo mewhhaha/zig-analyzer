@@ -98,7 +98,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 162 rules with stable codes, organized into five named profiles,
+There are 166 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings
@@ -108,7 +108,8 @@ can be suppressed with source directives;
 The engine runs without crashes over TigerBeetle (244 files), the complete
 Zig standard library (550 files), and roughly 6,100 mangled fuzzing variants
 of those sources — a run that surfaced two real bugs in the standard library.
-Worst-case single-file analysis time on that corpus is 39 ms.
+Worst-case single-file `check` time on that corpus is about 0.3 s
+(the 15k-line LLVM Builder binding); typical files take a few milliseconds.
 
 ## Installation
 
