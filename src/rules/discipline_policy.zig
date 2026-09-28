@@ -968,7 +968,7 @@ fn commentStart(line: []const u8) ?usize {
 }
 
 fn lineSpan(source: []const u8, start: usize, end: usize) usize {
-    return std.mem.count(u8, source[@min(start, source.len)..@min(end, source.len)], "\n") + 1;
+    return std.mem.countScalar(u8, source[@min(start, source.len)..@min(end, source.len)], '\n') + 1;
 }
 
 fn nextTagBefore(tokens: []const std.zig.Token, start: usize, wanted: std.zig.Token.Tag, stop: std.zig.Token.Tag) ?usize {

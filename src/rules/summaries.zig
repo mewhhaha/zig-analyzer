@@ -573,7 +573,7 @@ pub fn build(
 fn collectNestedFunctionRanges(allocator: std.mem.Allocator, functions: []FunctionSummary) !void {
     const nested_ranges = try allocator.alloc(std.ArrayList(TokenRange), functions.len);
     defer allocator.free(nested_ranges);
-    for (nested_ranges) |*ranges| ranges.* = .empty;
+    @memset(nested_ranges, .empty);
     errdefer for (nested_ranges) |*ranges| ranges.deinit(allocator);
     for (functions) |candidate| {
         const parent = candidate.parent_function orelse continue;

@@ -187,6 +187,8 @@ pub const Rule = enum {
     expect_equal_argument_order,
     prefer_allocator_dupe,
     prefer_append_slice,
+    prefer_eql_over_order,
+    prefer_math_pow,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -339,6 +341,8 @@ pub const Rule = enum {
             .expect_equal_argument_order,
             .prefer_allocator_dupe,
             .prefer_append_slice,
+            .prefer_eql_over_order,
+            .prefer_math_pow,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,

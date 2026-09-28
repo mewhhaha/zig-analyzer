@@ -384,6 +384,10 @@ Compiler-backed project rules are opt-in.
   `std.fmt.allocPrint` duplicating slices or string literals instead of `allocator.dupe`.
 - [`prefer-append-slice`](prefer-append-slice.md) — Reports loops appending
   slice elements one-by-one into an `ArrayList` instead of `appendSlice`.
+- [`prefer-eql-over-order`](prefer-eql-over-order.md) — Reports testing
+  equality with `std.mem.order` instead of `std.mem.eql`.
+- [`prefer-math-pow`](prefer-math-pow.md) — Reports `std.math.pow` with
+  square-root, square, or trivial exponents where faster operations exist.
 
 ## Modernization profile
 

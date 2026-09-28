@@ -16,11 +16,13 @@ pub fn run(context: RuleRun) !void {
             lastIndexOf,
             indexOfAny,
             lastIndexOfAny,
+            count,
         };
         const func = std.meta.stringToEnum(SearchFunc, func_name) orelse continue;
         const replacement_func: []const u8 = switch (func) {
             .indexOf, .indexOfAny => "indexOfScalar",
             .lastIndexOf, .lastIndexOfAny => "lastIndexOfScalar",
+            .count => "countScalar",
         };
 
         const is_std_mem = (call_index >= 4 and context.tokenIs(call_index - 4, "std") and
@@ -179,6 +181,20 @@ test "prefer index of scalar honors suppression" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "prefer index of scalar detects single-character count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn lineCount(buffer: []const u8) usize {\n" ++
+        "    return std.mem.count(u8, buffer, \"\\n\");\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("countScalar", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("'\\n'", findings[0].fixes[0].edits[1].replacement);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

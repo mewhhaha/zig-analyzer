@@ -73,6 +73,8 @@ const rule_modules = .{
     @import("expect_equal_argument_order.zig"),
     @import("prefer_allocator_dupe.zig"),
     @import("prefer_append_slice.zig"),
+    @import("prefer_eql_over_order.zig"),
+    @import("prefer_math_pow.zig"),
 };
 
 pub fn run(context: RuleRun) !void {
