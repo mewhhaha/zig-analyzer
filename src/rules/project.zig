@@ -2076,6 +2076,20 @@ fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize) usize {
     return tokens.len;
 }
 
+/// Returns the closing brace when `index` opens a nested struct declaration, so
+/// member scans attribute direct members to each container exactly once. It
+/// matches only the `const Name = struct {` shape that the struct scans process
+/// independently; anything else keeps the legacy overlapping scan.
+fn nestedStructClose(tokens: []const std.zig.Token, index: usize, end: usize) ?usize {
+    if (index + 4 >= end) return null;
+    if (tokens[index].tag != .keyword_const or tokens[index + 1].tag != .identifier or
+        tokens[index + 2].tag != .equal or tokens[index + 3].tag != .keyword_struct or
+        tokens[index + 4].tag != .l_brace) return null;
+    const close = matchingToken(tokens, index + 4, .l_brace, .r_brace) orelse return null;
+    if (close >= end) return null;
+    return close;
+}
+
 fn findIncompleteOwnedElementCleanup(
     allocator: std.mem.Allocator,
     files: []const IndexedSourceFile,
@@ -2091,7 +2105,13 @@ fn findIncompleteOwnedElementCleanup(
                 file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
                 file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
             const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-            for (file.tokens[declaration_index + 5 .. container_end], declaration_index + 5..) |field_token, field_index| {
+            var field_index = declaration_index + 5;
+            while (field_index < container_end) : (field_index += 1) {
+                if (nestedStructClose(file.tokens, field_index, container_end)) |close| {
+                    field_index = close;
+                    continue;
+                }
+                const field_token = file.tokens[field_index];
                 if (field_token.tag != .identifier or field_index + 1 >= container_end or
                     file.tokens[field_index + 1].tag != .colon) continue;
                 const sequence_field = tokenText(file.source, field_token);
@@ -2124,7 +2144,13 @@ fn findSequenceCleanupOmissions(
     evidence: []const OwnedFieldEvidence,
     found: *std.ArrayList(Finding),
 ) !void {
-    for (file.tokens[container_start..container_end], container_start..) |token, fn_index| {
+    var fn_index = container_start;
+    while (fn_index < container_end) : (fn_index += 1) {
+        if (nestedStructClose(file.tokens, fn_index, container_end)) |close| {
+            fn_index = close;
+            continue;
+        }
+        const token = file.tokens[fn_index];
         if (token.tag != .keyword_fn or fn_index + 2 >= container_end or file.tokens[fn_index + 1].tag != .identifier or
             file.tokens[fn_index + 2].tag != .l_paren) continue;
         const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
@@ -4998,6 +5024,25 @@ test "cleanup methods release every proven owned field" {
             "fn makeRecord(allocator: std.mem.Allocator) !Record {" ++
             "const title = try make(allocator, \"title\"); const payload = try make(allocator, \"payload\");" ++
             "return .{ .title = title, .payload = payload, .allocator = allocator }; }",
+    }};
+    const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
+    var cleanup_count: usize = 0;
+    for (found) |finding| if (finding.rule == .incomplete_owned_field_cleanup) {
+        cleanup_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "nested struct cleanup drops report once per owned field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const files = [_]SourceFile{.{
+        .path = "src/store.zig",
+        .source = "const Entry = struct { payload: []u8 };" ++
+            "const Outer = struct { const Store = struct { items: std.ArrayList(Entry)," ++
+            "fn add(self: *Store, allocator: std.mem.Allocator, text: []const u8) !void {" ++
+            "try self.items.append(allocator, .{ .payload = try allocator.dupe(u8, text) }); }" ++
+            "fn deinit(self: *Store, allocator: std.mem.Allocator) void { self.items.deinit(allocator); } } };",
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     var cleanup_count: usize = 0;

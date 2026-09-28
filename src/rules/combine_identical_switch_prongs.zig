@@ -7,6 +7,7 @@ const Prong = struct {
     body_span: std.zig.Token.Loc,
     has_capture: bool,
     has_comment: bool,
+    is_else: bool,
 };
 
 pub fn run(context: RuleRun) !void {
@@ -39,9 +40,11 @@ pub fn run(context: RuleRun) !void {
                 .has_comment = containsComment(
                     context.source[context.tokens[cursor].loc.start..context.tokens[body_end].loc.end],
                 ),
+                .is_else = isElseCase(context.tokens, cursor, arrow),
             };
             if (previous) |prior| {
-                if (!prior.has_capture and !current.has_capture and std.mem.eql(u8, prior.body, current.body) and
+                if (!prior.has_capture and !current.has_capture and !prior.is_else and !current.is_else and
+                    std.mem.eql(u8, prior.body, current.body) and
                     !prior.has_comment and !current.has_comment)
                 {
                     try context.emit(.{
@@ -63,6 +66,13 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
+fn isElseCase(tokens: []const std.zig.Token, start: usize, arrow: usize) bool {
+    for (tokens[start..arrow]) |token| {
+        if (token.tag == .keyword_else) return true;
+    }
+    return false;
+}
+
 fn topLevelArrow(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
     var depth: usize = 0;
     for (tokens[start..end], start..) |token, index| switch (token.tag) {
@@ -76,13 +86,20 @@ fn topLevelArrow(tokens: []const std.zig.Token, start: usize, end: usize) ?usize
 
 fn prongBodyEnd(context: RuleRun, start: usize, switch_end: usize) ?usize {
     if (start >= switch_end) return null;
-    if (context.tokens[start].tag == .pipe) return null;
-    if (context.tokens[start].tag == .l_brace) return context.matchingToken(start, .l_brace, .r_brace);
+    var body_expr = start;
+    if (context.tokens[body_expr].tag == .pipe) {
+        body_expr += 1;
+        while (body_expr < switch_end and context.tokens[body_expr].tag != .pipe) : (body_expr += 1) {}
+        if (body_expr >= switch_end) return null;
+        body_expr += 1;
+    }
+    if (body_expr >= switch_end) return null;
+    if (context.tokens[body_expr].tag == .l_brace) return context.matchingToken(body_expr, .l_brace, .r_brace);
     var depth: usize = 0;
-    for (context.tokens[start..switch_end], start..) |token, index| switch (token.tag) {
+    for (context.tokens[body_expr..switch_end], body_expr..) |token, index| switch (token.tag) {
         .l_paren, .l_bracket, .l_brace => depth += 1,
         .r_paren, .r_bracket, .r_brace => depth -|= 1,
-        .comma => if (depth == 0) return if (index == start) null else index - 1,
+        .comma => if (depth == 0) return if (index == body_expr) null else index - 1,
         else => {},
     };
     return switch_end - 1;
@@ -111,10 +128,25 @@ test "captured and different switch bodies stay separate" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "switch (value) { .left => |payload| use(payload), .right => |payload| use(payload) }\n" ++
+        "switch (mode) { .fast => run(), else => run() }\n" ++
         "switch (mode) { .fast => run(), .safe => recover() }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "captured prong does not abort scanning subsequent identical prongs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (value) {\n" ++
+        "    .left => |payload| use(payload),\n" ++
+        "    .fast => run(),\n" ++
+        "    .turbo => run(),\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 test "identical switch prong preference respects source suppression" {

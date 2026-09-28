@@ -18,7 +18,8 @@ const SwitchProng = struct {
 
 const SwitchComparison = struct {
     subject: []const u8,
-    subject_index: usize,
+    subject_start: usize,
+    subject_end: usize,
     prong: SwitchProng,
 };
 
@@ -37,7 +38,8 @@ pub fn run(context: RuleRun) !void {
         prongs.clearRetainingCapacity();
         var current_if = if_index;
         var subject: ?[]const u8 = null;
-        var subject_index: ?usize = null;
+        var subject_start: ?usize = null;
+        var subject_end: ?usize = null;
         var domain: ?SwitchDomain = null;
         var chain_is_switchable = true;
         while (true) {
@@ -60,7 +62,8 @@ pub fn run(context: RuleRun) !void {
                 }
             } else {
                 subject = comparison.subject;
-                subject_index = comparison.subject_index;
+                subject_start = comparison.subject_start;
+                subject_end = comparison.subject_end;
                 domain = comparison.prong.domain;
             }
             if (domain.? != comparison.prong.domain) chain_is_switchable = false;
@@ -92,7 +95,7 @@ pub fn run(context: RuleRun) !void {
         }
 
         if (!chain_is_switchable or prongs.items.len < 2) continue;
-        if (bindingSwitchDomain(context, &scope_index, subject_index.?) != domain.?) continue;
+        if (subjectSwitchDomain(context, &scope_index, subject_start.?, subject_end.?, domain.?) != domain.?) continue;
         try context.emit(.{
             .rule = .prefer_switch,
             .level = level,
@@ -109,18 +112,20 @@ pub fn run(context: RuleRun) !void {
 fn switchComparison(context: RuleRun, start: usize, end: usize) ?SwitchComparison {
     const equality = singleEquality(context.tokens, start, end) orelse return null;
     if (switchProng(context, start, equality)) |prong| {
-        const subject_index = stableSubject(context, equality + 1, end) orelse return null;
+        const span = stableSubject(context, equality + 1, end) orelse return null;
         return .{
-            .subject = context.tokenText(subject_index),
-            .subject_index = subject_index,
+            .subject = context.source[context.tokens[span.start].loc.start..context.tokens[span.end - 1].loc.end],
+            .subject_start = span.start,
+            .subject_end = span.end,
             .prong = prong,
         };
     }
-    const subject_index = stableSubject(context, start, equality) orelse return null;
+    const span = stableSubject(context, start, equality) orelse return null;
     const prong = switchProng(context, equality + 1, end) orelse return null;
     return .{
-        .subject = context.tokenText(subject_index),
-        .subject_index = subject_index,
+        .subject = context.source[context.tokens[span.start].loc.start..context.tokens[span.end - 1].loc.end],
+        .subject_start = span.start,
+        .subject_end = span.end,
         .prong = prong,
     };
 }
@@ -135,9 +140,22 @@ fn singleEquality(tokens: []const std.zig.Token, start: usize, end: usize) ?usiz
     return equality;
 }
 
-fn stableSubject(context: RuleRun, start: usize, end: usize) ?usize {
-    if (start + 1 != end or context.tokens[start].tag != .identifier) return null;
-    return start;
+const SubjectSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn stableSubject(context: RuleRun, start: usize, end: usize) ?SubjectSpan {
+    if (start >= end) return null;
+    for (context.tokens[start..end], 0..) |token, offset| {
+        if (offset % 2 == 0) {
+            if (token.tag != .identifier) return null;
+        } else {
+            if (token.tag != .period) return null;
+        }
+    }
+    if ((end - start) % 2 != 1) return null;
+    return .{ .start = start, .end = end };
 }
 
 fn switchProng(context: RuleRun, start: usize, end: usize) ?SwitchProng {
@@ -187,6 +205,125 @@ fn switchProng(context: RuleRun, start: usize, end: usize) ?SwitchProng {
         };
     }
     return null;
+}
+
+fn subjectSwitchDomain(
+    context: RuleRun,
+    scope_index: *const syntax_scope.Index,
+    start: usize,
+    end: usize,
+    domain: SwitchDomain,
+) ?SwitchDomain {
+    if (start + 1 == end) {
+        return bindingSwitchDomain(context, scope_index, start);
+    }
+    const root_binding = scope_index.findBinding(start) orelse return null;
+    if (bindingIsAnytype(context, root_binding)) return null;
+
+    if (resolveDottedFieldDomain(context, scope_index, start, end)) |res| {
+        return res;
+    }
+    if ((domain == .enumeration or domain == .error_set) and hasExplicitType(context, root_binding)) {
+        return domain;
+    }
+    return null;
+}
+
+fn bindingIsAnytype(context: RuleRun, binding: syntax_scope.Binding) bool {
+    if (binding.token_index + 2 >= context.tokens.len or
+        context.tokens[binding.token_index + 1].tag != .colon) return false;
+    return context.tokenIs(binding.token_index + 2, "anytype");
+}
+
+fn hasExplicitType(context: RuleRun, binding: syntax_scope.Binding) bool {
+    if (binding.token_index + 2 >= context.tokens.len or
+        context.tokens[binding.token_index + 1].tag != .colon) return false;
+    return !context.tokenIs(binding.token_index + 2, "anytype");
+}
+
+fn resolveDottedFieldDomain(
+    context: RuleRun,
+    scope_index: *const syntax_scope.Index,
+    start: usize,
+    end: usize,
+) ?SwitchDomain {
+    var current_binding = scope_index.findBinding(start) orelse return null;
+    var cursor = start;
+    while (cursor + 2 < end) {
+        cursor += 2;
+        const field_name = context.tokenText(cursor);
+        const container_type_binding = resolveContainerTypeBinding(context, scope_index, current_binding) orelse return null;
+        current_binding = findFieldInContainer(context, container_type_binding, field_name) orelse return null;
+    }
+    return bindingDomainFromDecl(context, scope_index, current_binding.token_index);
+}
+
+fn resolveContainerTypeBinding(
+    context: RuleRun,
+    scope_index: *const syntax_scope.Index,
+    binding: syntax_scope.Binding,
+) ?syntax_scope.Binding {
+    if (binding.token_index + 2 >= context.tokens.len or
+        context.tokens[binding.token_index + 1].tag != .colon) return null;
+    var type_cursor = binding.token_index + 2;
+    while (type_cursor < context.tokens.len and
+        (context.tokens[type_cursor].tag == .asterisk or
+            context.tokens[type_cursor].tag == .question_mark or
+            context.tokens[type_cursor].tag == .keyword_const)) : (type_cursor += 1)
+    {}
+    if (type_cursor >= context.tokens.len or context.tokens[type_cursor].tag != .identifier) return null;
+    return scope_index.findBindingNamed(context.tokenText(type_cursor), binding.token_index);
+}
+
+fn findFieldInContainer(
+    context: RuleRun,
+    container_binding: syntax_scope.Binding,
+    field_name: []const u8,
+) ?syntax_scope.Binding {
+    const decl_idx = container_binding.token_index;
+    if (decl_idx + 2 >= context.tokens.len or context.tokens[decl_idx + 1].tag != .equal) return null;
+    var struct_kw = decl_idx + 2;
+    if (struct_kw < context.tokens.len and context.tokens[struct_kw].tag == .keyword_packed) struct_kw += 1;
+    if (struct_kw >= context.tokens.len or context.tokens[struct_kw].tag != .keyword_struct) return null;
+    if (struct_kw + 1 >= context.tokens.len or context.tokens[struct_kw + 1].tag != .l_brace) return null;
+    const closing = context.matchingToken(struct_kw + 1, .l_brace, .r_brace) orelse return null;
+
+    var index = struct_kw + 2;
+    while (index < closing) : (index += 1) {
+        if (context.tokens[index].tag == .identifier and context.tokenIs(index, field_name) and
+            index + 1 < closing and context.tokens[index + 1].tag == .colon)
+        {
+            return .{
+                .token_index = index,
+                .scope = context.tokens[index].loc,
+                .kind = .non_callable,
+            };
+        }
+    }
+    return null;
+}
+
+fn bindingDomainFromDecl(
+    context: RuleRun,
+    scope_index: *const syntax_scope.Index,
+    field_decl_index: usize,
+) ?SwitchDomain {
+    const type_start = field_decl_index + 2;
+    if (field_decl_index + 1 >= context.tokens.len or context.tokens[field_decl_index + 1].tag != .colon or
+        type_start >= context.tokens.len) return null;
+    const type_end = bindingTypeEnd(context.tokens, type_start) orelse return null;
+    if (type_start + 1 != type_end or context.tokens[type_start].tag != .identifier) return null;
+    if (context.tokenIs(type_start, "anyerror")) return .error_set;
+    if (integerTypeName(context.tokenText(type_start))) return .integer;
+
+    const type_binding = scope_index.findBinding(type_start) orelse return null;
+    if (type_binding.token_index + 2 >= context.tokens.len or
+        context.tokens[type_binding.token_index + 1].tag != .equal) return null;
+    return switch (context.tokens[type_binding.token_index + 2].tag) {
+        .keyword_enum => .enumeration,
+        .keyword_error => .error_set,
+        else => null,
+    };
 }
 
 fn bindingSwitchDomain(
@@ -355,6 +492,31 @@ test "prefer switch respects source suppression" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "prefer switch supports dotted field dispatch on typed struct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { fast, safe };\n" ++
+        "const Config = struct { mode: Mode };\n" ++
+        "fn run(cfg: Config) void {\n" ++
+        "    if (cfg.mode == .fast) {} else if (cfg.mode == .safe) {}\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "cfg.mode") != null);
+}
+
+test "prefer switch ignores anytype receiver" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(cfg: anytype) void {\n" ++
+        "    if (cfg.mode == .fast) {} else if (cfg.mode == .safe) {}\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

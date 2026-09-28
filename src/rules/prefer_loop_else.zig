@@ -8,12 +8,19 @@ pub fn run(context: RuleRun) !void {
 
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 4 >= context.tokens.len or
-            context.tokens[declaration_index + 1].tag != .identifier or
-            context.tokens[declaration_index + 2].tag != .equal or
-            !context.tokenIs(declaration_index + 3, "false") or
-            context.tokens[declaration_index + 4].tag != .semicolon) continue;
+            context.tokens[declaration_index + 1].tag != .identifier) continue;
+        var cursor = declaration_index + 2;
+        if (cursor < context.tokens.len and context.tokens[cursor].tag == .colon) {
+            cursor += 1;
+            if (cursor >= context.tokens.len or context.tokens[cursor].tag != .identifier) continue;
+            cursor += 1;
+        }
+        if (cursor + 2 >= context.tokens.len or
+            context.tokens[cursor].tag != .equal or
+            !context.tokenIs(cursor + 1, "false") or
+            context.tokens[cursor + 2].tag != .semicolon) continue;
         const flag = context.tokenText(declaration_index + 1);
-        const for_index = declaration_index + 5;
+        const for_index = cursor + 3;
         if (for_index + 6 >= context.tokens.len or context.tokens[for_index].tag != .keyword_for or
             context.tokens[for_index + 1].tag != .l_paren) continue;
         const iterable_end = context.matchingToken(for_index + 1, .l_paren, .r_paren) orelse continue;
@@ -27,9 +34,11 @@ pub fn run(context: RuleRun) !void {
         const fallback_if = loop_end + 1;
         if (fallback_if + 5 >= context.tokens.len or context.tokens[fallback_if].tag != .keyword_if or
             context.tokens[fallback_if + 1].tag != .l_paren or context.tokens[fallback_if + 2].tag != .bang or
-            !context.tokenIs(fallback_if + 3, flag) or context.tokens[fallback_if + 4].tag != .r_paren or
-            context.tokens[fallback_if + 5].tag != .l_brace) continue;
-        const fallback_end = context.matchingToken(fallback_if + 5, .l_brace, .r_brace) orelse continue;
+            !context.tokenIs(fallback_if + 3, flag) or context.tokens[fallback_if + 4].tag != .r_paren) continue;
+        const fallback_end = if (context.tokens[fallback_if + 5].tag == .l_brace)
+            context.matchingToken(fallback_if + 5, .l_brace, .r_brace) orelse continue
+        else
+            context.statementEnd(fallback_if + 5) orelse continue;
         if (bindingUsed(context, fallback_if + 5, fallback_end, flag)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse context.tokens.len;
         if (bindingUsed(context, fallback_end + 1, scope_end, flag)) continue;
@@ -83,6 +92,20 @@ test "a found flag used only by fallback prefers loop else" {
         "    if (matches(value)) { found = true; break; }\n" ++
         "}\n" ++
         "if (!found) { fallback(); }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "explicit bool flag and unbraced fallback prefer loop else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "var found: bool = false;\n" ++
+        "for (values) |value| {\n" ++
+        "    if (matches(value)) { found = true; break; }\n" ++
+        "}\n" ++
+        "if (!found) fallback();";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);

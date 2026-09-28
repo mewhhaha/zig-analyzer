@@ -10,7 +10,59 @@ pub fn run(context: RuleRun) !void {
         if (token.tag != .keyword_if or if_index + 5 >= context.tokens.len or
             context.tokens[if_index + 1].tag != .l_paren) continue;
         const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
-        if (condition_end == if_index + 2 or condition_end + 4 >= context.tokens.len or
+        if (condition_end == if_index + 2) continue;
+
+        if (parseBooleanReturnBranch(context, condition_end + 1)) |then_branch| {
+            const else_index = then_branch.end + 1;
+            if (else_index < context.tokens.len and context.tokens[else_index].tag == .keyword_else) {
+                if (parseBooleanReturnBranch(context, else_index + 1)) |else_branch| {
+                    if (then_branch.value != else_branch.value) {
+                        const inverted = !then_branch.value and else_branch.value;
+                        const statement_source = context.source[token.loc.start..context.tokens[else_branch.end].loc.end];
+                        if (!containsComment(statement_source)) {
+                            const condition_source = context.source[context.tokens[if_index + 1].loc.end..context.tokens[condition_end].loc.start];
+                            const condition = std.mem.trim(u8, condition_source, " \t\r\n");
+                            const replacement = if (inverted) blk: {
+                                if (isSimpleCondition(context, if_index + 2, condition_end)) {
+                                    break :blk try std.fmt.allocPrint(context.allocator, "return !{s};", .{condition});
+                                }
+                                break :blk try std.fmt.allocPrint(context.allocator, "return !({s});", .{condition});
+                            } else try std.fmt.allocPrint(context.allocator, "return {s};", .{condition});
+
+                            const edits = try context.allocator.alloc(types.Edit, 1);
+                            edits[0] = .{
+                                .span = .{ .start = token.loc.start, .end = context.tokens[else_branch.end].loc.end },
+                                .replacement = replacement,
+                            };
+                            const fixes = try context.allocator.alloc(types.Fix, 1);
+                            fixes[0] = .{
+                                .title = if (inverted) "Negate the boolean condition directly" else "Return the boolean condition directly",
+                                .kind = .quickfix,
+                                .edits = edits,
+                                .preferred = true,
+                                .fix_all = true,
+                            };
+                            try context.emit(.{
+                                .rule = .redundant_boolean_if,
+                                .level = level,
+                                .span = token.loc,
+                                .message = try context.allocator.dupe(
+                                    u8,
+                                    if (inverted)
+                                        "if statement only negates its boolean condition"
+                                    else
+                                        "if statement returns the same boolean value as its condition",
+                                ),
+                                .fixes = fixes,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (condition_end + 4 >= context.tokens.len or
             context.tokens[condition_end + 1].tag != .identifier or
             context.tokens[condition_end + 2].tag != .keyword_else or
             context.tokens[condition_end + 3].tag != .identifier or
@@ -61,6 +113,35 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+const BranchResult = struct {
+    value: bool,
+    end: usize,
+};
+
+fn parseBooleanReturnBranch(context: RuleRun, start: usize) ?BranchResult {
+    if (start >= context.tokens.len) return null;
+    if (context.tokens[start].tag == .l_brace) {
+        if (start + 4 >= context.tokens.len) return null;
+        if (context.tokens[start + 1].tag != .keyword_return) return null;
+        if (context.tokens[start + 2].tag != .identifier) return null;
+        if (context.tokens[start + 3].tag != .semicolon) return null;
+        if (context.tokens[start + 4].tag != .r_brace) return null;
+        const val_str = context.tokenText(start + 2);
+        if (std.mem.eql(u8, val_str, "true")) return .{ .value = true, .end = start + 4 };
+        if (std.mem.eql(u8, val_str, "false")) return .{ .value = false, .end = start + 4 };
+        return null;
+    } else if (context.tokens[start].tag == .keyword_return) {
+        if (start + 2 >= context.tokens.len) return null;
+        if (context.tokens[start + 1].tag != .identifier) return null;
+        if (context.tokens[start + 2].tag != .semicolon) return null;
+        const val_str = context.tokenText(start + 1);
+        if (std.mem.eql(u8, val_str, "true")) return .{ .value = true, .end = start + 2 };
+        if (std.mem.eql(u8, val_str, "false")) return .{ .value = false, .end = start + 2 };
+        return null;
+    }
+    return null;
 }
 
 fn containsComment(source: []const u8) bool {
@@ -133,6 +214,24 @@ test "boolean if respects source suppression" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "boolean-valued if return statements suggest direct return" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn testDirect(c: bool) bool {\n" ++
+        "    if (c) return true; else return false;\n" ++
+        "}\n" ++
+        "fn testInverse(c: bool) bool {\n" ++
+        "    if (c) { return false; } else { return true; }\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expectEqualStrings("return c;", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("return !c;", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqual(types.ActionKind.quickfix, findings[0].fixes[0].kind);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

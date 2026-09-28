@@ -56,7 +56,7 @@ fn receiverIsAllocatingWriter(context: RuleRun, receiver: []const u8, before: us
 }
 
 fn ioReceiver(name: []const u8) bool {
-    const fragments = [_][]const u8{ "writer", "file", "stream", "socket" };
+    const fragments = [_][]const u8{ "writer", "file", "stream", "socket", "w", "out", "stdout", "stderr", "conn", "f", "fd", "pipe" };
     for (fragments) |fragment| if (hasRoleName(name, fragment)) return true;
     return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
 }
@@ -121,6 +121,20 @@ test "allocating writers cannot return partial writes" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "common writer receiver names report discarded write counts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn send(w: anytype, stdout: anytype, conn: anytype, bytes: []const u8) !void {\n" ++
+        "    _ = try w.write(bytes);\n" ++
+        "    _ = try stdout.write(bytes);\n" ++
+        "    _ = try conn.write(bytes);\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

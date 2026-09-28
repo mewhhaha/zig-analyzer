@@ -62,8 +62,13 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn pointerSizedFieldType(context: RuleRun, colon_index: usize, closing: usize) ?usize {
-    if (context.tokens[colon_index - 1].tag != .identifier) return null;
-    switch (context.tokens[colon_index - 2].tag) {
+    if (colon_index < 2 or context.tokens[colon_index - 1].tag != .identifier) return null;
+    var prev_index = colon_index - 2;
+    if (context.tokens[prev_index].tag == .keyword_pub) {
+        if (prev_index == 0) return null;
+        prev_index -= 1;
+    }
+    switch (context.tokens[prev_index].tag) {
         // '}' and ';' precede fields that follow a method or nested declaration.
         .l_brace, .comma, .doc_comment, .r_brace, .semicolon => {},
         else => return null,
@@ -117,6 +122,19 @@ test "pointer-sized fields after methods and declarations report the hazard" {
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'base'") != null);
+}
+
+test "public pointer-sized fields report the hazard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Header = packed struct {\n" ++
+        "    pub count: usize,\n" ++
+        "};";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'count'") != null);
 }
 
 test "plain and extern containers stay clean" {

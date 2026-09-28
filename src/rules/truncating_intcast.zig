@@ -274,12 +274,18 @@ fn guardMentions(context: RuleRun, start: usize, end: usize, name: []const u8) b
     var index = start;
     while (index < end) : (index += 1) {
         switch (context.tokens[index].tag) {
-            .keyword_if, .keyword_while, .keyword_switch => {
+            .keyword_if, .keyword_while => {
+                if (conditionHasBoundaryCheck(context, index + 1, end, name)) return true;
+            },
+            .keyword_switch => {
                 if (guardedParenMentions(context, index + 1, end, name)) return true;
             },
             .identifier => {
-                if (!context.tokenIs(index, "assert") and !context.tokenIs(index, "cast")) continue;
-                if (guardedParenMentions(context, index + 1, end, name)) return true;
+                if (context.tokenIs(index, "assert")) {
+                    if (conditionHasBoundaryCheck(context, index + 1, end, name)) return true;
+                } else if (context.tokenIs(index, "cast") or context.tokenIs(index, "clamp")) {
+                    if (guardedParenMentions(context, index + 1, end, name)) return true;
+                }
             },
             .builtin => {
                 if (!context.tokenIs(index, "@min") and !context.tokenIs(index, "@max") and
@@ -293,6 +299,23 @@ fn guardMentions(context: RuleRun, start: usize, end: usize, name: []const u8) b
         }
     }
     return false;
+}
+
+fn conditionHasBoundaryCheck(context: RuleRun, opening: usize, end: usize, name: []const u8) bool {
+    if (opening >= end or context.tokens[opening].tag != .l_paren) return false;
+    const closing = context.matchingToken(opening, .l_paren, .r_paren) orelse return true;
+    var mentions_name = false;
+    var has_boundary = false;
+    for (context.tokens[opening + 1 .. @min(closing, end)], opening + 1..) |token, index| {
+        if (token.tag == .identifier and context.refersToBinding(index, name)) {
+            mentions_name = true;
+        }
+        switch (token.tag) {
+            .angle_bracket_left, .angle_bracket_left_equal, .angle_bracket_right, .angle_bracket_right_equal => has_boundary = true,
+            else => {},
+        }
+    }
+    return mentions_name and has_boundary;
 }
 
 fn guardedParenMentions(context: RuleRun, opening: usize, end: usize, name: []const u8) bool {
@@ -393,6 +416,21 @@ test "a guard mentioning the value before the cast keeps it clean" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "equality check does not count as a range guard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn nonZero(count: u64) void {\n" ++
+        "    if (count != 0) {\n" ++
+        "        const small: u8 = @intCast(count);\n" ++
+        "        _ = small;\n" ++
+        "    }\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
 }
 
 test "widening equal-width and usize-u64 casts stay clean" {

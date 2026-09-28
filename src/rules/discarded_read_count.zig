@@ -67,7 +67,7 @@ fn bindingUsedAfter(context: RuleRun, binding: []const u8, start: usize, end: us
 }
 
 fn ioReceiver(name: []const u8) bool {
-    const fragments = [_][]const u8{ "reader", "file", "stream", "socket" };
+    const fragments = [_][]const u8{ "reader", "file", "stream", "socket", "r", "src", "in", "stdin", "conn", "f", "fd", "pipe" };
     for (fragments) |fragment| if (hasRoleName(name, fragment)) return true;
     return std.mem.eql(u8, name, "posix") or std.mem.eql(u8, name, "linux");
 }
@@ -162,6 +162,21 @@ test "profile reads do not look like file input" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "common reader receiver names report discarded read counts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn receive(r: anytype, src: anytype, conn: anytype, bytes: []u8) !void {\n" ++
+        "    _ = try r.read(bytes);\n" ++
+        "    _ = try src.read(bytes);\n" ++
+        "    _ = try conn.read(bytes);\n" ++
+        "    consume(bytes);\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
