@@ -388,6 +388,14 @@ Compiler-backed project rules are opt-in.
   equality with `std.mem.order` instead of `std.mem.eql`.
 - [`prefer-math-pow`](prefer-math-pow.md) — Reports `std.math.pow` with
   square-root, square, or trivial exponents where faster operations exist.
+- [`prefer-vector-splat`](prefer-vector-splat.md) — Reports `@Vector` literals
+  repeating a scalar value across all lanes instead of `@splat`.
+- [`prefer-vector-load`](prefer-vector-load.md) — Reports `@Vector` literals
+  unpacking consecutive array elements instead of direct vector assignment.
+- [`prefer-vector-op`](prefer-vector-op.md) — Reports `@Vector` literals
+  performing element-wise lane arithmetic instead of vector operators.
+- [`prefer-vector-reduce`](prefer-vector-reduce.md) — Reports serial lane
+  accumulation chains across vectors instead of `@reduce`.
 
 ## Modernization profile
 

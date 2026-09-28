@@ -75,6 +75,10 @@ const rule_modules = .{
     @import("prefer_append_slice.zig"),
     @import("prefer_eql_over_order.zig"),
     @import("prefer_math_pow.zig"),
+    @import("prefer_vector_splat.zig"),
+    @import("prefer_vector_load.zig"),
+    @import("prefer_vector_op.zig"),
+    @import("prefer_vector_reduce.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

@@ -189,6 +189,10 @@ pub const Rule = enum {
     prefer_append_slice,
     prefer_eql_over_order,
     prefer_math_pow,
+    prefer_vector_splat,
+    prefer_vector_load,
+    prefer_vector_op,
+    prefer_vector_reduce,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -343,6 +347,10 @@ pub const Rule = enum {
             .prefer_append_slice,
             .prefer_eql_over_order,
             .prefer_math_pow,
+            .prefer_vector_splat,
+            .prefer_vector_load,
+            .prefer_vector_op,
+            .prefer_vector_reduce,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,
