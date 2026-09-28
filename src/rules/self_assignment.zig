@@ -81,8 +81,13 @@ const PathSpan = struct {
 };
 
 fn pathBefore(tokens: []const std.zig.Token, before: usize) ?PathSpan {
-    if (before == 0 or tokens[before - 1].tag != .identifier) return null;
-    var cursor = before - 1;
+    if (before == 0) return null;
+    var cursor = before;
+    if (tokens[cursor - 1].tag == .period_asterisk) {
+        cursor -= 1;
+    }
+    if (cursor == 0 or tokens[cursor - 1].tag != .identifier) return null;
+    cursor -= 1;
     while (cursor >= 2 and tokens[cursor - 1].tag == .period and tokens[cursor - 2].tag == .identifier) {
         cursor -= 2;
     }
@@ -94,6 +99,9 @@ fn pathAfter(tokens: []const std.zig.Token, start: usize) ?PathSpan {
     var cursor = start + 1;
     while (cursor + 1 < tokens.len and tokens[cursor].tag == .period and tokens[cursor + 1].tag == .identifier) {
         cursor += 2;
+    }
+    if (cursor < tokens.len and tokens[cursor].tag == .period_asterisk) {
+        cursor += 1;
     }
     return .{ .start = start, .end = cursor };
 }
@@ -123,13 +131,15 @@ test "self-assignment reports simple and dotted paths" {
         "    var a = x;\n" ++
         "    a = a;\n" ++
         "    self.field = self.field;\n" ++
+        "    self.ptr.* = self.ptr.*;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
-    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "self-assignment of 'a'") != null);
     try std.testing.expectEqualStrings("_", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "self-assignment of 'self.field'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "self-assignment of 'self.ptr.*'") != null);
 }
 
 test "shadowing variable declarations and modifications stay unchanged" {

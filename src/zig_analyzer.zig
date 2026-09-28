@@ -1,4 +1,8 @@
 pub const build_options = @import("build_options");
+
+comptime {
+    @setEvalBranchQuota(50_000);
+}
 pub const analysis = @import("analysis.zig");
 pub const backend_bootstrap = @import("backend_bootstrap.zig");
 pub const compiler_protocol = @import("compiler_protocol.zig");

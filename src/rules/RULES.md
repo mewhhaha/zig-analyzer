@@ -168,6 +168,15 @@ Compiler-backed project rules are opt-in.
   left-hand side and right-hand side evaluate to the same path.
 - [`identical-comparison-operands`](identical-comparison-operands.md) — Reports
   a comparison where both operands evaluate to the same path.
+- [`identical-logical-operands`](identical-logical-operands.md) — Reports a
+  logical `and` or `or` expression whose operands evaluate to the same path.
+- [`identical-conditional-branches`](identical-conditional-branches.md) —
+  Reports an `if` expression or statement where the `then` and `else` branches
+  have identical bodies.
+- [`nan-comparison`](nan-comparison.md) — Reports comparison with a NaN value,
+  which always evaluates to a constant.
+- [`identical-bitwise-operands`](identical-bitwise-operands.md) — Reports a
+  bitwise `&`, `|`, or `^` operation whose operands evaluate to the same path.
 
 ## Opt-in style and policy rules
 
@@ -339,6 +348,8 @@ Compiler-backed project rules are opt-in.
   whose upper bound explicitly specifies `<slice>.len`.
 - [`redundant-boolean-negation`](redundant-boolean-negation.md) — Reports
   double boolean negation operations (`!!x` or `!(!x)`).
+- [`prefer-min-max`](prefer-min-max.md) — Reports conditional `if` expressions
+  choosing between two operands that `@min` or `@max` expresses directly.
 - [`inconsistent-import-alias`](inconsistent-import-alias.md) — Reports a module
   alias that differs from the project majority.
 - [`minority-naming-style`](minority-naming-style.md) — Reports declaration
@@ -359,6 +370,32 @@ Compiler-backed project rules are opt-in.
   boolean mode arguments whose meaning is hidden at the call site.
 - [`line-length`](line-length.md) — Reports source lines over the configured
   display-column limit.
+- [`prefer-empty-slice-len`](prefer-empty-slice-len.md) — Reports comparing a
+  slice with an empty slice literal using `std.mem.eql` instead of checking `.len`.
+- [`prefer-index-of-scalar`](prefer-index-of-scalar.md) — Reports searching
+  for a single character using `indexOf` or `lastIndexOf` instead of `indexOfScalar`.
+- [`prefer-split-scalar`](prefer-split-scalar.md) — Reports splitting by a
+  single character delimiter using sequence iterators instead of `splitScalar`.
+- [`pointer-to-allocator`](pointer-to-allocator.md) — Reports passing or
+  storing `std.mem.Allocator` as a pointer instead of by value.
+- [`expect-equal-argument-order`](expect-equal-argument-order.md) — Reports
+  `std.testing.expectEqual` called with literal expected constants in the second argument.
+- [`prefer-allocator-dupe`](prefer-allocator-dupe.md) — Reports
+  `std.fmt.allocPrint` duplicating slices or string literals instead of `allocator.dupe`.
+- [`prefer-append-slice`](prefer-append-slice.md) — Reports loops appending
+  slice elements one-by-one into an `ArrayList` instead of `appendSlice`.
+- [`prefer-eql-over-order`](prefer-eql-over-order.md) — Reports testing
+  equality with `std.mem.order` instead of `std.mem.eql`.
+- [`prefer-math-pow`](prefer-math-pow.md) — Reports `std.math.pow` with
+  square-root, square, or trivial exponents where faster operations exist.
+- [`prefer-vector-splat`](prefer-vector-splat.md) — Reports `@Vector` literals
+  repeating a scalar value across all lanes instead of `@splat`.
+- [`prefer-vector-load`](prefer-vector-load.md) — Reports `@Vector` literals
+  unpacking consecutive array elements instead of direct vector assignment.
+- [`prefer-vector-op`](prefer-vector-op.md) — Reports `@Vector` literals
+  performing element-wise lane arithmetic instead of vector operators.
+- [`prefer-vector-reduce`](prefer-vector-reduce.md) — Reports serial lane
+  accumulation chains across vectors instead of `@reduce`.
 
 ## Modernization profile
 

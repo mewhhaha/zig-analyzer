@@ -2,6 +2,10 @@ const std = @import("std");
 const build_options = @import("build_options");
 const lsp = @import("lsp");
 
+comptime {
+    @setEvalBranchQuota(50_000);
+}
+
 const action_lsp = @import("actions/lsp_adapter.zig");
 const project_actions = @import("actions/project.zig");
 const zig_actions = @import("actions/registry.zig");
@@ -19,6 +23,17 @@ const zig_environment = @import("zig_environment.zig");
 const Document = document_module.Document;
 const Declaration = document_module.Declaration;
 
+fn runBasicServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    server: *Server,
+    log_fn: anytype,
+) !void {
+    @setEvalBranchQuota(50_000);
+    return lsp.basic_server.run(io, allocator, transport, server, log_fn);
+}
+
 pub fn run(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) !void {
     var read_buffer: [4096]u8 = undefined;
     var stdio = lsp.Transport.Stdio.init(&read_buffer, .stdin(), .stdout());
@@ -29,7 +44,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Enviro
     var server = Server.init(io, allocator, environ, &thread_safe_transport.transport);
     defer server.deinit();
     try server.startCompilerWorker();
-    try lsp.basic_server.run(io, allocator, &thread_safe_transport.transport, &server, std.log.err);
+    try runBasicServer(io, allocator, &thread_safe_transport.transport, &server, std.log.err);
     if (!server.shutdown_requested) return error.ExitWithoutShutdown;
 }
 
@@ -117,6 +132,7 @@ pub const Server = struct {
                     .retriggerCharacters = &.{","},
                 },
                 .definitionProvider = .{ .bool = true },
+                .typeDefinitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
                 .documentSymbolProvider = .{ .bool = true },
                 .codeLensProvider = .{ .resolveProvider = false },
@@ -142,7 +158,7 @@ pub const Server = struct {
                     .full = .{ .bool = true },
                 } },
                 .inlayHintProvider = .{ .inlay_hint_options = .{ .resolveProvider = false } },
-                .executeCommandProvider = .{ .commands = &.{"zig-analyzer.peekResolvedType"} },
+                .executeCommandProvider = .{ .commands = &.{ "zig-analyzer.peekResolvedType", "zig-analyzer.typeAtPosition" } },
                 .callHierarchyProvider = .{ .call_hierarchy_options = .{} },
                 .workspace = .{ .workspaceFolders = .{
                     .supported = true,
@@ -431,6 +447,61 @@ pub const Server = struct {
         } } };
     }
 
+    pub fn @"textDocument/typeDefinition"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/typeDefinition"),
+    ) !lsp.ResultType("textDocument/typeDefinition") {
+        const document = server.documents.getConst(params.textDocument.uri) orelse return null;
+        const byte_offset = document.byteOffset(params.position);
+        const token = document.tokenAt(byte_offset) orelse return null;
+        if (token.tag != .identifier) return null;
+        const name = document.source[token.loc.start..token.loc.end];
+
+        if (document.declarationNamed(name)) |declaration| {
+            if (isTypeDeclaration(document.source, declaration.span)) {
+                return .{ .definition = .{ .location = .{
+                    .uri = document.uri,
+                    .range = document.range(declaration.span),
+                } } };
+            }
+        }
+
+        if (try declaredTypeName(arena, document.source, name)) |type_name| {
+            if (try server.findTypeDefinition(arena, document, type_name)) |location| {
+                return .{ .definition = .{ .location = location } };
+            }
+        }
+
+        if (memberReceiver(document.source, token.loc.start)) |receiver| {
+            const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+            const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
+            const receiver_type = try declaredTypeName(arena, document.source, receiver_name) orelse receiver_name;
+            const members = try structMembers(arena, document.source, receiver_type);
+            for (members) |member| {
+                if (!std.mem.eql(u8, member.name, name)) continue;
+                if (try declaredTypeName(arena, document.source, name)) |member_type| {
+                    if (try server.findTypeDefinition(arena, document, member_type)) |location| {
+                        return .{ .definition = .{ .location = location } };
+                    }
+                }
+            }
+        }
+
+        if (try server.hoverDescription(arena, document, token.loc)) |desc| {
+            if (desc.type_summary) |summary| {
+                const type_name = extractTypeNameFromSummary(summary);
+                if (type_name.len > 0) {
+                    if (try server.findTypeDefinition(arena, document, type_name)) |location| {
+                        return .{ .definition = .{ .location = location } };
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
     pub fn @"textDocument/signatureHelp"(
         server: *Server,
         arena: std.mem.Allocator,
@@ -590,20 +661,58 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("workspace/executeCommand"),
     ) !lsp.ResultType("workspace/executeCommand") {
-        if (!std.mem.eql(u8, params.command, "zig-analyzer.peekResolvedType")) return error.InvalidParams;
-        const arguments = params.arguments orelse return error.InvalidParams;
-        if (arguments.len != 2) return error.InvalidParams;
-        const uri = switch (arguments[0]) {
-            .string => |value| value,
-            else => return error.InvalidParams,
-        };
-        const type_name = switch (arguments[1]) {
-            .string => |value| value,
-            else => return error.InvalidParams,
-        };
-        const document = server.documents.getConst(uri) orelse return error.InvalidParams;
-        const shape = try server.resolvedShapeForName(arena, document, type_name) orelse return null;
-        return .{ .string = try renderResolvedShape(arena, type_name, shape) };
+        if (std.mem.eql(u8, params.command, "zig-analyzer.peekResolvedType")) {
+            const arguments = params.arguments orelse return error.InvalidParams;
+            if (arguments.len != 2) return error.InvalidParams;
+            const uri = switch (arguments[0]) {
+                .string => |value| value,
+                else => return error.InvalidParams,
+            };
+            const type_name = switch (arguments[1]) {
+                .string => |value| value,
+                else => return error.InvalidParams,
+            };
+            const document = server.documents.getConst(uri) orelse return error.InvalidParams;
+            const shape = try server.resolvedShapeForName(arena, document, type_name) orelse return null;
+            return .{ .string = try renderResolvedShape(arena, type_name, shape) };
+        }
+        if (std.mem.eql(u8, params.command, "zig-analyzer.typeAtPosition")) {
+            const arguments = params.arguments orelse return error.InvalidParams;
+            if (arguments.len < 2) return error.InvalidParams;
+            const uri = switch (arguments[0]) {
+                .string => |value| value,
+                else => return error.InvalidParams,
+            };
+            const document = server.documents.getConst(uri) orelse return error.InvalidParams;
+            const position = switch (arguments[1]) {
+                .object => |obj| pos: {
+                    const line_val = obj.get("line") orelse return error.InvalidParams;
+                    const char_val = obj.get("character") orelse return error.InvalidParams;
+                    const line: u32 = switch (line_val) {
+                        .integer => |l| @intCast(l),
+                        else => return error.InvalidParams,
+                    };
+                    const character: u32 = switch (char_val) {
+                        .integer => |c| @intCast(c),
+                        else => return error.InvalidParams,
+                    };
+                    break :pos lsp.types.Position{ .line = line, .character = character };
+                },
+                .integer => |line| pos: {
+                    if (arguments.len < 3) return error.InvalidParams;
+                    const char_val = arguments[2];
+                    const character: u32 = switch (char_val) {
+                        .integer => |c| @intCast(c),
+                        else => return error.InvalidParams,
+                    };
+                    break :pos lsp.types.Position{ .line = @intCast(line), .character = character };
+                },
+                else => return error.InvalidParams,
+            };
+            const type_string = try server.typeAtPosition(arena, document, position) orelse return null;
+            return .{ .string = type_string };
+        }
+        return error.InvalidParams;
     }
 
     pub fn @"textDocument/prepareCallHierarchy"(
@@ -751,6 +860,7 @@ pub const Server = struct {
         var fix_all_edits: std.ArrayList(analysis.Edit) = .empty;
         var offered_line_suppressions: std.ArrayList(OfferedSuppression) = .empty;
         var offered_file_suppressions: std.ArrayList(OfferedSuppression) = .empty;
+        var offered_rule_fix_alls: std.ArrayList(analysis.Rule) = .empty;
 
         for (document_findings) |finding| {
             for (finding.fixes) |fix| {
@@ -768,6 +878,38 @@ pub const Server = struct {
                     .isPreferred = fix.preferred,
                     .edit = try action_lsp.documentEdit(arena, document, fix.edits),
                 } });
+                if (fix.fix_all and spansOverlap(requested_span, finding.span)) {
+                    var already_offered = false;
+                    for (offered_rule_fix_alls.items) |r| {
+                        if (r == finding.rule) {
+                            already_offered = true;
+                            break;
+                        }
+                    }
+                    if (!already_offered) {
+                        try offered_rule_fix_alls.append(arena, finding.rule);
+                        var rule_edits: std.ArrayList(analysis.Edit) = .empty;
+                        for (document_findings) |other| {
+                            if (other.rule != finding.rule) continue;
+                            for (other.fixes) |other_fix| {
+                                if (other_fix.fix_all) try rule_edits.appendSlice(arena, other_fix.edits);
+                            }
+                        }
+                        const safe_rule_edits = try nonOverlappingEdits(arena, rule_edits.items);
+                        if (safe_rule_edits.len > 0) {
+                            const can_offer = action_lsp.isRequested(params.context.only, .@"source.fixAll") or
+                                action_lsp.isRequested(params.context.only, .quickfix);
+                            if (can_offer) {
+                                try actions.append(arena, .{ .code_action = .{
+                                    .title = try std.fmt.allocPrint(arena, "Fix all '{s}' in this file", .{finding.rule.code()}),
+                                    .kind = .@"source.fixAll",
+                                    .isPreferred = false,
+                                    .edit = try action_lsp.documentEdit(arena, document, safe_rule_edits),
+                                } });
+                            }
+                        }
+                    }
+                }
             }
             if (finding.rule == .unresolved_call and spansOverlap(requested_span, finding.span) and
                 action_lsp.isRequested(params.context.only, .@"refactor.rewrite"))
@@ -1303,6 +1445,53 @@ pub const Server = struct {
                     document.source[member_token.loc.start..member_token.loc.end],
                 );
             }
+        }
+        return null;
+    }
+
+    pub fn typeAtPosition(
+        server: *Server,
+        arena: std.mem.Allocator,
+        document: *const Document,
+        position: lsp.types.Position,
+    ) !?[]const u8 {
+        const byte_offset = document.byteOffset(position);
+        const token = document.tokenAt(byte_offset) orelse return null;
+        const spelling = document.source[token.loc.start..token.loc.end];
+
+        if (try language_hover.describe(arena, spelling, token.tag)) |language| {
+            return language.type_summary orelse language.category;
+        }
+
+        if (token.tag == .identifier) {
+            if (try server.hoverDescription(arena, document, token.loc)) |description| {
+                if (description.type_summary) |summary| return summary;
+                return description.declaration;
+            }
+            if (document.declarationNamed(spelling)) |declaration| {
+                if (isTypeDeclaration(document.source, declaration.span)) {
+                    return "type";
+                }
+            }
+        }
+
+        return inferredLiteralType(spelling, token.tag);
+    }
+
+    fn findTypeDefinition(
+        server: *Server,
+        arena: std.mem.Allocator,
+        document: *const Document,
+        type_name: []const u8,
+    ) !?lsp.types.Location {
+        if (document.declarationNamed(type_name)) |declaration| {
+            return .{
+                .uri = document.uri,
+                .range = document.range(declaration.span),
+            };
+        }
+        if (try server.importAliasDefinition(arena, document, type_name)) |location| {
+            return location;
         }
         return null;
     }
@@ -3154,6 +3343,38 @@ fn inferredLiteralType(source: []const u8, tag: std.zig.Token.Tag) ?[]const u8 {
     };
 }
 
+fn isTypeDeclaration(source: []const u8, span: std.zig.Token.Loc) bool {
+    var cursor = span.end;
+    while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t' or source[cursor] == '\r' or source[cursor] == '\n')) : (cursor += 1) {}
+    if (cursor < source.len and source[cursor] == '=') {
+        cursor += 1;
+        while (cursor < source.len and (source[cursor] == ' ' or source[cursor] == '\t' or source[cursor] == '\r' or source[cursor] == '\n')) : (cursor += 1) {}
+        const rest = source[cursor..];
+        return std.mem.startsWith(u8, rest, "struct") or
+            std.mem.startsWith(u8, rest, "enum") or
+            std.mem.startsWith(u8, rest, "union") or
+            std.mem.startsWith(u8, rest, "opaque") or
+            std.mem.startsWith(u8, rest, "@Type");
+    }
+    return false;
+}
+
+fn extractTypeNameFromSummary(summary: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, summary, " \t\r\n");
+    if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal| {
+        trimmed = std.mem.trim(u8, trimmed[0..equal], " \t\r\n");
+    }
+    while (trimmed.len > 0 and (trimmed[0] == '?' or trimmed[0] == '*')) {
+        trimmed = trimmed[1..];
+    }
+    if (std.mem.startsWith(u8, trimmed, "[]const ")) {
+        trimmed = trimmed["[]const ".len..];
+    } else if (std.mem.startsWith(u8, trimmed, "[]")) {
+        trimmed = trimmed[2..];
+    }
+    return std.mem.trim(u8, trimmed, " \t\r\n");
+}
+
 fn documentationBefore(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -4785,7 +5006,7 @@ test "LSP formatting delegates to zig fmt without applying lint fixes" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5272,7 +5493,7 @@ test "LSP member completion and rename respect syntax context" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5315,7 +5536,7 @@ test "LSP import completion and definition resolve another file" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5359,7 +5580,7 @@ test "LSP resolves import paths and nested imported definitions" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5403,7 +5624,7 @@ test "LSP hover describes parameters locals functions and bounded constants" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5449,7 +5670,7 @@ test "LSP hover documents Zig keywords primitive types and values" {
     server.compiler_restart_available = false;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 8), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "```zig\\nconst\\n```\\n```zig\\n(keyword)\\n```") != null);
@@ -5488,7 +5709,7 @@ test "LSP hover documents builtins operators literals and semicolons" {
     server.compiler_restart_available = false;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "@as(comptime T: type, expression: anytype) T") != null);
@@ -5524,7 +5745,7 @@ test "LSP hover follows inferred returns through imported type aliases" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5562,7 +5783,7 @@ test "LSP hover resolves constructed types through imports and type functions" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5595,7 +5816,7 @@ test "LSP publishes memory ownership warnings" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5629,7 +5850,7 @@ test "LSP publishes unresolved calls before the document is saved" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5661,7 +5882,7 @@ test "LSP publishes unresolved type references after an unsaved rename" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5699,7 +5920,7 @@ test "LSP advertises and returns complete filtered code actions" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5747,7 +5968,7 @@ test "LSP offers line and file suppression quickfixes for a finding" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5782,7 +6003,7 @@ test "LSP returns Zig error recovery actions" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Propagate the error with try") != null);
@@ -5814,7 +6035,7 @@ test "LSP returns build repair and c import extraction workspace actions" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "Add module 'feature' to build.zig") != null);
@@ -5846,7 +6067,7 @@ test "LSP call hierarchy connects callers and callees" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5878,7 +6099,7 @@ test "LSP extracts an exact UTF-16 expression selection" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5909,7 +6130,7 @@ test "LSP organizes imports when the style lint is disabled" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -5941,7 +6162,7 @@ test "LSP diagnostics map positions past astral-plane characters in UTF-16" {
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 3), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "syntax-error") != null);
@@ -5973,7 +6194,7 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     server.compiler_restart_available = false;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"result\":null") != null);
@@ -6050,7 +6271,7 @@ test "LSP answers from current syntax while the compiler worker is busy" {
         server.deinit();
     }
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "publishDiagnostics") != null);
@@ -6084,7 +6305,7 @@ test "LSP discards an out-of-order document version instead of clobbering newer 
     server.compiler_start_attempted = true;
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     // The stale version publishes nothing: open, newer change, symbols, shutdown.
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
@@ -6111,7 +6332,7 @@ test "LSP survives a save notification for a document that was never opened" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     defer server.deinit();
 
-    try lsp.basic_server.run(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "answer") != null);
@@ -6152,7 +6373,7 @@ test "LSP session covers lifecycle synchronization and broad features" {
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
     defer server.deinit();
 
-    try lsp.basic_server.run(
+    try runBasicServer(
         std.testing.io,
         std.testing.allocator,
         &transport.transport,
@@ -6171,6 +6392,132 @@ test "LSP session covers lifecycle synchronization and broad features" {
     try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"data\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(8), "comptime_int") != null);
     try std.testing.expect(std.mem.indexOf(u8, transport.output(9), "\"result\":null") != null);
+}
+
+test "LSP textDocument/typeDefinition resolves variable type definition" {
+    var transport = TestTransport.init(&.{});
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+
+    const uri = "file:///type_def.zig";
+    const source: [:0]const u8 =
+        "const Config = struct {\n" ++
+        "    port: u16,\n" ++
+        "};\n" ++
+        "\n" ++
+        "pub fn main() void {\n" ++
+        "    const cfg: Config = .{ .port = 8080 };\n" ++
+        "    _ = cfg;\n" ++
+        "}\n";
+
+    try server.documents.open(uri, 1, source);
+    const document = server.documents.getConst(uri).?;
+
+    const cfg_start = std.mem.indexOf(u8, source, "cfg: Config").?;
+    const cfg_pos = document.range(.{ .start = cfg_start, .end = cfg_start + 3 }).start;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const response = (try server.@"textDocument/typeDefinition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = cfg_pos,
+    })).?;
+
+    const definition = switch (response) {
+        .definition => |value| value,
+        .definition_links => return error.ExpectedDefinitionLocation,
+    };
+    const location = switch (definition) {
+        .location => |value| value,
+        .locations => return error.ExpectedSingleDefinition,
+    };
+
+    const config_decl = document.declarationNamed("Config").?;
+    try std.testing.expectEqualStrings(uri, location.uri);
+    try std.testing.expectEqual(document.range(config_decl.span).start, location.range.start);
+}
+
+test "LSP workspace/executeCommand zig-analyzer.typeAtPosition returns type description" {
+    var transport = TestTransport.init(&.{});
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+
+    const uri = "file:///type_pos.zig";
+    const source: [:0]const u8 =
+        "const Config = struct {\n" ++
+        "    port: u16,\n" ++
+        "};\n" ++
+        "\n" ++
+        "pub fn main() void {\n" ++
+        "    const cfg: Config = .{ .port = 8080 };\n" ++
+        "    _ = cfg;\n" ++
+        "}\n";
+
+    try server.documents.open(uri, 1, source);
+    const document = server.documents.getConst(uri).?;
+
+    const cfg_start = std.mem.indexOf(u8, source, "cfg: Config").?;
+    const cfg_pos = document.range(.{ .start = cfg_start, .end = cfg_start + 3 }).start;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const args = try arena_state.allocator().alloc(std.json.Value, 3);
+    args[0] = .{ .string = uri };
+    args[1] = .{ .integer = cfg_pos.line };
+    args[2] = .{ .integer = cfg_pos.character };
+
+    const result = (try server.@"workspace/executeCommand"(arena_state.allocator(), .{
+        .command = "zig-analyzer.typeAtPosition",
+        .arguments = args,
+    })).?;
+
+    try std.testing.expectEqualStrings("Config", result.string);
+}
+
+test "LSP code action offers rule-wide fix-all for deterministic rule" {
+    var transport = TestTransport.init(&.{});
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+
+    const uri = "file:///fix_all_rule.zig";
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "pub fn run(allocator: std.mem.Allocator, a: []const u8, b: []const u8) !void {\n" ++
+        "    _ = try std.fmt.allocPrint(allocator, \"{s}\", .{a});\n" ++
+        "    _ = try std.fmt.allocPrint(allocator, \"{s}\", .{b});\n" ++
+        "}\n";
+
+    try server.documents.open(uri, 1, source);
+    const document = server.documents.getConst(uri).?;
+
+    const first_call = std.mem.indexOf(u8, source, "std.fmt.allocPrint(allocator, \"{s}\", .{a})").?;
+    const action_range = document.range(.{ .start = first_call, .end = first_call + 10 });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const result = (try server.@"textDocument/codeAction"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .range = action_range,
+        .context = .{ .diagnostics = &.{} },
+    })).?;
+
+    var found_rule_fix_all = false;
+    for (result) |action_res| {
+        const action = switch (action_res) {
+            .code_action => |ca| ca,
+            else => continue,
+        };
+        if (std.mem.eql(u8, action.title, "Fix all 'prefer-allocator-dupe' in this file")) {
+            found_rule_fix_all = true;
+            const edit = action.edit.?;
+            const text_edits = edit.changes.?.map.get(uri).?;
+            try std.testing.expectEqual(@as(usize, 2), text_edits.len);
+        }
+    }
+    try std.testing.expect(found_rule_fix_all);
 }
 
 const TestTransport = struct {

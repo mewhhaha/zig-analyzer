@@ -14,6 +14,8 @@ pub const Binding = struct {
     scope_rank: usize = 0,
 };
 
+pub const none_token: u32 = std.math.maxInt(u32);
+
 const LexicalScope = struct {
     opening: ?usize,
     closing: usize,
@@ -25,8 +27,8 @@ pub const Index = struct {
     tokens: []const std.zig.Token,
     bindings: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Binding)) = .empty,
     usingnamespace_scopes: std.ArrayListUnmanaged(std.zig.Token.Loc) = .empty,
-    matching_tokens: []?usize = &.{},
-    enclosing_braces: []?usize = &.{},
+    matching_tokens: []u32 = &.{},
+    enclosing_braces: []u32 = &.{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -41,38 +43,47 @@ pub const Index = struct {
         defer parenthesis_openings.deinit(allocator);
         var bracket_openings: std.ArrayListUnmanaged(usize) = .empty;
         defer bracket_openings.deinit(allocator);
-        index.matching_tokens = try allocator.alloc(?usize, tokens.len);
-        @memset(index.matching_tokens, null);
-        index.enclosing_braces = try allocator.alloc(?usize, tokens.len);
-        @memset(index.enclosing_braces, null);
+        index.matching_tokens = try allocator.alloc(u32, tokens.len);
+        @memset(index.matching_tokens, none_token);
+        index.enclosing_braces = try allocator.alloc(u32, tokens.len);
+        @memset(index.enclosing_braces, none_token);
         for (tokens, 0..) |token, token_index| switch (token.tag) {
             .l_brace => try scope_openings.append(allocator, token_index),
             .r_brace => if (scope_openings.pop()) |opening| {
-                index.matching_tokens[opening] = token_index;
-                index.matching_tokens[token_index] = opening;
+                if (token_index <= std.math.maxInt(u32)) {
+                    index.matching_tokens[opening] = @intCast(token_index);
+                    index.matching_tokens[token_index] = @intCast(opening);
+                }
             },
             .l_paren => try parenthesis_openings.append(allocator, token_index),
             .r_paren => if (parenthesis_openings.pop()) |opening| {
-                index.matching_tokens[opening] = token_index;
-                index.matching_tokens[token_index] = opening;
+                if (token_index <= std.math.maxInt(u32)) {
+                    index.matching_tokens[opening] = @intCast(token_index);
+                    index.matching_tokens[token_index] = @intCast(opening);
+                }
             },
             .l_bracket => try bracket_openings.append(allocator, token_index),
             .r_bracket => if (bracket_openings.pop()) |opening| {
-                index.matching_tokens[opening] = token_index;
-                index.matching_tokens[token_index] = opening;
+                if (token_index <= std.math.maxInt(u32)) {
+                    index.matching_tokens[opening] = @intCast(token_index);
+                    index.matching_tokens[token_index] = @intCast(opening);
+                }
             },
             else => {},
         };
         scope_openings.clearRetainingCapacity();
         for (tokens, 0..) |token, token_index| {
             if (token.tag == .r_brace) _ = scope_openings.pop();
-            index.enclosing_braces[token_index] = scope_openings.getLastOrNull();
+            index.enclosing_braces[token_index] = if (scope_openings.getLastOrNull()) |opening|
+                @intCast(opening)
+            else
+                none_token;
             if (token.tag == .identifier) {
                 const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
-                    .{ .opening = opening, .closing = index.matching_tokens[opening] orelse tokens.len - 1 }
+                    .{ .opening = opening, .closing = index.matchingToken(opening) orelse tokens.len - 1 }
                 else
                     .{ .opening = null, .closing = tokens.len - 1 };
-                if (binding(tokens, source, token_index, lexical_scope)) |unindexed_candidate| {
+                if (bindingWithIndex(tokens, source, token_index, lexical_scope, &index)) |unindexed_candidate| {
                     var candidate = unindexed_candidate;
                     candidate.alias_target = aliasTarget(source, tokens, token_index);
                     candidate.scope_rank = if (scope_openings.getLastOrNull()) |opening| opening + 1 else 0;
@@ -81,12 +92,12 @@ pub const Index = struct {
                     try entry.value_ptr.append(allocator, candidate);
                 }
             }
-            if (std.mem.eql(u8, tokenText(source, token), "usingnamespace")) {
+            if (token.tag == .identifier and token.loc.end - token.loc.start == 14 and std.mem.eql(u8, tokenText(source, token), "usingnamespace")) {
                 const lexical_scope: LexicalScope = if (scope_openings.getLastOrNull()) |opening|
-                    .{ .opening = opening, .closing = index.matching_tokens[opening] orelse tokens.len - 1 }
+                    .{ .opening = opening, .closing = index.matchingToken(opening) orelse tokens.len - 1 }
                 else
                     .{ .opening = null, .closing = tokens.len - 1 };
-                const scope = declarationScope(tokens, token_index, true, lexical_scope) orelse continue;
+                const scope = declarationScopeWithIndex(tokens, token_index, true, lexical_scope, &index) orelse continue;
                 try index.usingnamespace_scopes.append(allocator, scope);
             }
             if (token.tag == .l_brace) try scope_openings.append(allocator, token_index);
@@ -150,12 +161,14 @@ pub const Index = struct {
 
     pub fn matchingToken(index: *const Index, opening_index: usize) ?usize {
         if (opening_index >= index.matching_tokens.len) return null;
-        return index.matching_tokens[opening_index];
+        const target = index.matching_tokens[opening_index];
+        return if (target == none_token) null else target;
     }
 
     pub fn enclosingScopeEnd(index: *const Index, token_index: usize) ?usize {
         if (token_index >= index.enclosing_braces.len) return null;
-        const opening = index.enclosing_braces[token_index] orelse return null;
+        const opening = index.enclosing_braces[token_index];
+        if (opening == none_token) return null;
         return index.matchingToken(opening);
     }
 
@@ -229,7 +242,7 @@ pub fn isContainerFieldDeclaration(tokens: []const std.zig.Token, identifier_ind
 pub fn usingnamespaceMayProvideName(source: []const u8, tokens: []const std.zig.Token, use_index: usize) bool {
     if (use_index >= tokens.len) return false;
     for (tokens, 0..) |token, index| {
-        if (!std.mem.eql(u8, tokenText(source, token), "usingnamespace")) continue;
+        if (token.tag != .identifier or token.loc.end - token.loc.start != 14 or !std.mem.eql(u8, tokenText(source, token), "usingnamespace")) continue;
         const scope = declarationScope(tokens, index, true, null) orelse continue;
         if (spanContains(scope, tokens[use_index].loc)) return true;
     }
@@ -242,24 +255,34 @@ fn binding(
     identifier_index: usize,
     lexical_scope: ?LexicalScope,
 ) ?Binding {
+    return bindingWithIndex(tokens, source, identifier_index, lexical_scope, null);
+}
+
+fn bindingWithIndex(
+    tokens: []const std.zig.Token,
+    source: []const u8,
+    identifier_index: usize,
+    lexical_scope: ?LexicalScope,
+    opt_idx: ?*const Index,
+) ?Binding {
     if (identifierIsNamedDeclaration(tokens, identifier_index)) {
         const declaration_tag = tokens[identifier_index - 1].tag;
         const container_member = if (lexical_scope) |scope|
             if (scope.opening) |opening| braceStartsContainer(tokens, opening) else true
         else
-            declarationIsContainerMember(tokens, identifier_index - 1);
+            declarationIsContainerMember(tokens, identifier_index - 1, opt_idx);
         return .{
             .token_index = identifier_index,
-            .scope = declarationScope(tokens, identifier_index - 1, container_member, lexical_scope) orelse return null,
+            .scope = declarationScopeWithIndex(tokens, identifier_index - 1, container_member, lexical_scope, opt_idx) orelse return null,
             .kind = if (declaration_tag == .keyword_fn)
                 .callable
             else
                 initializerKind(source, tokens, identifier_index),
         };
     }
-    if (identifierIsFunctionParameter(tokens, identifier_index)) {
-        const body = functionBodyAfterParameter(tokens, identifier_index) orelse return null;
-        const closing = matchingToken(tokens, body, .l_brace, .r_brace) orelse return null;
+    if (identifierIsFunctionParameter(tokens, identifier_index, opt_idx)) {
+        const body = functionBodyAfterParameter(tokens, identifier_index, opt_idx) orelse return null;
+        const closing = if (opt_idx) |idx| idx.matchingToken(body) orelse return null else matchingToken(tokens, body, .l_brace, .r_brace) orelse return null;
         return .{
             .token_index = identifier_index,
             .scope = .{ .start = tokens[identifier_index].loc.end, .end = tokens[closing].loc.end },
@@ -267,12 +290,12 @@ fn binding(
         };
     }
     if (identifierIsCapture(tokens, identifier_index)) {
-        const scope = captureScope(tokens, identifier_index) orelse return null;
+        const scope = captureScope(tokens, identifier_index, opt_idx) orelse return null;
         return .{ .token_index = identifier_index, .scope = scope, .kind = .unknown };
     }
     if (identifierIsDestructureBinding(tokens, identifier_index)) {
         const declaration_index = destructureDeclarationIndex(tokens, identifier_index) orelse return null;
-        var scope = declarationScope(tokens, declaration_index, false, null) orelse return null;
+        var scope = declarationScopeWithIndex(tokens, declaration_index, false, null, opt_idx) orelse return null;
         scope.start = tokens[identifier_index].loc.end;
         return .{
             .token_index = identifier_index,
@@ -318,8 +341,8 @@ fn declarationKeywordStartsStatement(tokens: []const std.zig.Token, index: usize
     };
 }
 
-fn declarationIsContainerMember(tokens: []const std.zig.Token, keyword_index: usize) bool {
-    const opening = enclosingOpeningBrace(tokens, keyword_index) orelse return true;
+fn declarationIsContainerMember(tokens: []const std.zig.Token, keyword_index: usize, opt_idx: ?*const Index) bool {
+    const opening = enclosingOpeningBraceWithIndex(tokens, keyword_index, opt_idx) orelse return true;
     return braceStartsContainer(tokens, opening);
 }
 
@@ -346,6 +369,16 @@ fn declarationScope(
     order_independent: bool,
     lexical_scope: ?LexicalScope,
 ) ?std.zig.Token.Loc {
+    return declarationScopeWithIndex(tokens, declaration_index, order_independent, lexical_scope, null);
+}
+
+fn declarationScopeWithIndex(
+    tokens: []const std.zig.Token,
+    declaration_index: usize,
+    order_independent: bool,
+    lexical_scope: ?LexicalScope,
+    opt_idx: ?*const Index,
+) ?std.zig.Token.Loc {
     if (lexical_scope) |scope| return .{
         .start = if (order_independent)
             if (scope.opening) |opening| tokens[opening].loc.end else 0
@@ -353,9 +386,9 @@ fn declarationScope(
             tokens[declaration_index].loc.end,
         .end = tokens[scope.closing].loc.end,
     };
-    const opening = enclosingOpeningBrace(tokens, declaration_index);
+    const opening = enclosingOpeningBraceWithIndex(tokens, declaration_index, opt_idx);
     const closing = if (opening) |brace|
-        matchingToken(tokens, brace, .l_brace, .r_brace) orelse return null
+        if (opt_idx) |idx| idx.matchingToken(brace) orelse return null else matchingToken(tokens, brace, .l_brace, .r_brace) orelse return null
     else
         tokens.len - 1;
     return .{
@@ -367,21 +400,25 @@ fn declarationScope(
     };
 }
 
-fn identifierIsFunctionParameter(tokens: []const std.zig.Token, index: usize) bool {
+fn identifierIsFunctionParameter(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) bool {
     if (index + 1 >= tokens.len or tokens[index + 1].tag != .colon) return false;
     const opening = enclosingOpeningParenthesis(tokens, index) orelse return false;
     if (opening < 2 or tokens[opening - 1].tag != .identifier or tokens[opening - 2].tag != .keyword_fn) return false;
-    const closing = matchingToken(tokens, opening, .l_paren, .r_paren) orelse return false;
+    const closing = if (opt_idx) |idx| idx.matchingToken(opening) orelse return false else matchingToken(tokens, opening, .l_paren, .r_paren) orelse return false;
     return index < closing;
 }
 
-fn functionBodyAfterParameter(tokens: []const std.zig.Token, index: usize) ?usize {
+fn functionBodyAfterParameter(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) ?usize {
     const opening = enclosingOpeningParenthesis(tokens, index) orelse return null;
-    const closing = matchingToken(tokens, opening, .l_paren, .r_paren) orelse return null;
-    return functionBodyAfterParameters(tokens, closing);
+    const closing = if (opt_idx) |idx| idx.matchingToken(opening) orelse return null else matchingToken(tokens, opening, .l_paren, .r_paren) orelse return null;
+    return functionBodyAfterParametersWithIndex(tokens, closing, opt_idx);
 }
 
 pub fn functionBodyAfterParameters(tokens: []const std.zig.Token, parameters_end: usize) ?usize {
+    return functionBodyAfterParametersWithIndex(tokens, parameters_end, null);
+}
+
+fn functionBodyAfterParametersWithIndex(tokens: []const std.zig.Token, parameters_end: usize, opt_idx: ?*const Index) ?usize {
     if (parameters_end >= tokens.len or tokens[parameters_end].tag != .r_paren) return null;
     var cursor = parameters_end + 1;
     var parenthesis_depth: usize = 0;
@@ -394,7 +431,7 @@ pub fn functionBodyAfterParameters(tokens: []const std.zig.Token, parameters_end
             .r_bracket => bracket_depth -|= 1,
             .l_brace => if (parenthesis_depth == 0 and bracket_depth == 0) {
                 if (!braceStartsReturnType(tokens, cursor, parameters_end + 1)) return cursor;
-                cursor = matchingToken(tokens, cursor, .l_brace, .r_brace) orelse return null;
+                cursor = if (opt_idx) |idx| idx.matchingToken(cursor) orelse return null else matchingToken(tokens, cursor, .l_brace, .r_brace) orelse return null;
             },
             .comma, .semicolon => if (parenthesis_depth == 0 and bracket_depth == 0) return null,
             else => {},
@@ -443,14 +480,14 @@ fn identifierIsCapture(tokens: []const std.zig.Token, index: usize) bool {
     return false;
 }
 
-fn captureScope(tokens: []const std.zig.Token, index: usize) ?std.zig.Token.Loc {
+fn captureScope(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) ?std.zig.Token.Loc {
     var closing_pipe = index + 1;
     while (closing_pipe < tokens.len and tokens[closing_pipe].tag != .pipe) : (closing_pipe += 1) {}
     if (closing_pipe == tokens.len) return null;
     const body = closing_pipe + 1;
     if (body >= tokens.len) return null;
     const end = if (tokens[body].tag == .l_brace)
-        matchingToken(tokens, body, .l_brace, .r_brace) orelse return null
+        if (opt_idx) |idx| idx.matchingToken(body) orelse return null else matchingToken(tokens, body, .l_brace, .r_brace) orelse return null
     else
         expressionEnd(tokens, body) orelse return null;
     return .{ .start = tokens[body].loc.start, .end = tokens[end].loc.end };
@@ -499,6 +536,15 @@ fn initializerKind(source: []const u8, tokens: []const std.zig.Token, identifier
         .period => .non_callable,
         else => .unknown,
     };
+}
+
+fn enclosingOpeningBraceWithIndex(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) ?usize {
+    if (opt_idx) |idx| {
+        if (index >= idx.enclosing_braces.len) return null;
+        const b = idx.enclosing_braces[index];
+        return if (b == none_token) null else b;
+    }
+    return enclosingOpeningBrace(tokens, index);
 }
 
 fn enclosingOpeningBrace(tokens: []const std.zig.Token, index: usize) ?usize {

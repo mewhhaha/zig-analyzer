@@ -1,5 +1,10 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zig_analyzer = @import("zig_analyzer");
+
+comptime {
+    @setEvalBranchQuota(50_000);
+}
 
 const usage =
     \\zig-analyzer - compiler-backed language intelligence for Zig
@@ -15,8 +20,10 @@ const usage =
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const allocator = debug_allocator.allocator();
+    defer if (builtin.mode == .Debug) {
+        _ = debug_allocator.deinit();
+    };
+    const allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else std.heap.smp_allocator;
 
     var threaded: std.Io.Threaded = .init(allocator, .{
         .environ = init.environ,

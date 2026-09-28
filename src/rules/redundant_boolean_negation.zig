@@ -43,7 +43,7 @@ pub fn run(context: RuleRun) !void {
                 ),
                 .fixes = fixes,
             });
-            index = operand_end;
+            index = operand_end - 1;
             continue;
         }
 
@@ -90,6 +90,50 @@ pub fn run(context: RuleRun) !void {
             index = close_paren;
             continue;
         }
+
+        // Case 3: `!true` or `!false`
+        if (index + 1 < context.tokens.len and context.tokens[index + 1].tag == .identifier) {
+            const next_text = context.tokenText(index + 1);
+            const is_true = std.mem.eql(u8, next_text, "true");
+            const is_false = std.mem.eql(u8, next_text, "false");
+            if (is_true or is_false) {
+                const constant_source = if (is_true) "true" else "false";
+                const simplified = if (is_true) "false" else "true";
+                const whole_span = std.zig.Token.Loc{
+                    .start = token.loc.start,
+                    .end = context.tokens[index + 1].loc.end,
+                };
+                if (!containsComment(context.source[whole_span.start..whole_span.end])) {
+                    const edits = try context.allocator.alloc(types.Edit, 1);
+                    edits[0] = .{
+                        .span = whole_span,
+                        .replacement = try context.allocator.dupe(u8, simplified),
+                    };
+                    const fixes = try context.allocator.alloc(types.Fix, 1);
+                    fixes[0] = .{
+                        .title = try std.fmt.allocPrint(context.allocator, "Simplify '!{s}' to '{s}'", .{ constant_source, simplified }),
+                        .kind = .quickfix,
+                        .edits = edits,
+                        .preferred = true,
+                        .fix_all = true,
+                    };
+
+                    try context.emit(.{
+                        .rule = .redundant_boolean_negation,
+                        .level = level,
+                        .span = whole_span,
+                        .message = try std.fmt.allocPrint(
+                            context.allocator,
+                            "negation of boolean constant '!{s}' is redundant; use '{s}' directly",
+                            .{ constant_source, simplified },
+                        ),
+                        .fixes = fixes,
+                    });
+                    index += 1;
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -123,13 +167,17 @@ test "redundant boolean negation reports !! and !(!...)" {
         "fn check(flag: bool) bool {\n" ++
         "    if (!!flag) return true;\n" ++
         "    if (!(!flag)) return true;\n" ++
+        "    if (!true) return false;\n" ++
+        "    if (!false) return true;\n" ++
         "    return false;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
-    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expectEqual(@as(usize, 4), findings.len);
     try std.testing.expectEqualStrings("", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("flag", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("false", findings[2].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("true", findings[3].fixes[0].edits[0].replacement);
 }
 
 test "single negation stays unchanged" {

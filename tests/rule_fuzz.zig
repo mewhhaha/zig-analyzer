@@ -9,7 +9,7 @@ const largest_robustness_input = 4096;
 
 fn everythingOnConfiguration() analysis.Configuration {
     var configuration = analysis.Configuration.defaults();
-    for (&configuration.levels) |*level| level.* = .warning;
+    @memset(&configuration.levels, .warning);
     return configuration;
 }
 

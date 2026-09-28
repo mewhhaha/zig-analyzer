@@ -3,31 +3,21 @@ const RuleRun = @import("context.zig").RuleRun;
 const types = @import("types.zig");
 
 pub fn run(context: RuleRun) !void {
-    const level = context.level(.identical_comparison_operands);
+    const level = context.level(.identical_logical_operands);
     if (level == .off) return;
 
     for (context.tokens, 0..) |token, op_index| {
-        if (!isComparisonOp(token.tag) or op_index == 0 or op_index + 1 >= context.tokens.len) continue;
+        if ((token.tag != .keyword_and and token.tag != .keyword_or) or
+            op_index == 0 or op_index + 1 >= context.tokens.len) continue;
 
-        // Find LHS path ending at op_index
         const lhs_span = pathBefore(context.tokens, op_index) orelse continue;
 
-        // Ensure LHS is not part of a larger dot, call, or index expression
-        if (lhs_span.start > 0) {
-            const prev = context.tokens[lhs_span.start - 1].tag;
-            if (prev == .period or prev == .r_paren or prev == .r_bracket or prev == .period_asterisk) continue;
-        }
+        if (lhs_span.start > 0 and !isLogicalBoundaryBefore(context.tokens[lhs_span.start - 1].tag)) continue;
 
-        // Find RHS path starting at op_index + 1
         const rhs_span = pathAfter(context.tokens, op_index + 1) orelse continue;
 
-        // Ensure RHS is not part of a larger dot, call, or index expression
-        if (rhs_span.end < context.tokens.len) {
-            const next = context.tokens[rhs_span.end].tag;
-            if (next == .period or next == .l_paren or next == .l_bracket or next == .period_asterisk) continue;
-        }
+        if (rhs_span.end < context.tokens.len and !isLogicalBoundaryAfter(context.tokens[rhs_span.end].tag)) continue;
 
-        // Compare LHS and RHS paths
         const lhs_len = lhs_span.end - lhs_span.start;
         const rhs_len = rhs_span.end - rhs_span.start;
         if (lhs_len != rhs_len) continue;
@@ -49,35 +39,41 @@ pub fn run(context: RuleRun) !void {
         if (containsComment(expr_source)) continue;
 
         const operand_text = context.source[context.tokens[lhs_span.start].loc.start..context.tokens[lhs_span.end - 1].loc.end];
-        const op_text = context.tokenText(op_index);
+        const op_text = if (token.tag == .keyword_and) "and" else "or";
 
-        const message = if (token.tag == .equal_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} == {s}' always evaluates to true; operands are identical", .{ operand_text, operand_text })
-        else if (token.tag == .bang_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} != {s}' always evaluates to false; if checking for NaN, use std.math.isNan or @isnan", .{ operand_text, operand_text })
-        else
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} {s} {s}' compares identical operands and always evaluates to a constant", .{ operand_text, op_text, operand_text });
+        const edits = try context.allocator.alloc(types.Edit, 1);
+        var fix_start = token.loc.start;
+        if (lhs_span.end > 0 and context.tokens[lhs_span.end - 1].loc.end < token.loc.start) {
+            fix_start = context.tokens[lhs_span.end - 1].loc.end;
+        }
+        edits[0] = .{
+            .span = .{ .start = fix_start, .end = context.tokens[rhs_span.end - 1].loc.end },
+            .replacement = "",
+        };
+
+        const fixes = try context.allocator.alloc(types.Fix, 1);
+        fixes[0] = .{
+            .title = try std.fmt.allocPrint(context.allocator, "Remove redundant '{s} {s}'", .{ op_text, operand_text }),
+            .kind = .quickfix,
+            .edits = edits,
+            .preferred = true,
+            .fix_all = true,
+        };
+
+        const message = try std.fmt.allocPrint(
+            context.allocator,
+            "logical '{s}' with identical operands '{s} {s} {s}' is redundant and likely a typo",
+            .{ op_text, operand_text, op_text, operand_text },
+        );
 
         try context.emit(.{
-            .rule = .identical_comparison_operands,
+            .rule = .identical_logical_operands,
             .level = level,
             .span = .{ .start = context.tokens[lhs_span.start].loc.start, .end = context.tokens[rhs_span.end - 1].loc.end },
             .message = message,
+            .fixes = fixes,
         });
     }
-}
-
-fn isComparisonOp(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .equal_equal,
-        .bang_equal,
-        .angle_bracket_left,
-        .angle_bracket_right,
-        .angle_bracket_left_equal,
-        .angle_bracket_right_equal,
-        => true,
-        else => false,
-    };
 }
 
 const PathSpan = struct {
@@ -111,39 +107,70 @@ fn pathAfter(tokens: []const std.zig.Token, start: usize) ?PathSpan {
     return .{ .start = start, .end = cursor };
 }
 
+fn isLogicalBoundaryBefore(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .l_paren,
+        .keyword_if,
+        .keyword_while,
+        .keyword_and,
+        .keyword_or,
+        .keyword_return,
+        .equal,
+        .comma,
+        .colon,
+        .semicolon,
+        => true,
+        else => false,
+    };
+}
+
+fn isLogicalBoundaryAfter(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .r_paren,
+        .keyword_and,
+        .keyword_or,
+        .semicolon,
+        .comma,
+        .l_brace,
+        .keyword_else,
+        => true,
+        else => false,
+    };
+}
+
 fn containsComment(source: []const u8) bool {
     return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
 }
 
-test "identical comparison operands reports comparisons of identical paths" {
+test "identical logical operands reports repeated conditions in and and or" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
-        "fn check(x: u32, s: Struct) bool {\n" ++
-        "    if (x == x) return true;\n" ++
-        "    if (s.len != s.len) return false;\n" ++
-        "    if (x < x) return false;\n" ++
-        "    if (s.ptr.* == s.ptr.*) return true;\n" ++
-        "    return true;\n" ++
+        "fn check(valid: bool, s: Struct) bool {\n" ++
+        "    if (valid and valid) return true;\n" ++
+        "    if (s.ready or s.ready) return true;\n" ++
+        "    if (s.ptr.* and s.ptr.*) return true;\n" ++
+        "    return false;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
-    try std.testing.expectEqual(@as(usize, 4), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "x == x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "s.len != s.len") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "x < x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[3].message, "s.ptr.* == s.ptr.*") != null);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "valid and valid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "s.ready or s.ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "s.ptr.* and s.ptr.*") != null);
+    try std.testing.expectEqualStrings("", findings[0].fixes[0].edits[0].replacement);
 }
 
-test "comparisons of distinct operands stay unchanged" {
+test "distinct logical operands stay unchanged" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
-        "fn check(x: u32, y: u32, s: Struct, other: Struct) bool {\n" ++
-        "    if (x == y) return true;\n" ++
-        "    if (s.len == other.len) return true;\n" ++
-        "    if (s.len < 10) return true;\n" ++
-        "    if (get().x == get().x) return true;\n" ++
+        "fn check(a: bool, b: bool, s: Struct, other: Struct, start: usize, index: usize, end: usize) bool {\n" ++
+        "    if (a and b) return true;\n" ++
+        "    if (s.ready or other.ready) return true;\n" ++
+        "    if (s.ptr.* and other.ptr.*) return true;\n" ++
+        "    if (start < index and index < end) return true;\n" ++
+        "    if (start == index or index + 1 == end) return true;\n" ++
         "    return false;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
@@ -151,13 +178,13 @@ test "comparisons of distinct operands stay unchanged" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
-test "identical comparison operands honors suppression" {
+test "identical logical operands honors suppression" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
-        "fn check(x: u32) bool {\n" ++
-        "    // zig-analyzer: disable-next-line identical-comparison-operands\n" ++
-        "    return x == x;\n" ++
+        "fn check(x: bool) bool {\n" ++
+        "    // zig-analyzer: disable-next-line identical-logical-operands\n" ++
+        "    return x and x;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
@@ -168,7 +195,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.identical_comparison_operands)] = .warning;
+    configuration.levels[@intFromEnum(types.Rule.identical_logical_operands)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,
