@@ -170,6 +170,11 @@ Compiler-backed project rules are opt-in.
   a comparison where both operands evaluate to the same path.
 - [`identical-logical-operands`](identical-logical-operands.md) — Reports a
   logical `and` or `or` expression whose operands evaluate to the same path.
+- [`identical-conditional-branches`](identical-conditional-branches.md) —
+  Reports an `if` expression or statement where the `then` and `else` branches
+  have identical bodies.
+- [`nan-comparison`](nan-comparison.md) — Reports comparison with a NaN value,
+  which always evaluates to a constant.
 
 ## Opt-in style and policy rules
 

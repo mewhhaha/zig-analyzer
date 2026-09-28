@@ -2666,45 +2666,79 @@ fn findNeedlessCasts(
     const level = configuration.level(.needless_cast);
     if (level == .off) return;
     for (tokens, 0..) |token, index| {
-        if (token.tag != .builtin or !tokenIs(source, token, "@as") or index + 5 >= tokens.len) continue;
-        if (tokens[index + 1].tag != .l_paren or tokens[index + 2].tag != .identifier or tokens[index + 3].tag != .comma) continue;
-        const outer_close = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
-        const type_name = tokenText(source, tokens[index + 2]);
-        var replacement: []const u8 = undefined;
-        var message: []const u8 = undefined;
-        if (tokenIs(source, tokens[index + 4], "@as") and tokens[index + 5].tag == .l_paren and index + 7 < tokens.len and
-            tokens[index + 6].tag == .identifier and tokens[index + 7].tag == .comma and
-            std.mem.eql(u8, type_name, tokenText(source, tokens[index + 6])))
-        {
-            const inner_close = matchingToken(tokens, index + 5, .l_paren, .r_paren) orelse continue;
-            if (inner_close + 1 != outer_close) continue;
-            replacement = source[tokens[index + 4].loc.start..tokens[inner_close].loc.end];
-            message = try std.fmt.allocPrint(allocator, "nested cast to '{s}' repeats the same proven type", .{type_name});
-        } else if (tokens[index + 4].tag == .identifier and index + 5 == outer_close and
-            indexedBindingHasType(source, tokens, scope_index, index + 4, type_name))
-        {
-            replacement = tokenText(source, tokens[index + 4]);
-            message = try std.fmt.allocPrint(
-                allocator,
-                "cast of '{s}' to its proven type '{s}' is unnecessary",
-                .{ replacement, type_name },
-            );
-        } else continue;
-        const edits = try allocator.alloc(Edit, 1);
-        edits[0] = .{
-            .span = .{ .start = token.loc.start, .end = tokens[outer_close].loc.end },
-            .replacement = replacement,
-        };
-        const fixes = try allocator.alloc(Fix, 1);
-        fixes[0] = .{ .title = "Remove redundant cast", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
-        try addFinding(allocator, source, configuration, found, .{
-            .rule = .needless_cast,
-            .level = level,
-            .span = token.loc,
-            .message = message,
-            .fixes = fixes,
-        });
+        if (token.tag != .builtin or index + 3 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
+        const builtin_name = tokenText(source, token);
+        if (tokenIs(source, token, "@as")) {
+            if (index + 5 >= tokens.len or tokens[index + 2].tag != .identifier or tokens[index + 3].tag != .comma) continue;
+            const outer_close = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
+            const type_name = tokenText(source, tokens[index + 2]);
+            var replacement: []const u8 = undefined;
+            var message: []const u8 = undefined;
+            if (tokenIs(source, tokens[index + 4], "@as") and tokens[index + 5].tag == .l_paren and index + 7 < tokens.len and
+                tokens[index + 6].tag == .identifier and tokens[index + 7].tag == .comma and
+                std.mem.eql(u8, type_name, tokenText(source, tokens[index + 6])))
+            {
+                const inner_close = matchingToken(tokens, index + 5, .l_paren, .r_paren) orelse continue;
+                if (inner_close + 1 != outer_close) continue;
+                replacement = source[tokens[index + 4].loc.start..tokens[inner_close].loc.end];
+                message = try std.fmt.allocPrint(allocator, "nested cast to '{s}' repeats the same proven type", .{type_name});
+            } else if (tokens[index + 4].tag == .identifier and index + 5 == outer_close and
+                indexedBindingHasType(source, tokens, scope_index, index + 4, type_name))
+            {
+                replacement = tokenText(source, tokens[index + 4]);
+                message = try std.fmt.allocPrint(
+                    allocator,
+                    "cast of '{s}' to its proven type '{s}' is unnecessary",
+                    .{ replacement, type_name },
+                );
+            } else continue;
+            const edits = try allocator.alloc(Edit, 1);
+            edits[0] = .{
+                .span = .{ .start = token.loc.start, .end = tokens[outer_close].loc.end },
+                .replacement = replacement,
+            };
+            const fixes = try allocator.alloc(Fix, 1);
+            fixes[0] = .{ .title = "Remove redundant cast", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
+            try addFinding(allocator, source, configuration, found, .{
+                .rule = .needless_cast,
+                .level = level,
+                .span = token.loc,
+                .message = message,
+                .fixes = fixes,
+            });
+        } else if (isSingleArgumentCastBuiltin(builtin_name)) {
+            if (tokens[index + 2].tag != .builtin or !std.mem.eql(u8, builtin_name, tokenText(source, tokens[index + 2]))) continue;
+            if (tokens[index + 3].tag != .l_paren) continue;
+            const outer_close = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
+            const inner_close = matchingToken(tokens, index + 3, .l_paren, .r_paren) orelse continue;
+            if (inner_close + 1 != outer_close and !(inner_close + 2 == outer_close and tokens[inner_close + 1].tag == .comma)) continue;
+            const replacement = source[tokens[index + 2].loc.start..tokens[inner_close].loc.end];
+            const message = try std.fmt.allocPrint(allocator, "nested '{s}' is redundant", .{builtin_name});
+            const edits = try allocator.alloc(Edit, 1);
+            edits[0] = .{
+                .span = .{ .start = token.loc.start, .end = tokens[outer_close].loc.end },
+                .replacement = replacement,
+            };
+            const fixes = try allocator.alloc(Fix, 1);
+            fixes[0] = .{ .title = "Remove redundant cast", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
+            try addFinding(allocator, source, configuration, found, .{
+                .rule = .needless_cast,
+                .level = level,
+                .span = token.loc,
+                .message = message,
+                .fixes = fixes,
+            });
+        }
     }
+}
+
+fn isSingleArgumentCastBuiltin(name: []const u8) bool {
+    return std.mem.eql(u8, name, "@intCast") or
+        std.mem.eql(u8, name, "@floatCast") or
+        std.mem.eql(u8, name, "@ptrCast") or
+        std.mem.eql(u8, name, "@alignCast") or
+        std.mem.eql(u8, name, "@truncate") or
+        std.mem.eql(u8, name, "@addrSpaceCast");
 }
 
 fn findNeedlessElse(
@@ -3428,15 +3462,26 @@ fn findOptionalCaptureIdioms(
     const level = configuration.level(.prefer_optional_capture);
     if (level == .off) return;
     for (tokens, 0..) |token, if_index| {
-        if (token.tag != .keyword_if or if_index + 6 >= tokens.len or tokens[if_index + 1].tag != .l_paren or
-            tokens[if_index + 2].tag != .identifier or tokens[if_index + 3].tag != .bang_equal or
-            !tokenIs(source, tokens[if_index + 4], "null") or tokens[if_index + 5].tag != .r_paren) continue;
+        if (token.tag != .keyword_if or if_index + 6 >= tokens.len or tokens[if_index + 1].tag != .l_paren) continue;
+        var optional_name: []const u8 = undefined;
+        if (tokens[if_index + 2].tag == .identifier and !tokenIs(source, tokens[if_index + 2], "null") and
+            tokens[if_index + 3].tag == .bang_equal and
+            tokenIs(source, tokens[if_index + 4], "null") and
+            tokens[if_index + 5].tag == .r_paren)
+        {
+            optional_name = tokenText(source, tokens[if_index + 2]);
+        } else if (tokenIs(source, tokens[if_index + 2], "null") and
+            tokens[if_index + 3].tag == .bang_equal and
+            tokens[if_index + 4].tag == .identifier and !tokenIs(source, tokens[if_index + 4], "null") and
+            tokens[if_index + 5].tag == .r_paren)
+        {
+            optional_name = tokenText(source, tokens[if_index + 4]);
+        } else continue;
         const body_start = if_index + 6;
         const body_close = if (tokens[body_start].tag == .l_brace)
             matchingToken(tokens, body_start, .l_brace, .r_brace) orelse continue
         else
             statementEnd(tokens, body_start) orelse continue;
-        const optional_name = tokenText(source, tokens[if_index + 2]);
         var unwraps: std.ArrayList(std.zig.Token.Loc) = .empty;
         var unsafe = false;
         for (tokens[body_start..body_close], body_start..) |body_token, body_index| {
@@ -5600,6 +5645,45 @@ test "optional capture skips foreign fields and assigned unwraps" {
         try std.testing.expectEqual(std.mem.indexOf(u8, source, "y.? + box").?, finding.fixes[0].edits[1].span.start);
     };
     try std.testing.expectEqual(@as(usize, 1), capture_count);
+}
+
+test "optional capture supports null != opt operand order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn read(y: ?u32) u32 {\n" ++
+        "    if (null != y) { return y.?; }\n" ++
+        "    return 0;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.prefer_optional_capture)] = .information;
+    const found = try findings(arena.allocator(), source, configuration);
+    var capture_count: usize = 0;
+    for (found) |finding| if (finding.rule == .prefer_optional_capture) {
+        capture_count += 1;
+        try std.testing.expectEqualStrings("y) |value|", finding.fixes[0].edits[0].replacement);
+        try std.testing.expectEqualStrings("value", finding.fixes[0].edits[1].replacement);
+    };
+    try std.testing.expectEqual(@as(usize, 1), capture_count);
+}
+
+test "needless cast catches nested identical casts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn cast(x: u32) u8 {\n" ++
+        "    const a = @intCast(@intCast(x));\n" ++
+        "    const b = @truncate(@truncate(x));\n" ++
+        "    return a + b;\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@intFromEnum(Rule.needless_cast)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var cast_count: usize = 0;
+    for (found) |finding| if (finding.rule == .needless_cast) {
+        cast_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), cast_count);
 }
 
 test "discarded error is reported even with an unused capture" {

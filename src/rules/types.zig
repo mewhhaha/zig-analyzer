@@ -177,6 +177,8 @@ pub const Rule = enum {
     redundant_boolean_negation,
     prefer_min_max,
     identical_logical_operands,
+    identical_conditional_branches,
+    nan_comparison,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -252,6 +254,8 @@ pub const Rule = enum {
             .self_assignment,
             .identical_comparison_operands,
             .identical_logical_operands,
+            .identical_conditional_branches,
+            .nan_comparison,
             => .correctness,
             else => .style,
         };

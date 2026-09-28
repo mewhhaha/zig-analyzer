@@ -63,6 +63,8 @@ const rule_modules = .{
     @import("redundant_boolean_negation.zig"),
     @import("prefer_min_max.zig"),
     @import("identical_logical_operands.zig"),
+    @import("identical_conditional_branches.zig"),
+    @import("nan_comparison.zig"),
 };
 
 pub fn run(context: RuleRun) !void {
