@@ -450,6 +450,7 @@ fn loadConfiguration(
     var directory_path = scan_root;
     while (true) {
         const configuration_path = try std.fs.path.join(allocator, &.{ directory_path, "zig-analyzer.json" });
+        defer allocator.free(configuration_path);
         const source = std.Io.Dir.cwd().readFileAlloc(
             io,
             configuration_path,

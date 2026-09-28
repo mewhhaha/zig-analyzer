@@ -3386,8 +3386,7 @@ fn documentationBefore(
     var found = false;
     while (cursor > 0) {
         const previous_end = cursor - 1;
-        const previous_start = (std.mem.lastIndexOfScalar(u8, source[0..previous_end], '\n') orelse 0) +
-            @intFromBool(std.mem.lastIndexOfScalar(u8, source[0..previous_end], '\n') != null);
+        const previous_start = if (std.mem.lastIndexOfScalar(u8, source[0..previous_end], '\n')) |nl| nl + 1 else 0;
         const line = std.mem.trim(u8, source[previous_start..previous_end], " \t\r");
         if (!std.mem.startsWith(u8, line, "///")) break;
         found = true;
@@ -3834,8 +3833,7 @@ fn allocationCleanupEdit(
     source: []const u8,
     binding_span: std.zig.Token.Loc,
 ) !?CleanupAction {
-    const statement_start = (std.mem.lastIndexOfScalar(u8, source[0..binding_span.start], '\n') orelse 0) +
-        @intFromBool(std.mem.lastIndexOfScalar(u8, source[0..binding_span.start], '\n') != null);
+    const statement_start = if (std.mem.lastIndexOfScalar(u8, source[0..binding_span.start], '\n')) |nl| nl + 1 else 0;
     const relative_end = std.mem.indexOfScalar(u8, source[binding_span.end..], ';') orelse return null;
     const statement_end = binding_span.end + relative_end + 1;
     const statement = source[statement_start..statement_end];
@@ -3911,8 +3909,7 @@ fn moveCleanupAfterAcquisition(
         defer_index = candidate_end + 1;
     } else return null;
 
-    const cleanup_line_start = (std.mem.lastIndexOfScalar(u8, source[0..tokens[defer_index].loc.start], '\n') orelse 0) +
-        @intFromBool(std.mem.lastIndexOfScalar(u8, source[0..tokens[defer_index].loc.start], '\n') != null);
+    const cleanup_line_start = if (std.mem.lastIndexOfScalar(u8, source[0..tokens[defer_index].loc.start], '\n')) |nl| nl + 1 else 0;
     const cleanup_prefix = source[cleanup_line_start..tokens[defer_index].loc.start];
     if (std.mem.trim(u8, cleanup_prefix, " \t\r").len != 0) return null;
     const cleanup_statement_end = tokens[defer_end].loc.end;
@@ -4064,8 +4061,7 @@ fn extractExpressionEdits(
         }
     }
     if (!exact_node) return null;
-    const line_start = (std.mem.lastIndexOfScalar(u8, document.source[0..selection.start], '\n') orelse 0) +
-        @intFromBool(std.mem.lastIndexOfScalar(u8, document.source[0..selection.start], '\n') != null);
+    const line_start = if (std.mem.lastIndexOfScalar(u8, document.source[0..selection.start], '\n')) |nl| nl + 1 else 0;
     var indentation_end = line_start;
     while (indentation_end < document.source.len and
         (document.source[indentation_end] == ' ' or document.source[indentation_end] == '\t')) : (indentation_end += 1)

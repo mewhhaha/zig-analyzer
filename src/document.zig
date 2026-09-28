@@ -64,15 +64,17 @@ pub const Document = struct {
     ) !void {
         if (next_version <= document.version) return error.StaleVersion;
 
-        var next_source = try copySource(document.allocator, document.source);
-        errdefer document.allocator.free(next_source);
+        var current_source: [:0]const u8 = document.source;
+        var owned_source: ?[:0]u8 = null;
+        errdefer if (owned_source) |owned| document.allocator.free(owned);
 
         for (changes) |source_change| {
             const replacement = switch (source_change) {
                 .text_document_content_change_whole_document => |whole| {
                     const replaced = try copySource(document.allocator, whole.text);
-                    document.allocator.free(next_source);
-                    next_source = replaced;
+                    if (owned_source) |owned| document.allocator.free(owned);
+                    owned_source = replaced;
+                    current_source = replaced;
                     continue;
                 },
                 .text_document_content_change_partial => |partial| partial,
@@ -81,7 +83,7 @@ pub const Document = struct {
             if (lsp.offsets.orderPosition(replacement.range.start, replacement.range.end) == .gt) {
                 return error.InvalidRange;
             }
-            const changed_span = lsp.offsets.rangeToLoc(next_source, replacement.range, .@"utf-16");
+            const changed_span = lsp.offsets.rangeToLoc(current_source, replacement.range, .@"utf-16");
             const prefix_length = std.math.add(
                 usize,
                 changed_span.start,
@@ -90,21 +92,25 @@ pub const Document = struct {
             const replaced_length = std.math.add(
                 usize,
                 prefix_length,
-                next_source.len - changed_span.end,
+                current_source.len - changed_span.end,
             ) catch return error.InvalidRange;
             const replaced_source = try document.allocator.allocSentinel(u8, replaced_length, 0);
-            @memcpy(replaced_source[0..changed_span.start], next_source[0..changed_span.start]);
+            @memcpy(replaced_source[0..changed_span.start], current_source[0..changed_span.start]);
             @memcpy(
                 replaced_source[changed_span.start..][0..replacement.text.len],
                 replacement.text,
             );
             @memcpy(
                 replaced_source[changed_span.start + replacement.text.len ..],
-                next_source[changed_span.end..],
+                current_source[changed_span.end..],
             );
-            document.allocator.free(next_source);
-            next_source = replaced_source;
+            if (owned_source) |owned| document.allocator.free(owned);
+            owned_source = replaced_source;
+            current_source = replaced_source;
         }
+
+        const next_source = owned_source orelse try copySource(document.allocator, document.source);
+        errdefer document.allocator.free(next_source);
 
         var parsed = try parseSource(document.allocator, next_source);
         errdefer parsed.deinit(document.allocator);
@@ -148,14 +154,13 @@ pub const Document = struct {
     }
 
     pub fn tokenAt(document: *const Document, byte_offset: usize) ?std.zig.Token {
-        var tokenizer = std.zig.Tokenizer.init(document.source);
         var token_ending_at_offset: ?std.zig.Token = null;
-        while (true) {
-            const token = tokenizer.next();
+        for (document.tokens) |token| {
             if (token.tag == .eof or token.loc.start > byte_offset) return token_ending_at_offset;
             if (token.loc.start <= byte_offset and byte_offset < token.loc.end) return token;
             if (token.loc.end == byte_offset) token_ending_at_offset = token;
         }
+        return token_ending_at_offset;
     }
 
     pub fn declarationNamed(document: *const Document, name: []const u8) ?Declaration {
@@ -172,9 +177,7 @@ pub const Document = struct {
     ) ![]std.zig.Token.Loc {
         var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
         errdefer spans.deinit(allocator);
-        var tokenizer = std.zig.Tokenizer.init(document.source);
-        while (true) {
-            const token = tokenizer.next();
+        for (document.tokens) |token| {
             if (token.tag == .eof) break;
             if (token.tag != .identifier) continue;
             if (std.mem.eql(u8, document.source[token.loc.start..token.loc.end], name)) {
@@ -189,27 +192,23 @@ pub const Document = struct {
         allocator: std.mem.Allocator,
         byte_offset: usize,
     ) !?[]std.zig.Token.Loc {
-        var tokens: std.ArrayList(std.zig.Token) = .empty;
-        defer tokens.deinit(allocator);
-        var tokenizer = std.zig.Tokenizer.init(document.source);
-        while (true) {
-            const token = tokenizer.next();
-            if (token.tag == .eof) break;
-            try tokens.append(allocator, token);
-        }
+        const tokens = if (document.tokens.len > 0 and document.tokens[document.tokens.len - 1].tag == .eof)
+            document.tokens[0 .. document.tokens.len - 1]
+        else
+            document.tokens;
 
-        const target_index = for (tokens.items, 0..) |token, index| {
+        const target_index = for (tokens, 0..) |token, index| {
             if (token.tag == .identifier and token.loc.start <= byte_offset and byte_offset <= token.loc.end) {
                 break index;
             }
         } else return null;
-        const target = tokens.items[target_index];
+        const target = tokens[target_index];
         const name = document.source[target.loc.start..target.loc.end];
-        const binding = findBinding(tokens.items, document.source, target_index, name) orelse return null;
+        const binding = findBinding(tokens, document.source, target_index, name) orelse return null;
 
         var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
         errdefer spans.deinit(allocator);
-        for (tokens.items, 0..) |token, index| {
+        for (tokens, 0..) |token, index| {
             if (token.tag != .identifier) continue;
             if (!std.mem.eql(u8, document.source[token.loc.start..token.loc.end], name)) continue;
             if (index == binding.token_index) {
@@ -217,7 +216,7 @@ pub const Document = struct {
                 continue;
             }
             if (token.loc.start < binding.scope.start or token.loc.end > binding.scope.end) continue;
-            if (isInsideShadow(tokens.items, document.source, index, name, binding)) continue;
+            if (isInsideShadow(tokens, document.source, index, name, binding)) continue;
             try spans.append(allocator, token.loc);
         }
         return try spans.toOwnedSlice(allocator);
@@ -296,6 +295,7 @@ fn parseSource(allocator: std.mem.Allocator, source: [:0]const u8) !ParsedSource
     errdefer tree.deinit(allocator);
     var tokens: std.ArrayList(std.zig.Token) = .empty;
     errdefer tokens.deinit(allocator);
+    try tokens.ensureTotalCapacity(allocator, @max(16, source.len / 8));
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

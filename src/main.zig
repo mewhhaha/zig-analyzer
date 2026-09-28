@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 try std.Io.File.stdout().writeStreamingAll(io, usage);
                 return 0;
             }
-            if (std.mem.startsWith(u8, argument, "-")) {
+            if (argument.len > 0 and argument[0] == '-') {
                 var buffer: [256]u8 = undefined;
                 var file_writer = std.Io.File.stderr().writer(io, &buffer);
                 try file_writer.interface.print("zig-analyzer check: unknown option '{s}'\n", .{argument});

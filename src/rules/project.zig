@@ -3556,10 +3556,12 @@ fn findConfigurationDivergentApis(
         for (left_unit.shapes) |left_shape| {
             for (compiler_facts.units[left_index + 1 ..]) |right_unit| {
                 const right_shape = shapeNamed(right_unit.shapes, left_shape.name) orelse continue;
-                if (shapesEqual(left_shape, right_shape) or reported.contains(left_shape.name)) continue;
+                if (shapesEqual(left_shape, right_shape)) continue;
                 const name = declarationBaseName(left_shape.name);
                 const location = publicDeclarationNamed(files, name) orelse continue;
-                try reported.put(allocator, left_shape.name, {});
+                const rep_gop = try reported.getOrPut(allocator, left_shape.name);
+                if (rep_gop.found_existing) continue;
+                rep_gop.value_ptr.* = {};
                 try found.append(allocator, .{
                     .file_index = location.file_index,
                     .rule = .configuration_divergent_api,
@@ -3758,7 +3760,10 @@ fn findDuplicateCImports(
                 if (!std.ascii.isWhitespace(character)) try signature_writer.writer.writeByte(character);
             }
             const signature = try signature_writer.toOwnedSlice();
-            if (signatures.get(signature)) |first| {
+            const gop = try signatures.getOrPut(allocator, signature);
+            if (gop.found_existing) {
+                allocator.free(signature);
+                const first = gop.value_ptr.*;
                 if (first.file_index == file_index) continue;
                 try found.append(allocator, .{
                     .file_index = file_index,
@@ -3770,7 +3775,9 @@ fn findDuplicateCImports(
                         .{files[first.file_index].path},
                     ),
                 });
-            } else try signatures.put(allocator, signature, .{ .file_index = file_index, .span = token.loc });
+            } else {
+                gop.value_ptr.* = .{ .file_index = file_index, .span = token.loc };
+            }
         }
     }
 }
@@ -3900,11 +3907,17 @@ fn findConflictingBuildOptions(
             const block = enclosingInitializer(file.tokens, index) orelse continue;
             const signature = try optionSignature(allocator, file.source, file.tokens, block.opening + 1, block.closing);
             if (std.mem.eql(u8, signature, "target=<default>;optimize=<default>")) continue;
-            if (roots.get(root_path)) |first| {
+            const gop = try roots.getOrPut(allocator, root_path);
+            if (gop.found_existing) {
+                const first = gop.value_ptr.*;
                 if (std.mem.eql(u8, first.signature, signature)) continue;
                 const conflict_key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ root_path, signature });
-                if (reported.contains(conflict_key)) continue;
-                try reported.put(allocator, conflict_key, {});
+                const rep_gop = try reported.getOrPut(allocator, conflict_key);
+                if (rep_gop.found_existing) {
+                    allocator.free(conflict_key);
+                    continue;
+                }
+                rep_gop.value_ptr.* = {};
                 try found.append(allocator, .{
                     .file_index = file_index,
                     .rule = .conflicting_build_options,
@@ -3915,7 +3928,9 @@ fn findConflictingBuildOptions(
                         .{ root_path, first.signature, signature },
                     ),
                 });
-            } else try roots.put(allocator, root_path, .{ .signature = signature, .file_index = file_index });
+            } else {
+                gop.value_ptr.* = .{ .signature = signature, .file_index = file_index };
+            }
         }
     }
 }
@@ -4206,15 +4221,17 @@ fn findLiteralBooleanArguments(
             }
             if (boolean_parameters.items.len == 0) {
                 boolean_parameters.deinit(allocator);
-            } else if (!boolean_functions.contains(function_name)) {
-                const owned_parameters = try boolean_parameters.toOwnedSlice(allocator);
-                errdefer allocator.free(owned_parameters);
-                try boolean_functions.put(allocator, function_name, .{
-                    .parameter_count = parameter_count,
-                    .boolean_parameters = owned_parameters,
-                });
             } else {
-                boolean_parameters.deinit(allocator);
+                const entry = try boolean_functions.getOrPut(allocator, function_name);
+                if (!entry.found_existing) {
+                    const owned_parameters = try boolean_parameters.toOwnedSlice(allocator);
+                    entry.value_ptr.* = .{
+                        .parameter_count = parameter_count,
+                        .boolean_parameters = owned_parameters,
+                    };
+                } else {
+                    boolean_parameters.deinit(allocator);
+                }
             }
         }
     }

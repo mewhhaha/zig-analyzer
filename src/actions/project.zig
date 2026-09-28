@@ -193,7 +193,7 @@ fn cImportAction(
         const document_directory = std.fs.path.dirname(document_path) orelse return null;
         const relative_path = try std.fs.path.relative(allocator, "/", null, document_directory, wrapper_path);
         defer allocator.free(relative_path);
-        const import_path = if (std.mem.startsWith(u8, relative_path, "."))
+        const import_path = if (relative_path.len > 0 and relative_path[0] == '.')
             relative_path
         else
             try std.fmt.allocPrint(allocator, "./{s}", .{relative_path});

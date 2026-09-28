@@ -37,36 +37,39 @@ pub const Index = struct {
     ) !Index {
         var index: Index = .{ .allocator = allocator, .source = source, .tokens = tokens };
         errdefer index.deinit();
-        var scope_openings: std.ArrayListUnmanaged(usize) = .empty;
+        var scope_openings: std.ArrayListUnmanaged(u32) = .empty;
         defer scope_openings.deinit(allocator);
-        var parenthesis_openings: std.ArrayListUnmanaged(usize) = .empty;
+        try scope_openings.ensureTotalCapacity(allocator, 32);
+        var parenthesis_openings: std.ArrayListUnmanaged(u32) = .empty;
         defer parenthesis_openings.deinit(allocator);
-        var bracket_openings: std.ArrayListUnmanaged(usize) = .empty;
+        try parenthesis_openings.ensureTotalCapacity(allocator, 32);
+        var bracket_openings: std.ArrayListUnmanaged(u32) = .empty;
         defer bracket_openings.deinit(allocator);
+        try bracket_openings.ensureTotalCapacity(allocator, 32);
         index.matching_tokens = try allocator.alloc(u32, tokens.len);
         @memset(index.matching_tokens, none_token);
         index.enclosing_braces = try allocator.alloc(u32, tokens.len);
         @memset(index.enclosing_braces, none_token);
         for (tokens, 0..) |token, token_index| switch (token.tag) {
-            .l_brace => try scope_openings.append(allocator, token_index),
+            .l_brace => if (token_index <= std.math.maxInt(u32)) try scope_openings.append(allocator, @intCast(token_index)),
             .r_brace => if (scope_openings.pop()) |opening| {
                 if (token_index <= std.math.maxInt(u32)) {
                     index.matching_tokens[opening] = @intCast(token_index);
-                    index.matching_tokens[token_index] = @intCast(opening);
+                    index.matching_tokens[token_index] = opening;
                 }
             },
-            .l_paren => try parenthesis_openings.append(allocator, token_index),
+            .l_paren => if (token_index <= std.math.maxInt(u32)) try parenthesis_openings.append(allocator, @intCast(token_index)),
             .r_paren => if (parenthesis_openings.pop()) |opening| {
                 if (token_index <= std.math.maxInt(u32)) {
                     index.matching_tokens[opening] = @intCast(token_index);
-                    index.matching_tokens[token_index] = @intCast(opening);
+                    index.matching_tokens[token_index] = opening;
                 }
             },
-            .l_bracket => try bracket_openings.append(allocator, token_index),
+            .l_bracket => if (token_index <= std.math.maxInt(u32)) try bracket_openings.append(allocator, @intCast(token_index)),
             .r_bracket => if (bracket_openings.pop()) |opening| {
                 if (token_index <= std.math.maxInt(u32)) {
                     index.matching_tokens[opening] = @intCast(token_index);
-                    index.matching_tokens[token_index] = @intCast(opening);
+                    index.matching_tokens[token_index] = opening;
                 }
             },
             else => {},
@@ -75,7 +78,7 @@ pub const Index = struct {
         for (tokens, 0..) |token, token_index| {
             if (token.tag == .r_brace) _ = scope_openings.pop();
             index.enclosing_braces[token_index] = if (scope_openings.getLastOrNull()) |opening|
-                @intCast(opening)
+                opening
             else
                 none_token;
             if (token.tag == .identifier) {
@@ -100,7 +103,7 @@ pub const Index = struct {
                 const scope = declarationScopeWithIndex(tokens, token_index, true, lexical_scope, &index) orelse continue;
                 try index.usingnamespace_scopes.append(allocator, scope);
             }
-            if (token.tag == .l_brace) try scope_openings.append(allocator, token_index);
+            if (token.tag == .l_brace and token_index <= std.math.maxInt(u32)) try scope_openings.append(allocator, @intCast(token_index));
         }
         var binding_lists = index.bindings.valueIterator();
         while (binding_lists.next()) |bindings| {

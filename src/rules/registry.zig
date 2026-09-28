@@ -79,6 +79,11 @@ const rule_modules = .{
     @import("prefer_vector_load.zig"),
     @import("prefer_vector_op.zig"),
     @import("prefer_vector_reduce.zig"),
+    @import("prefer_map_get_or_put.zig"),
+    @import("prefer_starts_with_scalar.zig"),
+    @import("prefer_ends_with_scalar.zig"),
+    @import("prefer_write_byte.zig"),
+    @import("prefer_simd_iota.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

@@ -223,7 +223,7 @@ fn errorSwitchReplacement(
     defer writer.deinit();
     try writer.writer.print("{s} catch |{s}| switch ({s}) {{\n", .{ expression, capture, capture });
     for (errors) |name| try writer.writer.print("    error.{s} => @panic(\"TODO\"),\n", .{name});
-    try writer.writer.writeAll("}");
+    try writer.writer.writeByte('}');
     return try writer.toOwnedSlice();
 }
 
@@ -231,8 +231,7 @@ fn standaloneStatement(context: ActionRun, expression_span: std.zig.Token.Loc) ?
     var end = expression_span.end;
     while (end < context.source.len and (context.source[end] == ' ' or context.source[end] == '\t')) : (end += 1) {}
     if (end >= context.source.len or context.source[end] != ';') return null;
-    const line_start = (std.mem.lastIndexOfScalar(u8, context.source[0..expression_span.start], '\n') orelse 0) +
-        @intFromBool(std.mem.lastIndexOfScalar(u8, context.source[0..expression_span.start], '\n') != null);
+    const line_start = if (std.mem.lastIndexOfScalar(u8, context.source[0..expression_span.start], '\n')) |nl| nl + 1 else 0;
     if (std.mem.trim(u8, context.source[line_start..expression_span.start], " \t").len != 0) return null;
     return .{ .start = expression_span.start, .end = end + 1 };
 }

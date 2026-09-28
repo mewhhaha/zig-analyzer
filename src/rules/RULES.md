@@ -396,6 +396,16 @@ Compiler-backed project rules are opt-in.
   performing element-wise lane arithmetic instead of vector operators.
 - [`prefer-vector-reduce`](prefer-vector-reduce.md) — Reports serial lane
   accumulation chains across vectors instead of `@reduce`.
+- [`prefer-map-get-or-put`](prefer-map-get-or-put.md) — Reports checking key
+  presence followed immediately by inserting into a hash map instead of `getOrPut`.
+- [`prefer-starts-with-scalar`](prefer-starts-with-scalar.md) — Reports
+  `std.mem.startsWith` called with a 1-character string instead of single-byte comparison.
+- [`prefer-ends-with-scalar`](prefer-ends-with-scalar.md) — Reports
+  `std.mem.endsWith` called with a 1-character string instead of single-byte comparison.
+- [`prefer-write-byte`](prefer-write-byte.md) — Reports writing a single
+  character via `writeAll` or `print` instead of `writeByte`.
+- [`prefer-simd-iota`](prefer-simd-iota.md) — Reports vector literals initialized
+  with sequential integers instead of `std.simd.iota`.
 
 ## Modernization profile
 

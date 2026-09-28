@@ -4316,11 +4316,13 @@ test "findings include switch struct and var fixes" {
     for (found) |finding| {
         if (finding.rule == .missing_switch_prong) {
             saw_switch = true;
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "\n"));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '\n');
         }
         if (finding.rule == .missing_struct_field) {
             saw_struct = true;
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "\n"));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '\n');
         }
         if (finding.rule == .never_mutated_var) saw_var = true;
     }
@@ -4495,7 +4497,8 @@ test "error comparisons and mixed operators report precise findings" {
         .mixed_bitwise_arithmetic => {
             saw_mixed_operators = true;
             try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "("));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '(');
         },
         else => {},
     };
