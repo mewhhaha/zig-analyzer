@@ -247,6 +247,7 @@ fn reportProjectFindings(
     summary: *Summary,
 ) !void {
     var files: std.ArrayList(project_rules.SourceFile) = .empty;
+    defer files.deinit(allocator);
     for (loaded_files) |loaded_file| {
         const source = loaded_file.source orelse continue;
         try files.append(allocator, .{
@@ -288,6 +289,7 @@ fn reportProjectFindings(
     const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration);
     const findings = try project_rules.findingsWithCompilerFacts(allocator, files.items, configuration, compiler_facts);
     var records: std.ArrayList(check_cache.ProjectRecord) = .empty;
+    defer records.deinit(allocator);
     for (findings) |finding| {
         const file = files.items[finding.file_index];
         if (analysis.isSuppressed(file.source, finding.rule, finding.span.start)) continue;
@@ -332,6 +334,7 @@ fn collectCompilerFacts(
     var public_type_names = try collectPublicTypeNames(allocator, loaded_files);
     defer public_type_names.deinit(allocator);
     var root_paths: std.ArrayList([]const u8) = .empty;
+    defer root_paths.deinit(allocator);
     var root_declarations_complete = true;
     for (loaded_files) |loaded_file| {
         if (!std.mem.eql(u8, std.fs.path.basename(loaded_file.relative_path), "build.zig")) continue;
@@ -767,6 +770,7 @@ fn reportedFindings(
 
 fn safeFixAllEdits(allocator: std.mem.Allocator, findings: []const analysis.Finding) ![]const analysis.Edit {
     var candidates: std.ArrayList(analysis.Edit) = .empty;
+    defer candidates.deinit(allocator);
     for (findings) |finding| {
         for (finding.fixes) |fix| {
             if (fix.fix_all) try candidates.appendSlice(allocator, fix.edits);

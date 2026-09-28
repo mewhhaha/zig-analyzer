@@ -92,7 +92,13 @@ pub fn findingsWithShapesAndTokens(
     var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
     defer scope_index.deinit();
     var containers: std.ArrayList(Container) = .empty;
-    try containers.appendSlice(allocator, try collectContainers(allocator, source, tokens));
+    defer {
+        for (containers.items) |c| allocator.free(c.fields);
+        containers.deinit(allocator);
+    }
+    const initial_containers = try collectContainers(allocator, source, tokens);
+    defer allocator.free(initial_containers);
+    try containers.appendSlice(allocator, initial_containers);
     for (resolved_shapes) |shape| {
         if (containerDeclared(containers.items, shape.type_name)) continue;
         const fields = try allocator.alloc(Field, shape.fields.len);
@@ -1693,6 +1699,7 @@ fn findUnusedPrivateDeclarations(
     const level = configuration.level(.unused_private_declaration);
     if (level == .off) return;
     var declarations: std.ArrayList(PrivateDeclaration) = .empty;
+    defer declarations.deinit(allocator);
     for (0..tree.nodes.len) |raw_node| {
         const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
         if (tree.fullVarDecl(node)) |declaration| {
@@ -4077,6 +4084,7 @@ fn findUnsortedImports(
     const level = configuration.level(.unsorted_imports);
     if (level == .off) return;
     var imports: std.ArrayList(Import) = .empty;
+    defer imports.deinit(allocator);
     var brace_depth: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.tag == .l_brace) {

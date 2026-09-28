@@ -30,13 +30,16 @@ pub fn run(context: RuleRun) !void {
             const method_name = context.tokenText(index + 2);
             if (isMutatingMethod(method_name)) {
                 has_mutating_call = true;
-                if (allocator_name == null and index + 3 < scope_end and context.tokens[index + 3].tag == .l_paren) {
+                if (allocator_name == null and isAllocatingMethod(method_name) and
+                    index + 3 < scope_end and context.tokens[index + 3].tag == .l_paren)
+                {
                     allocator_name = firstArgumentText(context.source, context.tokens, index + 3);
                 }
             }
         }
 
         if (!has_mutating_call) continue;
+        if (isArenaAllocator(allocator_name)) continue;
 
         // Check if container is deinitialized or transferred
         if (hasDeinitOrTransfer(context, container_name, declaration_end + 1, scope_end)) continue;
@@ -151,6 +154,34 @@ fn isMutatingMethod(name: []const u8) bool {
         if (std.mem.eql(u8, name, candidate)) return true;
     }
     return false;
+}
+
+fn isAllocatingMethod(name: []const u8) bool {
+    const allocating_methods = [_][]const u8{
+        "append",
+        "appendSlice",
+        "appendNTimes",
+        "insert",
+        "insertSlice",
+        "addOne",
+        "put",
+        "putNoClobber",
+        "getOrPut",
+        "getOrPutValue",
+        "ensureTotalCapacity",
+        "ensureTotalCapacityPrecise",
+        "ensureUnusedCapacity",
+        "clone",
+    };
+    for (allocating_methods) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn isArenaAllocator(allocator_name: ?[]const u8) bool {
+    const name = allocator_name orelse return false;
+    return std.ascii.indexOfIgnoreCase(name, "arena") != null;
 }
 
 fn isContainerDeclaration(
@@ -461,6 +492,30 @@ test "missing container deinit ignores unmutated container" {
         \\fn process() void {
         \\    var list: std.ArrayList(u32) = .empty;
         \\    _ = list;
+        \\}
+    ;
+
+    const tokens = try tokenize(arena.allocator(), source);
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = tokens,
+        .configuration = testConfiguration(),
+        .findings = &findings,
+    });
+
+    try std.testing.expectEqual(0, findings.items.len);
+}
+
+test "missing container deinit ignores arena-backed container" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const source: [:0]const u8 =
+        \\fn process(arena: std.mem.Allocator) !void {
+        \\    var list: std.ArrayList(u32) = .empty;
+        \\    try list.append(arena, 42);
         \\}
     ;
 

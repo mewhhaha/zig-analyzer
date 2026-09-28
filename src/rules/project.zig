@@ -926,7 +926,9 @@ fn findIncompleteOwnedFieldCleanup(
         configuration.level(.partial_ownership_transfer) == .off and
         configuration.level(.missing_errdefer) == .off) return;
     var evidence: std.ArrayList(OwnedFieldEvidence) = .empty;
+    defer evidence.deinit(allocator);
     var sequence_evidence: std.ArrayList(OwnedSequenceEvidence) = .empty;
+    defer sequence_evidence.deinit(allocator);
     for (files, 0..) |file, file_index| {
         try collectOwnedFieldEvidence(allocator, file, file_index, summary_index, &evidence);
         try collectOwnedSequenceEvidence(allocator, file, file_index, summary_index, &sequence_evidence);
@@ -4411,6 +4413,7 @@ fn findInconsistentErrorSetStyle(
 ) !void {
     if (configuration.level(.inconsistent_error_set_style) == .off) return;
     var samples: std.ArrayList(ErrorStyleSample) = .empty;
+    defer samples.deinit(allocator);
     for (files, 0..) |file, file_index| {
         if (generated_source.isTranslateCOutput(file.source)) continue;
         for (file.tokens, 0..) |token, fn_index| {

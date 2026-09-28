@@ -1519,6 +1519,7 @@ test "one-off and non-front array list removals remain clean" {
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8, configuration: types.Configuration) ![]const types.Finding {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    defer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
