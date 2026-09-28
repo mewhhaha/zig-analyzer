@@ -35,7 +35,7 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
             if (format.len < 2 or format[format.len - 1] != '"') continue;
             try writer.writer.writeAll(format[0 .. format.len - 1]);
             for (placeholder_count..arguments.len) |_| try writer.writer.writeAll(" {any}");
-            try writer.writer.writeAll("\"");
+            try writer.writer.writeByte('"');
             try context.oneEdit(
                 "Add missing format placeholders",
                 .refactor_rewrite,
@@ -56,7 +56,7 @@ fn addFormatArgumentRepair(context: ActionRun) !void {
                 try writer.writer.writeAll("@panic(\"TODO\")");
             }
         }
-        try writer.writer.writeAll("}");
+        try writer.writer.writeByte('}');
         try context.oneEdit(
             "Add missing format arguments",
             .refactor_rewrite,
@@ -219,7 +219,7 @@ fn mutablePointerBinding(context: ActionRun, name: []const u8, before: usize) bo
         {}
         const type_end = context.tokens[type_end_index].loc.start;
         const binding_type = std.mem.trim(u8, context.source[type_start..type_end], " \t\r\n");
-        return std.mem.startsWith(u8, binding_type, "*") and !std.mem.startsWith(u8, binding_type, "*const");
+        return binding_type.len > 0 and binding_type[0] == '*' and !std.mem.startsWith(u8, binding_type, "*const");
     }
     return false;
 }

@@ -92,7 +92,13 @@ pub fn findingsWithShapesAndTokens(
     var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
     defer scope_index.deinit();
     var containers: std.ArrayList(Container) = .empty;
-    try containers.appendSlice(allocator, try collectContainers(allocator, source, tokens));
+    defer {
+        for (containers.items) |c| allocator.free(c.fields);
+        containers.deinit(allocator);
+    }
+    const initial_containers = try collectContainers(allocator, source, tokens);
+    defer allocator.free(initial_containers);
+    try containers.appendSlice(allocator, initial_containers);
     for (resolved_shapes) |shape| {
         if (containerDeclared(containers.items, shape.type_name)) continue;
         const fields = try allocator.alloc(Field, shape.fields.len);
@@ -1693,6 +1699,7 @@ fn findUnusedPrivateDeclarations(
     const level = configuration.level(.unused_private_declaration);
     if (level == .off) return;
     var declarations: std.ArrayList(PrivateDeclaration) = .empty;
+    defer declarations.deinit(allocator);
     for (0..tree.nodes.len) |raw_node| {
         const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
         if (tree.fullVarDecl(node)) |declaration| {
@@ -3981,6 +3988,7 @@ fn findImportIssues(
     const path_level = configuration.level(.redundant_import_path);
     if (duplicate_level == .off and unused_level == .off and path_level == .off) return;
     var seen_paths: std.StringHashMapUnmanaged(std.zig.Token.Loc) = .empty;
+    defer seen_paths.deinit(allocator);
     var brace_depth: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.tag == .l_brace) brace_depth += 1;
@@ -4076,6 +4084,7 @@ fn findUnsortedImports(
     const level = configuration.level(.unsorted_imports);
     if (level == .off) return;
     var imports: std.ArrayList(Import) = .empty;
+    defer imports.deinit(allocator);
     var brace_depth: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.tag == .l_brace) {
@@ -4316,11 +4325,13 @@ test "findings include switch struct and var fixes" {
     for (found) |finding| {
         if (finding.rule == .missing_switch_prong) {
             saw_switch = true;
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "\n"));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '\n');
         }
         if (finding.rule == .missing_struct_field) {
             saw_struct = true;
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "\n"));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '\n');
         }
         if (finding.rule == .never_mutated_var) saw_var = true;
     }
@@ -4495,7 +4506,8 @@ test "error comparisons and mixed operators report precise findings" {
         .mixed_bitwise_arithmetic => {
             saw_mixed_operators = true;
             try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
-            try std.testing.expect(std.mem.startsWith(u8, finding.fixes[0].edits[0].replacement, "("));
+            const replacement = finding.fixes[0].edits[0].replacement;
+            try std.testing.expect(replacement.len > 0 and replacement[0] == '(');
         },
         else => {},
     };

@@ -297,6 +297,7 @@ fn parseAndRender(allocator: std.mem.Allocator, source: [:0]const u8) ![:0]const
 
 fn insertProbeComment(allocator: std.mem.Allocator, source: [:0]const u8, random: std.Random) ![:0]const u8 {
     var line_starts: std.ArrayList(usize) = .empty;
+    defer line_starts.deinit(allocator);
     try line_starts.append(allocator, 0);
     for (source, 0..) |byte, index| {
         if (byte == '\n' and index + 1 < source.len) try line_starts.append(allocator, index + 1);

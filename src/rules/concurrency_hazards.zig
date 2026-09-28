@@ -30,11 +30,13 @@ fn findLockOrderCycles(context: RuleRun) !void {
     if (level == .off) return;
 
     var edges: std.ArrayList(LockEdge) = .empty;
+    defer edges.deinit(context.allocator);
     for (context.tokens, 0..) |token, function_index| {
         if (token.tag != .keyword_fn) continue;
         const function = functionRange(context, function_index) orelse continue;
         const owner_scope = context.enclosingOpeningBrace(function.start);
         var held: std.ArrayList(LockUse) = .empty;
+        defer held.deinit(context.allocator);
         for (context.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |body_token, index| {
             if (body_token.tag != .identifier or index < 4 or context.tokens[index - 1].tag != .period or
                 context.tokens[index + 1].tag != .l_paren) continue;

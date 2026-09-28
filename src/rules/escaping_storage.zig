@@ -20,6 +20,7 @@ fn findDeinitializedViews(context: RuleRun) !void {
         if (!hasDeferredMethod(context, container_name, "deinit", declaration_end + 1, scope_end, scope_opening)) continue;
 
         var borrowed_names: std.StringHashMapUnmanaged(void) = .empty;
+        defer borrowed_names.deinit(context.allocator);
         for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, index| {
             if ((candidate.tag == .keyword_const or candidate.tag == .keyword_var) and index + 6 < scope_end and
                 context.tokens[index + 1].tag == .identifier and context.tokens[index + 2].tag == .equal and
@@ -65,7 +66,9 @@ fn findArenaReturns(context: RuleRun) !void {
         if (!hasDeferredMethod(context, arena_name, "deinit", declaration_end + 1, scope_end, scope_opening)) continue;
 
         var allocations: std.StringHashMapUnmanaged(void) = .empty;
+        defer allocations.deinit(context.allocator);
         var allocator_bindings: std.StringHashMapUnmanaged(void) = .empty;
+        defer allocator_bindings.deinit(context.allocator);
         for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, index| {
             if ((candidate.tag == .keyword_const or candidate.tag == .keyword_var) and index + 3 < scope_end and
                 context.tokens[index + 1].tag == .identifier)

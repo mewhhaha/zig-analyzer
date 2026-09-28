@@ -10,6 +10,15 @@ pub fn inferredBindingType(
     @memcpy(source, source_bytes);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    return inferredBindingTypeWithTokens(allocator, source, tokens, binding_span);
+}
+
+pub fn inferredBindingTypeWithTokens(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    binding_span: std.zig.Token.Loc,
+) !?[]const u8 {
     const binding_index = for (tokens, 0..) |token, index| {
         if (token.tag == .identifier and std.meta.eql(token.loc, binding_span)) break index;
     } else return null;
@@ -55,6 +64,15 @@ pub fn initializerTypeExpression(
     @memcpy(source, source_bytes);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    return initializerTypeExpressionWithTokens(allocator, source, tokens, binding_span);
+}
+
+pub fn initializerTypeExpressionWithTokens(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    binding_span: std.zig.Token.Loc,
+) !?[]const u8 {
     const binding_index = for (tokens, 0..) |token, index| {
         if (token.tag == .identifier and std.meta.eql(token.loc, binding_span)) break index;
     } else return null;
@@ -97,6 +115,15 @@ pub fn memberSpan(
     @memcpy(source, source_bytes);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
+    return memberSpanWithTokens(source, tokens, type_path, member_name);
+}
+
+pub fn memberSpanWithTokens(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    type_path: []const u8,
+    member_name: []const u8,
+) ?std.zig.Token.Loc {
     const root = Container{ .start = 0, .end = tokens.len };
     const container = resolveContainer(source, tokens, root, root, type_path, 0) orelse return null;
     return directFieldSpan(source, tokens, container, member_name);
@@ -289,6 +316,8 @@ fn matchingToken(
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    errdefer tokens.deinit(allocator);
+    try tokens.ensureTotalCapacity(allocator, @max(16, source.len / 8));
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

@@ -95,6 +95,7 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
     if (type_level == .off and error_level == .off) return;
 
     var declarations: std.ArrayList(PrivateDeclaration) = .empty;
+    defer declarations.deinit(context.allocator);
     var brace_depth: usize = 0;
     for (context.tokens, 0..) |token, index| {
         switch (token.tag) {
@@ -217,6 +218,7 @@ fn findDeprecatedReferences(context: RuleRun) !void {
     const level = context.level(.deprecated_declaration);
     if (level == .off) return;
     var declarations: std.ArrayList(DeprecatedDeclaration) = .empty;
+    defer declarations.deinit(context.allocator);
     for (context.tokens, 0..) |token, doc_index| {
         if (token.tag != .doc_comment and token.tag != .container_doc_comment) continue;
         const comment = std.mem.trim(u8, context.tokenText(doc_index), "/!< \t\r\n");
@@ -575,6 +577,7 @@ test "mutated container copies reject shadowed standard library aliases" {
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8, configuration: types.Configuration) ![]const types.Finding {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    defer tokens.deinit(allocator);
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();

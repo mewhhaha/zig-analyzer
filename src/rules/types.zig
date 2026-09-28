@@ -193,6 +193,12 @@ pub const Rule = enum {
     prefer_vector_load,
     prefer_vector_op,
     prefer_vector_reduce,
+    prefer_map_get_or_put,
+    prefer_starts_with_scalar,
+    prefer_ends_with_scalar,
+    prefer_write_byte,
+    prefer_simd_iota,
+    missing_container_deinit,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -271,6 +277,7 @@ pub const Rule = enum {
             .identical_conditional_branches,
             .nan_comparison,
             .identical_bitwise_operands,
+            .missing_container_deinit,
             => .correctness,
             else => .style,
         };
@@ -351,6 +358,11 @@ pub const Rule = enum {
             .prefer_vector_load,
             .prefer_vector_op,
             .prefer_vector_reduce,
+            .prefer_map_get_or_put,
+            .prefer_starts_with_scalar,
+            .prefer_ends_with_scalar,
+            .prefer_write_byte,
+            .prefer_simd_iota,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,

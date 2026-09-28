@@ -247,6 +247,7 @@ fn reportProjectFindings(
     summary: *Summary,
 ) !void {
     var files: std.ArrayList(project_rules.SourceFile) = .empty;
+    defer files.deinit(allocator);
     for (loaded_files) |loaded_file| {
         const source = loaded_file.source orelse continue;
         try files.append(allocator, .{
@@ -288,6 +289,7 @@ fn reportProjectFindings(
     const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration);
     const findings = try project_rules.findingsWithCompilerFacts(allocator, files.items, configuration, compiler_facts);
     var records: std.ArrayList(check_cache.ProjectRecord) = .empty;
+    defer records.deinit(allocator);
     for (findings) |finding| {
         const file = files.items[finding.file_index];
         if (analysis.isSuppressed(file.source, finding.rule, finding.span.start)) continue;
@@ -332,6 +334,7 @@ fn collectCompilerFacts(
     var public_type_names = try collectPublicTypeNames(allocator, loaded_files);
     defer public_type_names.deinit(allocator);
     var root_paths: std.ArrayList([]const u8) = .empty;
+    defer root_paths.deinit(allocator);
     var root_declarations_complete = true;
     for (loaded_files) |loaded_file| {
         if (!std.mem.eql(u8, std.fs.path.basename(loaded_file.relative_path), "build.zig")) continue;
@@ -450,6 +453,7 @@ fn loadConfiguration(
     var directory_path = scan_root;
     while (true) {
         const configuration_path = try std.fs.path.join(allocator, &.{ directory_path, "zig-analyzer.json" });
+        defer allocator.free(configuration_path);
         const source = std.Io.Dir.cwd().readFileAlloc(
             io,
             configuration_path,
@@ -766,6 +770,7 @@ fn reportedFindings(
 
 fn safeFixAllEdits(allocator: std.mem.Allocator, findings: []const analysis.Finding) ![]const analysis.Edit {
     var candidates: std.ArrayList(analysis.Edit) = .empty;
+    defer candidates.deinit(allocator);
     for (findings) |finding| {
         for (finding.fixes) |fix| {
             if (fix.fix_all) try candidates.appendSlice(allocator, fix.edits);
@@ -796,6 +801,7 @@ fn applyEdits(
     edits: []const analysis.Edit,
 ) ![:0]const u8 {
     var fixed: std.ArrayList(u8) = .empty;
+    try fixed.ensureTotalCapacity(allocator, source.len);
     var source_offset: usize = 0;
     for (edits) |edit| {
         std.debug.assert(source_offset <= edit.span.start);
@@ -840,6 +846,7 @@ test "source locations use indexed UTF-8 line and column positions" {
 
 fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
     var tokens: std.ArrayList(std.zig.Token) = .empty;
+    try tokens.ensureTotalCapacity(allocator, @max(16, source.len / 8));
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
