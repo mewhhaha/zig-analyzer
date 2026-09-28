@@ -380,6 +380,10 @@ Compiler-backed project rules are opt-in.
   storing `std.mem.Allocator` as a pointer instead of by value.
 - [`expect-equal-argument-order`](expect-equal-argument-order.md) — Reports
   `std.testing.expectEqual` called with literal expected constants in the second argument.
+- [`prefer-allocator-dupe`](prefer-allocator-dupe.md) — Reports
+  `std.fmt.allocPrint` duplicating slices or string literals instead of `allocator.dupe`.
+- [`prefer-append-slice`](prefer-append-slice.md) — Reports loops appending
+  slice elements one-by-one into an `ArrayList` instead of `appendSlice`.
 
 ## Modernization profile
 

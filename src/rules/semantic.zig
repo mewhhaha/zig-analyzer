@@ -3581,7 +3581,7 @@ fn findTryIdioms(
             .replacement = try std.fmt.allocPrint(allocator, "try {s}", .{expression}),
         };
         const fixes = try allocator.alloc(Fix, 1);
-        fixes[0] = .{ .title = "Propagate the error with try", .kind = .refactor_rewrite, .edits = edits };
+        fixes[0] = .{ .title = "Propagate the error with try", .kind = .refactor_rewrite, .edits = edits, .preferred = true, .fix_all = true };
         try addFinding(allocator, source, configuration, found, .{
             .rule = .prefer_try,
             .level = level,
@@ -3878,6 +3878,8 @@ fn findComptimeIdioms(
             .title = if (is_redundant_comptime) "Remove redundant comptime" else "Remove redundant inline",
             .kind = .refactor_rewrite,
             .edits = edits,
+            .preferred = true,
+            .fix_all = true,
         };
         try addFinding(allocator, source, configuration, found, .{
             .rule = if (is_redundant_comptime) .redundant_comptime else .redundant_inline,
@@ -3999,7 +4001,7 @@ fn findImportIssues(
                     const edits = try allocator.alloc(Edit, 1);
                     edits[0] = .{ .span = declaration_span, .replacement = "" };
                     const allocated = try allocator.alloc(Fix, 1);
-                    allocated[0] = .{ .title = "Remove duplicate import", .kind = .quickfix, .edits = edits };
+                    allocated[0] = .{ .title = "Remove duplicate import", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
                     break :fixes allocated;
                 } else &.{};
                 const related = try allocator.alloc(RelatedSpan, 1);
@@ -4019,7 +4021,7 @@ fn findImportIssues(
                 const edits = try allocator.alloc(Edit, 1);
                 edits[0] = .{ .span = declaration_span, .replacement = "" };
                 const allocated = try allocator.alloc(Fix, 1);
-                allocated[0] = .{ .title = "Remove unused import", .kind = .quickfix, .edits = edits };
+                allocated[0] = .{ .title = "Remove unused import", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
                 break :fixes allocated;
             } else &.{};
             try addFinding(allocator, source, configuration, found, .{

@@ -121,14 +121,14 @@ fn parseSingleByteLiteral(allocator: std.mem.Allocator, text: []const u8) ?[]con
     const inner = text[1 .. text.len - 1];
     if (inner.len == 1) {
         if (inner[0] == '\\') return null;
-        if (inner[0] == '\'') return std.fmt.allocPrint(allocator, "'\\''", .{}) catch null;
+        if (inner[0] == '\'') return allocator.dupe(u8, "'\\''") catch null;
         return std.fmt.allocPrint(allocator, "'{c}'", .{inner[0]}) catch null;
     }
     if (inner.len == 2 and inner[0] == '\\') {
         switch (inner[1]) {
             'n', 'r', 't', '\\', '0' => return std.fmt.allocPrint(allocator, "'\\{c}'", .{inner[1]}) catch null,
-            '\'' => return std.fmt.allocPrint(allocator, "'\\''", .{}) catch null,
-            '"' => return std.fmt.allocPrint(allocator, "'\"'", .{}) catch null,
+            '\'' => return allocator.dupe(u8, "'\\''") catch null,
+            '"' => return allocator.dupe(u8, "'\"'") catch null,
             else => return null,
         }
     }

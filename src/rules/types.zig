@@ -185,6 +185,8 @@ pub const Rule = enum {
     prefer_split_scalar,
     pointer_to_allocator,
     expect_equal_argument_order,
+    prefer_allocator_dupe,
+    prefer_append_slice,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -335,6 +337,8 @@ pub const Rule = enum {
             .prefer_split_scalar,
             .pointer_to_allocator,
             .expect_equal_argument_order,
+            .prefer_allocator_dupe,
+            .prefer_append_slice,
             => .idiomatic,
             .modernize_managed_container,
             .modernize_deprecated_io,

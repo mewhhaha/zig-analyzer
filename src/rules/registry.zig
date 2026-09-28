@@ -71,6 +71,8 @@ const rule_modules = .{
     @import("prefer_split_scalar.zig"),
     @import("pointer_to_allocator.zig"),
     @import("expect_equal_argument_order.zig"),
+    @import("prefer_allocator_dupe.zig"),
+    @import("prefer_append_slice.zig"),
 };
 
 pub fn run(context: RuleRun) !void {

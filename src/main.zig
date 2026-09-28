@@ -2,6 +2,10 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zig_analyzer = @import("zig_analyzer");
 
+comptime {
+    @setEvalBranchQuota(50_000);
+}
+
 const usage =
     \\zig-analyzer - compiler-backed language intelligence for Zig
     \\
