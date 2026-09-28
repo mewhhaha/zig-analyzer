@@ -1108,6 +1108,8 @@ fn collectOwnedFieldEvidence(
     summary_index: summaries.Index,
     evidence: *std.ArrayList(OwnedFieldEvidence),
 ) !void {
+    var element_types = ElementTypeCache{};
+    defer element_types.entries.deinit(allocator);
     try collectCleanupOwnedFieldEvidence(allocator, file, file_index, summary_index, evidence);
     for (file.tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= file.tokens.len or file.tokens[fn_index + 2].tag != .l_paren) continue;
@@ -1181,7 +1183,7 @@ fn collectOwnedFieldEvidence(
                 method_index < 2 or file.tokens[method_index - 1].tag != .period or
                 file.tokens[method_index - 2].tag != .identifier or method_index + 1 >= body_end or
                 file.tokens[method_index + 1].tag != .l_paren) continue;
-            const element_type = sequenceElementType(file, tokenText(file.source, file.tokens[method_index - 2])) orelse continue;
+            const element_type = try element_types.lookup(allocator, file, tokenText(file.source, file.tokens[method_index - 2])) orelse continue;
             const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
             try collectAggregateOwnedFields(
                 allocator,
@@ -1424,6 +1426,27 @@ fn aggregateBindingFieldCount(file: IndexedSourceFile, binding: []const u8, star
     return count;
 }
 
+const OwnedAllocationCache = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { field_name: []const u8, owned: bool };
+
+    fn lookup(
+        cache: *OwnedAllocationCache,
+        allocator: std.mem.Allocator,
+        file: IndexedSourceFile,
+        field_name: []const u8,
+        summary_index: summaries.Index,
+    ) !bool {
+        for (cache.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.field_name, field_name)) return entry.owned;
+        }
+        const owned = sequenceStoresOwnedAllocation(file, field_name, 0, file.tokens.len, summary_index);
+        try cache.entries.append(allocator, .{ .field_name = field_name, .owned = owned });
+        return owned;
+    }
+};
+
 fn collectOwnedSequenceEvidence(
     allocator: std.mem.Allocator,
     file: IndexedSourceFile,
@@ -1431,6 +1454,8 @@ fn collectOwnedSequenceEvidence(
     summary_index: summaries.Index,
     evidence: *std.ArrayList(OwnedSequenceEvidence),
 ) !void {
+    var owned_cache = OwnedAllocationCache{};
+    defer owned_cache.entries.deinit(allocator);
     for (file.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
@@ -1449,11 +1474,10 @@ fn collectOwnedSequenceEvidence(
             if (depth != 0 or field.tag != .identifier or field_index + 1 >= container_end or
                 file.tokens[field_index + 1].tag != .colon or !fieldStoresSlices(file, field_index, container_end)) continue;
             const field_name = tokenText(file.source, field);
-            if ((arena_lifetime or !sequenceStoresOwnedAllocation(
+            if ((arena_lifetime or !try owned_cache.lookup(
+                allocator,
                 file,
                 field_name,
-                0,
-                file.tokens.len,
                 summary_index,
             )) and !sequenceCleanupReleasesElements(file, field_name, container_start, container_end)) continue;
             try evidence.append(allocator, .{
@@ -1562,6 +1586,27 @@ fn sequenceCleanupReleasesElements(
     return false;
 }
 
+const TypeContainerCache = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { file_index: usize, type_name: []const u8, container: ?TypeContainer };
+
+    fn lookup(
+        cache: *TypeContainerCache,
+        allocator: std.mem.Allocator,
+        files: []const IndexedSourceFile,
+        file_index: usize,
+        type_name: []const u8,
+    ) !?TypeContainer {
+        for (cache.entries.items) |entry| {
+            if (entry.file_index == file_index and std.mem.eql(u8, entry.type_name, type_name)) return entry.container;
+        }
+        const container = typeContainer(files[file_index], type_name);
+        try cache.entries.append(allocator, .{ .file_index = file_index, .type_name = type_name, .container = container });
+        return container;
+    }
+};
+
 fn findOwnedSequenceIssues(
     allocator: std.mem.Allocator,
     files: []const IndexedSourceFile,
@@ -1570,9 +1615,11 @@ fn findOwnedSequenceIssues(
     evidence: []const OwnedSequenceEvidence,
     found: *std.ArrayList(Finding),
 ) !void {
+    var containers = TypeContainerCache{};
+    defer containers.entries.deinit(allocator);
     for (evidence) |sequence| {
         const file = files[sequence.file_index];
-        const container = typeContainer(file, sequence.type_name) orelse continue;
+        const container = try containers.lookup(allocator, files, sequence.file_index, sequence.type_name) orelse continue;
         try findOwnedSequenceCleanupOmissions(allocator, file, configuration, sequence, container, found);
         try findOwnedSequenceDiscardedRemovals(allocator, file, configuration, sequence, container, found);
         try findOwnedSequenceOverwrites(
@@ -2034,6 +2081,26 @@ fn rangeHasErrdeferForField(
     return false;
 }
 
+const ElementTypeCache = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { field_name: []const u8, element_type: ?[]const u8 };
+
+    fn lookup(
+        cache: *ElementTypeCache,
+        allocator: std.mem.Allocator,
+        file: IndexedSourceFile,
+        field_name: []const u8,
+    ) !?[]const u8 {
+        for (cache.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.field_name, field_name)) return entry.element_type;
+        }
+        const element_type = sequenceElementType(file, field_name);
+        try cache.entries.append(allocator, .{ .field_name = field_name, .element_type = element_type });
+        return element_type;
+    }
+};
+
 fn sequenceElementType(file: IndexedSourceFile, field_name: []const u8) ?[]const u8 {
     var selected: ?[]const u8 = null;
     for (file.tokens, 0..) |token, field_index| {
@@ -2100,6 +2167,8 @@ fn findIncompleteOwnedElementCleanup(
     const level = configuration.level(.incomplete_owned_field_cleanup);
     if (level == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, declaration_index| {
             if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
                 file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
@@ -2115,7 +2184,7 @@ fn findIncompleteOwnedElementCleanup(
                 if (field_token.tag != .identifier or field_index + 1 >= container_end or
                     file.tokens[field_index + 1].tag != .colon) continue;
                 const sequence_field = tokenText(file.source, field_token);
-                const element_type = sequenceElementType(file, sequence_field) orelse continue;
+                const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
                 if (!hasOwnedFieldEvidence(evidence, file_index, element_type)) continue;
                 try findSequenceCleanupOmissions(
                     allocator,
@@ -2453,12 +2522,14 @@ fn findRemovedOwnedValueTransfers(
 ) !void {
     if (configuration.level(.partial_ownership_transfer) == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, declaration_index| {
             if ((token.tag != .keyword_const and token.tag != .keyword_var) or
                 declaration_index + 3 >= file.tokens.len or file.tokens[declaration_index + 1].tag != .identifier) continue;
             const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
             const sequence_field = removedValueSequence(file, declaration_index + 2, declaration_end) orelse continue;
-            const element_type = sequenceElementType(file, sequence_field) orelse continue;
+            const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
             if (!hasOwnedFieldEvidence(evidence, file_index, element_type)) continue;
             const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
             const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
@@ -2608,6 +2679,8 @@ fn findDroppedOwnedElements(
     const level = configuration.level(.unreleased_allocation);
     if (level == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, equal_index| {
             if (token.tag != .equal or equal_index == 0 or !tokenIs(file.source, file.tokens[equal_index - 1], "_")) continue;
             const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
@@ -2616,7 +2689,7 @@ fn findDroppedOwnedElements(
                     (!tokenIs(file.source, candidate, "swapRemove") and !tokenIs(file.source, candidate, "orderedRemove")) or
                     method_index < 2 or file.tokens[method_index - 1].tag != .period or file.tokens[method_index - 2].tag != .identifier) continue;
                 const sequence_field = tokenText(file.source, file.tokens[method_index - 2]);
-                const element_type = sequenceElementType(file, sequence_field) orelse continue;
+                const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
                 if (removedElementTransferredBefore(file, sequence_field, method_index)) continue;
                 if (sequenceElementDeinitializedBeforeRemoval(file, sequence_field, method_index)) continue;
                 if (sequenceStoresPointers(file, sequence_field) and
@@ -2919,6 +2992,8 @@ fn findOwnedElementOverwrites(
     const level = configuration.level(.overwritten_owning_value);
     if (level == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, equal_index| {
             if (token.tag != .equal or equal_index < 6) continue;
             const field_index = equal_index - 1;
@@ -2926,7 +3001,7 @@ fn findOwnedElementOverwrites(
             const items_index = findItemsBefore(file, field_index, equal_index -| 16) orelse continue;
             if (items_index < 2 or file.tokens[items_index - 1].tag != .period or file.tokens[items_index - 2].tag != .identifier) continue;
             const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = sequenceElementType(file, sequence_field) orelse continue;
+            const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
             const field_name = tokenText(file.source, file.tokens[field_index]);
             if (!ownedFieldIsProven(evidence, file_index, element_type, field_name)) continue;
             const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
@@ -2966,6 +3041,8 @@ fn findAliasedOwnedElementOverwrites(
     const level = configuration.level(.overwritten_owning_value);
     if (level == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, declaration_index| {
             if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
                 file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
@@ -2975,7 +3052,7 @@ fn findAliasedOwnedElementOverwrites(
             if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
                 file.tokens[items_index - 2].tag != .identifier) continue;
             const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = sequenceElementType(file, sequence_field) orelse continue;
+            const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
             const alias = tokenText(file.source, file.tokens[declaration_index + 1]);
             const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
             var equal_index = declaration_end + 1;
@@ -3022,6 +3099,8 @@ fn findCapturedOwnedElementOverwrites(
     const level = configuration.level(.overwritten_owning_value);
     if (level == .off) return;
     for (files, 0..) |file, file_index| {
+        var element_types = ElementTypeCache{};
+        defer element_types.entries.deinit(allocator);
         for (file.tokens, 0..) |token, for_index| {
             if (token.tag != .keyword_for or for_index + 1 >= file.tokens.len or
                 file.tokens[for_index + 1].tag != .l_paren) continue;
@@ -3030,7 +3109,7 @@ fn findCapturedOwnedElementOverwrites(
             if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
                 file.tokens[items_index - 2].tag != .identifier) continue;
             const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = sequenceElementType(file, sequence_field) orelse continue;
+            const element_type = try element_types.lookup(allocator, file, sequence_field) orelse continue;
             if (sequence_end + 4 >= file.tokens.len or file.tokens[sequence_end + 1].tag != .pipe or
                 file.tokens[sequence_end + 2].tag != .asterisk or file.tokens[sequence_end + 3].tag != .identifier or
                 file.tokens[sequence_end + 4].tag != .pipe) continue;
