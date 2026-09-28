@@ -113,7 +113,7 @@ Worst-case single-file `check` time on that corpus is about 0.3 s
 
 ## Installation
 
-The `0.16.0-5` release provides a relocatable x86_64 Linux archive containing
+The `0.16.0-6` release provides a relocatable x86_64 Linux archive containing
 both zig-analyzer and its patched compiler backend. Verify the published
 SHA-256 checksum before installing it. Building from source requires Zig
 0.16.0 exactly:

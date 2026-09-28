@@ -147,8 +147,8 @@ create and push an annotated tag with the same version:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.16.0-5 -m "zig-analyzer 0.16.0-5"
-git push origin v0.16.0-5
+git tag -a v0.16.0-6 -m "zig-analyzer 0.16.0-6"
+git push origin v0.16.0-6
 ```
 
 The Release workflow rejects a tag that differs from `build.zig.zon`, reruns
