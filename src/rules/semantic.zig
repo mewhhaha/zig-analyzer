@@ -222,7 +222,7 @@ pub fn fileNameFindingWithTokens(
 ) !?Finding {
     const level = configuration.level(.non_idiomatic_file_name);
     if (level == .off) return null;
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     if (!std.mem.endsWith(u8, basename, ".zig") or basename.len == ".zig".len) return null;
     if (std.mem.eql(u8, basename, "build.zig")) return null;
     const name = basename[0 .. basename.len - ".zig".len];
@@ -245,8 +245,7 @@ pub fn fileNameFindingWithTokens(
         .rule = .non_idiomatic_file_name,
         .level = level,
         .span = .{ .start = 0, .end = @min(source.len, 1) },
-        .message = try std.fmt.allocPrint(
-            allocator,
+        .message = try allocator.print(
             "file '{s}' represents {s} and should use a {s} name",
             .{
                 basename,
@@ -294,7 +293,7 @@ fn findUnresolvedCalls(
                 .rule = .unresolved_call,
                 .level = level,
                 .span = token.loc,
-                .message = try std.fmt.allocPrint(allocator, "binding '{s}' is not callable", .{name}),
+                .message = try allocator.print("binding '{s}' is not callable", .{name}),
             });
             continue;
         }
@@ -303,7 +302,7 @@ fn findUnresolvedCalls(
             .rule = .unresolved_call,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "call to unresolved function '{s}'", .{name}),
+            .message = try allocator.print("call to unresolved function '{s}'", .{name}),
         });
     }
 }
@@ -341,7 +340,7 @@ fn findUnresolvedIdentifiers(
             .rule = .unresolved_identifier,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "use of unresolved identifier '{s}'", .{name}),
+            .message = try allocator.print("use of unresolved identifier '{s}'", .{name}),
         });
     }
 }
@@ -412,8 +411,7 @@ fn findUnresolvedMembers(
             .rule = .unresolved_member,
             .level = level,
             .span = member_token.loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "type '{s}' has no member named '{s}'",
                 .{ container.name, member_name },
             ),
@@ -467,7 +465,7 @@ fn findUnresolvedLabels(
             .rule = .unresolved_label,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "branch targets unresolved label '{s}'", .{name}),
+            .message = try allocator.print("branch targets unresolved label '{s}'", .{name}),
         });
     }
 }
@@ -582,7 +580,7 @@ fn findNeverMutatedVariables(
         edits[0] = .{ .span = token.loc, .replacement = "const" };
         const fixes = try allocator.alloc(Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(allocator, "Change '{s}' to const", .{name}),
+            .title = try allocator.print("Change '{s}' to const", .{name}),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -591,7 +589,7 @@ fn findNeverMutatedVariables(
             .rule = .never_mutated_var,
             .level = level,
             .span = name_token.loc,
-            .message = try std.fmt.allocPrint(allocator, "variable '{s}' is never mutated", .{name}),
+            .message = try allocator.print("variable '{s}' is never mutated", .{name}),
             .fixes = fixes,
         });
     }
@@ -835,7 +833,7 @@ fn findCatchDiagnostics(
                 const edits = try allocator.alloc(Edit, 1);
                 edits[0] = .{
                     .span = .{ .start = tokens[expression_start].loc.start, .end = tokens[body_start].loc.end },
-                    .replacement = try std.fmt.allocPrint(allocator, "try {s}", .{expression}),
+                    .replacement = try allocator.print("try {s}", .{expression}),
                 };
                 const allocated = try allocator.alloc(Fix, 1);
                 allocated[0] = .{ .title = "Propagate the error with try", .kind = .quickfix, .edits = edits };
@@ -857,8 +855,7 @@ fn findCatchDiagnostics(
             .rule = .lost_error_context,
             .level = context_level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "catch maps every failure to '{s}' and loses the original error identity",
                 .{tokenText(source, remapped_error)},
             ),
@@ -1077,16 +1074,14 @@ fn findMissingResourceCleanup(
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{
                 .span = .{ .start = tokens[statement_end].loc.end, .end = tokens[statement_end].loc.end },
-                .replacement = try std.fmt.allocPrint(
-                    allocator,
+                .replacement = try allocator.print(
                     "\n{s}defer {s}.{s}({s});",
                     .{ source[line_start..indentation_end], binding_name, resource.release, release_argument orelse "" },
                 ),
             };
             const allocated_fixes = try allocator.alloc(Fix, 1);
             allocated_fixes[0] = .{
-                .title = try std.fmt.allocPrint(
-                    allocator,
+                .title = try allocator.print(
                     "Insert 'defer {s}.{s}({s})'",
                     .{ binding_name, resource.release, release_argument orelse "" },
                 ),
@@ -1101,14 +1096,13 @@ fn findMissingResourceCleanup(
             .level = level,
             .span = tokens[declaration_index + 1].loc,
             .fixes = fixes,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "resource '{s}' from {s} has no visible {s}{s} or ownership transfer",
                 .{
                     binding_name,
                     resource.acquisition,
                     resource.release,
-                    if (resource.alternative_release) |alternative| try std.fmt.allocPrint(allocator, "/{s}", .{alternative}) else "",
+                    if (resource.alternative_release) |alternative| try allocator.print("/{s}", .{alternative}) else "",
                 },
             ),
         });
@@ -1132,8 +1126,7 @@ fn findMissingResourceCleanup(
                     .rule = .missing_resource_cleanup,
                     .level = level,
                     .span = tokens[return_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "mutex '{s}' remains locked when this error path leaves the scope before unlock",
                         .{receiver},
                     ),
@@ -1147,7 +1140,7 @@ fn findMissingResourceCleanup(
             .rule = .missing_resource_cleanup,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "mutex '{s}' is locked without a visible unlock before leaving this scope", .{receiver}),
+            .message = try allocator.print("mutex '{s}' is locked without a visible unlock before leaving this scope", .{receiver}),
         });
     }
 }
@@ -1393,8 +1386,7 @@ fn findUndefinedValueEscapes(
                 .rule = .undefined_value_escape,
                 .level = level,
                 .span = tokens[index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "value '{s}' initialized with undefined is read or escapes before whole-value initialization",
                     .{binding_name},
                 ),
@@ -1505,7 +1497,7 @@ fn findBooleanComparisons(
         const replacement = if (equal_to_true)
             try allocator.dupe(u8, operand_name)
         else
-            try std.fmt.allocPrint(allocator, "!{s}", .{operand_name});
+            try allocator.print("!{s}", .{operand_name});
         const edits = try allocator.alloc(Edit, 1);
         edits[0] = .{ .span = .{ .start = left.loc.start, .end = right.loc.end }, .replacement = replacement };
         const fixes = try allocator.alloc(Fix, 1);
@@ -1520,7 +1512,7 @@ fn findBooleanComparisons(
             .rule = .redundant_bool_comparison,
             .level = level,
             .span = operator.loc,
-            .message = try std.fmt.allocPrint(allocator, "comparison of bool '{s}' with '{s}' is redundant", .{ operand_name, literal_text }),
+            .message = try allocator.print("comparison of bool '{s}' with '{s}' is redundant", .{ operand_name, literal_text }),
             .fixes = fixes,
         });
     }
@@ -1558,7 +1550,7 @@ fn findErrorValueComparisons(
         if (binding_index >= tokens.len) continue;
         const binding_name = tokenText(source, tokens[binding_index]);
         const error_source = tree.getNodeSource(error_value);
-        const error_name_start = std.mem.lastIndexOfScalar(u8, error_source, '.') orelse continue;
+        const error_name_start = std.mem.findScalarLast(u8, error_source, '.') orelse continue;
         const error_name = error_source[error_name_start + 1 ..];
         const error_is_declared: ?bool = declared: {
             var cursor = binding_index;
@@ -1591,8 +1583,7 @@ fn findErrorValueComparisons(
             .rule = .error_value_comparison,
             .level = level,
             .span = tokens[operator_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "comparison with '{s}' can never be {s}; explicit error set of '{s}' does not contain it",
                 .{ error_source, impossible_result, binding_name },
             ),
@@ -1631,7 +1622,7 @@ fn findMixedBitwiseArithmetic(
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{
                 .span = child_span,
-                .replacement = try std.fmt.allocPrint(allocator, "({s})", .{source[child_span.start..child_span.end]}),
+                .replacement = try allocator.print("({s})", .{source[child_span.start..child_span.end]}),
             };
             const fixes = try allocator.alloc(Fix, 1);
             fixes[0] = .{
@@ -1644,8 +1635,7 @@ fn findMixedBitwiseArithmetic(
                 .rule = .mixed_bitwise_arithmetic,
                 .level = level,
                 .span = tokens[operator_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "bitwise operator '{s}' and arithmetic operator '{s}' are mixed without parentheses",
                     .{
                         if (isBitwiseOperator(parent_tag)) tree.tokenSlice(tree.nodeMainToken(node)) else tree.tokenSlice(tree.nodeMainToken(child)),
@@ -1741,8 +1731,7 @@ fn findUnusedPrivateDeclarations(
             isImplicitDeclarationName(name) or (occurrence_counts.get(name) orelse 0) != 1 or
             reflected_names.names.contains(name)) continue;
         const fixes = try unusedDeclarationFixes(allocator, source, tokens, declaration);
-        const message = try std.fmt.allocPrint(
-            allocator,
+        const message = try allocator.print(
             "private {s} '{s}' is never referenced",
             .{ @tagName(declaration.kind), name },
         );
@@ -1964,7 +1953,7 @@ fn collectContainerFields(
                     }) continue;
                 if (kind == .structure and index + 1 < closing and tokens[index + 1].tag == .comma) {
                     try fields.append(allocator, .{
-                        .name = try std.fmt.allocPrint(allocator, "@\"{d}\"", .{fields.items.len}),
+                        .name = try allocator.print("@\"{d}\"", .{fields.items.len}),
                         .required = true,
                     });
                     continue;
@@ -2030,20 +2019,17 @@ fn findComptimeReflectionIssues(
             containerHasDeclaration(source, tokens, container.name, member_name, true);
         if (exists) continue;
         const message = if (field_lookup)
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s} cannot resolve member '{s}' on type '{s}' in this analyzed shape",
                 .{ tokenText(source, token), member_name, container.name },
             )
         else if (!has_field)
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s} is always false: type '{s}' has no public declaration named '{s}' in this analyzed shape",
                 .{ tokenText(source, token), container.name, member_name },
             )
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s} is always false: type '{s}' has no member named '{s}' in this analyzed shape",
                 .{ tokenText(source, token), container.name, member_name },
             );
@@ -2122,8 +2108,7 @@ fn findConstantComptimeConditions(
             .rule = .constant_comptime_condition,
             .level = level,
             .span = tokens[condition_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "comptime condition is always {s}; the other branch is inactive in this configuration",
                 .{tokenText(source, tokens[condition_index])},
             ),
@@ -2271,7 +2256,7 @@ fn findSwitches(
 
 const maximum_named_else_cases = 8;
 
-const BindingDeclarationSites = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize));
+const BindingDeclarationSites = std.StringHashMapUnmanaged(std.ArrayList(usize));
 const FunctionReturnTypes = std.StringHashMapUnmanaged([]const u8);
 
 /// Indexes every 'name:' and 'const/var name' site so switch analysis can find
@@ -2707,13 +2692,12 @@ fn findNeedlessCasts(
                 const inner_close = matchingToken(tokens, index + 5, .l_paren, .r_paren) orelse continue;
                 if (inner_close + 1 != outer_close) continue;
                 replacement = source[tokens[index + 4].loc.start..tokens[inner_close].loc.end];
-                message = try std.fmt.allocPrint(allocator, "nested cast to '{s}' repeats the same proven type", .{type_name});
+                message = try allocator.print("nested cast to '{s}' repeats the same proven type", .{type_name});
             } else if (tokens[index + 4].tag == .identifier and index + 5 == outer_close and
                 indexedBindingHasType(source, tokens, scope_index, index + 4, type_name))
             {
                 replacement = tokenText(source, tokens[index + 4]);
-                message = try std.fmt.allocPrint(
-                    allocator,
+                message = try allocator.print(
                     "cast of '{s}' to its proven type '{s}' is unnecessary",
                     .{ replacement, type_name },
                 );
@@ -2739,7 +2723,7 @@ fn findNeedlessCasts(
             const inner_close = matchingToken(tokens, index + 3, .l_paren, .r_paren) orelse continue;
             if (inner_close + 1 != outer_close and !(inner_close + 2 == outer_close and tokens[inner_close + 1].tag == .comma)) continue;
             const replacement = source[tokens[index + 2].loc.start..tokens[inner_close].loc.end];
-            const message = try std.fmt.allocPrint(allocator, "nested '{s}' is redundant", .{builtin_name});
+            const message = try allocator.print("nested '{s}' is redundant", .{builtin_name});
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{
                 .span = .{ .start = token.loc.start, .end = tokens[outer_close].loc.end },
@@ -2973,7 +2957,7 @@ fn findNonIdiomaticNames(
             .rule = .non_idiomatic_name,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention }),
+            .message = try allocator.print("declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention }),
         });
     }
 }
@@ -3299,11 +3283,11 @@ fn functionDeclarationReturnsType(
 }
 
 fn isCamelCase(name: []const u8) bool {
-    return name.len != 0 and std.ascii.isLower(name[0]) and std.mem.indexOfScalar(u8, name, '_') == null;
+    return name.len != 0 and std.ascii.isLower(name[0]) and std.mem.findScalar(u8, name, '_') == null;
 }
 
 fn isTitleCase(name: []const u8) bool {
-    return name.len != 0 and std.ascii.isUpper(name[0]) and std.mem.indexOfScalar(u8, name, '_') == null;
+    return name.len != 0 and std.ascii.isUpper(name[0]) and std.mem.findScalar(u8, name, '_') == null;
 }
 
 fn isSnakeCase(name: []const u8) bool {
@@ -3342,8 +3326,7 @@ fn findOfficialStyleIssues(
                 .rule = .underscore_private_name,
                 .level = underscore_level,
                 .span = token.loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "declaration '{s}' uses an underscore prefix even though Zig does not use names to express privacy",
                     .{name},
                 ),
@@ -3356,8 +3339,7 @@ fn findOfficialStyleIssues(
                     .rule = .vague_type_name,
                     .level = vague_level,
                     .span = token.loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "type '{s}' contains the vague word '{s}', which does not describe its domain role",
                         .{ name, word },
                     ),
@@ -3380,8 +3362,7 @@ fn findOfficialStyleIssues(
                     .rule = .doc_comment_style,
                     .level = docs_level,
                     .span = tokens[first_doc_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "documentation for '{s}' repeats information already provided by its name",
                         .{name},
                     ),
@@ -3407,8 +3388,7 @@ fn findOfficialStyleIssues(
                     .rule = .redundant_qualified_name,
                     .level = qualified_level,
                     .span = tokens[cursor + 1].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "type '{s}' repeats its containing namespace '{s}'; '{s}' is sufficient when qualified",
                         .{ declaration_name, namespace_name, suffix },
                     ),
@@ -3431,7 +3411,7 @@ fn findOfficialStyleIssues(
                 .rule = .public_declaration_docs,
                 .level = public_docs_level,
                 .span = tokens[pub_index + 2].loc,
-                .message = try std.fmt.allocPrint(allocator, "public declaration '{s}' has no doc comment", .{declaration_name}),
+                .message = try allocator.print("public declaration '{s}' has no doc comment", .{declaration_name}),
             });
         }
     }
@@ -3534,7 +3514,7 @@ fn findOptionalCaptureIdioms(
         const edits = try allocator.alloc(Edit, unwraps.items.len + 1);
         edits[0] = .{
             .span = .{ .start = tokens[if_index + 2].loc.start, .end = tokens[if_index + 5].loc.end },
-            .replacement = try std.fmt.allocPrint(allocator, "{s}) |{s}|", .{ optional_name, capture_name }),
+            .replacement = try allocator.print("{s}) |{s}|", .{ optional_name, capture_name }),
         };
         for (unwraps.items, edits[1..]) |span, *edit| edit.* = .{ .span = span, .replacement = capture_name };
         const fixes = try allocator.alloc(Fix, 1);
@@ -3543,8 +3523,7 @@ fn findOptionalCaptureIdioms(
             .rule = .prefer_optional_capture,
             .level = level,
             .span = tokens[if_index + 3].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "optional '{s}' is checked and then force-unwrapped; capture the payload in the if condition",
                 .{optional_name},
             ),
@@ -3555,12 +3534,12 @@ fn findOptionalCaptureIdioms(
 
 fn collisionFreeCaptureName(allocator: std.mem.Allocator, source: []const u8, optional_name: []const u8) ![]const u8 {
     if (!identifierAppears(source, "value")) return try allocator.dupe(u8, "value");
-    const candidate = try std.fmt.allocPrint(allocator, "{s}_value", .{optional_name});
+    const candidate = try allocator.print("{s}_value", .{optional_name});
     if (!identifierAppears(source, candidate)) return candidate;
     allocator.free(candidate);
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
-        const numbered = try std.fmt.allocPrint(allocator, "{s}_value_{d}", .{ optional_name, suffix });
+        const numbered = try allocator.print("{s}_value_{d}", .{ optional_name, suffix });
         if (!identifierAppears(source, numbered)) return numbered;
         allocator.free(numbered);
     }
@@ -3568,7 +3547,7 @@ fn collisionFreeCaptureName(allocator: std.mem.Allocator, source: []const u8, op
 
 fn identifierAppears(source: []const u8, name: []const u8) bool {
     var start: usize = 0;
-    while (std.mem.indexOfPos(u8, source, start, name)) |offset| {
+    while (std.mem.findPos(u8, source, start, name)) |offset| {
         const before_is_identifier = offset > 0 and isIdentifierCharacter(source[offset - 1]);
         const end = offset + name.len;
         const after_is_identifier = end < source.len and isIdentifierCharacter(source[end]);
@@ -3604,7 +3583,7 @@ fn findTryIdioms(
         const edits = try allocator.alloc(Edit, 1);
         edits[0] = .{
             .span = .{ .start = tokens[expression_start].loc.start, .end = tokens[catch_index + 5].loc.end },
-            .replacement = try std.fmt.allocPrint(allocator, "try {s}", .{expression}),
+            .replacement = try allocator.print("try {s}", .{expression}),
         };
         const fixes = try allocator.alloc(Fix, 1);
         fixes[0] = .{ .title = "Propagate the error with try", .kind = .refactor_rewrite, .edits = edits, .preferred = true, .fix_all = true };
@@ -3612,7 +3591,7 @@ fn findTryIdioms(
             .rule = .prefer_try,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(allocator, "caught error '{s}' is returned unchanged; use try to propagate it", .{error_name}),
+            .message = try allocator.print("caught error '{s}' is returned unchanged; use try to propagate it", .{error_name}),
             .fixes = fixes,
         });
     }
@@ -3666,8 +3645,7 @@ fn findTestingIdioms(
         const edits = try allocator.alloc(Edit, 1);
         edits[0] = .{
             .span = .{ .start = tokens[expression_start].loc.start, .end = tokens[expect_index + 5].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                allocator,
+            .replacement = try allocator.print(
                 "{s}expectEqual({s}, {s})",
                 .{ qualification, tokenText(source, expected), tokenText(source, actual) },
             ),
@@ -3678,8 +3656,7 @@ fn findTestingIdioms(
             .rule = .prefer_testing_expect_equal,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "comparison of '{s}' with a literal produces a less useful test failure than expectEqual",
                 .{tokenText(source, actual)},
             ),
@@ -3749,8 +3726,7 @@ fn findPointerParameterIdioms(
                 .rule = .mutable_pointer_parameter,
                 .level = level,
                 .span = tokens[parameter_index + 2].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "parameter '{s}' is only read through this pointer; '*const' communicates that contract",
                     .{parameter_name},
                 ),
@@ -3965,7 +3941,7 @@ fn findTypeExpressionIdioms(
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{
                 .span = .{ .start = tokens[declaration_index + 5].loc.start, .end = tokens[declaration_index + 7].loc.end },
-                .replacement = try std.fmt.allocPrint(allocator, ".{s}", .{tokenText(source, tokens[declaration_index + 7])}),
+                .replacement = try allocator.print(".{s}", .{tokenText(source, tokens[declaration_index + 7])}),
             };
             const fixes = try allocator.alloc(Fix, 1);
             fixes[0] = .{ .title = "Use inferred enum literal", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
@@ -3973,7 +3949,7 @@ fn findTypeExpressionIdioms(
                 .rule = .redundant_type_qualification,
                 .level = qualification_level,
                 .span = tokens[declaration_index + 5].loc,
-                .message = try std.fmt.allocPrint(allocator, "type '{s}' is already established by the result location", .{type_name}),
+                .message = try allocator.print("type '{s}' is already established by the result location", .{type_name}),
                 .fixes = fixes,
             });
         } else if (initializer_level != .off and tokens[declaration_index + 6].tag == .l_brace) {
@@ -3988,7 +3964,7 @@ fn findTypeExpressionIdioms(
                 .rule = .prefer_anonymous_initializer,
                 .level = initializer_level,
                 .span = tokens[declaration_index + 5].loc,
-                .message = try std.fmt.allocPrint(allocator, "initializer repeats result type '{s}'", .{type_name}),
+                .message = try allocator.print("initializer repeats result type '{s}'", .{type_name}),
                 .fixes = fixes,
             });
         }
@@ -4037,7 +4013,7 @@ fn findImportIssues(
                     .rule = .duplicate_import,
                     .level = duplicate_level,
                     .span = tokens[index + 5].loc,
-                    .message = try std.fmt.allocPrint(allocator, "module '{s}' is imported more than once", .{path}),
+                    .message = try allocator.print("module '{s}' is imported more than once", .{path}),
                     .related = related,
                     .fixes = fixes,
                 });
@@ -4055,7 +4031,7 @@ fn findImportIssues(
                 .rule = .unused_import,
                 .level = unused_level,
                 .span = tokens[index + 1].loc,
-                .message = try std.fmt.allocPrint(allocator, "import alias '{s}' is never referenced", .{alias}),
+                .message = try allocator.print("import alias '{s}' is never referenced", .{alias}),
                 .fixes = fixes,
             });
         }
@@ -4063,7 +4039,7 @@ fn findImportIssues(
             const edits = try allocator.alloc(Edit, 1);
             edits[0] = .{
                 .span = tokens[index + 5].loc,
-                .replacement = try std.fmt.allocPrint(allocator, "\"{s}\"", .{path[2..]}),
+                .replacement = try allocator.print("\"{s}\"", .{path[2..]}),
             };
             const fixes = try allocator.alloc(Fix, 1);
             fixes[0] = .{ .title = "Normalize import path", .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
@@ -4071,7 +4047,7 @@ fn findImportIssues(
                 .rule = .redundant_import_path,
                 .level = path_level,
                 .span = tokens[index + 5].loc,
-                .message = try std.fmt.allocPrint(allocator, "relative import path '{s}' has a redundant './' segment", .{path}),
+                .message = try allocator.print("relative import path '{s}' has a redundant './' segment", .{path}),
                 .fixes = fixes,
             });
         }
@@ -4161,6 +4137,7 @@ fn attachedCommentStart(source: []const u8, declaration_start: usize) usize {
 
 fn importsAreContiguous(source: []const u8, imports: []const Import) bool {
     for (imports[1..], 1..) |current, index| {
+        if (imports[index - 1].end > current.start) return false;
         const between = std.mem.trim(u8, source[imports[index - 1].end..current.start], " \t\r\n");
         if (between.len != 0) return false;
     }
@@ -4185,7 +4162,7 @@ fn importLessThan(left: Import, right: Import) bool {
 
 fn importGroup(path: []const u8) u2 {
     if (std.mem.eql(u8, path, "std") or std.mem.eql(u8, path, "builtin") or std.mem.eql(u8, path, "root")) return 0;
-    if (std.mem.indexOfScalar(u8, path, '/') == null and !std.mem.endsWith(u8, path, ".zig")) return 1;
+    if (std.mem.findScalar(u8, path, '/') == null and !std.mem.endsWith(u8, path, ".zig")) return 1;
     return 2;
 }
 
@@ -4216,11 +4193,11 @@ fn lineIndentation(source: []const u8, offset: usize) []const u8 {
 }
 
 fn lineStart(source: []const u8, offset: usize) usize {
-    return (std.mem.lastIndexOfScalar(u8, source[0..@min(offset, source.len)], '\n') orelse return 0) + 1;
+    return (std.mem.findScalarLast(u8, source[0..@min(offset, source.len)], '\n') orelse return 0) + 1;
 }
 
 fn lineEnd(source: []const u8, offset: usize) usize {
-    const relative = std.mem.indexOfScalar(u8, source[@min(offset, source.len)..], '\n') orelse return source.len;
+    const relative = std.mem.findScalar(u8, source[@min(offset, source.len)..], '\n') orelse return source.len;
     return @min(offset, source.len) + relative + 1;
 }
 
@@ -4322,7 +4299,7 @@ test "configuration reports unknown rules" {
         \\{"lints":{"rules":{"mystery-rule":"warning"}}}
     );
     defer std.testing.allocator.free(configuration.warning.?);
-    try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, "mystery-rule") != null);
+    try std.testing.expect(std.mem.find(u8, configuration.warning.?, "mystery-rule") != null);
 }
 
 test "findings include switch struct and var fixes" {
@@ -4400,7 +4377,7 @@ test "struct findings resolve directly typed inferred initializers" {
     var missing_field_count: usize = 0;
     for (found) |finding| if (finding.rule == .missing_struct_field) {
         missing_field_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".count") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, ".count") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), missing_field_count);
 }
@@ -4416,7 +4393,7 @@ test "struct findings do not count nested initializer fields" {
     var missing_field_count: usize = 0;
     for (found) |finding| if (finding.rule == .missing_struct_field) {
         missing_field_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "Parent") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "Parent") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), missing_field_count);
 }
@@ -4447,8 +4424,8 @@ test "organize imports preserves directly attached comments" {
     const found = try findings(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     const replacement = found[0].fixes[0].edits[0].replacement;
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "// standard library\nconst std") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "// package docs\nconst package") != null);
+    try std.testing.expect(std.mem.find(u8, replacement, "// standard library\nconst std") != null);
+    try std.testing.expect(std.mem.find(u8, replacement, "// package docs\nconst package") != null);
 }
 
 test "cleanup defer in a loop never fires because it runs each iteration" {
@@ -4631,11 +4608,11 @@ test "discarded error ignores an explanatory catch comment" {
 test "suppression parser reports malformed and unknown rules" {
     const malformed = try suppressionWarning(std.testing.allocator, "// zig-analyzer: ignore-next-line never-mutated-var\nconst x = 1;");
     defer std.testing.allocator.free(malformed.?);
-    try std.testing.expect(std.mem.indexOf(u8, malformed.?, "malformed") != null);
+    try std.testing.expect(std.mem.find(u8, malformed.?, "malformed") != null);
 
     const unknown = try suppressionWarning(std.testing.allocator, "// zig-analyzer: disable-file unknown-rule\n");
     defer std.testing.allocator.free(unknown.?);
-    try std.testing.expect(std.mem.indexOf(u8, unknown.?, "unknown-rule") != null);
+    try std.testing.expect(std.mem.find(u8, unknown.?, "unknown-rule") != null);
 }
 
 test "line and scoped suppressions apply to semantic and modular rules" {
@@ -4799,7 +4776,7 @@ test "else after one terminating branch stays inside an else-if chain" {
     var warning_count: usize = 0;
     for (found) |finding| if (finding.rule == .needless_else_after_terminator) {
         warning_count += 1;
-        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn simple").?);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn simple").?);
     };
     try std.testing.expectEqual(@as(usize, 1), warning_count);
 }
@@ -4832,7 +4809,7 @@ test "configuration reports the removed formatting profile and still loads lints
         \\{"format":{"profile":"analyzer","organizeImports":true},"lints":{"profile":"idiomatic"}}
     );
     defer std.testing.allocator.free(configuration.warning.?);
-    try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, "always delegates to zig fmt") != null);
+    try std.testing.expect(std.mem.find(u8, configuration.warning.?, "always delegates to zig fmt") != null);
     try std.testing.expectEqual(LintProfile.idiomatic, configuration.lint_profile);
 }
 
@@ -4889,7 +4866,7 @@ test "official style rules describe names namespaces and documentation" {
         .vague_type_name => vague = true,
         .underscore_private_name => underscore = true,
         .doc_comment_style => repeated_docs = true,
-        .public_declaration_docs => if (std.mem.indexOf(u8, finding.message, "undocumented") != null) {
+        .public_declaration_docs => if (std.mem.find(u8, finding.message, "undocumented") != null) {
             missing_docs = true;
         },
         else => {},
@@ -5033,7 +5010,7 @@ test "error switches and import rules provide conservative actions" {
     for (found) |finding| switch (finding.rule) {
         .non_exhaustive_error_switch => {
             error_switch = true;
-            try std.testing.expect(std.mem.indexOf(u8, finding.fixes[0].edits[0].replacement, "error.Denied") != null);
+            try std.testing.expect(std.mem.find(u8, finding.fixes[0].edits[0].replacement, "error.Denied") != null);
         },
         .duplicate_import => duplicate = true,
         .unused_import => unused_count += 1,
@@ -5101,7 +5078,7 @@ test "error-set types foreign symbols and re-exports keep their names" {
             naming_count += 1;
             // 'error.Oops' is a value, not an error-set type, so the TitleCase
             // binding is still reported.
-            try std.testing.expect(std.mem.indexOf(u8, finding.message, "'BadValue'") != null);
+            try std.testing.expect(std.mem.find(u8, finding.message, "'BadValue'") != null);
         },
         .underscore_private_name => underscore_count += 1,
         else => {},
@@ -5388,7 +5365,7 @@ test "hasDecl only sees public declarations while field lookup sees local declar
     for (found) |finding| {
         if (finding.rule != .unknown_comptime_member) continue;
         count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "no public declaration") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "no public declaration") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), count);
 }
@@ -5415,8 +5392,8 @@ test "switch analysis reads multiline multi-value prongs as present cases" {
     var missing_switch_count: usize = 0;
     for (found) |finding| if (finding.rule == .missing_switch_prong) {
         missing_switch_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".slow") != null);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".fast") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, ".slow") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, ".fast") == null);
     };
     try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
 }
@@ -5437,9 +5414,9 @@ test "switch prongs never propose the non-exhaustive '_' marker" {
     var missing_switch_count: usize = 0;
     for (found) |finding| if (finding.rule == .missing_switch_prong) {
         missing_switch_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, ".b") != null);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "._") == null);
-        try std.testing.expect(std.mem.indexOf(u8, finding.fixes[0].edits[0].replacement, "._") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, ".b") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "._") == null);
+        try std.testing.expect(std.mem.find(u8, finding.fixes[0].edits[0].replacement, "._") == null);
     };
     try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
 }
@@ -5465,7 +5442,7 @@ test "pointer parameters mutated through nested members or subscripts stay mutab
     var pointer_count: usize = 0;
     for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
         pointer_count += 1;
-        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn observe").?);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn observe").?);
     };
     try std.testing.expectEqual(@as(usize, 1), pointer_count);
 }
@@ -5509,7 +5486,7 @@ test "pointer owner stays mutable when another parameter mutates its field type"
     var pointer_count: usize = 0;
     for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
         pointer_count += 1;
-        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "fn count").?);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn count").?);
     };
     try std.testing.expectEqual(@as(usize, 1), pointer_count);
 }
@@ -5632,7 +5609,7 @@ test "needless cast proof stays within the enclosing function" {
     var cast_count: usize = 0;
     for (found) |finding| if (finding.rule == .needless_cast) {
         cast_count += 1;
-        try std.testing.expect(finding.span.start < std.mem.indexOf(u8, source, "fn narrow").?);
+        try std.testing.expect(finding.span.start < std.mem.find(u8, source, "fn narrow").?);
     };
     try std.testing.expectEqual(@as(usize, 1), cast_count);
 }
@@ -5651,8 +5628,8 @@ test "organize imports leaves container doc comments in place" {
     var import_count: usize = 0;
     for (found) |finding| if (finding.rule == .unsorted_imports) {
         import_count += 1;
-        try std.testing.expectEqual(std.mem.indexOf(u8, source, "const zebra").?, finding.fixes[0].edits[0].span.start);
-        try std.testing.expect(std.mem.indexOf(u8, finding.fixes[0].edits[0].replacement, "//!") == null);
+        try std.testing.expectEqual(std.mem.find(u8, source, "const zebra").?, finding.fixes[0].edits[0].span.start);
+        try std.testing.expect(std.mem.find(u8, finding.fixes[0].edits[0].replacement, "//!") == null);
     };
     try std.testing.expectEqual(@as(usize, 1), import_count);
 }
@@ -5700,7 +5677,7 @@ test "optional capture skips foreign fields and assigned unwraps" {
     for (found) |finding| if (finding.rule == .prefer_optional_capture) {
         capture_count += 1;
         try std.testing.expectEqual(@as(usize, 2), finding.fixes[0].edits.len);
-        try std.testing.expectEqual(std.mem.indexOf(u8, source, "y.? + box").?, finding.fixes[0].edits[1].span.start);
+        try std.testing.expectEqual(std.mem.find(u8, source, "y.? + box").?, finding.fixes[0].edits[1].span.start);
     };
     try std.testing.expectEqual(@as(usize, 1), capture_count);
 }
@@ -5783,7 +5760,7 @@ test "lost error context ignores conditional remaps" {
     var context_count: usize = 0;
     for (found) |finding| if (finding.rule == .lost_error_context) {
         context_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "LoadFailed") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "LoadFailed") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), context_count);
 }
@@ -5812,7 +5789,7 @@ test "usingnamespace uncertainty stays within its container" {
         if (finding.rule == .unresolved_call) call_count += 1;
         if (finding.rule == .unknown_comptime_member) {
             member_count += 1;
-            try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Plain'") != null);
+            try std.testing.expect(std.mem.find(u8, finding.message, "'Plain'") != null);
         }
     }
     try std.testing.expectEqual(@as(usize, 1), member_count);
@@ -5843,7 +5820,7 @@ test "doc comment style checks the first line of a multi-line comment" {
     var docs_count: usize = 0;
     for (found) |finding| if (finding.rule == .doc_comment_style) {
         docs_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'render'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "'render'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), docs_count);
 }
@@ -5882,7 +5859,7 @@ test "bound lock results are guards not mutex locks" {
     var lock_count: usize = 0;
     for (found) |finding| if (finding.rule == .missing_resource_cleanup) {
         lock_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'mutex'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "'mutex'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), lock_count);
 }
@@ -5904,7 +5881,7 @@ test "catch unreachable offers try only inside fallible functions" {
     var unreachable_count: usize = 0;
     for (found) |finding| if (finding.rule == .unsafe_catch_unreachable) {
         unreachable_count += 1;
-        if (finding.span.start < std.mem.indexOf(u8, source, "fn swallow").?) {
+        if (finding.span.start < std.mem.find(u8, source, "fn swallow").?) {
             try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
             try std.testing.expectEqualStrings("try fail()", finding.fixes[0].edits[0].replacement);
         } else {
@@ -5977,7 +5954,7 @@ test "missing resource cleanup offers inserting a defer after the acquisition" {
         try std.testing.expect(!finding.fixes[0].fix_all);
         const edit = finding.fixes[0].edits[0];
         try std.testing.expectEqual(edit.span.start, edit.span.end);
-        try std.testing.expectEqual(std.mem.indexOfScalar(u8, source, ';').? + 1, edit.span.start);
+        try std.testing.expectEqual(std.mem.findScalar(u8, source, ';').? + 1, edit.span.start);
         try std.testing.expectEqualStrings("\n    defer file.close();", edit.replacement);
     };
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
@@ -6206,7 +6183,7 @@ test "compound Context and State names describe their role" {
     var vague_count: usize = 0;
     for (found) |finding| if (finding.rule == .vague_type_name) {
         vague_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "'Context'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "'Context'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), vague_count);
 }
@@ -6224,7 +6201,7 @@ test "renamed declarations report their unresolved type references" {
     for (found) |finding| if (finding.rule == .unresolved_identifier) {
         unresolved_count += 1;
         try std.testing.expectEqualStrings("Message", source[finding.span.start..finding.span.end]);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "unresolved identifier 'Message'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "unresolved identifier 'Message'") != null);
     };
     try std.testing.expectEqual(@as(usize, 2), unresolved_count);
 }
@@ -6314,7 +6291,7 @@ test "obvious value bindings cannot be called" {
     var non_callable_count: usize = 0;
     for (found) |finding| {
         if (finding.rule == .unresolved_call and
-            std.mem.indexOf(u8, finding.message, "not callable") != null) non_callable_count += 1;
+            std.mem.find(u8, finding.message, "not callable") != null) non_callable_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), non_callable_count);
 }

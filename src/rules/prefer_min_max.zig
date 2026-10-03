@@ -52,9 +52,9 @@ pub fn run(context: RuleRun) !void {
         const rhs_text = context.source[context.tokens[cond_rhs.start].loc.start..context.tokens[cond_rhs.end - 1].loc.end];
 
         const replacement = if (branch_info.is_return_statement)
-            try std.fmt.allocPrint(context.allocator, "return @{s}({s}, {s});", .{ builtin_name, lhs_text, rhs_text })
+            try context.allocator.print("return @{s}({s}, {s});", .{ builtin_name, lhs_text, rhs_text })
         else
-            try std.fmt.allocPrint(context.allocator, "@{s}({s}, {s})", .{ builtin_name, lhs_text, rhs_text });
+            try context.allocator.print("@{s}({s}, {s})", .{ builtin_name, lhs_text, rhs_text });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -63,7 +63,7 @@ pub fn run(context: RuleRun) !void {
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Use @{s}({s}, {s})", .{ builtin_name, lhs_text, rhs_text }),
+            .title = try context.allocator.print("Use @{s}({s}, {s})", .{ builtin_name, lhs_text, rhs_text }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -74,8 +74,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_min_max,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "conditional expression chooses between '{s}' and '{s}'; use '@{s}({s}, {s})' directly",
                 .{ lhs_text, rhs_text, builtin_name, lhs_text, rhs_text },
             ),
@@ -223,7 +222,7 @@ fn tokensMatch(context: RuleRun, a: TokenSpan, b: TokenSpan) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "prefer min max detects ternary-style min and max expressions" {

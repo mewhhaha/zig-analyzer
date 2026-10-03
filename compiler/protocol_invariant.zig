@@ -5,25 +5,25 @@ test "compiler patch uses the analyzer protocol and Zig versions" {
     const build_options = @import("build_options");
 
     var protocol_buffer: [64]u8 = undefined;
-    const protocol_declaration = try std.fmt.bufPrint(
+    const protocol_declaration = try std.mem.print(
         &protocol_buffer,
         "pub const version: u16 = {d};",
         .{build_options.compiler_protocol_version},
     );
-    try std.testing.expect(std.mem.indexOf(u8, patch, protocol_declaration) != null);
+    try std.testing.expect(std.mem.find(u8, patch, protocol_declaration) != null);
 
     var zig_version_buffer: [64]u8 = undefined;
-    const zig_version_check = try std.fmt.bufPrint(
+    const zig_version_check = try std.mem.print(
         &zig_version_buffer,
         "std.mem.eql(u8, zig_version, \"{s}\")",
         .{build_options.zig_version},
     );
-    try std.testing.expect(std.mem.indexOf(u8, patch, zig_version_check) != null);
+    try std.testing.expect(std.mem.find(u8, patch, zig_version_check) != null);
 
-    const zig_version_response = try std.fmt.bufPrint(
+    const zig_version_response = try std.mem.print(
         &zig_version_buffer,
         "const zig_version = \"{s}\";",
         .{build_options.zig_version},
     );
-    try std.testing.expect(std.mem.indexOf(u8, patch, zig_version_response) != null);
+    try std.testing.expect(std.mem.find(u8, patch, zig_version_response) != null);
 }

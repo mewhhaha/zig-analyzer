@@ -76,7 +76,7 @@ pub fn run(context: RuleRun) !void {
                 .start = context.tokens[dot_start].loc.start,
                 .end = context.tokens[brace_end].loc.end,
             },
-            .replacement = try std.fmt.allocPrint(context.allocator, "@splat({s})", .{first_text}),
+            .replacement = try context.allocator.print("@splat({s})", .{first_text}),
         };
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
@@ -92,7 +92,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_vector_splat,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "vector literal repeats '{s}' across all lanes; use @splat", .{first_text}),
+            .message = try context.allocator.print("vector literal repeats '{s}' across all lanes; use @splat", .{first_text}),
             .fixes = fixes,
         });
     }

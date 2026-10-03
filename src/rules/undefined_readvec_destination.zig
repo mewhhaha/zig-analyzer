@@ -19,8 +19,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .undefined_readvec_destination,
             .level = level,
             .span = context.tokens[call_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "readVec reads destination slice descriptors from '{s}', but those descriptors are still undefined",
                 .{binding},
             ),

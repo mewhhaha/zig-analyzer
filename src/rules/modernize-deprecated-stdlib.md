@@ -8,9 +8,10 @@ ships, naming the current replacement. Also recognizes removed reflection
 already-removed names fail to compile with no migration advice; naming the
 replacement at the use site makes the release migration mechanical.
 
-**When it matters.** Enabled by the `modernize` profile. Only literal
-`std.…` paths are matched, not module aliases; declared objects and parameters
-that shadow `std` are skipped. Signature-identical renames
+**When it matters.** Enabled by the `modernize` profile. General replacements
+match literal `std.…` paths. Runtime-safety and target checks also follow proven
+immutable namespace/type aliases and explicit receiver types. Declared objects,
+mutable type aliases, and parameters that shadow standard imports are skipped. Signature-identical renames
 carry a fix and participate in fix-all; shape-changing migrations only name
 the replacement.
 
@@ -18,5 +19,14 @@ Coverage includes formatting moving to `std.mem` and allocator methods,
 bit-set renames, `std.builtin` becoming `std.lang`, optimization-mode names,
 removed managed memory pools, and reflection moving to parallel field arrays.
 The replacements are checked against the pinned standard library.
+
+`std.debug.runtime_safety` describes the standard library's optimization mode;
+guidance asks callers to review their own `@import("builtin").mode.runtimeSafety()`.
+This changes semantics and receives no automatic edit.
+
+Target checks cover `Query.allocDescription` becoming `zigTriple`, deprecated
+architecture-family method spellings, direct `glibc_version` assignment, and
+triple helpers moving to `std.zig.target`. Exact method renames receive fixes;
+changed signatures and argument order receive advice.
 
 See [Zig 0.17 standard-library changes](https://ziglang.org/download/0.17.0/release-notes.html#Standard-Library).

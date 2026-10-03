@@ -6,7 +6,8 @@ IDs are `modernize-deprecated-builtin`, `modernize-removed-syntax`,
 `modernize-build-api`, `modernize-bitcast`, `modernize-extern-bitcast`,
 `modernize-global-linkage`, `modernize-array-list-access`, and
 `modernize-container-init`. The idiomatic profile also adds `prefer-div-ceil`.
-All nine are documented separately in
+The correctness rule `unreported-partial-send` is also new.
+All ten are documented separately in
 the [rule reference](../src/rules/RULES.md).
 No existing rule is removed: the language, lifetime and policy checks remain
 useful, while release-dependent API advice and ownership recognition are updated.
@@ -42,6 +43,9 @@ verify ownership and diagnostics freshness.
   differ on negative zero.
 - Legacy `@cImport` migration inputs still receive duplicate-import diagnostics;
   the linter does not suggest the removed builtin for new 0.17 programs.
+- Deprecation warnings follow resolved local and imported declarations, including
+  standard-library documentation, immutable aliases and typed receivers. CLI
+  cache reuse and editor dependency changes refresh imported warnings.
 
 ## Evidence
 
@@ -94,9 +98,9 @@ broader parser, rule, example and compiler integration coverage.
 | --- | ---: |
 | Retain: language | 76 |
 | Updated shared model | 14 |
-| Retain: policy/project | 36 |
+| Retain: policy/project | 35 |
 | Retain: API verified | 50 |
-| Updated | 13 |
+| Updated | 14 |
 | Retain for migration | 1 |
 | **Total** | **190** |
 
@@ -194,7 +198,7 @@ broader parser, rule, example and compiler integration coverage.
 | [`useless-error-return`](../src/rules/useless-error-return.md) | Retain: language | [compiler_hygiene.zig](../src/rules/compiler_hygiene.zig); Predicate concerns control flow, types, bounds, initialization or lifetime; the 0.17 language changes do not invalidate the recommendation. [R6] |
 | [`exposed-private-type`](../src/rules/exposed-private-type.md) | Retain: language | [compiler_hygiene.zig](../src/rules/compiler_hygiene.zig); Predicate concerns control flow, types, bounds, initialization or lifetime; the 0.17 language changes do not invalidate the recommendation. [R6] |
 | [`exposed-private-error-set`](../src/rules/exposed-private-error-set.md) | Retain: language | [compiler_hygiene.zig](../src/rules/compiler_hygiene.zig); Predicate concerns control flow, types, bounds, initialization or lifetime; the 0.17 language changes do not invalidate the recommendation. [R6] |
-| [`deprecated-declaration`](../src/rules/deprecated-declaration.md) | Retain: policy/project | [compiler_hygiene.zig](../src/rules/compiler_hygiene.zig); Predicate is a local naming, documentation, configuration, contract or project evidence policy; no removed 0.17 API recommendation. |
+| [`deprecated-declaration`](../src/rules/deprecated-declaration.md) | Updated | [deprecated_declarations.zig](../src/rules/deprecated_declarations.zig); Resolves local and imported deprecation markers, immutable aliases and typed receivers, preserving author advice. Imported sources refresh independently of CLI cache hits and editor dependency changes refresh importers. [R4, S1–S7] |
 | [`mutated-container-copy`](../src/rules/mutated-container-copy.md) | Retain: API verified | [compiler_hygiene.zig](../src/rules/compiler_hygiene.zig); Container/resource ownership and invalidation contracts remain applicable. Allocator-taking unmanaged APIs remain current. [S3, S5] |
 | [`prefer-range-for`](../src/rules/prefer-range-for.md) | Retain: language | [helping_hand.zig](../src/rules/helping_hand.zig); Predicate concerns control flow, types, bounds, initialization or lifetime; the 0.17 language changes do not invalidate the recommendation. [R6] |
 | [`prefer-index-of`](../src/rules/prefer-index-of.md) | Updated | [memory_idioms.zig](../src/rules/memory_idioms.zig); Advice uses `std.mem.findScalar` / `find`. [S1] |

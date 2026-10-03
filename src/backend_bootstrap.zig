@@ -37,9 +37,9 @@ pub fn findBackend(io: std.Io, allocator: std.mem.Allocator) !?Backend {
     defer allocator.free(installed_directory);
     if (try findBackendInDirectories(io, allocator, installed_directory, installed_directory)) |backend| return backend;
 
-    const source_install_directory = try std.fs.path.resolve(allocator, &.{ executable_directory, "../backend" });
+    const source_install_directory = try std.Io.Dir.path.resolveAlloc(allocator, &.{ executable_directory, "../backend" });
     defer allocator.free(source_install_directory);
-    const source_install_binary_directory = try std.fs.path.join(allocator, &.{ source_install_directory, "bin" });
+    const source_install_binary_directory = try std.Io.Dir.path.join(allocator, &.{ source_install_directory, "bin" });
     defer allocator.free(source_install_binary_directory);
     if (try findBackendInDirectories(io, allocator, source_install_binary_directory, source_install_directory)) |backend| return backend;
 
@@ -52,9 +52,9 @@ fn findBackendInDirectories(
     binary_directory: []const u8,
     manifest_directory: []const u8,
 ) !?Backend {
-    const binary_path = try std.fs.path.join(allocator, &.{ binary_directory, backendExecutableName() });
+    const binary_path = try std.Io.Dir.path.join(allocator, &.{ binary_directory, backendExecutableName() });
     errdefer allocator.free(binary_path);
-    const backend_manifest_path = try std.fs.path.join(allocator, &.{ manifest_directory, "zig-analyzer-backend.json" });
+    const backend_manifest_path = try std.Io.Dir.path.join(allocator, &.{ manifest_directory, "zig-analyzer-backend.json" });
     errdefer allocator.free(backend_manifest_path);
     if (try pathExists(io, binary_path) and try pathExists(io, backend_manifest_path)) {
         return .{
@@ -68,7 +68,7 @@ fn findBackendInDirectories(
 }
 
 fn installedBackendDirectory(allocator: std.mem.Allocator, executable_directory: []const u8) ![]u8 {
-    return std.fs.path.resolve(allocator, &.{ executable_directory, "../libexec/zig-analyzer" });
+    return std.Io.Dir.path.resolveAlloc(allocator, &.{ executable_directory, "../libexec/zig-analyzer" });
 }
 
 fn backendExecutableName() []const u8 {
@@ -251,7 +251,7 @@ fn patchSha256(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(bytes);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(digest, .lower)});
+    return try allocator.print("{s}", .{std.fmt.bytesToHex(digest, .lower)});
 }
 
 fn commandOutput(

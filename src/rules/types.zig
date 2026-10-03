@@ -158,6 +158,7 @@ pub const Rule = enum {
     discarded_read_count,
     discarded_realloc_result,
     discarded_write_count,
+    unreported_partial_send,
     unchecked_first_element,
     unsequenced_state_access,
     unchecked_slice_reinterpretation,
@@ -262,6 +263,7 @@ pub const Rule = enum {
             .discarded_read_count,
             .discarded_realloc_result,
             .discarded_write_count,
+            .unreported_partial_send,
             .unchecked_first_element,
             .unsequenced_state_access,
             .unchecked_slice_reinterpretation,
@@ -545,7 +547,7 @@ test "rule reference documents every rule" {
 
     for (std.enums.values(Rule)) |rule| {
         var heading_bytes: [128]u8 = undefined;
-        const link = try std.fmt.bufPrint(&heading_bytes, "]({s}.md)", .{rule.code()});
+        const link = try std.mem.print(&heading_bytes, "]({s}.md)", .{rule.code()});
         if (std.mem.count(u8, reference, link) != 1) {
             std.debug.print("rule reference needs exactly one '{s}' link\n", .{link});
             return error.IncompleteRuleReference;
@@ -554,8 +556,8 @@ test "rule reference documents every rule" {
 
     inline for (@typeInfo(Rule).@"enum".field_names) |enum_name| {
         const document = @embedFile(comptime derivedRuleDocumentPath(enum_name));
-        if (std.mem.indexOf(u8, document, "**Why it matters.**") == null or
-            std.mem.indexOf(u8, document, "**When it matters.**") == null)
+        if (std.mem.find(u8, document, "**Why it matters.**") == null or
+            std.mem.find(u8, document, "**When it matters.**") == null)
         {
             std.debug.print("rule document '{s}' needs why and when explanations\n", .{enum_name});
             return error.IncompleteRuleReference;

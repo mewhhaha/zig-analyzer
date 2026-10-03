@@ -52,11 +52,11 @@ pub fn run(context: RuleRun) !void {
         const op_text = context.tokenText(op_index);
 
         const message = if (token.tag == .equal_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} == {s}' compares identical operands; floating-point NaN is not equal to itself", .{ operand_text, operand_text })
+            try context.allocator.print("comparison '{s} == {s}' compares identical operands; floating-point NaN is not equal to itself", .{ operand_text, operand_text })
         else if (token.tag == .bang_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} != {s}' compares identical operands; if checking for NaN, use std.math.isNan", .{ operand_text, operand_text })
+            try context.allocator.print("comparison '{s} != {s}' compares identical operands; if checking for NaN, use std.math.isNan", .{ operand_text, operand_text })
         else
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} {s} {s}' compares identical operands; check whether a different value was intended", .{ operand_text, op_text, operand_text });
+            try context.allocator.print("comparison '{s} {s} {s}' compares identical operands; check whether a different value was intended", .{ operand_text, op_text, operand_text });
 
         try context.emit(.{
             .rule = .identical_comparison_operands,
@@ -112,7 +112,7 @@ fn pathAfter(tokens: []const std.zig.Token, start: usize) ?PathSpan {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "identical comparison operands reports comparisons of identical paths" {
@@ -129,10 +129,10 @@ test "identical comparison operands reports comparisons of identical paths" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 4), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "x == x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "s.len != s.len") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "x < x") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[3].message, "s.ptr.* == s.ptr.*") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "x == x") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "s.len != s.len") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "x < x") != null);
+    try std.testing.expect(std.mem.find(u8, findings[3].message, "s.ptr.* == s.ptr.*") != null);
 }
 
 test "comparisons of distinct operands stay unchanged" {

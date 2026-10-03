@@ -39,7 +39,7 @@ test "compiler session tracks unsaved overlay syntax without changing the file" 
         error.SemanticsUnavailable,
         session.replaceOverlay("file:///workspace/outside-compile-unit.zig", 1, "const value = 1;\n"),
     );
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{fixture_path});
     defer std.testing.allocator.free(uri);
     try std.testing.expectError(error.SemanticsUnavailable, session.analyzeOverlay(uri, 1));
     const first_source = "const first = 1;\nconst second = 2;\n";
@@ -73,7 +73,7 @@ test "compiler session accepts a multi-kilobyte unsaved overlay" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(fixture_path);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{fixture_path});
     defer std.testing.allocator.free(uri);
 
     var session = try zig_analyzer.compiler_session.Session.start(
@@ -105,7 +105,7 @@ test "compiler diagnostics use the unsaved root overlay" {
         .limited(1024 * 1024),
     );
     defer std.testing.allocator.free(saved_source);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{fixture_path});
     defer std.testing.allocator.free(uri);
 
     var session = try zig_analyzer.compiler_session.Session.start(
@@ -125,7 +125,7 @@ test "compiler diagnostics use the unsaved root overlay" {
     defer changed_diagnostics.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), changed_diagnostics.errorMessageCount());
     const changed_message = changed_diagnostics.getErrorMessage(changed_diagnostics.getMessages()[0]);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         changed_diagnostics.nullTerminatedString(changed_message.msg),
         "found 'bool'",
@@ -148,7 +148,7 @@ test "incremental diagnostics recover across repeated root overlay edits" {
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = saved_source });
     const root_path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(root_path);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{root_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{root_path});
     defer std.testing.allocator.free(uri);
     var session = try zig_analyzer.compiler_session.Session.start(std.testing.io, std.testing.allocator, .empty, root_path);
     defer session.deinit();
@@ -183,7 +183,7 @@ test "incremental diagnostics refresh disk imports behind an unchanged root over
     try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const value: u32 = 1;\n" });
     const root_path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(root_path);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{root_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{root_path});
     defer std.testing.allocator.free(uri);
     var session = try zig_analyzer.compiler_session.Session.start(std.testing.io, std.testing.allocator, .empty, root_path);
     defer session.deinit();
@@ -205,7 +205,7 @@ fn expectCompilerDiagnostic(session: *zig_analyzer.compiler_session.Session, exp
     try std.testing.expectEqual(@as(u32, if (expected_message != null) 1 else 0), diagnostics.errorMessageCount());
     if (expected_message) |expected| {
         const message = diagnostics.getErrorMessage(diagnostics.getMessages()[0]);
-        try std.testing.expect(std.mem.indexOf(u8, diagnostics.nullTerminatedString(message.msg), expected) != null);
+        try std.testing.expect(std.mem.find(u8, diagnostics.nullTerminatedString(message.msg), expected) != null);
     }
 }
 
@@ -224,7 +224,7 @@ test "compiler session returns structured semantic errors" {
     );
     defer session.deinit();
 
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{fixture_path});
     defer std.testing.allocator.free(uri);
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -239,7 +239,7 @@ test "compiler session returns structured semantic errors" {
     try std.testing.expectEqual(@as(u32, 1), diagnostics.errorMessageCount());
 
     const message = diagnostics.getErrorMessage(diagnostics.getMessages()[0]);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         diagnostics.nullTerminatedString(message.msg),
         "expected type 'u32'",

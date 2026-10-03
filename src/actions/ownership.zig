@@ -30,8 +30,7 @@ fn addOwnedSliceReturn(context: ActionRun) !void {
             "Return owned container storage",
             .quickfix,
             expression_span,
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "{s}{s}.toOwnedSlice({s}){s}",
                 .{ prefix, container, allocator, suffix },
             ),
@@ -76,7 +75,7 @@ fn addReturnedOwnershipTransfer(context: ActionRun) !void {
         if (!function.returnsError(context) or
             !everyReturnTransfersOwnership(context, binding, defer_end + 1, function.body_end)) continue;
         try context.oneEdit(
-            try std.fmt.allocPrint(context.allocator, "Transfer ownership of '{s}' on success", .{binding}),
+            try context.allocator.print("Transfer ownership of '{s}' on success", .{binding}),
             .refactor_rewrite,
             token.loc,
             "errdefer",
@@ -141,8 +140,7 @@ fn addCheckedAllocationSize(context: ActionRun) !void {
             "Check allocation size overflow",
             .refactor_rewrite,
             product_span,
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "(@import(\"std\").math.mul(usize, {s}, {s}) catch @panic(\"allocation size overflow\"))",
                 .{ context.tokenText(multiplication_index - 1), context.tokenText(multiplication_index + 1) },
             ),
@@ -199,7 +197,7 @@ fn addPoisonAfterDeinit(context: ActionRun) !void {
             "Poison after deinit",
             .refactor_rewrite,
             .{ .start = context.tokens[body_end].loc.start, .end = context.tokens[body_end].loc.start },
-            try std.fmt.allocPrint(context.allocator, "{s}    self.* = undefined;\n", .{indentation}),
+            try context.allocator.print("{s}    self.* = undefined;\n", .{indentation}),
             .{},
         );
     }
@@ -229,10 +227,10 @@ test "owned slices and successful ownership transfers are explicit" {
     const source: [:0]const u8 =
         "fn list(a: anytype) ![]u8 { var values = std.ArrayList(u8).empty; defer values.deinit(a); return values.items; } " ++
         "fn bytes(a: anytype) ![]u8 { const value = try a.alloc(u8, 1); defer a.free(value); return value; }";
-    const items = std.mem.indexOf(u8, source, "values.items") orelse unreachable;
+    const items = std.mem.find(u8, source, "values.items") orelse unreachable;
     const owned = try registry.actions(arena.allocator(), source, .{ .start = items, .end = items + 12 }, &.{});
     try std.testing.expectEqualStrings("try values.toOwnedSlice(a)", owned[0].edits[0].replacement);
-    const defer_start = std.mem.lastIndexOf(u8, source, "defer") orelse unreachable;
+    const defer_start = std.mem.findLast(u8, source, "defer") orelse unreachable;
     const transfer = try registry.actions(arena.allocator(), source, .{ .start = defer_start, .end = defer_start + 5 }, &.{});
     try std.testing.expectEqualStrings("errdefer", transfer[0].edits[0].replacement);
 }
@@ -242,10 +240,10 @@ test "allocation products get an overflow-checking refactor" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run(a: anytype, count: usize) !void { _ = try a.alloc(u8, count * 4); }";
-    const start = std.mem.indexOf(u8, source, "count * 4") orelse unreachable;
+    const start = std.mem.find(u8, source, "count * 4") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 9 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "math.mul") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "math.mul") != null);
 }
 
 test "checked allocation sizes keep trailing addends out of the catch" {
@@ -254,7 +252,7 @@ test "checked allocation sizes keep trailing addends out of the catch" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn run(a: anytype, count: usize, header_len: usize) !void { _ = try a.alloc(u8, count * 4 + header_len); }";
-    const start = std.mem.indexOf(u8, source, "count * 4") orelse unreachable;
+    const start = std.mem.find(u8, source, "count * 4") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 9 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings(
@@ -268,7 +266,7 @@ test "field-access operands get no size check rewrite" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run(a: anytype, hdr: anytype) !void { _ = try a.alloc(u8, hdr.count * 4); }";
-    const start = std.mem.indexOf(u8, source, "count * 4") orelse unreachable;
+    const start = std.mem.find(u8, source, "count * 4") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 9 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -280,21 +278,21 @@ test "defer blocks and extra success returns keep their defer" {
     const block_source: [:0]const u8 =
         "fn both(a: anytype) ![]u8 { const one = try a.dupe(u8, \"x\"); const two = try a.dupe(u8, \"y\"); " ++
         "defer { a.free(one); a.free(two); } return one; }";
-    const block_defer = std.mem.indexOf(u8, block_source, "defer") orelse unreachable;
+    const block_defer = std.mem.find(u8, block_source, "defer") orelse unreachable;
     const block = try registry.actions(arena.allocator(), block_source, .{ .start = block_defer, .end = block_defer + 5 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), block.len);
 
     const branch_source: [:0]const u8 =
         "fn pick(a: anytype, flag: bool) ![]u8 { const value = try a.dupe(u8, \"x\"); defer a.free(value); " ++
         "if (flag) return try a.dupe(u8, \"y\"); return value; }";
-    const branch_defer = std.mem.indexOf(u8, branch_source, "defer") orelse unreachable;
+    const branch_defer = std.mem.find(u8, branch_source, "defer") orelse unreachable;
     const branch = try registry.actions(arena.allocator(), branch_source, .{ .start = branch_defer, .end = branch_defer + 5 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), branch.len);
 
     const error_source: [:0]const u8 =
         "fn load(a: anytype, flag: bool) ![]u8 { const value = try a.dupe(u8, \"x\"); defer a.free(value); " ++
         "if (flag) return error.Missing; return value; }";
-    const error_defer = std.mem.indexOf(u8, error_source, "defer") orelse unreachable;
+    const error_defer = std.mem.find(u8, error_source, "defer") orelse unreachable;
     const propagated = try registry.actions(arena.allocator(), error_source, .{ .start = error_defer, .end = error_defer + 5 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), propagated.len);
     try std.testing.expectEqualStrings("errdefer", propagated[0].edits[0].replacement);
@@ -307,7 +305,7 @@ test "owned slice returns ignore same-named lists in other functions" {
     const source: [:0]const u8 =
         "fn first(a: anytype) ![]u8 { var values = std.ArrayList(u8).empty; defer values.deinit(a); return values.items; } " ++
         "fn second() ![]u8 { return values.items; }";
-    const items = std.mem.lastIndexOf(u8, source, "values.items") orelse unreachable;
+    const items = std.mem.findLast(u8, source, "values.items") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = items, .end = items + 12 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -323,7 +321,7 @@ test "deinit methods offer poisoning self as their final statement" {
         "        a.free(self.bytes);\n" ++
         "    }\n" ++
         "};";
-    const name = std.mem.indexOf(u8, source, "deinit") orelse unreachable;
+    const name = std.mem.find(u8, source, "deinit") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = name, .end = name + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings("Poison after deinit", actions[0].title);
@@ -336,7 +334,7 @@ test "deinit stubs that discard self get no poison action" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "const Tight = struct { fn deinit(self: *Tight) void { _ = self; } };";
-    const name = std.mem.indexOf(u8, source, "deinit") orelse unreachable;
+    const name = std.mem.find(u8, source, "deinit") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = name, .end = name + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -347,13 +345,13 @@ test "const-self and already-poisoned deinit methods get no poison action" {
     defer arena.deinit();
     const const_source: [:0]const u8 =
         "const Buffer = struct { fn deinit(self: *const Buffer) void { _ = self; } };";
-    const const_name = std.mem.indexOf(u8, const_source, "deinit") orelse unreachable;
+    const const_name = std.mem.find(u8, const_source, "deinit") orelse unreachable;
     const const_actions = try registry.actions(arena.allocator(), const_source, .{ .start = const_name, .end = const_name + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), const_actions.len);
 
     const poisoned_source: [:0]const u8 =
         "const Buffer = struct { bytes: []u8, fn deinit(self: *Buffer, a: anytype) void { a.free(self.bytes); self.* = undefined; } };";
-    const poisoned_name = std.mem.indexOf(u8, poisoned_source, "deinit") orelse unreachable;
+    const poisoned_name = std.mem.find(u8, poisoned_source, "deinit") orelse unreachable;
     const poisoned_actions = try registry.actions(arena.allocator(), poisoned_source, .{ .start = poisoned_name, .end = poisoned_name + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), poisoned_actions.len);
 }

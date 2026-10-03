@@ -21,8 +21,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .copied_io_interface,
             .level = level,
             .span = context.tokens[copied_field].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "copying the '{s}' interface detaches it from implementation state used by its callbacks; keep the implementation value and pass a pointer to its interface",
                 .{context.tokenText(copied_field)},
             ),
@@ -111,9 +110,9 @@ fn bindingIsIoImplementation(context: RuleRun, binding: []const u8, before: usiz
         "std.fs.File.Writer",
         "std.Io.Writer.Allocating",
     })) return true;
-    if (std.mem.indexOf(u8, source, ".reader(") == null and
-        std.mem.indexOf(u8, source, ".writer(") == null) return false;
-    if (std.mem.indexOf(u8, source, "std.") != null) return true;
+    if (std.mem.find(u8, source, ".reader(") == null and
+        std.mem.find(u8, source, ".writer(") == null) return false;
+    if (std.mem.find(u8, source, "std.") != null) return true;
 
     const method_index = findMethod(context, declaration.start, declaration.end, &.{ "reader", "writer" }) orelse return false;
     if (method_index < 2 or context.tokens[method_index - 2].tag != .identifier) return false;
@@ -123,18 +122,18 @@ fn bindingIsIoImplementation(context: RuleRun, binding: []const u8, before: usiz
 fn bindingIsWriterImplementation(context: RuleRun, binding: []const u8, before: usize) bool {
     const declaration = bindingDeclaration(context, binding, before) orelse return false;
     const source = statementSource(context, declaration.start, declaration.end);
-    return std.mem.indexOf(u8, source, "std.Io.Writer.") != null and
-        std.mem.indexOf(u8, source, "std.Io.Writer =") == null;
+    return std.mem.find(u8, source, "std.Io.Writer.") != null and
+        std.mem.find(u8, source, "std.Io.Writer =") == null;
 }
 
 fn bindingIsFile(context: RuleRun, binding: []const u8, before: usize) bool {
     const declaration = bindingDeclaration(context, binding, before) orelse return false;
     const source = statementSource(context, declaration.start, declaration.end);
     return containsAny(source, &.{ "std.Io.File", "std.fs.File", "std.Io.Dir", "std.fs.cwd()" }) and
-        (std.mem.indexOf(u8, source, "openFile(") != null or
-            std.mem.indexOf(u8, source, "createFile(") != null or
-            std.mem.indexOf(u8, source, ": std.Io.File") != null or
-            std.mem.indexOf(u8, source, ": std.fs.File") != null);
+        (std.mem.find(u8, source, "openFile(") != null or
+            std.mem.find(u8, source, "createFile(") != null or
+            std.mem.find(u8, source, ": std.Io.File") != null or
+            std.mem.find(u8, source, ": std.fs.File") != null);
 }
 
 const Declaration = struct {
@@ -203,7 +202,7 @@ fn statementSource(context: RuleRun, start: usize, end: usize) []const u8 {
 }
 
 fn containsAny(source: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| if (std.mem.indexOf(u8, source, needle) != null) return true;
+    for (needles) |needle| if (std.mem.find(u8, source, needle) != null) return true;
     return false;
 }
 

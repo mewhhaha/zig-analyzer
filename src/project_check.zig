@@ -4,17 +4,59 @@ const analysis = @import("analysis.zig");
 const check_cache = @import("check_cache.zig");
 const compile_units = @import("compile_units.zig");
 const compiler_session = @import("compiler_session.zig");
+const deprecation_loader = @import("deprecation_loader.zig");
+const deprecated_declarations = @import("rules/deprecated_declarations.zig");
 const generated_source = @import("rules/generated_source.zig");
 const project_rules = @import("rules/project.zig");
 
 const max_source_size = 64 * 1024 * 1024;
 const max_configuration_size = 1024 * 1024;
 
+test "CLI imported deprecations refresh when an unscanned dependency changes despite cache" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const api = @import(\"dependency.zig\"); pub fn run() void { api.old(); }" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "/// Deprecated; use current\npub fn old() void {}" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const first = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &output.writer);
+    try std.testing.expectEqual(@as(u8, 1), first);
+    try std.testing.expect(std.mem.find(u8, output.written(), "warning[deprecated-declaration]") != null);
+    try std.testing.expect(std.mem.find(u8, output.written(), "use current") != null);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub fn old() void {}" });
+    var refreshed: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer refreshed.deinit();
+    const second = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &refreshed.writer);
+    try std.testing.expectEqual(@as(u8, 0), second);
+    try std.testing.expect(std.mem.find(u8, refreshed.written(), "deprecated-declaration") == null);
+}
+
 pub const Options = struct {
     path: []const u8 = ".",
     fix: bool = false,
     cache: bool = true,
 };
+
+test "CLI deprecations skip ambiguous named module bindings and oversized imports" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const api = @import(\"api\"); const large = @import(\"large.zig\"); pub fn run() void { api.old(); _ = large.old; }" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "deprecated.zig", .data = "/// Deprecated: wrong module\npub fn old() void {}" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "custom.zig", .data = "pub fn old() void {}" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "const std = @import(\"std\"); pub fn build(b: *std.Build) void { _ = b.addModule(\"api\", .{ .root_source_file = b.path(\"deprecated.zig\") }); const custom = b.createModule(.{ .root_source_file = b.path(\"custom.zig\") }); const root = b.createModule(.{ .root_source_file = b.path(\"main.zig\") }); root.addImport(\"api\", custom); }" });
+    const large = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024 + 1);
+    defer std.testing.allocator.free(large);
+    @memset(large, ' ');
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "large.zig", .data = large });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(@as(u8, 0), try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path, .cache = false }, &output.writer));
+    try std.testing.expect(std.mem.find(u8, output.written(), "deprecated-declaration") == null);
+}
 
 const Summary = struct {
     files_checked: usize = 0,
@@ -256,6 +298,7 @@ fn reportProjectFindings(
             .tokens = loaded_file.tokens,
         });
     }
+    try reportImportedDeprecations(io, allocator, root, files.items, configuration, writer, summary);
     const cache_sources = try allocator.alloc(check_cache.ProjectSource, files.items.len);
     for (files.items, cache_sources) |file, *cache_source| cache_source.* = .{
         .path = file.path,
@@ -322,6 +365,57 @@ fn reportProjectFindings(
     if (compiler_independent) cache.storeProject(io, allocator, cache_sources, records.items);
 }
 
+fn reportImportedDeprecations(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    files: []const project_rules.SourceFile,
+    configuration: analysis.Configuration,
+    writer: *std.Io.Writer,
+    summary: *Summary,
+) !void {
+    if (configuration.level(.deprecated_declaration) == .off) return;
+    var loader: deprecation_loader.Context = .{ .io = io };
+    defer loader.deinit(allocator);
+    var index: deprecated_declarations.Index = .init(allocator, loader.loader());
+    defer index.deinit();
+    const paths = try allocator.alloc([]const u8, files.len);
+    var initialized: usize = 0;
+    defer {
+        for (paths[0..initialized]) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    for (files, paths) |file, *path| {
+        path.* = try std.Io.Dir.path.resolveAlloc(allocator, &.{ root.absolute_path, file.path });
+        initialized += 1;
+        try index.addSource(.{ .path = path.*, .source = file.source, .tokens = file.tokens });
+    }
+    for (files, paths) |file, path| {
+        if (generated_source.isTranslateCOutput(file.source)) continue;
+        var found: std.ArrayList(analysis.Finding) = .empty;
+        defer found.deinit(allocator);
+        try index.run(.{
+            .allocator = allocator,
+            .source = file.source,
+            .tokens = file.tokens.?,
+            .configuration = configuration,
+            .findings = &found,
+        }, path, true);
+        if (found.items.len == 0) continue;
+        const locator = try SourceLocator.init(allocator, file.source);
+        defer allocator.free(locator.line_starts);
+        const display = try displayPath(allocator, root, file.path);
+        defer if (!std.mem.eql(u8, root.display_path, ".")) allocator.free(display);
+        for (found.items) |finding| {
+            const location = locator.location(finding.span.start);
+            try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
+                display, location.line, location.column, @tagName(finding.level), finding.rule.code(), finding.message,
+            });
+            summary.findings += 1;
+        }
+    }
+}
+
 fn collectCompilerFacts(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -337,10 +431,10 @@ fn collectCompilerFacts(
     defer root_paths.deinit(allocator);
     var root_declarations_complete = true;
     for (loaded_files) |loaded_file| {
-        if (!std.mem.eql(u8, std.fs.path.basename(loaded_file.relative_path), "build.zig")) continue;
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(loaded_file.relative_path), "build.zig")) continue;
         const build_source = loaded_file.source orelse continue;
         if (!try compile_units.rootSourceDeclarationsAreStatic(allocator, build_source)) root_declarations_complete = false;
-        const build_directory = std.fs.path.dirname(try std.fs.path.join(
+        const build_directory = std.Io.Dir.path.dirname(try std.Io.Dir.path.join(
             allocator,
             &.{ root.absolute_path, loaded_file.relative_path },
         )) orelse root.absolute_path;
@@ -375,7 +469,7 @@ fn collectCompilerFacts(
                 .fields = resolved.fields,
             });
         };
-        const relative_root = try std.fs.path.relative(
+        const relative_root = try std.Io.Dir.path.relativeAlloc(
             allocator,
             "/",
             null,
@@ -414,7 +508,7 @@ fn collectPublicTypeNames(
 }
 
 fn compilerDeclarationBaseName(declaration: []const u8) []const u8 {
-    const separator = std.mem.lastIndexOfScalar(u8, declaration, '.') orelse return declaration;
+    const separator = std.mem.findScalarLast(u8, declaration, '.') orelse return declaration;
     return declaration[separator + 1 ..];
 }
 
@@ -436,12 +530,12 @@ fn openScanRoot(io: std.Io, allocator: std.mem.Allocator, requested_path: []cons
     }
     if (stat.kind != .file or !std.mem.endsWith(u8, absolute_path, ".zig")) return error.NotZigFile;
 
-    const parent_path = std.fs.path.dirname(absolute_path) orelse return error.NotZigFile;
+    const parent_path = std.Io.Dir.path.dirname(absolute_path) orelse return error.NotZigFile;
     return .{
         .dir = try std.Io.Dir.openDirAbsolute(io, parent_path, .{}),
         .absolute_path = parent_path,
-        .display_path = std.fs.path.dirname(requested_path) orelse ".",
-        .single_file = std.fs.path.basename(absolute_path),
+        .display_path = std.Io.Dir.path.dirname(requested_path) orelse ".",
+        .single_file = std.Io.Dir.path.basename(absolute_path),
     };
 }
 
@@ -452,7 +546,7 @@ fn loadConfiguration(
 ) !analysis.Configuration {
     var directory_path = scan_root;
     while (true) {
-        const configuration_path = try std.fs.path.join(allocator, &.{ directory_path, "zig-analyzer.json" });
+        const configuration_path = try std.Io.Dir.path.join(allocator, &.{ directory_path, "zig-analyzer.json" });
         defer allocator.free(configuration_path);
         const source = std.Io.Dir.cwd().readFileAlloc(
             io,
@@ -463,8 +557,7 @@ fn loadConfiguration(
             error.FileNotFound => null,
             else => {
                 var configuration = analysis.Configuration.defaults();
-                configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                configuration.warning = try allocator.print(
                     "could not read {s}: {t}",
                     .{ configuration_path, err },
                 );
@@ -473,7 +566,7 @@ fn loadConfiguration(
         };
         if (source) |configuration_source| return try analysis.parseConfiguration(allocator, configuration_source);
 
-        const parent_path = std.fs.path.dirname(directory_path) orelse return analysis.Configuration.defaults();
+        const parent_path = std.Io.Dir.path.dirname(directory_path) orelse return analysis.Configuration.defaults();
         if (std.mem.eql(u8, parent_path, directory_path)) return analysis.Configuration.defaults();
         directory_path = parent_path;
     }
@@ -664,14 +757,14 @@ fn checkFile(
 
 fn configurationForPath(configuration: analysis.Configuration, path: []const u8) analysis.Configuration {
     var file_configuration = configuration;
-    if (isTestOnlyPath(path) or std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) {
+    if (isTestOnlyPath(path) or std.mem.eql(u8, std.Io.Dir.path.basename(path), "build.zig")) {
         file_configuration.levels[@backingInt(analysis.Rule.prefer_log_over_print)] = .off;
     }
     return file_configuration;
 }
 
 fn isTestOnlyPath(path: []const u8) bool {
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     if (std.mem.endsWith(u8, basename, "_test.zig") or std.mem.endsWith(u8, basename, "_tests.zig")) return true;
     var components = std.mem.splitAny(u8, path, "/\\");
     while (components.next()) |component| {
@@ -827,7 +920,7 @@ fn replaceFile(io: std.Io, dir: std.Io.Dir, path: []const u8, source: []const u8
 
 fn displayPath(allocator: std.mem.Allocator, root: ScanRoot, relative_path: []const u8) ![]const u8 {
     if (std.mem.eql(u8, root.display_path, ".")) return relative_path;
-    return try std.fs.path.join(allocator, &.{ root.display_path, relative_path });
+    return try std.Io.Dir.path.join(allocator, &.{ root.display_path, relative_path });
 }
 
 const SourceLocation = struct { line: usize, column: usize };
@@ -839,7 +932,7 @@ test "source locations use indexed UTF-8 line and column positions" {
     const locator = try SourceLocator.init(arena_state.allocator(), source);
 
     try std.testing.expectEqual(SourceLocation{ .line = 1, .column = 1 }, locator.location(0));
-    const second_pi = std.mem.lastIndexOf(u8, source, "π").?;
+    const second_pi = std.mem.findLast(u8, source, "π").?;
     try std.testing.expectEqual(SourceLocation{ .line = 2, .column = 3 }, locator.location(second_pi));
     try std.testing.expectEqual(SourceLocation{ .line = 3, .column = 1 }, locator.location(source.len));
 }
@@ -880,7 +973,7 @@ test "check fixes safe findings recursively and skips dependency directories" {
     try temporary.dir.writeFile(io, .{ .sub_path = "vendor/package/ignored.zig", .data = "fn vendored() void { missing(); }\n" });
     try temporary.dir.writeFile(io, .{ .sub_path = "tests/syntax/fixture.zig", .data = "fn fixture() void { fixtureCall(); }\n" });
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -892,10 +985,10 @@ test "check fixes safe findings recursively and skips dependency directories" {
     try std.testing.expectEqualStrings("fn main(ready: bool) void { var answer: u32 = 42; _ = answer; _ = ready; missing(); }\n", fixed);
     const ignored = try temporary.dir.readFileAlloc(io, "node_modules/package/ignored.zig", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(ignored);
-    try std.testing.expect(std.mem.indexOf(u8, ignored, "var dependency") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "unresolved-call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "fixtureCall") == null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "checked 1 Zig files") != null);
+    try std.testing.expect(std.mem.find(u8, ignored, "var dependency") != null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), "unresolved-call") != null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), "fixtureCall") == null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), "checked 1 Zig files") != null);
 }
 
 test "concurrent checks preserve sorted deterministic output" {
@@ -904,7 +997,7 @@ test "concurrent checks preserve sorted deterministic output" {
     defer temporary.cleanup();
     try temporary.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "fn b() void { missingB(); }\n" });
     try temporary.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "fn a() void { missingA(); }\n" });
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
 
     var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -915,8 +1008,8 @@ test "concurrent checks preserve sorted deterministic output" {
     _ = try runWithWriter(io, std.testing.allocator, .{ .path = path, .cache = false }, &second.writer);
 
     try std.testing.expectEqualStrings(first.writer.buffered(), second.writer.buffered());
-    const first_a = std.mem.indexOf(u8, first.writer.buffered(), "a.zig") orelse return error.TestUnexpectedResult;
-    const first_b = std.mem.indexOf(u8, first.writer.buffered(), "b.zig") orelse return error.TestUnexpectedResult;
+    const first_a = std.mem.find(u8, first.writer.buffered(), "a.zig") orelse return error.TestUnexpectedResult;
+    const first_b = std.mem.find(u8, first.writer.buffered(), "b.zig") orelse return error.TestUnexpectedResult;
     try std.testing.expect(first_a < first_b);
 }
 
@@ -925,7 +1018,7 @@ test "check exclusions reject parent paths" {
         \\{"check":{"exclude":["../fixtures"]}}
     );
     defer std.testing.allocator.free(configuration.warning.?);
-    try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, "../fixtures") != null);
+    try std.testing.expect(std.mem.find(u8, configuration.warning.?, "../fixtures") != null);
 }
 
 test "check reports UTF-8 source locations without modifying explicit fixes" {
@@ -937,14 +1030,14 @@ test "check reports UTF-8 source locations without modifying explicit fixes" {
         .data = "const label = \"😀\"; missing();\n",
     });
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/main.zig", .{temporary.sub_path});
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}/main.zig", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     const exit_code = try runWithWriter(io, std.testing.allocator, .{ .path = path, .fix = true }, &output.writer);
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), ":1:20: error[unresolved-call]") != null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), ":1:20: error[unresolved-call]") != null);
     const unchanged = try temporary.dir.readFileAlloc(io, "main.zig", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(unchanged);
     try std.testing.expectEqualStrings("const label = \"😀\"; missing();\n", unchanged);
@@ -963,7 +1056,7 @@ test "check discovers project configuration for style fixes" {
         .data = "/// Runs the configured operation.\npub fn run(enabled: bool) void { _ = enabled == true; }\n",
     });
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -976,7 +1069,7 @@ test "check discovers project configuration for style fixes" {
         "/// Runs the configured operation.\npub fn run(enabled: bool) void { _ = enabled; }\n",
         fixed,
     );
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "applied 1 safe edits across 1 files") != null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), "applied 1 safe edits across 1 files") != null);
 }
 
 test "check reports normalized duplicate module imports" {
@@ -993,12 +1086,12 @@ test "check reports normalized duplicate module imports" {
     });
     try temporary.dir.writeFile(io, .{ .sub_path = "shared.zig", .data = "pub const value = 1;\n" });
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(path);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     const exit_code = try runWithWriter(io, std.testing.allocator, .{ .path = path }, &output.writer);
 
     try std.testing.expectEqual(@as(u8, 1), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "duplicate-module-import") != null);
+    try std.testing.expect(std.mem.find(u8, output.writer.buffered(), "duplicate-module-import") != null);
 }

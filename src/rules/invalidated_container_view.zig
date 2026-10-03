@@ -38,8 +38,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .invalidated_container_view,
                 .level = level,
                 .span = context.tokens[view.name_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "{s} '{s}' into container '{s}' is used after {s}, which may invalidate the view or its backing storage",
                     .{ if (view.kind == .items) "slice" else "iterator", view_name, container_name, invalidation.method },
                 ),
@@ -68,8 +67,7 @@ fn findArenaResetViews(context: RuleRun, level: rule_types.Level) !void {
             .rule = .invalidated_container_view,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "arena allocation '{s}' is used after {s}.reset invalidates it",
                 .{ binding, arena },
             ),
@@ -178,8 +176,7 @@ fn findFieldContainerViews(context: RuleRun, level: rule_types.Level) !void {
             .rule = .invalidated_container_view,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "slice '{s}' into container field '{s}.{s}' is used after {s}, which may invalidate its backing storage",
                 .{ view_name, base_name, field_name, invalidation.method },
             ),
@@ -279,8 +276,7 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
                 .rule = .invalidated_container_view,
                 .level = level,
                 .span = context.tokens[declaration_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "view '{s}' is used after realloc invalidates its source allocation",
                     .{view_name},
                 ),
@@ -484,7 +480,7 @@ test "container views used after possible reallocation warn" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "append") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "append") != null);
 }
 
 test "arena allocations used after reset warn" {
@@ -584,7 +580,7 @@ test "container field views used after possible reallocation warn" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "self.output") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "self.output") != null);
 }
 
 test "views not used after mutation stay clean" {

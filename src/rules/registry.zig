@@ -57,6 +57,7 @@ const rule_modules = .{
     @import("modernize.zig"),
     @import("modernize_layout.zig"),
     @import("modernize_containers.zig"),
+    @import("modernize_io_targets.zig"),
     @import("discipline_policy.zig"),
     @import("invariant_loop_condition.zig"),
     @import("self_assignment.zig"),

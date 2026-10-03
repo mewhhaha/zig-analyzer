@@ -32,7 +32,7 @@ pub fn run(context: RuleRun) !void {
             context.source[context.tokens[for_index + 2].loc.start..context.tokens[paren_end - 1].loc.end],
             " \t\r\n",
         );
-        if (iterable.len == 0 or std.mem.indexOfScalar(u8, iterable, ',') != null) continue;
+        if (iterable.len == 0 or std.mem.findScalar(u8, iterable, ',') != null) continue;
 
         var cursor: usize = capture_end + 2;
         const has_try = context.tokens[cursor].tag == .keyword_try;
@@ -78,18 +78,18 @@ pub fn run(context: RuleRun) !void {
         if (std.mem.eql(u8, args_text, capture_name)) {
             // single argument: receiver.appendSlice(iterable)
             replacement = if (has_try)
-                try std.fmt.allocPrint(context.allocator, "try {s}.{s}({s});", .{ receiver_text, slice_method_name, iterable })
+                try context.allocator.print("try {s}.{s}({s});", .{ receiver_text, slice_method_name, iterable })
             else
-                try std.fmt.allocPrint(context.allocator, "{s}.{s}({s});", .{ receiver_text, slice_method_name, iterable });
-        } else if (std.mem.endsWith(u8, args_text, capture_name) and std.mem.indexOfScalar(u8, args_text, ',') != null) {
-            const comma_pos = std.mem.lastIndexOfScalar(u8, args_text, ',').?;
+                try context.allocator.print("{s}.{s}({s});", .{ receiver_text, slice_method_name, iterable });
+        } else if (std.mem.endsWith(u8, args_text, capture_name) and std.mem.findScalar(u8, args_text, ',') != null) {
+            const comma_pos = std.mem.findScalarLast(u8, args_text, ',').?;
             const first_arg = std.mem.trim(u8, args_text[0..comma_pos], " \t\r\n");
             const second_arg = std.mem.trim(u8, args_text[comma_pos + 1 ..], " \t\r\n");
             if (!std.mem.eql(u8, second_arg, capture_name)) continue;
             replacement = if (has_try)
-                try std.fmt.allocPrint(context.allocator, "try {s}.{s}({s}, {s});", .{ receiver_text, slice_method_name, first_arg, iterable })
+                try context.allocator.print("try {s}.{s}({s}, {s});", .{ receiver_text, slice_method_name, first_arg, iterable })
             else
-                try std.fmt.allocPrint(context.allocator, "{s}.{s}({s}, {s});", .{ receiver_text, slice_method_name, first_arg, iterable });
+                try context.allocator.print("{s}.{s}({s}, {s});", .{ receiver_text, slice_method_name, first_arg, iterable });
         } else continue;
 
         const edits = try context.allocator.alloc(types.Edit, 1);
@@ -102,7 +102,7 @@ pub fn run(context: RuleRun) !void {
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Replace loop with {s}", .{slice_method_name}),
+            .title = try context.allocator.print("Replace loop with {s}", .{slice_method_name}),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -112,8 +112,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_append_slice,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "loop appends elements one by one; use '{s}.{s}' for better performance",
                 .{ receiver_text, slice_method_name },
             ),
@@ -123,7 +122,7 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn containsComment(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "//") != null or std.mem.indexOf(u8, text, "/*") != null;
+    return std.mem.find(u8, text, "//") != null or std.mem.find(u8, text, "/*") != null;
 }
 
 test "prefer append slice detects element loop" {

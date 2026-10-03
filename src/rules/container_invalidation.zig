@@ -37,8 +37,7 @@ fn findInvalidatedPointers(context: RuleRun) !void {
                 .rule = .invalidated_element_pointer,
                 .level = level,
                 .span = context.tokens[pointer_declaration + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "pointer '{s}' into '{s}.items' is used after {s}, which may move the container's backing allocation",
                     .{ pointer_name, container_name, invalidation.method },
                 ),
@@ -72,8 +71,7 @@ fn findFieldElementPointers(context: RuleRun, level: rule_types.Level) !void {
             .rule = .invalidated_element_pointer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "pointer '{s}' into '{s}.items' is used after {s}, which invalidates or may move the referenced element",
                 .{ pointer_name, path, invalidation.method },
             ),
@@ -173,8 +171,7 @@ fn findMutatedIteration(context: RuleRun) !void {
                 .rule = .iterator_invalidated_during_loop,
                 .level = level,
                 .span = context.tokens[mutation.index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "{s} mutates map '{s}' while iterator '{s}' is active; the next iteration may use invalid iterator state",
                     .{ mutation.method, map_name, iterator_name },
                 ),
@@ -274,8 +271,7 @@ fn findInvalidatedMapEntryPointers(context: RuleRun) !void {
             .rule = .invalidated_element_pointer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "map entry pointer '{s}' from '{s}' is used after {s}, which may rehash and invalidate it",
                 .{ pointer_name, path, mutation.method },
             ),
@@ -301,8 +297,7 @@ fn findStaleIndexMaps(context: RuleRun) !void {
                 .rule = .stale_index_map,
                 .level = level,
                 .span = token.loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "{s} changes indices in '{s}' without updating sibling index map '{s}'",
                     .{ context.tokenText(removal_index), sequence_field, index_field },
                 ),
@@ -323,8 +318,7 @@ fn findStaleIndexMaps(context: RuleRun) !void {
             .rule = .stale_index_map,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "orderedRemove changes indices in '{s}' without removing and reindexing references stored in element field '{s}'",
                 .{ sequence_field, reference_field },
             ),
@@ -437,7 +431,7 @@ fn indexMapField(context: RuleRun, sequence_field: []const u8, start: usize, end
         for (context.tokens[field_index + 2 .. field_end], field_index + 2..) |type_token, index| {
             if (type_token.tag != .identifier) continue;
             const name = context.tokenText(index);
-            if (std.mem.indexOf(u8, name, "HashMap") != null) saw_map = true;
+            if (std.mem.find(u8, name, "HashMap") != null) saw_map = true;
             if (std.mem.eql(u8, name, "usize")) saw_usize = true;
         }
         if (saw_map and saw_usize) {
@@ -735,7 +729,7 @@ test "getOrPut during iteration invalidates the iterator" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "getOrPut") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "getOrPut") != null);
 }
 
 test "returning a field element pointer after removal reports" {
@@ -865,7 +859,7 @@ test "stored sequence indices must remove references to an ordered-removed eleme
 
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(rule_types.Rule.stale_index_map, findings.items[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "links") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "links") != null);
 }
 
 test "removing equal references and shifting later indices repairs ordered removal" {

@@ -46,7 +46,7 @@ pub const Cache = struct {
         root_dir: std.Io.Dir,
         configuration: analysis.Configuration,
     ) Cache {
-        var executable_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var executable_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const executable_path_length = std.process.executablePath(io, &executable_path_buffer) catch return .{};
         const executable_stat = std.Io.Dir.cwd().statFile(io, executable_path_buffer[0..executable_path_length], .{}) catch return .{};
 

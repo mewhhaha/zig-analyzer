@@ -100,8 +100,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_switch,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "{d} equality branches dispatch on '{s}'; use a switch",
                 .{ prongs.items.len, subject.? },
             ),
@@ -395,8 +394,8 @@ test "enum equality chains prefer switch dispatch" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "3 equality branches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'mode'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "3 equality branches") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'mode'") != null);
     try std.testing.expectEqual(@as(usize, 0), findings[0].fixes.len);
 }
 
@@ -411,8 +410,8 @@ test "error equality chains prefer switch dispatch" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "2 equality branches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'err'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "2 equality branches") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'err'") != null);
 }
 
 test "integer equality chains prefer switch dispatch" {
@@ -425,8 +424,8 @@ test "integer equality chains prefer switch dispatch" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "3 equality branches") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'code'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "3 equality branches") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'code'") != null);
 }
 
 test "ambiguous or invalid switch conversions stay unchanged" {
@@ -505,7 +504,7 @@ test "prefer switch supports dotted field dispatch on typed struct" {
         "}";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "cfg.mode") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "cfg.mode") != null);
 }
 
 test "prefer switch ignores anytype receiver" {

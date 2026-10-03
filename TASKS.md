@@ -354,6 +354,9 @@ Acceptance:
 - [x] Eight opt-in modernization rules cover deprecated builtins, removed
   syntax, build APIs, changed bit casts, linkage, and container APIs; idiomatic
   ceiling-division guidance preserves the checked helper's error contract.
+- [x] Imported deprecation warnings, build and target migration coverage,
+  explicit container initialization, Reader renames, module runtime safety,
+  and partial network-send guidance cover the remaining release gaps.
 - [x] Incremental sessions survive ordinary saves while imported edits and
   closed overlays refresh diagnostics; changed build configuration or an
   independent saved source root restarts the appropriate compilation.

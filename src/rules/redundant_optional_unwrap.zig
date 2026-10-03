@@ -44,8 +44,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .redundant_optional_unwrap,
             .level = level,
             .span = context.tokens[condition_index + 2].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional '{s}' is already available as capture '{s}'; forcing it again obscures the proven non-null value",
                 .{ optional_name, capture_name },
             ),

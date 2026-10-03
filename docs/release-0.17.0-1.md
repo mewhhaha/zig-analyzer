@@ -17,7 +17,7 @@ optional `ArrayList.last()`, allocator printing and sentinel duplication,
 public-only `@hasDecl`, and overlapping copies through `@memmove`. Power
 simplifications preserve fallible integer-power behavior.
 
-Nine new rules bring the catalog to 199. Eight are enabled by the opt-in
+Ten new rules bring the catalog to 200. Eight are enabled by the opt-in
 `modernize` profile:
 
 - [`modernize-deprecated-builtin`](../src/rules/modernize-deprecated-builtin.md)
@@ -26,7 +26,8 @@ Nine new rules bring the catalog to 199. Eight are enabled by the opt-in
   covers removed C imports, array repetition, `void{}`, captured `errdefer`
   errors, and `i0`.
 - [`modernize-build-api`](../src/rules/modernize-build-api.md)
-  covers removed build argument access and deprecated C translation APIs.
+  covers removed build argument access, deprecated Run helpers, lazy dependencies,
+  and deprecated C translation APIs.
 - [`modernize-bitcast`](../src/rules/modernize-bitcast.md)
   requests review of array and vector bit casts whose semantics changed.
 - [`modernize-extern-bitcast`](../src/rules/modernize-extern-bitcast.md)
@@ -36,7 +37,8 @@ Nine new rules bring the catalog to 199. Eight are enabled by the opt-in
 - [`modernize-array-list-access`](../src/rules/modernize-array-list-access.md)
   migrates deprecated last-element accessors to `last()` or `last().?`.
 - [`modernize-container-init`](../src/rules/modernize-container-init.md)
-  migrates removed fixed-bitset and enum-set initializers to constant values.
+  migrates removed fixed-bitset and enum-set initializers and deprecated default
+  initialization to constant values.
 
 The idiomatic profile adds
 [`prefer-div-ceil`](../src/rules/prefer-div-ceil.md) for canonical unsigned
@@ -46,11 +48,27 @@ standard-library function have different error-handling contracts.
 
 Build migration guidance also covers removed `LazyPath.basename` and deprecated
 Windows resource compilation, including proven module factories and compile
-steps' `root_module` receivers.
+steps' `root_module` receivers. It also covers deprecated Run argument helpers,
+new lazy-dependency error propagation, and legacy program lookup signatures.
 
 Existing modernization rules also recognize the 0.17 standard-library moves,
 reflection changes, allocator API replacements, and optimization mode names.
 Migration guidance that requires a semantic choice carries no automatic edit.
+
+Deprecated default initialization now points proven unmanaged maps and `EnumMap`
+to `.empty`, and `ArenaAllocator.State` to `.init`. Reader and target deprecations
+receive direct renames where signatures agree. Runtime-safety advice checks the
+caller's optimization mode rather than the standard library's mode.
+
+The new default warning [`unreported-partial-send`](../src/rules/unreported-partial-send.md)
+flags `Socket.sendMany`, whose error result hides partial-send progress. It asks
+callers to use `sendManyTimeout` and handle both the error and progress count.
+
+`deprecated-declaration` now follows local and imported declarations and recognizes
+standard-library deprecation wording. It preserves author advice, resolves literal
+file and standard-library imports on demand, and skips unresolved named build
+modules. CLI cache reuse still refreshes imported source diagnostics; editor
+updates and closes refresh importers using the current unsaved dependency text.
 
 ## Editor and backend compatibility
 

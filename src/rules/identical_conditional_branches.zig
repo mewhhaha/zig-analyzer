@@ -41,7 +41,7 @@ pub fn run(context: RuleRun) !void {
                 "";
 
             const replacement = if (then_inner.start < then_inner.end)
-                try std.fmt.allocPrint(context.allocator, "{s}\n", .{body_text})
+                try context.allocator.print("{s}\n", .{body_text})
             else
                 "";
 
@@ -86,7 +86,7 @@ pub fn run(context: RuleRun) !void {
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Use '{s}' directly", .{expr_text}),
+            .title = try context.allocator.print("Use '{s}' directly", .{expr_text}),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -97,8 +97,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .identical_conditional_branches,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "both branches of 'if' evaluate to the identical expression '{s}'; the condition has no effect",
                 .{expr_text},
             ),
@@ -181,7 +180,7 @@ fn tokensMatch(context: RuleRun, a: TokenSpan, b: TokenSpan) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "identical conditional branches reports identical if and else bodies" {
@@ -202,8 +201,8 @@ test "identical conditional branches reports identical if and else bodies" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "identical bodies") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "identical expression '42'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "identical bodies") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "identical expression '42'") != null);
     try std.testing.expectEqualStrings("42", findings[1].fixes[0].edits[0].replacement);
 }
 

@@ -78,7 +78,7 @@ pub fn standardAllocatorArgument(callable: []const u8) ?usize {
             if (std.mem.eql(u8, callable[prefix.len..], method)) return 0;
         }
     }
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const separator = std.mem.findScalarLast(u8, callable, '.');
     const method = if (separator) |position| callable[position + 1 ..] else callable;
     if (std.mem.eql(u8, method, "allocRemaining") or std.mem.eql(u8, method, "toOwnedSlice")) return 0;
     return null;
@@ -86,13 +86,13 @@ pub fn standardAllocatorArgument(callable: []const u8) ?usize {
 
 pub fn releaseForCallable(callable: []const u8) ?[]const u8 {
     if (standardAllocatorArgument(callable) != null) return "free";
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const separator = std.mem.findScalarLast(u8, callable, '.');
     const method = if (separator) |position| callable[position + 1 ..] else callable;
     const release = releaseForMethod(method) orelse return null;
     if (!std.mem.eql(u8, method, "create")) return release;
     const position = separator orelse return null;
     const receiver = callable[0..position];
-    const receiver_name = if (std.mem.lastIndexOfScalar(u8, receiver, '.')) |receiver_separator|
+    const receiver_name = if (std.mem.findScalarLast(u8, receiver, '.')) |receiver_separator|
         receiver[receiver_separator + 1 ..]
     else
         receiver;

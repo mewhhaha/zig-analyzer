@@ -24,10 +24,10 @@ pub fn run(context: RuleRun) !void {
                             const condition = std.mem.trim(u8, condition_source, " \t\r\n");
                             const replacement = if (inverted) blk: {
                                 if (isSimpleCondition(context, if_index + 2, condition_end)) {
-                                    break :blk try std.fmt.allocPrint(context.allocator, "return !{s};", .{condition});
+                                    break :blk try context.allocator.print("return !{s};", .{condition});
                                 }
-                                break :blk try std.fmt.allocPrint(context.allocator, "return !({s});", .{condition});
-                            } else try std.fmt.allocPrint(context.allocator, "return {s};", .{condition});
+                                break :blk try context.allocator.print("return !({s});", .{condition});
+                            } else try context.allocator.print("return {s};", .{condition});
 
                             const edits = try context.allocator.alloc(types.Edit, 1);
                             edits[0] = .{
@@ -79,13 +79,13 @@ pub fn run(context: RuleRun) !void {
         const condition = std.mem.trim(u8, condition_source, " \t\r\n");
         const replacement = if (inverted) blk: {
             if (isSimpleCondition(context, if_index + 2, condition_end)) {
-                break :blk try std.fmt.allocPrint(context.allocator, "!{s}", .{condition});
+                break :blk try context.allocator.print("!{s}", .{condition});
             }
-            break :blk try std.fmt.allocPrint(context.allocator, "!({s})", .{condition});
+            break :blk try context.allocator.print("!({s})", .{condition});
         } else if (startsStandaloneExpression(context.tokens, if_index))
             try context.allocator.dupe(u8, condition)
         else
-            try std.fmt.allocPrint(context.allocator, "({s})", .{condition});
+            try context.allocator.print("({s})", .{condition});
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[condition_end + 3].loc.end },
@@ -145,7 +145,7 @@ fn parseBooleanReturnBranch(context: RuleRun, start: usize) ?BranchResult {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 fn endsExpression(tag: std.zig.Token.Tag) bool {

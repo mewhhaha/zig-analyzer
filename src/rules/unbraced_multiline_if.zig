@@ -33,19 +33,19 @@ pub fn run(context: RuleRun) !void {
         }
         const guard_end_offset = context.tokens[guard_end].loc.end;
         const body_start_offset = context.tokens[body_start].loc.start;
-        if (std.mem.indexOfScalar(u8, context.source[guard_end_offset..body_start_offset], '\n') == null) continue;
+        if (std.mem.findScalar(u8, context.source[guard_end_offset..body_start_offset], '\n') == null) continue;
         const statement_end = context.statementEnd(body_start) orelse continue;
         if (containsElse(context, body_start, statement_end)) continue;
 
         const semicolon_end = context.tokens[statement_end].loc.end;
-        const statement_line_end = std.mem.indexOfScalarPos(u8, context.source, semicolon_end, '\n') orelse context.source.len;
+        const statement_line_end = std.mem.findScalarPos(u8, context.source, semicolon_end, '\n') orelse context.source.len;
         const fixes: []const types.Fix = if (containsComment(context.source[guard_end_offset..statement_line_end])) &.{} else blk: {
             const indent = lineIndent(context.source, token.loc.start);
             const edits = try context.allocator.alloc(types.Edit, 2);
             edits[0] = .{ .span = .{ .start = guard_end_offset, .end = guard_end_offset }, .replacement = " {" };
             edits[1] = .{
                 .span = .{ .start = semicolon_end, .end = semicolon_end },
-                .replacement = try std.fmt.allocPrint(context.allocator, "\n{s}}}", .{indent}),
+                .replacement = try context.allocator.print("\n{s}}}", .{indent}),
             };
             const fixes = try context.allocator.alloc(types.Fix, 1);
             fixes[0] = .{
@@ -61,8 +61,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .unbraced_multiline_if,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "unbraced 'if' body starting with '{s}' begins on a different line than the condition; only that single statement is guarded",
                 .{context.tokenText(body_start)},
             ),
@@ -77,11 +76,11 @@ fn containsElse(context: RuleRun, start: usize, end: usize) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 fn lineIndent(source: []const u8, offset: usize) []const u8 {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
     var end = line_start;
     while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
     return source[line_start..end];
@@ -98,7 +97,7 @@ test "if body on its own unbraced line warns and offers a brace fix" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'fail'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'fail'") != null);
     try std.testing.expectEqual(@as(usize, 2), findings[0].fixes[0].edits.len);
     try std.testing.expectEqualStrings(" {", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("\n    }", findings[0].fixes[0].edits[1].replacement);
@@ -132,7 +131,7 @@ test "the trailing if of an else-if chain warns when its body drops to another l
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'two'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'two'") != null);
     try std.testing.expectEqualStrings(" {", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("\n    }", findings[0].fixes[0].edits[1].replacement);
 }

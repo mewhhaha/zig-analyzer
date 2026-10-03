@@ -36,8 +36,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .redundant_boolean_negation,
                 .level = level,
                 .span = .{ .start = token.loc.start, .end = context.tokens[index + 1].loc.end },
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "double boolean negation '!!{s}' is redundant; use '{s}' directly",
                     .{ operand_source, operand_source },
                 ),
@@ -80,8 +79,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .redundant_boolean_negation,
                 .level = level,
                 .span = .{ .start = token.loc.start, .end = context.tokens[close_paren].loc.end },
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "double boolean negation '!(!{s})' is redundant; use '{s}' directly",
                     .{ inner_source, inner_source },
                 ),
@@ -111,7 +109,7 @@ pub fn run(context: RuleRun) !void {
                     };
                     const fixes = try context.allocator.alloc(types.Fix, 1);
                     fixes[0] = .{
-                        .title = try std.fmt.allocPrint(context.allocator, "Simplify '!{s}' to '{s}'", .{ constant_source, simplified }),
+                        .title = try context.allocator.print("Simplify '!{s}' to '{s}'", .{ constant_source, simplified }),
                         .kind = .quickfix,
                         .edits = edits,
                         .preferred = true,
@@ -122,8 +120,7 @@ pub fn run(context: RuleRun) !void {
                         .rule = .redundant_boolean_negation,
                         .level = level,
                         .span = whole_span,
-                        .message = try std.fmt.allocPrint(
-                            context.allocator,
+                        .message = try context.allocator.print(
                             "negation of boolean constant '!{s}' is redundant; use '{s}' directly",
                             .{ constant_source, simplified },
                         ),
@@ -157,7 +154,7 @@ fn findOperandEnd(context: RuleRun, start: usize) ?usize {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "redundant boolean negation reports !! and !(!...)" {

@@ -31,8 +31,7 @@ fn findSliceExpectations(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[call_start].loc.start, .end = context.tokens[expect_end].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "{s}expectEqualSlices({s}, {s}, {s})",
                 .{ qualification, element_type, expected, actual },
             ),
@@ -42,8 +41,7 @@ fn findSliceExpectations(context: RuleRun) !void {
             .rule = .prefer_testing_expect_equal_slices,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "slice comparison for element type '{s}' produces a less useful failure than expectEqualSlices",
                 .{element_type},
             ),
@@ -81,8 +79,7 @@ fn findManualErrorExpectations(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[expression_start].loc.start, .end = context.tokens[body_end + 6].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "try std.testing.expectError({s}, {s});",
                 .{ expected_error, operation },
             ),

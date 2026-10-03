@@ -126,7 +126,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_vector_load,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "manually unpacking array '{s}' into vector; use direct vector coercion/cast", .{array_receiver.?}),
+            .message = try context.allocator.print("manually unpacking array '{s}' into vector; use direct vector coercion/cast", .{array_receiver.?}),
             .fixes = fixes,
         });
     }

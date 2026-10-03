@@ -46,8 +46,7 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
                 .rule = .defer_uses_reassigned_binding,
                 .level = level,
                 .span = candidate.loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "binding '{s}' is reassigned after deferred cleanup captures it; cleanup will target the replacement and may leak the original value",
                     .{cleanup_binding},
                 ),
@@ -119,7 +118,7 @@ fn replacementRelinquishesOwnership(
         }
         if (context.tokens[opening].tag != .l_paren or opening == 0 or
             context.tokens[opening - 1].tag != .identifier) continue;
-        if (std.mem.indexOf(u8, context.tokenText(opening - 1), "Owned") != null) return true;
+        if (std.mem.find(u8, context.tokenText(opening - 1), "Owned") != null) return true;
     }
     return false;
 }
@@ -208,8 +207,7 @@ fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
             .rule = .resource_cleanup_on_error_only,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "resource '{s}' is cleaned up by errdefer only; a successful return leaves {s} unhandled unless ownership is transferred",
                 .{ binding_name, resource.release },
             ),
@@ -328,8 +326,7 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
                 .rule = .allocation_size_overflow,
                 .level = level,
                 .span = context.tokens[growth_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "allocation capacity passed to {s} is grown with unchecked multiplication; validate overflow before growing",
                     .{context.tokenText(method_index)},
                 ),
@@ -366,8 +363,7 @@ fn findUncheckedAllocationSizes(context: RuleRun) !void {
             .rule = .allocation_size_overflow,
             .level = level,
             .span = length_span,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "allocation length passed to {s} uses unchecked runtime {s}; validate overflow before allocating",
                 .{ context.tokenText(method_index), operation },
             ),
@@ -417,8 +413,8 @@ fn rangeHasRuntimeName(context: RuleRun, start: usize, end: usize, before: usize
 
 fn multiplicationFitsMinimumUsize(context: RuleRun, expression: ArgumentRange, before: usize) bool {
     const text = context.source[context.tokens[expression.start].loc.start..context.tokens[expression.end - 1].loc.end];
-    if (std.mem.indexOf(u8, text, "@as(usize") == null and
-        std.mem.indexOf(u8, text, "@as( usize") == null) return false;
+    if (std.mem.find(u8, text, "@as(usize") == null and
+        std.mem.find(u8, text, "@as( usize") == null) return false;
 
     var total_bits: usize = 0;
     var factor_count: usize = 0;

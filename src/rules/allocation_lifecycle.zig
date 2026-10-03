@@ -188,20 +188,17 @@ pub fn warningsWithSummaries(
 
         const message = switch (cleanup) {
             .released => unreachable,
-            .errdefer_only => try std.fmt.allocPrint(
-                allocator,
+            .errdefer_only => try allocator.print(
                 "allocation '{s}' from {s} is released by errdefer only; the success path has no visible {s} or ownership return",
                 .{ binding_name, allocation.method, allocation.release },
             ),
             .missing => if (ownership_is_path_incomplete)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "allocation '{s}' from {s} is not released or transferred on every path before leaving this scope",
                     .{ binding_name, allocation.method },
                 )
             else
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "allocation '{s}' from {s} has no visible {s} or ownership return before leaving this scope",
                     .{ binding_name, allocation.method, allocation.release },
                 ),
@@ -293,8 +290,7 @@ fn findOverlappingAggregateErrdefers(
             try found.append(allocator, .{
                 .rule = .double_release,
                 .span = tokens[aggregate_cleanup].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "errdefer cleanup for '{s}' releases owned field '{s}' after an earlier errdefer already releases '{s}'",
                     .{ owner_name, field_name, binding_name },
                 ),
@@ -671,14 +667,14 @@ fn allocatorMatchesArenaContract(
         .{ allocator_source, member }
     else provider: {
         const provider = std.mem.trimEnd(u8, allocator_source, "()");
-        const separator = std.mem.indexOfScalar(u8, provider, '.') orelse return false;
+        const separator = std.mem.findScalar(u8, provider, '.') orelse return false;
         break :provider .{ provider[0..separator], provider[separator + 1 ..] };
     };
     const binding = scope_index.findBindingNamed(receiver_name, use_index) orelse return false;
     const type_name = declaredBindingTypeName(source, tokens, binding.token_index) orelse return false;
 
     for (contracts) |contract| {
-        const contract_separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const contract_separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, field_name, contract[contract_separator + 1 ..])) continue;
         const owner_type = contract[0..contract_separator];
         if (std.mem.eql(u8, type_name, owner_type)) return true;
@@ -826,7 +822,7 @@ fn functionParameterMatchesArenaContract(
     contracts: []const []const u8,
 ) bool {
     for (contracts) |contract| {
-        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, parameter_name, contract[separator + 1 ..])) continue;
         const function_name = contract[0..separator];
         if (std.mem.eql(u8, function.name, function_name)) return true;
@@ -891,20 +887,17 @@ fn findMismatchedRelease(
         if (!wrong_method and !wrong_allocator) continue;
         mismatched = true;
         const message = if (wrong_method)
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' from {s} must use {s}, not {s}",
                 .{ binding_name, allocation.method, allocation.release, actual_release },
             )
         else if (allocation.allocator_member) |member|
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' created by allocator '{s}.{s}' is released through different allocator '{s}'",
                 .{ binding_name, expected_allocator.?, member, receiver_name.? },
             )
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' created by allocator '{s}' is released through different allocator '{s}'",
                 .{ binding_name, expected_allocator.?, receiver_name.? },
             );
@@ -980,8 +973,7 @@ fn findReleaseOrderingIssues(
             try found.append(allocator, .{
                 .rule = .cleanup_after_fallible_operation,
                 .span = tokens[binding_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "cleanup for allocation '{s}' is registered after a fallible operation; an earlier error can leak it",
                     .{binding_name},
                 ),
@@ -993,8 +985,7 @@ fn findReleaseOrderingIssues(
                 for (fixes) |fix| allocator.free(fix.edits);
                 allocator.free(fixes);
             }
-            const message = try std.fmt.allocPrint(
-                allocator,
+            const message = try allocator.print(
                 "allocation '{s}' has more than one visible {s} in the same control-flow scope",
                 .{ binding_name, allocation.release },
             );
@@ -1014,8 +1005,7 @@ fn findReleaseOrderingIssues(
                 try found.append(allocator, .{
                     .rule = .use_after_release,
                     .span = tokens[use_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "allocation '{s}' is used after its visible {s}",
                         .{ binding_name, allocation.release },
                     ),
@@ -1029,8 +1019,7 @@ fn findReleaseOrderingIssues(
         try found.append(allocator, .{
             .rule = .overwritten_owning_value,
             .span = tokens[assignment_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "assignment replaces owning value '{s}' before its original allocation is released",
                 .{binding_name},
             ),
@@ -2510,7 +2499,7 @@ fn localCallOwnership(
         tokens[callable_start - 2].tag == .identifier) callable_start -= 2;
     const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
     const argument_count = callArgumentCount(tokens, call_open + 1, call_close);
-    const method = if (std.mem.lastIndexOfScalar(u8, callable, '.')) |separator| callable[separator + 1 ..] else callable;
+    const method = if (std.mem.findScalarLast(u8, callable, '.')) |separator| callable[separator + 1 ..] else callable;
     if (containing_argument == 2 and argument_count >= 6 and
         std.mem.eql(u8, method, "write") and
         asyncWriteCallbackReleasesBuffer(source, tokens, scope_index, call_open, call_close)) return .released;
@@ -2615,7 +2604,7 @@ fn bindingArgumentIndex(
 }
 
 fn conventionalBorrowingCall(callable: []const u8, argument_index: usize, argument_count: usize) bool {
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const separator = std.mem.findScalarLast(u8, callable, '.');
     const method = if (separator) |index| callable[index + 1 ..] else callable;
     const methods = [_][]const u8{ "appendSlice", "writeAll", "writeStreamingAll", "print" };
     for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return argument_index + 1 == argument_count;
@@ -2852,7 +2841,7 @@ test "warns when an allocation has no release" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "buffer") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "buffer") != null);
 }
 
 test "accepts deferred and explicit releases" {
@@ -3167,7 +3156,7 @@ test "nested labeled allocation expressions do not cross their enclosing scope" 
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "sha") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "sha") != null);
 }
 
 test "cleanup registered after a fallible operation warns" {
@@ -3857,7 +3846,7 @@ test "aggregate errdefer cannot overlap direct field cleanup" {
     var double_release_count: usize = 0;
     for (found) |warning| if (warning.rule == .double_release) {
         double_release_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, warning.message, "owned field 'payload'") != null);
+        try std.testing.expect(std.mem.find(u8, warning.message, "owned field 'payload'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), double_release_count);
 }
@@ -4090,7 +4079,7 @@ test "cleanup in only one conditional branch leaves an allocation unreleased" {
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "not released or transferred on every path") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "not released or transferred on every path") != null);
 }
 
 test "cleanup in every conditional branch releases an allocation" {

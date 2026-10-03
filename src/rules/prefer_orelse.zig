@@ -24,8 +24,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_orelse,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional capture '{s}' is returned unchanged; use orelse for the fallback value",
                 .{capture},
             ),

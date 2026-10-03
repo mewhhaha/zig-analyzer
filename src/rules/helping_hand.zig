@@ -44,7 +44,7 @@ fn findRangeLoops(context: RuleRun) !void {
         const scope_end = context.enclosingScopeEnd(var_index) orelse context.tokens.len;
         if (findIdentifier(context, body_end + 1, scope_end, name) != null) continue;
         const bound = context.source[context.tokens[while_index + 4].loc.start..context.tokens[condition_end - 1].loc.end];
-        const replacement = try std.fmt.allocPrint(context.allocator, "for (0..{s}) |{s}| {{", .{ bound, name });
+        const replacement = try context.allocator.print("for (0..{s}) |{s}| {{", .{ bound, name });
         errdefer context.allocator.free(replacement);
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -57,7 +57,7 @@ fn findRangeLoops(context: RuleRun) !void {
             .rule = .prefer_range_for,
             .level = level,
             .span = context.tokens[while_index].loc,
-            .message = try std.fmt.allocPrint(context.allocator, "counter '{s}' only describes the range 0..{s}; use a range for loop", .{ name, bound }),
+            .message = try context.allocator.print("counter '{s}' only describes the range 0..{s}; use a range for loop", .{ name, bound }),
             .fixes = fixes,
         });
     }
@@ -87,7 +87,7 @@ fn findManualSearches(context: RuleRun) !void {
             .rule = .prefer_index_of,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "manual linear search over '{s}' can state its intent with std.mem.findScalar or std.mem.find", .{iterable}),
+            .message = try context.allocator.print("manual linear search over '{s}' can state its intent with std.mem.findScalar or std.mem.find", .{iterable}),
         });
     }
 }
@@ -166,7 +166,7 @@ fn findElementFills(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
-            .replacement = try std.fmt.allocPrint(context.allocator, "@memset({s}, {s});", .{ target, value }),
+            .replacement = try context.allocator.print("@memset({s}, {s});", .{ target, value }),
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{ .title = "Replace the element loop with @memset", .kind = .refactor_rewrite, .edits = edits, .preferred = true, .fix_all = true };
@@ -198,7 +198,7 @@ fn findElementCopies(context: RuleRun) !void {
         if (comma_in_header) |comma_idx| {
             const arg1_text = std.mem.trim(u8, context.source[context.tokens[for_index + 2].loc.start..context.tokens[comma_idx - 1].loc.end], " \t\r\n");
             const arg2_text = std.mem.trim(u8, context.source[context.tokens[comma_idx + 1].loc.start..context.tokens[iter_end - 1].loc.end], " \t\r\n");
-            if (std.mem.indexOf(u8, arg1_text, "..") == null and std.mem.indexOf(u8, arg2_text, "..") == null) {
+            if (std.mem.find(u8, arg1_text, "..") == null and std.mem.find(u8, arg2_text, "..") == null) {
                 // Multi-sequence loop over two sequences
                 const captures = context.tokens[iter_end + 2 .. capture_end];
                 var comma_in_caps: ?usize = null;
@@ -253,7 +253,7 @@ fn findElementCopies(context: RuleRun) !void {
                             const edits = try context.allocator.alloc(types.Edit, 1);
                             edits[0] = .{
                                 .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
-                                .replacement = try std.fmt.allocPrint(context.allocator, "@memcpy({s}, {s});", .{ dest_arg.?, src_arg.? }),
+                                .replacement = try context.allocator.print("@memcpy({s}, {s});", .{ dest_arg.?, src_arg.? }),
                             };
                             const fixes = try context.allocator.alloc(types.Fix, 1);
                             fixes[0] = .{ .title = "Replace the element loop with @memcpy", .kind = .refactor_rewrite, .edits = edits, .preferred = true, .fix_all = true };
@@ -267,7 +267,7 @@ fn findElementCopies(context: RuleRun) !void {
 
         // Index-based copy: for (0..dst.len) |j| { dst[j] = src[j]; }
         const range = context.source[context.tokens[for_index + 2].loc.start..context.tokens[iter_end - 1].loc.end];
-        if (std.mem.indexOf(u8, range, "0..") == null or std.mem.indexOf(u8, range, ".len") == null) continue;
+        if (std.mem.find(u8, range, "0..") == null or std.mem.find(u8, range, ".len") == null) continue;
         if (capture_end != iter_end + 3 or capture_end + 1 >= context.tokens.len) continue;
 
         const is_braced = context.tokens[capture_end + 1].tag == .l_brace;
@@ -293,7 +293,7 @@ fn findElementCopies(context: RuleRun) !void {
         const source = context.tokenText(stmt_start + 5);
         if (std.mem.eql(u8, destination, source) or !bindingsAreDistinctLocalArrays(context, for_index, destination, source)) continue;
         const edits = try context.allocator.alloc(types.Edit, 1);
-        edits[0] = .{ .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end }, .replacement = try std.fmt.allocPrint(context.allocator, "@memcpy({s}, {s});", .{ destination, source }) };
+        edits[0] = .{ .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end }, .replacement = try context.allocator.print("@memcpy({s}, {s});", .{ destination, source }) };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{ .title = "Replace the element loop with @memcpy", .kind = .refactor_rewrite, .edits = edits, .preferred = true, .fix_all = true };
         try context.emit(.{ .rule = .prefer_memcpy, .level = level, .span = token.loc, .message = "this loop only copies corresponding elements from distinct bindings; use @memcpy", .fixes = fixes });
@@ -363,7 +363,7 @@ fn findStringDispatch(context: RuleRun) !void {
             .rule = .prefer_string_switch,
             .level = level,
             .span = context.tokens[first.?].loc,
-            .message = try std.fmt.allocPrint(context.allocator, "three or more string comparisons dispatch on '{s}'; use std.meta.stringToEnum or std.StaticStringMap", .{subject.?}),
+            .message = try context.allocator.print("three or more string comparisons dispatch on '{s}'; use std.meta.stringToEnum or std.StaticStringMap", .{subject.?}),
         });
     }
 }
@@ -371,8 +371,8 @@ fn findStringDispatch(context: RuleRun) !void {
 fn findDebugPrints(context: RuleRun) !void {
     const level = context.level(.prefer_log_over_print);
     if (level == .off) return;
-    if (std.mem.indexOf(u8, context.source, "pub fn build(") != null or
-        std.mem.indexOf(u8, context.source, "pub fn main(") != null) return;
+    if (std.mem.find(u8, context.source, "pub fn build(") != null or
+        std.mem.find(u8, context.source, "pub fn main(") != null) return;
     for (context.tokens, 0..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, "print") or index < 4 or
             !context.tokenIs(index - 4, "std") or !context.tokenIs(index - 2, "debug")) continue;
@@ -401,7 +401,7 @@ fn findUnbufferedLoopWrites(context: RuleRun) !void {
                 .rule = .prefer_buffered_writer,
                 .level = level,
                 .span = body_token.loc,
-                .message = try std.fmt.allocPrint(context.allocator, "writer '{s}' performs small unbuffered writes inside a loop; buffer it and flush once", .{writer}),
+                .message = try context.allocator.print("writer '{s}' performs small unbuffered writes inside a loop; buffer it and flush once", .{writer}),
             });
             break;
         }
@@ -447,7 +447,7 @@ fn findArenaShapedScopes(context: RuleRun) !void {
             .rule = .prefer_arena,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "scope makes {d} allocations from '{s}' and releases all at exit; an ArenaAllocator can make that lifetime structural", .{ allocation_count, allocator_name.? }),
+            .message = try context.allocator.print("scope makes {d} allocations from '{s}' and releases all at exit; an ArenaAllocator can make that lifetime structural", .{ allocation_count, allocator_name.? }),
         });
     }
 }
@@ -526,9 +526,9 @@ fn bindingComesFromDirectWriter(context: RuleRun, before: usize, name: []const u
             !context.tokenIs(index + 1, name)) continue;
         const end = context.statementEnd(index) orelse continue;
         const declaration = context.source[context.tokens[index].loc.start..context.tokens[end].loc.end];
-        if (std.mem.indexOf(u8, declaration, "stdout()") != null) return true;
-        const writer_call = std.mem.indexOf(u8, declaration, ".writer(") orelse continue;
-        const receiver_start = std.mem.lastIndexOfAny(u8, declaration[0..writer_call], " =") orelse continue;
+        if (std.mem.find(u8, declaration, "stdout()") != null) return true;
+        const writer_call = std.mem.find(u8, declaration, ".writer(") orelse continue;
+        const receiver_start = std.mem.findLastAny(u8, declaration[0..writer_call], " =") orelse continue;
         const receiver = std.mem.trim(u8, declaration[receiver_start + 1 .. writer_call], " \t\r\n");
         if (bindingComesFromFileOpen(context, index, receiver)) return true;
     }
@@ -542,9 +542,9 @@ fn bindingComesFromFileOpen(context: RuleRun, before: usize, name: []const u8) b
             !context.tokenIs(index + 1, name)) continue;
         const end = context.statementEnd(index) orelse continue;
         const declaration = context.source[context.tokens[index].loc.start..context.tokens[end].loc.end];
-        return std.mem.indexOf(u8, declaration, ".openFile(") != null or
-            std.mem.indexOf(u8, declaration, ".createFile(") != null or
-            std.mem.indexOf(u8, declaration, ".accept(") != null;
+        return std.mem.find(u8, declaration, ".openFile(") != null or
+            std.mem.find(u8, declaration, ".createFile(") != null or
+            std.mem.find(u8, declaration, ".accept(") != null;
     }
     return false;
 }
@@ -578,7 +578,7 @@ fn bindingsAreDistinctLocalArrays(context: RuleRun, before: usize, left: []const
         if (!std.mem.eql(u8, name, left) and !std.mem.eql(u8, name, right)) continue;
         const end = context.statementEnd(index) orelse continue;
         const declaration = context.source[context.tokens[index].loc.start..context.tokens[end].loc.end];
-        const owns_array = std.mem.indexOf(u8, declaration, "[_]") != null or
+        const owns_array = std.mem.find(u8, declaration, "[_]") != null or
             (findTag(context.tokens, index + 2, end, .colon) != null and findTag(context.tokens, index + 2, end, .l_bracket) != null);
         if (!owns_array) continue;
         if (std.mem.eql(u8, name, left)) saw_left = true else saw_right = true;

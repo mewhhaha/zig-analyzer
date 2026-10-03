@@ -58,7 +58,7 @@ pub fn run(context: RuleRun) !void {
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Use '{s}' with {s}", .{ replacement_func, char_lit }),
+            .title = try context.allocator.print("Use '{s}' with {s}", .{ replacement_func, char_lit }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -66,8 +66,7 @@ pub fn run(context: RuleRun) !void {
         };
 
         const prefix = if (is_std_mem) "std.mem." else "mem.";
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "searching for single character '{s}' using {s}{s}; use {s}{s} with {s}",
             .{ needle_text, prefix, func_name, prefix, replacement_func, char_lit },
         );
@@ -122,18 +121,18 @@ fn parseSingleByteLiteral(allocator: std.mem.Allocator, text: []const u8) ?[]con
     if (inner.len == 1) {
         if (inner[0] == '\\') return null;
         if (inner[0] == '\'') return allocator.dupe(u8, "'\\''") catch null;
-        return std.fmt.allocPrint(allocator, "'{c}'", .{inner[0]}) catch null;
+        return allocator.print("'{c}'", .{inner[0]}) catch null;
     }
     if (inner.len == 2 and inner[0] == '\\') {
         switch (inner[1]) {
-            'n', 'r', 't', '\\', '0' => return std.fmt.allocPrint(allocator, "'\\{c}'", .{inner[1]}) catch null,
+            'n', 'r', 't', '\\', '0' => return allocator.print("'\\{c}'", .{inner[1]}) catch null,
             '\'' => return allocator.dupe(u8, "'\\''") catch null,
             '"' => return allocator.dupe(u8, "'\"'") catch null,
             else => return null,
         }
     }
     if (inner.len == 4 and inner[0] == '\\' and inner[1] == 'x') {
-        return std.fmt.allocPrint(allocator, "'{s}'", .{inner}) catch null;
+        return allocator.print("'{s}'", .{inner}) catch null;
     }
     return null;
 }

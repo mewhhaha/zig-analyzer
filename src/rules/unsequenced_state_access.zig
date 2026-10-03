@@ -31,8 +31,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .unsequenced_state_access,
                 .level = level,
                 .span = context.tokens[receiver_index + 2].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "aggregate copies mutable local '{s}' in one field and calls state-changing method '{s}' in another; sequence the call before constructing the aggregate",
                     .{ binding, context.tokenText(receiver_index + 2) },
                 ),

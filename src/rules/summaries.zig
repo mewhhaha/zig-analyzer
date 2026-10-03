@@ -149,14 +149,14 @@ pub const Index = struct {
         if (index.releaseContract(callable)) |_| {
             if (parameter == 0) return .released;
         }
-        const separator = std.mem.indexOfScalar(u8, callable, '.') orelse {
+        const separator = std.mem.findScalar(u8, callable, '.') orelse {
             if (index.sourceHasLocalBinding(source, callable)) return .unknown;
             const file_index = index.fileIndexForSource(source) orelse return .unknown;
             const function = index.uniqueFunctionInFile(file_index, callable) orelse return .unknown;
             if (function.unresolved or parameter >= function.parameter_effects.len) return .unknown;
             return function.parameter_effects[parameter];
         };
-        if (std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') != null) return .unknown;
+        if (std.mem.findScalar(u8, callable[separator + 1 ..], '.') != null) return .unknown;
         const receiver = callable[0..separator];
         const target_file = if (index.sourceHasLocalBinding(source, receiver))
             null
@@ -175,13 +175,13 @@ pub const Index = struct {
         callable: []const u8,
         parameter: usize,
     ) bool {
-        const separator = std.mem.indexOfScalar(u8, callable, '.') orelse {
+        const separator = std.mem.findScalar(u8, callable, '.') orelse {
             if (index.sourceHasLocalBinding(source, callable)) return false;
             const file_index = index.fileIndexForSource(source) orelse return false;
             const function = index.uniqueFunctionInFile(file_index, callable) orelse return false;
             return !function.unresolved and parameter < function.parameter_escapes.len and function.parameter_escapes[parameter];
         };
-        if (std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') != null) return false;
+        if (std.mem.findScalar(u8, callable[separator + 1 ..], '.') != null) return false;
         const receiver = callable[0..separator];
         const target_file = if (index.sourceHasLocalBinding(source, receiver))
             null
@@ -207,7 +207,7 @@ pub const Index = struct {
     ) ?OwnedReturn {
         for (index.resource_contracts) |contract| {
             if (!std.mem.eql(u8, callableBaseName(contract.acquire), name)) continue;
-            const separator = std.mem.lastIndexOfScalar(u8, contract.acquire, '.');
+            const separator = std.mem.findScalarLast(u8, contract.acquire, '.');
             if (separator) |position| {
                 const actual_receiver = receiver orelse continue;
                 if (!std.mem.eql(u8, contract.acquire[0..position], actual_receiver)) continue;
@@ -309,13 +309,13 @@ pub const Index = struct {
         if (index.acquireContract(callable)) |contract| {
             return .{ .release = callableBaseName(contract.release) };
         }
-        const separator = std.mem.indexOfScalar(u8, callable, '.') orelse {
+        const separator = std.mem.findScalar(u8, callable, '.') orelse {
             if (index.sourceHasLocalBinding(source, callable)) return null;
             const file_index = index.fileIndexForSource(source) orelse return null;
             const function = index.uniqueFunctionInFile(file_index, callable) orelse return null;
             return ownedReturnFromFunction(function);
         };
-        if (std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') != null) return null;
+        if (std.mem.findScalar(u8, callable[separator + 1 ..], '.') != null) return null;
         const receiver = callable[0..separator];
         const target_file = if (index.sourceHasLocalBinding(source, receiver))
             index.fileIndexForSource(source) orelse return null
@@ -698,8 +698,8 @@ fn collectImportAliases(
         };
         defer allocator.free(spelling);
         if (!std.mem.endsWith(u8, spelling, ".zig")) continue;
-        const directory = std.fs.path.dirname(source_path) orelse "";
-        const resolved = try std.fs.path.resolve(allocator, &.{ "/", directory, spelling });
+        const directory = std.Io.Dir.path.dirname(source_path) orelse "";
+        const resolved = try std.Io.Dir.path.resolveAlloc(allocator, &.{ "/", directory, spelling });
         defer allocator.free(resolved);
         const target_path = std.mem.trimStart(u8, resolved, "/");
         const target_file_index = for (sources) |candidate| {
@@ -1185,16 +1185,16 @@ fn allocatorProvenance(function: FunctionSummary, callable: []const u8, call_ope
         if (parameterProvenanceAtArgument(function, call_open + 1, call_end, argument_index)) |provenance| {
             return provenance;
         }
-        const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
+        const separator = std.mem.findScalarLast(u8, callable, '.') orelse return null;
         if (std.mem.eql(u8, callable[separator + 1 ..], "toOwnedSlice")) {
             const receiver = callable[0..separator];
-            if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
+            if (std.mem.findScalar(u8, receiver, '.') == null) {
                 return localAllocatorProvenance(function, receiver, call_open);
             }
         }
         return null;
     }
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return null;
+    const separator = std.mem.findScalarLast(u8, callable, '.') orelse return null;
     const receiver = callable[0..separator];
     for (function.parameter_names, 0..) |parameter, index| {
         if (std.mem.eql(u8, parameter, receiver)) return .{ .parameter = index };
@@ -1204,7 +1204,7 @@ fn allocatorProvenance(function: FunctionSummary, callable: []const u8, call_ope
             return .{ .parameter = index, .member = receiver[parameter.len + 1 ..] };
         }
     }
-    if (std.mem.indexOfScalar(u8, receiver, '.') == null) {
+    if (std.mem.findScalar(u8, receiver, '.') == null) {
         if (localAllocatorProvenance(function, receiver, call_open)) |provenance| return provenance;
     }
     for (function.parameter_names, 0..) |parameter, index| {
@@ -1253,9 +1253,9 @@ fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
             const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
             const call_end = matchingToken(caller.tokens, call_open) orelse continue;
             const method = callableBaseName(callable);
-            const method_call = std.mem.indexOfScalar(u8, callable, '.') != null;
-            const imported_call = if (std.mem.indexOfScalar(u8, callable, '.')) |separator|
-                std.mem.indexOfScalar(u8, callable[separator + 1 ..], '.') == null and
+            const method_call = std.mem.findScalar(u8, callable, '.') != null;
+            const imported_call = if (std.mem.findScalar(u8, callable, '.')) |separator|
+                std.mem.findScalar(u8, callable[separator + 1 ..], '.') == null and
                     index.importedFile(caller.source, callable[0..separator]) != null
             else
                 false;
@@ -1352,7 +1352,7 @@ fn composeAllocatorMemberPath(
 ) !?[]const u8 {
     if (prefix == null) return suffix;
     if (suffix == null) return prefix;
-    const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix.?, suffix.? });
+    const path = try allocator.print("{s}.{s}", .{ prefix.?, suffix.? });
     errdefer allocator.free(path);
     try owned_paths.append(allocator, path);
     return path;
@@ -1439,13 +1439,13 @@ fn tokenBelongsToNestedFunction(function: FunctionSummary, token_index: usize) b
 }
 
 fn uniqueFunctionIndexForCall(index: Index, caller: FunctionSummary, callable: []const u8) ?usize {
-    const separator = std.mem.indexOfScalar(u8, callable, '.');
+    const separator = std.mem.findScalar(u8, callable, '.');
     const file_index = if (separator) |position|
         index.importedFile(caller.source, callable[0..position]) orelse return null
     else
         caller.file_index;
     const name = if (separator) |position| callable[position + 1 ..] else callable;
-    if (std.mem.indexOfScalar(u8, name, '.') != null) return null;
+    if (std.mem.findScalar(u8, name, '.') != null) return null;
     const file = index.fileForIndex(file_index) orelse return null;
     var selected: ?usize = null;
     for (index.functions[file.function_start..file.function_end], file.function_start..) |function, function_index| {
@@ -1667,7 +1667,7 @@ fn callableMatches(callable: []const u8, contract: []const u8) bool {
 }
 
 fn callableBaseName(callable: []const u8) []const u8 {
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.') orelse return callable;
+    const separator = std.mem.findScalarLast(u8, callable, '.') orelse return callable;
     return callable[separator + 1 ..];
 }
 

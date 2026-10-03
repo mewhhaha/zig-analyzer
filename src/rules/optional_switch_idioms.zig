@@ -32,15 +32,14 @@ fn findOptionalPresenceTests(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[index + 9].loc.end },
-            .replacement = try std.fmt.allocPrint(context.allocator, "{s} {s} null", .{ optional_name, operator }),
+            .replacement = try context.allocator.print("{s} {s} null", .{ optional_name, operator }),
         };
         const fixes = try oneFix(context, "Use an optional presence comparison", edits);
         try context.emit(.{
             .rule = .prefer_optional_presence_test,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional capture is used only to test whether '{s}' is null",
                 .{optional_name},
             ),
@@ -57,7 +56,7 @@ fn endsExpression(tag: std.zig.Token.Tag) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 fn findUnusedElseCaptures(context: RuleRun) !void {
@@ -93,7 +92,7 @@ fn findUnusedElseCaptures(context: RuleRun) !void {
             .rule = .needless_switch_else_capture,
             .level = level,
             .span = context.tokens[else_index + 3].loc,
-            .message = try std.fmt.allocPrint(context.allocator, "switch else capture '{s}' is never used", .{capture_name}),
+            .message = try context.allocator.print("switch else capture '{s}' is never used", .{capture_name}),
             .fixes = fixes,
         });
     }
@@ -140,8 +139,7 @@ fn findManualSentinels(context: RuleRun) !void {
             .rule = .prefer_sentinel_termination,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "buffer '{s}' manually allocates one extra element and writes a zero terminator; allocSentinel or dupeSentinel expresses the sentinel contract",
                 .{binding_name},
             ),

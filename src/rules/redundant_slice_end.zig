@@ -54,7 +54,7 @@ pub fn run(context: RuleRun) !void {
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Omit redundant upper bound '{s}.len'", .{base_text}),
+            .title = try context.allocator.print("Omit redundant upper bound '{s}.len'", .{base_text}),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -65,8 +65,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .redundant_slice_end,
             .level = level,
             .span = .{ .start = context.tokens[dotdot_index + 1].loc.start, .end = context.tokens[r_bracket - 1].loc.end },
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "redundant upper slice bound '{s}.len'; '{s}[...]' implicitly bounds to the slice length",
                 .{ base_text, base_text },
             ),
@@ -121,7 +120,7 @@ fn pathBefore(tokens: []const std.zig.Token, before: usize) ?PathSpan {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "redundant slice end reports slice.len as upper bound" {
@@ -135,9 +134,9 @@ test "redundant slice end reports slice.len as upper bound" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "buf.len") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "buf.len") != null);
     try std.testing.expectEqualStrings("", findings[0].fixes[0].edits[0].replacement);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "self.data.len") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "self.data.len") != null);
 }
 
 test "meaningful upper slice bounds stay unchanged" {

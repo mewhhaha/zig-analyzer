@@ -115,7 +115,7 @@ fn isIfInExpressionPosition(context: RuleRun, else_index: usize) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "empty else branches are removed" {

@@ -11,7 +11,7 @@ const Tier = rule_types.Tier;
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
     var configuration = Configuration.defaults();
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, source, .{}) catch |err| {
-        configuration.warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json is malformed: {t}", .{err});
+        configuration.warning = try allocator.print("zig-analyzer.json is malformed: {t}", .{err});
         return configuration;
     };
     defer parsed.deinit();
@@ -54,9 +54,8 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                         return configuration;
                     },
                 };
-                if (path.len == 0 or std.fs.path.isAbsolute(path) or containsParentPathComponent(path)) {
-                    configuration.warning = try std.fmt.allocPrint(
-                        allocator,
+                if (path.len == 0 or std.Io.Dir.path.isAbsolute(path) or containsParentPathComponent(path)) {
+                    configuration.warning = try allocator.print(
                         "zig-analyzer.json check exclusion '{s}' must be a non-empty relative path without '..' components",
                         .{path},
                     );
@@ -142,8 +141,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             var keys = entry.iterator();
             while (keys.next()) |pair| {
                 if (std.mem.eql(u8, pair.key_ptr.*, "path") or std.mem.eql(u8, pair.key_ptr.*, "hint")) continue;
-                configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                configuration.warning = try allocator.print(
                     "zig-analyzer.json key 'lints.banned' contains unknown key '{s}'",
                     .{pair.key_ptr.*},
                 );
@@ -161,8 +159,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                 },
             };
             if (!validBannedPath(path)) {
-                configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                configuration.warning = try allocator.print(
                     "zig-analyzer.json banned path '{s}' must be identifiers separated by single dots",
                     .{path},
                 );
@@ -171,8 +168,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             const hint: ?[]const u8 = if (entry.get("hint")) |hint_value| switch (hint_value) {
                 .string => |string| try allocator.dupe(u8, string),
                 else => {
-                    configuration.warning = try std.fmt.allocPrint(
-                        allocator,
+                    configuration.warning = try allocator.print(
                         "zig-analyzer.json key 'lints.banned' hint for '{s}' must be a string",
                         .{path},
                     );
@@ -195,16 +191,14 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
         var iterator = rules.iterator();
         while (iterator.next()) |entry| {
             const rule = ruleNamed(entry.key_ptr.*) orelse {
-                configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                configuration.warning = try allocator.print(
                     "zig-analyzer.json contains unknown lint rule '{s}'",
                     .{entry.key_ptr.*},
                 );
                 return configuration;
             };
             if (rule.tier() == .semantic) {
-                configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                configuration.warning = try allocator.print(
                     "zig-analyzer.json rule '{s}' is an always-on semantic diagnostic and cannot be configured",
                     .{entry.key_ptr.*},
                 );
@@ -247,7 +241,7 @@ fn parseContracts(
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "imports") or std.mem.eql(u8, key, "resources") or
             std.mem.eql(u8, key, "arena-allocators") or std.mem.eql(u8, key, "must-use")) continue;
-        return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts' contains unknown key '{s}'", .{key});
+        return try allocator.print("zig-analyzer.json key 'contracts' contains unknown key '{s}'", .{key});
     }
 
     if (contracts.get("imports")) |imports_value| {
@@ -264,7 +258,7 @@ fn parseContracts(
             var entry_keys = entry.iterator();
             while (entry_keys.next()) |pair| {
                 if (std.mem.eql(u8, pair.key_ptr.*, "from") or std.mem.eql(u8, pair.key_ptr.*, "deny")) continue;
-                return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts.imports' contains unknown key '{s}'", .{pair.key_ptr.*});
+                return try allocator.print("zig-analyzer.json key 'contracts.imports' contains unknown key '{s}'", .{pair.key_ptr.*});
             }
             const from_result = try contractRelativePath(allocator, entry.get("from") orelse return try allocator.dupe(
                 u8,
@@ -310,7 +304,7 @@ fn parseContracts(
             var entry_keys = entry.iterator();
             while (entry_keys.next()) |pair| {
                 if (std.mem.eql(u8, pair.key_ptr.*, "acquire") or std.mem.eql(u8, pair.key_ptr.*, "release")) continue;
-                return try std.fmt.allocPrint(allocator, "zig-analyzer.json key 'contracts.resources' contains unknown key '{s}'", .{pair.key_ptr.*});
+                return try allocator.print("zig-analyzer.json key 'contracts.resources' contains unknown key '{s}'", .{pair.key_ptr.*});
             }
             const acquire_result = try callableContract(allocator, entry.get("acquire") orelse return try allocator.dupe(
                 u8,
@@ -342,7 +336,7 @@ fn parseContracts(
         for (entries, arena_allocators) |entry, *arena_allocator| {
             const contract_result = try callableContract(allocator, entry, "contracts.arena-allocators");
             arena_allocator.* = switch (contract_result) {
-                .value => |name| if (std.mem.indexOfScalar(u8, name, '.') != null)
+                .value => |name| if (std.mem.findScalar(u8, name, '.') != null)
                     name
                 else
                     return try allocator.dupe(u8, "zig-analyzer.json key 'contracts.arena-allocators' entries must name an owner and allocator member"),
@@ -380,10 +374,10 @@ fn contractRelativePath(
 ) !ParsedString {
     const path = switch (value) {
         .string => |string| string,
-        else => return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' must be a relative path string", .{key}) },
+        else => return .{ .warning = try allocator.print("zig-analyzer.json key '{s}' must be a relative path string", .{key}) },
     };
-    if (path.len == 0 or std.fs.path.isAbsolute(path) or containsParentPathComponent(path)) {
-        return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' path '{s}' must be non-empty, relative, and contain no '..' component", .{ key, path }) };
+    if (path.len == 0 or std.Io.Dir.path.isAbsolute(path) or containsParentPathComponent(path)) {
+        return .{ .warning = try allocator.print("zig-analyzer.json key '{s}' path '{s}' must be non-empty, relative, and contain no '..' component", .{ key, path }) };
     }
     return .{ .value = try allocator.dupe(u8, std.mem.trimEnd(u8, path, "/\\")) };
 }
@@ -395,10 +389,10 @@ fn callableContract(
 ) !ParsedString {
     const callable = switch (value) {
         .string => |string| string,
-        else => return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' must contain callable strings", .{key}) },
+        else => return .{ .warning = try allocator.print("zig-analyzer.json key '{s}' must contain callable strings", .{key}) },
     };
     if (!validBannedPath(callable)) {
-        return .{ .warning = try std.fmt.allocPrint(allocator, "zig-analyzer.json key '{s}' callable '{s}' must be identifiers separated by single dots", .{ key, callable }) };
+        return .{ .warning = try allocator.print("zig-analyzer.json key '{s}' callable '{s}' must be identifiers separated by single dots", .{ key, callable }) };
     }
     return .{ .value = try allocator.dupe(u8, callable) };
 }
@@ -410,8 +404,7 @@ fn parseRuleSettings(
     configuration: *Configuration,
 ) !?[]const u8 {
     if (rule != .function_length and rule != .line_length and rule != .todo_comment) {
-        return try std.fmt.allocPrint(
-            allocator,
+        return try allocator.print(
             "zig-analyzer.json rule '{s}' accepts a severity string, not an options object",
             .{rule.code()},
         );
@@ -472,8 +465,7 @@ fn parseRuleSettings(
             },
             else => unreachable,
         }
-        return try std.fmt.allocPrint(
-            allocator,
+        return try allocator.print(
             "zig-analyzer.json rule '{s}' contains unknown setting '{s}'",
             .{ rule.code(), key },
         );
@@ -491,8 +483,7 @@ fn positiveInteger(value: std.json.Value) ?usize {
 }
 
 fn settingTypeWarning(allocator: std.mem.Allocator, rule: Rule, key: []const u8, expected: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(
-        allocator,
+    return try allocator.print(
         "zig-analyzer.json rule '{s}' setting '{s}' must be {s}",
         .{ rule.code(), key, expected },
     );
@@ -522,15 +513,14 @@ pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]
         const parsed = directiveOnLine(line);
         if (parsed) |directive| {
             if (directive.kind == .disable_file and (!file_header or lineHasCodeBeforeDirective(line, directive.comment_start))) {
-                return try std.fmt.allocPrint(
-                    allocator,
+                return try allocator.print(
                     "zig-analyzer disable-file suppression on line {d} must appear before code",
                     .{line_number},
                 );
             }
             if (try invalidDirectiveTargets(allocator, directive.targets, line_number)) |warning| return warning;
         } else if (containsDirectiveMarker(line)) {
-            return try std.fmt.allocPrint(allocator, "malformed zig-analyzer suppression on line {d}", .{line_number});
+            return try allocator.print("malformed zig-analyzer suppression on line {d}", .{line_number});
         }
         if (lineHasCode(line)) file_header = false;
     }
@@ -540,7 +530,7 @@ pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]
 /// Cheap pre-check so per-finding suppression lookups can be skipped for the
 /// common case of a file with no directives at all.
 pub fn hasSuppressionDirectives(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "// zig-analyzer:") != null;
+    return std.mem.find(u8, source, "// zig-analyzer:") != null;
 }
 
 pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
@@ -615,15 +605,14 @@ pub fn suppressionEdits(
     const target_line_start = lineStart(source, offset);
     const line_edit = if (extendableDirectiveEnd(source, target_line_start)) |directive_end| Edit{
         .span = .{ .start = directive_end, .end = directive_end },
-        .replacement = try std.fmt.allocPrint(allocator, ", {s}", .{rule.code()}),
+        .replacement = try allocator.print(", {s}", .{rule.code()}),
     } else line_edit: {
         var indentation_end = target_line_start;
         while (indentation_end < source.len and
             (source[indentation_end] == ' ' or source[indentation_end] == '\t')) indentation_end += 1;
         break :line_edit Edit{
             .span = .{ .start = target_line_start, .end = target_line_start },
-            .replacement = try std.fmt.allocPrint(
-                allocator,
+            .replacement = try allocator.print(
                 "{s}// zig-analyzer: disable-next-line {s}\n",
                 .{ source[target_line_start..indentation_end], rule.code() },
             ),
@@ -634,7 +623,7 @@ pub fn suppressionEdits(
         .line = line_edit,
         .file = .{
             .span = .{ .start = header_end, .end = header_end },
-            .replacement = try std.fmt.allocPrint(allocator, "// zig-analyzer: disable-file {s}\n", .{rule.code()}),
+            .replacement = try allocator.print("// zig-analyzer: disable-file {s}\n", .{rule.code()}),
         },
     };
 }
@@ -692,7 +681,7 @@ fn directiveOnLine(line: []const u8) ?Directive {
     const comment = std.mem.trimStart(u8, line[comment_start..], " \t\r");
     if (!std.mem.startsWith(u8, comment, marker)) return null;
     const remainder = std.mem.trim(u8, comment[marker.len..], " \t\r");
-    const name_end = std.mem.indexOfAny(u8, remainder, " \t\r") orelse remainder.len;
+    const name_end = std.mem.findAny(u8, remainder, " \t\r") orelse remainder.len;
     const name = remainder[0..name_end];
     const kind = directive_kinds.get(name) orelse return null;
     return .{
@@ -714,7 +703,7 @@ fn invalidDirectiveTargets(
     while (names.next()) |raw_name| {
         const name = std.mem.trim(u8, raw_name, " \t\r");
         if (name.len == 0) {
-            return try std.fmt.allocPrint(allocator, "empty lint rule in zig-analyzer suppression on line {d}", .{line_number});
+            return try allocator.print("empty lint rule in zig-analyzer suppression on line {d}", .{line_number});
         }
         name_count += 1;
         if (std.mem.eql(u8, name, "all")) {
@@ -722,16 +711,14 @@ fn invalidDirectiveTargets(
             continue;
         }
         if (ruleNamed(name) == null) {
-            return try std.fmt.allocPrint(
-                allocator,
+            return try allocator.print(
                 "zig-analyzer suppression on line {d} contains unknown lint rule '{s}'",
                 .{ line_number, name },
             );
         }
     }
     if (names_all and name_count != 1) {
-        return try std.fmt.allocPrint(
-            allocator,
+        return try allocator.print(
             "zig-analyzer suppression on line {d} cannot combine 'all' with named rules",
             .{line_number},
         );
@@ -793,12 +780,12 @@ fn lineCommentStart(line: []const u8) ?usize {
 }
 
 fn lineStart(source: []const u8, offset: usize) usize {
-    return (std.mem.lastIndexOfScalar(u8, source[0..@min(offset, source.len)], '\n') orelse return 0) + 1;
+    return (std.mem.findScalarLast(u8, source[0..@min(offset, source.len)], '\n') orelse return 0) + 1;
 }
 
 fn lineEnd(source: []const u8, offset: usize) usize {
     const start = @min(offset, source.len);
-    const relative = std.mem.indexOfScalar(u8, source[start..], '\n') orelse return source.len;
+    const relative = std.mem.findScalar(u8, source[start..], '\n') orelse return source.len;
     return start + relative;
 }
 
@@ -814,8 +801,7 @@ fn parseLevel(value: std.json.Value) ?Level {
 }
 
 fn invalidLevelMessage(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(
-        allocator,
+    return try allocator.print(
         "zig-analyzer.json key '{s}' must be off, hint, information, warning, or error",
         .{path},
     );
@@ -1048,7 +1034,7 @@ test "malformed project contracts identify the invalid contract field" {
     };
     for (cases) |case| {
         const configuration = try parse(arena.allocator(), case.source);
-        try std.testing.expect(std.mem.indexOf(u8, configuration.warning.?, case.expected) != null);
+        try std.testing.expect(std.mem.find(u8, configuration.warning.?, case.expected) != null);
     }
 }
 
@@ -1127,12 +1113,12 @@ test "line next-line and scoped suppressions target several rules" {
         "// zig-analyzer: enable all\n" ++
         "defer { closeAgain(); }\n";
 
-    const line_value = std.mem.indexOf(u8, source, "line_value").?;
-    const next_value = std.mem.indexOf(u8, source, "next_value").?;
-    const scoped_value = std.mem.indexOf(u8, source, "scoped_value").?;
-    const enabled_value = std.mem.indexOf(u8, source, "enabled_value").?;
-    const first_defer = std.mem.indexOf(u8, source, "defer { close(); }").?;
-    const second_defer = std.mem.indexOf(u8, source, "defer { closeAgain(); }").?;
+    const line_value = std.mem.find(u8, source, "line_value").?;
+    const next_value = std.mem.find(u8, source, "next_value").?;
+    const scoped_value = std.mem.find(u8, source, "scoped_value").?;
+    const enabled_value = std.mem.find(u8, source, "enabled_value").?;
+    const first_defer = std.mem.find(u8, source, "defer { close(); }").?;
+    const second_defer = std.mem.find(u8, source, "defer { closeAgain(); }").?;
 
     try std.testing.expect(isSuppressed(source, .never_mutated_var, line_value));
     try std.testing.expect(!isSuppressed(source, .needless_defer_block, line_value));
@@ -1147,7 +1133,7 @@ test "file and unnamed suppressions target all rules" {
     const file_source =
         "// zig-analyzer: disable-file never-mutated-var, needless-defer-block\n" ++
         "var value = 1;\n";
-    const value = std.mem.indexOf(u8, file_source, "value").?;
+    const value = std.mem.find(u8, file_source, "value").?;
     try std.testing.expect(isSuppressed(file_source, .never_mutated_var, value));
     try std.testing.expect(isSuppressed(file_source, .needless_defer_block, value));
     try std.testing.expect(!isSuppressed(file_source, .redundant_boolean_if, value));
@@ -1157,8 +1143,8 @@ test "file and unnamed suppressions target all rules" {
         "var disabled = 1;\n" ++
         "// zig-analyzer: enable\n" ++
         "var enabled = 2;\n";
-    const disabled = std.mem.indexOf(u8, scoped_source, "disabled").?;
-    const enabled = std.mem.indexOf(u8, scoped_source, "enabled =").?;
+    const disabled = std.mem.find(u8, scoped_source, "disabled").?;
+    const enabled = std.mem.find(u8, scoped_source, "enabled =").?;
     try std.testing.expect(isSuppressed(scoped_source, .never_mutated_var, disabled));
     try std.testing.expect(!isSuppressed(scoped_source, .never_mutated_var, enabled));
 }
@@ -1178,14 +1164,14 @@ test "suppression validation accepts eslint-style forms and rejects ambiguous ta
         "// zig-analyzer: disable all, never-mutated-var\n",
     )).?;
     defer std.testing.allocator.free(ambiguous);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "cannot combine 'all'") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous, "cannot combine 'all'") != null);
 
     const misplaced = (try suppressionWarning(
         std.testing.allocator,
         "const value = 1;\n// zig-analyzer: disable-file never-mutated-var\n",
     )).?;
     defer std.testing.allocator.free(misplaced);
-    try std.testing.expect(std.mem.indexOf(u8, misplaced, "must appear before code") != null);
+    try std.testing.expect(std.mem.find(u8, misplaced, "must appear before code") != null);
 }
 
 test "directive markers inside strings are ignored" {
@@ -1193,7 +1179,7 @@ test "directive markers inside strings are ignored" {
         "const marker = \"// zig-analyzer: disable-line never-mutated-var\";\n" ++
         "const multiline = \\\\// zig-analyzer: disable-file all;\n";
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(std.testing.allocator, source));
-    const marker = std.mem.indexOf(u8, source, "marker").?;
+    const marker = std.mem.find(u8, source, "marker").?;
     try std.testing.expect(!isSuppressed(source, .never_mutated_var, marker));
 }
 
@@ -1204,7 +1190,7 @@ test "suppression edits insert an indented next-line directive that suppresses t
         "fn run() void {\n" ++
         "    var value = 1;\n" ++
         "}\n";
-    const offset = std.mem.indexOf(u8, source, "value").?;
+    const offset = std.mem.find(u8, source, "value").?;
     const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
 
     const suppressed = try applyEdit(arena.allocator(), source, edits.line);
@@ -1215,7 +1201,7 @@ test "suppression edits insert an indented next-line directive that suppresses t
             "}\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
 }
 
@@ -1225,7 +1211,7 @@ test "suppression edits extend a next-line directive already above the finding" 
     const source =
         "// zig-analyzer: disable-next-line needless-defer-block\n" ++
         "var value = 1;\n";
-    const offset = std.mem.indexOf(u8, source, "value").?;
+    const offset = std.mem.find(u8, source, "value").?;
     const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
 
     const suppressed = try applyEdit(arena.allocator(), source, edits.line);
@@ -1234,8 +1220,8 @@ test "suppression edits extend a next-line directive already above the finding" 
             "var value = 1;\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
-    try std.testing.expect(isSuppressed(suppressed, .needless_defer_block, std.mem.indexOf(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .needless_defer_block, std.mem.find(u8, suppressed, "value").?));
 }
 
 test "suppression file edit lands after module doc comments and suppresses the whole file" {
@@ -1246,7 +1232,7 @@ test "suppression file edit lands after module doc comments and suppresses the w
         "\n" ++
         "var value = 1;\n" ++
         "var again = 2;\n";
-    const offset = std.mem.indexOf(u8, source, "again").?;
+    const offset = std.mem.find(u8, source, "again").?;
     const edits = try suppressionEdits(arena.allocator(), source, .never_mutated_var, offset);
 
     const suppressed = try applyEdit(arena.allocator(), source, edits.file);
@@ -1258,8 +1244,8 @@ test "suppression file edit lands after module doc comments and suppresses the w
             "var again = 2;\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "value").?));
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.indexOf(u8, suppressed, "again").?));
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "again").?));
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
 }
 

@@ -28,8 +28,7 @@ fn findIndexOfPrefixTests(context: RuleRun) !void {
             .rule = .prefer_starts_with,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "search checks whether '{s}' occurs at offset zero in '{s}'; use std.mem.startsWith",
                 .{ needle, haystack },
             ),
@@ -54,8 +53,7 @@ fn findGuardedSuffixTests(context: RuleRun) !void {
             .rule = .prefer_ends_with,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "guarded tail comparison checks whether '{s}' ends with '{s}'; use std.mem.endsWith",
                 .{ haystack, needle },
             ),
@@ -133,8 +131,7 @@ fn findScalarCounts(context: RuleRun) !void {
             .rule = .prefer_count_scalar,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "'{s}' only counts matching elements in '{s}'; use std.mem.countScalar",
                 .{ count_name, loop.iterable },
             ),
@@ -205,8 +202,7 @@ fn findScalarReplacements(context: RuleRun) !void {
             .rule = .prefer_replace_scalar,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "loop only replaces matching elements in '{s}'; use std.mem.replaceScalar",
                 .{context.tokenText(for_index + 2)},
             ),
@@ -250,8 +246,7 @@ fn findBooleanSearches(context: RuleRun) !void {
             .rule = .prefer_index_of,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "boolean linear search over '{s}' can use std.mem.findScalar or std.mem.find",
                 .{loop.iterable},
             ),

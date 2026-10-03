@@ -34,8 +34,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_expression_initializer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "'{s}' starts undefined and every {s} branch assigns it; initialize a const from the {s} expression",
                 .{ name, expr_info.name, expr_info.name },
             ),
@@ -181,7 +180,7 @@ test "undefined locals assigned by every if branch prefer expression initializat
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "const") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "const") != null);
 }
 
 test "undefined locals assigned by every switch prong prefer expression initialization" {
@@ -194,7 +193,7 @@ test "undefined locals assigned by every switch prong prefer expression initiali
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "switch") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "switch") != null);
 }
 
 test "partial and multi-statement assignments stay unchanged" {

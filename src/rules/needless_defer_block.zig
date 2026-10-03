@@ -19,7 +19,7 @@ pub fn run(context: RuleRun) !void {
         if (containsComment(block_source)) continue;
         const statement = std.mem.trim(u8, block_source, " \t\r\n");
         const replacement = if (context.tokens[defer_index].loc.end == context.tokens[opening_index].loc.start)
-            try std.fmt.allocPrint(context.allocator, " {s}", .{statement})
+            try context.allocator.print(" {s}", .{statement})
         else
             try context.allocator.dupe(u8, statement);
         const edits = try context.allocator.alloc(types.Edit, 1);
@@ -52,7 +52,7 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "single-expression defer blocks use the direct form" {

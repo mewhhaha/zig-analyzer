@@ -243,8 +243,7 @@ fn findSummaryContainerInvalidations(
                             .file_index = file_index,
                             .rule = .invalidated_element_pointer,
                             .span = file.tokens[declaration_index + 1].loc,
-                            .message = try std.fmt.allocPrint(
-                                allocator,
+                            .message = try allocator.print(
                                 "pointer '{s}' is used after helper '{s}' mutates its backing container",
                                 .{ binding, mutation.method },
                             ),
@@ -262,8 +261,7 @@ fn findSummaryContainerInvalidations(
             .file_index = file_index,
             .rule = .iterator_invalidated_during_loop,
             .span = file.tokens[mutation.method_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "helper '{s}' mutates the map while iterator '{s}' is active",
                 .{ mutation.method, binding },
             ),
@@ -415,8 +413,7 @@ fn findDiscardedSummaryIo(
             .file_index = file_index,
             .rule = rule,
             .span = file.tokens[call.name_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "discarding {s}'s summarized partial-{s} count loses how much data was transferred",
                 .{ name, if (partial_io == .read) "read" else "write" },
             ),
@@ -470,8 +467,7 @@ fn findBorrowedReturnInvalidations(
             .file_index = file_index,
             .rule = rule,
             .span = file.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "{s} '{s}' returned by {s} borrows from '{s}{s}{s}' and is used after {s}",
                 .{
                     if (borrowed.kind == .pointer) "pointer" else "view",
@@ -623,8 +619,7 @@ fn findEscapingLocalStorage(
                 .file_index = file_index,
                 .rule = .local_storage_escape,
                 .span = file.tokens[escaped.argument_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "'{s}' aliases local array '{s}' and is retained by {s} beyond that storage's safe lifetime",
                     .{ alias, array_name, escaped.callable },
                 ),
@@ -854,8 +849,7 @@ fn findDeferredOwnedEscapes(
                     .file_index = file_index,
                     .rule = .returning_released_value,
                     .span = file.tokens[equal_index + 1].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "stored owning value '{s}' is released by its deferred cleanup as the scope exits",
                         .{binding},
                     ),
@@ -1001,8 +995,7 @@ fn findIncompleteOwnedFieldCleanup(
                     .file_index = file_index,
                     .rule = .incomplete_owned_field_cleanup,
                     .span = field.span,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "cleanup for '{s}' releases {d} of {d} proven owned fields but omits '{s}'",
                         .{ type_name, released_count, owned_count, field.field_name },
                     ),
@@ -1065,14 +1058,12 @@ fn findDirectOwnedFieldOverwrites(
                         .rule = .overwritten_owning_value,
                         .span = file.tokens[equal_index - 1].loc,
                         .message = if (released)
-                            try std.fmt.allocPrint(
-                                allocator,
+                            try allocator.print(
                                 "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
                                 .{ type_name, field_name },
                             )
                         else
-                            try std.fmt.allocPrint(
-                                allocator,
+                            try allocator.print(
                                 "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
                                 .{ type_name, field_name },
                             ),
@@ -1684,8 +1675,7 @@ fn findOwnedSequenceCleanupOmissions(
             .file_index = sequence.file_index,
             .rule = .incomplete_owned_field_cleanup,
             .span = file.tokens[drop].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "{s} drops owned slice elements stored in '{s}.{s}' without freeing them",
                 .{ tokenText(file.source, file.tokens[drop]), sequence.type_name, sequence.field_name },
             ),
@@ -1728,8 +1718,7 @@ fn findOwnedSequenceDiscardedRemovals(
                 .file_index = sequence.file_index,
                 .rule = .unreleased_allocation,
                 .span = candidate.loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "discarding an element removed from '{s}.{s}' leaks its owned slice",
                     .{ sequence.type_name, sequence.field_name },
                 ),
@@ -1822,14 +1811,12 @@ fn findOwnedSequenceOverwrites(
             .rule = .overwritten_owning_value,
             .span = file.tokens[items_index].loc,
             .message = if (released)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "fallible replacement in '{s}.{s}' occurs after its previous owned slice is freed",
                     .{ sequence.type_name, sequence.field_name },
                 )
             else
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "assignment in '{s}.{s}' replaces an owned slice without freeing it",
                     .{ sequence.type_name, sequence.field_name },
                 ),
@@ -1862,8 +1849,7 @@ fn findInlineOwnedSequenceInsertions(
             .file_index = sequence.file_index,
             .rule = .missing_errdefer,
             .span = file.tokens[allocation_call.name_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "owned slice inserted inline into '{s}.{s}' leaks if append fails; bind it and add errdefer cleanup",
                 .{ sequence.type_name, sequence.field_name },
             ),
@@ -1985,8 +1971,7 @@ fn findFieldFailureUnsafeShrinks(
                 .file_index = file_index,
                 .rule = .partial_ownership_transfer,
                 .span = file.tokens[realloc_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "fallible shrink of '{s}' follows a move of owned '{s}' elements; realloc failure leaves duplicate ownership",
                     .{ field_name, element_type },
                 ),
@@ -2253,8 +2238,7 @@ fn findSequenceCleanupOmissions(
                 .file_index = file_index,
                 .rule = .incomplete_owned_field_cleanup,
                 .span = file.tokens[drop].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "{s} drops '{s}' elements without releasing proven owned field '{s}'",
                     .{ tokenText(file.source, file.tokens[drop]), element_type, owned_field.field_name },
                 ),
@@ -2541,8 +2525,7 @@ fn findRemovedOwnedValueTransfers(
                 .file_index = file_index,
                 .rule = .partial_ownership_transfer,
                 .span = file.tokens[insertion].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "fallible insertion can lose removed owned '{s}' value '{s}' when it fails",
                     .{ element_type, binding },
                 ),
@@ -2704,8 +2687,7 @@ fn findDroppedOwnedElements(
                         .file_index = file_index,
                         .rule = .unreleased_allocation,
                         .span = candidate.loc,
-                        .message = try std.fmt.allocPrint(
-                            allocator,
+                        .message = try allocator.print(
                             "discarding removed '{s}' drops proven owned field '{s}'",
                             .{ element_type, owned_field.field_name },
                         ),
@@ -2719,8 +2701,7 @@ fn findDroppedOwnedElements(
                     .file_index = file_index,
                     .rule = .unreleased_allocation,
                     .span = candidate.loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "discarding removed '{s}' drops proven owned field '{s}'",
                         .{ element_type, cleanup_field },
                     ),
@@ -3016,14 +2997,12 @@ fn findOwnedElementOverwrites(
                 .rule = .overwritten_owning_value,
                 .span = file.tokens[field_index].loc,
                 .message = if (released)
-                    try std.fmt.allocPrint(
-                        allocator,
+                    try allocator.print(
                         "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
                         .{ element_type, field_name },
                     )
                 else
-                    try std.fmt.allocPrint(
-                        allocator,
+                    try allocator.print(
                         "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
                         .{ element_type, field_name },
                     ),
@@ -3073,14 +3052,12 @@ fn findAliasedOwnedElementOverwrites(
                     .rule = .overwritten_owning_value,
                     .span = file.tokens[field_index].loc,
                     .message = if (released)
-                        try std.fmt.allocPrint(
-                            allocator,
+                        try allocator.print(
                             "fallible replacement through alias '{s}' occurs after proven owned field '{s}.{s}' is released",
                             .{ alias, element_type, field_name },
                         )
                     else
-                        try std.fmt.allocPrint(
-                            allocator,
+                        try allocator.print(
                             "assignment through alias '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
                             .{ alias, element_type, field_name },
                         ),
@@ -3139,14 +3116,12 @@ fn findCapturedOwnedElementOverwrites(
                     .rule = .overwritten_owning_value,
                     .span = file.tokens[field_index].loc,
                     .message = if (released)
-                        try std.fmt.allocPrint(
-                            allocator,
+                        try allocator.print(
                             "fallible replacement through pointer capture '{s}' occurs after proven owned field '{s}.{s}' is released",
                             .{ alias, element_type, field_name },
                         )
                     else
-                        try std.fmt.allocPrint(
-                            allocator,
+                        try allocator.print(
                             "assignment through pointer capture '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
                             .{ alias, element_type, field_name },
                         ),
@@ -3569,8 +3544,7 @@ fn findConfigurationDivergentApis(
                     .file_index = location.file_index,
                     .rule = .configuration_divergent_api,
                     .span = location.span,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "public declaration '{s}' has different compiler-resolved shapes in compile units '{s}' and '{s}'",
                         .{ name, left_unit.root_path, right_unit.root_path },
                     ),
@@ -3616,7 +3590,7 @@ fn findUnreachablePublicDeclarations(
         return;
     }
     for (files, 0..) |file, file_index| {
-        if (reachable[file_index] or std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig")) continue;
+        if (reachable[file_index] or std.mem.eql(u8, std.Io.Dir.path.basename(file.path), "build.zig")) continue;
         for (file.tokens, 0..) |token, pub_index| {
             if (token.tag != .keyword_pub or pub_index + 2 >= file.tokens.len) continue;
             const name_index = if (file.tokens[pub_index + 1].tag == .keyword_fn or
@@ -3631,8 +3605,7 @@ fn findUnreachablePublicDeclarations(
                 .file_index = file_index,
                 .rule = .unreachable_public_declaration,
                 .span = file.tokens[name_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "public declaration '{s}' is reachable from none of the {d} compiler-analyzed compile units",
                     .{ name, compiler_facts.units.len },
                 ),
@@ -3676,7 +3649,7 @@ fn shapesEqual(left: CompilerShape, right: CompilerShape) bool {
 }
 
 fn declarationBaseName(declaration: []const u8) []const u8 {
-    const separator = std.mem.lastIndexOfScalar(u8, declaration, '.') orelse return declaration;
+    const separator = std.mem.findScalarLast(u8, declaration, '.') orelse return declaration;
     return declaration[separator + 1 ..];
 }
 
@@ -3698,8 +3671,7 @@ fn findImportBoundaryViolations(
                     .file_index = import.file_index,
                     .rule = .import_boundary,
                     .span = import.span,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "source '{s}' may not import '{s}' because contract '{s}' denies '{s}'",
                         .{ source_path, import.resolved_path, boundary.from, denied },
                     ),
@@ -3713,8 +3685,8 @@ fn findImportBoundaryViolations(
 fn pathMatchesContract(path: []const u8, contract: []const u8) bool {
     if (!std.mem.startsWith(u8, path, contract)) return false;
     if (path.len == contract.len) return true;
-    if (contract.len != 0 and std.fs.path.isSep(contract[contract.len - 1])) return true;
-    return std.fs.path.isSep(path[contract.len]);
+    if (contract.len != 0 and std.Io.Dir.path.isSep(contract[contract.len - 1])) return true;
+    return std.Io.Dir.path.isSep(path[contract.len]);
 }
 
 fn findDuplicateModuleImports(
@@ -3733,8 +3705,7 @@ fn findDuplicateModuleImports(
                 .file_index = current.file_index,
                 .rule = .duplicate_module_import,
                 .span = current.span,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "imports '{s}' and '{s}' resolve to the same module '{s}'",
                     .{ previous.spelling, current.spelling, current.resolved_path },
                 ),
@@ -3802,7 +3773,7 @@ fn findUnreferencedTests(
     defer allocator.free(build_reachable);
     @memset(build_reachable, false);
     for (files, 0..) |file, file_index| {
-        build_reachable[file_index] = std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig");
+        build_reachable[file_index] = std.mem.eql(u8, std.Io.Dir.path.basename(file.path), "build.zig");
     }
     var changed = true;
     while (changed) {
@@ -3864,7 +3835,7 @@ fn findUnreferencedTests(
                 }
             }
             if (!enumerates_directory) continue;
-            var directory = std.fs.path.dirname(file.path);
+            var directory = std.Io.Dir.path.dirname(file.path);
             while (directory) |candidate_directory| {
                 for (build_file.tokens) |token| {
                     if (token.tag != .string_literal) continue;
@@ -3875,7 +3846,7 @@ fn findUnreferencedTests(
                     }
                 }
                 if (referenced) break;
-                directory = std.fs.path.dirname(candidate_directory);
+                directory = std.Io.Dir.path.dirname(candidate_directory);
             }
             if (referenced) break;
         };
@@ -3884,8 +3855,7 @@ fn findUnreferencedTests(
             .file_index = file_index,
             .rule = .unreferenced_test_file,
             .span = .{ .start = 0, .end = @min(file.source.len, 1) },
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "test source '{s}' is not imported by another Zig file or referenced from build.zig",
                 .{file.path},
             ),
@@ -3916,7 +3886,7 @@ fn findConflictingBuildOptions(
         reported.deinit(allocator);
     }
     for (files, 0..) |file, file_index| {
-        if (!std.mem.eql(u8, std.fs.path.basename(file.path), "build.zig")) continue;
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(file.path), "build.zig")) continue;
         for (file.tokens, 0..) |token, index| {
             if (token.tag != .identifier or !tokenIs(file.source, token, "root_source_file") or index + 6 >= file.tokens.len) continue;
             var string_index = index + 1;
@@ -3937,7 +3907,7 @@ fn findConflictingBuildOptions(
                 defer allocator.free(signature);
                 const first = gop.value_ptr.*;
                 if (std.mem.eql(u8, first.signature, signature)) continue;
-                const conflict_key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ gop.key_ptr.*, signature });
+                const conflict_key = try allocator.print("{s}\x00{s}", .{ gop.key_ptr.*, signature });
                 const rep_gop = try reported.getOrPut(allocator, conflict_key);
                 if (rep_gop.found_existing) {
                     allocator.free(conflict_key);
@@ -3948,8 +3918,7 @@ fn findConflictingBuildOptions(
                     .file_index = file_index,
                     .rule = .conflicting_build_options,
                     .span = file.tokens[string_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "root source '{s}' is configured with both '{s}' and '{s}'; semantic results may differ between compile units",
                         .{ gop.key_ptr.*, first.signature, signature },
                     ),
@@ -4030,9 +3999,9 @@ fn findInconsistentImportAliases(
         group.value_ptr.total += 1;
         var stack_buf: [512]u8 = undefined;
         const lookup_key = if (current.resolved_path.len +| alias.len +| 1 <= stack_buf.len)
-            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
+            std.mem.print(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
         else
-            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
+            try allocator.print("{s}\x00{s}", .{ current.resolved_path, alias });
         defer if (lookup_key.ptr != &stack_buf) allocator.free(lookup_key);
 
         if (alias_counts.getPtr(lookup_key)) |ptr| {
@@ -4048,9 +4017,9 @@ fn findInconsistentImportAliases(
         const group = groups.getPtr(current.resolved_path).?;
         var stack_buf: [512]u8 = undefined;
         const key = if (current.resolved_path.len +| alias.len +| 1 <= stack_buf.len)
-            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
+            std.mem.print(&stack_buf, "{s}\x00{s}", .{ current.resolved_path, alias }) catch unreachable
         else
-            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ current.resolved_path, alias });
+            try allocator.print("{s}\x00{s}", .{ current.resolved_path, alias });
         defer if (key.ptr != &stack_buf) allocator.free(key);
         const count = alias_counts.get(key).?;
         if (count > group.dominant_count) {
@@ -4067,8 +4036,7 @@ fn findInconsistentImportAliases(
             .file_index = current.file_index,
             .rule = .inconsistent_import_alias,
             .span = current.alias_span.?,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "module '{s}' is imported as '{s}', while {d} of {d} project imports use '{s}'",
                 .{ current.spelling, current_alias, group.dominant_count, group.total, group.dominant_alias.? },
             ),
@@ -4135,8 +4103,7 @@ fn findMinorityNamingStyles(
             .file_index = sample.file_index,
             .rule = .minority_naming_style,
             .span = sample.span,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "{s} name '{s}' uses {s}, while {d} of {d} project declarations use {s}",
                 .{ @tagName(sample.kind), sample.name, @tagName(sample.style), dominant_count, total, @tagName(dominant) },
             ),
@@ -4201,9 +4168,9 @@ fn findInconsistentParameterVocabulary(
         group.value_ptr.total += 1;
         var stack_buf: [512]u8 = undefined;
         const lookup_key = if (sample.type_name.len +| sample.name.len +| 1 <= stack_buf.len)
-            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
+            std.mem.print(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
         else
-            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
+            try allocator.print("{s}\x00{s}", .{ sample.type_name, sample.name });
         defer if (lookup_key.ptr != &stack_buf) allocator.free(lookup_key);
 
         if (name_counts.getPtr(lookup_key)) |ptr| {
@@ -4218,9 +4185,9 @@ fn findInconsistentParameterVocabulary(
         const group = groups.getPtr(sample.type_name).?;
         var stack_buf: [512]u8 = undefined;
         const key = if (sample.type_name.len +| sample.name.len +| 1 <= stack_buf.len)
-            std.fmt.bufPrint(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
+            std.mem.print(&stack_buf, "{s}\x00{s}", .{ sample.type_name, sample.name }) catch unreachable
         else
-            try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ sample.type_name, sample.name });
+            try allocator.print("{s}\x00{s}", .{ sample.type_name, sample.name });
         defer if (key.ptr != &stack_buf) allocator.free(key);
         const count = name_counts.get(key).?;
         if (count > group.dominant_count) {
@@ -4236,7 +4203,7 @@ fn findInconsistentParameterVocabulary(
             .file_index = sample.file_index,
             .rule = .inconsistent_parameter_vocabulary,
             .span = sample.span,
-            .message = try std.fmt.allocPrint(allocator, "parameter '{s}' has type '{s}', for which {d} of {d} project parameters use '{s}'", .{ sample.name, sample.type_name, group.dominant_count, group.total, group.dominant_name.? }),
+            .message = try allocator.print("parameter '{s}' has type '{s}', for which {d} of {d} project parameters use '{s}'", .{ sample.name, sample.type_name, group.dominant_count, group.total, group.dominant_name.? }),
         });
     }
 }
@@ -4340,8 +4307,7 @@ fn findLiteralBooleanArguments(
                     .file_index = file_index,
                     .rule = .literal_boolean_argument,
                     .span = file.tokens[argument.start].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "literal boolean argument hides parameter '{s}' in call to '{s}'; use an enum or options struct",
                         .{ parameter.name, function_name },
                     ),
@@ -4440,7 +4406,7 @@ fn findInconsistentErrorSetStyle(
             .file_index = sample.file_index,
             .rule = .inconsistent_error_set_style,
             .span = sample.span,
-            .message = try std.fmt.allocPrint(allocator, "public function uses an {s} error set, while {d} of {d} public error-returning functions use {s} sets", .{ if (sample.explicit) "explicit" else "inferred", dominant_count, samples.items.len, if (dominant_explicit) "explicit" else "inferred" }),
+            .message = try allocator.print("public function uses an {s} error set, while {d} of {d} public error-returning functions use {s} sets", .{ if (sample.explicit) "explicit" else "inferred", dominant_count, samples.items.len, if (dominant_explicit) "explicit" else "inferred" }),
         });
     }
 }
@@ -4482,12 +4448,12 @@ fn findAllocationsAfterInit(
                 }
                 if (!is_allocation) continue;
                 const receiver = tokenText(file.source, file.tokens[index - 2]);
-                if (std.mem.indexOf(u8, receiver, "alloc") == null and !bindingHasAllocatorType(file, fn_index, opening, receiver)) continue;
+                if (std.mem.find(u8, receiver, "alloc") == null and !bindingHasAllocatorType(file, fn_index, opening, receiver)) continue;
                 try found.append(allocator, .{
                     .file_index = file_index,
                     .rule = .allocation_after_init,
                     .span = body_token.loc,
-                    .message = try std.fmt.allocPrint(allocator, "function '{s}' allocates through '{s}' outside a recognized initialization path", .{ function_name, receiver }),
+                    .message = try allocator.print("function '{s}' allocates through '{s}' outside a recognized initialization path", .{ function_name, receiver }),
                 });
             }
         }
@@ -4502,7 +4468,7 @@ const FunctionDeclaration = struct {
     inline_fn: bool,
 };
 
-const FunctionDeclarationsByName = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize));
+const FunctionDeclarationsByName = std.StringHashMapUnmanaged(std.ArrayList(usize));
 
 fn findRecursiveCalls(
     allocator: std.mem.Allocator,
@@ -4548,7 +4514,7 @@ fn findRecursiveCalls(
             .file_index = declaration.file_index,
             .rule = .recursive_call,
             .span = declaration.span,
-            .message = try std.fmt.allocPrint(allocator, "function '{s}' calls itself recursively; use an explicitly bounded worklist", .{declaration.name}),
+            .message = try allocator.print("function '{s}' calls itself recursively; use an explicitly bounded worklist", .{declaration.name}),
         });
     }
     for (declarations.items, 0..) |left, left_index| {
@@ -4563,7 +4529,7 @@ fn findRecursiveCalls(
                     .file_index = right.file_index,
                     .rule = .recursive_call,
                     .span = right.span,
-                    .message = try std.fmt.allocPrint(allocator, "mutual recursion cycle '{s} -> {s} -> {s}' has input-controlled stack depth", .{ left.name, right.name, left.name }),
+                    .message = try allocator.print("mutual recursion cycle '{s} -> {s} -> {s}' has input-controlled stack depth", .{ left.name, right.name, left.name }),
                 });
             }
         }
@@ -4613,7 +4579,7 @@ fn bindingHasAllocatorType(file: IndexedSourceFile, start: usize, end: usize, na
     for (file.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or !tokenIs(file.source, token, name) or index + 6 >= end or file.tokens[index + 1].tag != .colon) continue;
         const type_end = topLevelComma(file.tokens, index + 2, end) orelse end;
-        if (std.mem.indexOf(u8, file.source[file.tokens[index + 2].loc.start..file.tokens[type_end - 1].loc.end], "Allocator") != null) return true;
+        if (std.mem.find(u8, file.source[file.tokens[index + 2].loc.start..file.tokens[type_end - 1].loc.end], "Allocator") != null) return true;
     }
     return false;
 }
@@ -4638,7 +4604,7 @@ fn foreignDeclaration(tokens: []const std.zig.Token, index: usize) bool {
 
 fn namingStyle(name: []const u8) NamingStyle {
     if (name.len == 0) return .other;
-    if (std.mem.indexOfScalar(u8, name, '_') != null) return .snake;
+    if (std.mem.findScalar(u8, name, '_') != null) return .snake;
     if (std.ascii.isUpper(name[0])) return .title;
     var has_upper = false;
     for (name[1..]) |character| if (std.ascii.isUpper(character)) {
@@ -4677,15 +4643,15 @@ fn topLevelComma(tokens: []const std.zig.Token, start: usize, end: usize) ?usize
 }
 
 fn resolveImportPath(allocator: std.mem.Allocator, importing_path: []const u8, spelling: []const u8) ![]const u8 {
-    const directory = std.fs.path.dirname(importing_path) orelse "";
-    const absolute = try std.fs.path.resolve(allocator, &.{ "/", directory, spelling });
+    const directory = std.Io.Dir.path.dirname(importing_path) orelse "";
+    const absolute = try std.Io.Dir.path.resolveAlloc(allocator, &.{ "/", directory, spelling });
     return std.mem.trimStart(u8, absolute, "/");
 }
 
 fn looksLikeTestPath(path: []const u8) bool {
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     if (std.mem.endsWith(u8, basename, "_test.zig")) return true;
-    var components = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var components = std.mem.splitScalar(u8, path, std.Io.Dir.path.sep);
     while (components.next()) |component| if (std.mem.eql(u8, component, "test") or std.mem.eql(u8, component, "tests")) return true;
     return false;
 }
@@ -4696,9 +4662,9 @@ fn containsTestDeclaration(tokens: []const std.zig.Token) bool {
 }
 
 fn sourceMentionsPath(source: []const u8, path: []const u8) bool {
-    if (std.mem.indexOf(u8, source, path) != null) return true;
-    const basename = std.fs.path.basename(path);
-    return std.mem.indexOf(u8, source, basename) != null;
+    if (std.mem.find(u8, source, path) != null) return true;
+    const basename = std.Io.Dir.path.basename(path);
+    return std.mem.find(u8, source, basename) != null;
 }
 
 const Block = struct { opening: usize, closing: usize };
@@ -4729,7 +4695,7 @@ fn optionSignature(
 ) ![]const u8 {
     const target = optionValue(source, tokens, start, end, "target") orelse "<default>";
     const optimize = optionValue(source, tokens, start, end, "optimize") orelse "<default>";
-    return try std.fmt.allocPrint(allocator, "target={s};optimize={s}", .{ target, optimize });
+    return try allocator.print("target={s};optimize={s}", .{ target, optimize });
 }
 
 fn optionValue(source: []const u8, tokens: []const std.zig.Token, start: usize, end: usize, name: []const u8) ?[]const u8 {
@@ -4828,11 +4794,11 @@ test "project conventions require a strong corpus majority" {
     const files = try allocator.alloc(SourceFile, 20);
     for (files, 0..) |*file, index| {
         const outlier = index == files.len - 1;
-        const path = try std.fmt.allocPrint(allocator, "src/file{d}.zig", .{index});
+        const path = try allocator.print("src/file{d}.zig", .{index});
         const source = if (outlier)
-            try std.fmt.allocPrintSentinel(allocator, "const db = @import(\"pkg\"); pub fn snake_name(alloc: std.mem.Allocator) !void {{ _ = db; _ = alloc; }}", .{}, 0)
+            try allocator.printSentinel("const db = @import(\"pkg\"); pub fn snake_name(alloc: std.mem.Allocator) !void {{ _ = db; _ = alloc; }}", .{}, 0)
         else
-            try std.fmt.allocPrintSentinel(allocator, "const library = @import(\"pkg\"); pub fn camelName{d}(allocator: std.mem.Allocator) Error!void {{ _ = library; _ = allocator; }}", .{index}, 0);
+            try allocator.printSentinel("const library = @import(\"pkg\"); pub fn camelName{d}(allocator: std.mem.Allocator) Error!void {{ _ = library; _ = allocator; }}", .{index}, 0);
         file.* = .{ .path = path, .source = source };
     }
     var configuration = types.Configuration.defaults();
@@ -4931,7 +4897,7 @@ test "allocation policy attributes nested function work only to the nested funct
     var allocations: usize = 0;
     for (found) |finding| if (finding.rule == .allocation_after_init) {
         allocations += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "function 'work'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "function 'work'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), allocations);
 }
@@ -4950,7 +4916,7 @@ test "recursive calls use the runtime body and stay inside nested functions" {
     for (found) |finding| {
         if (finding.rule == .recursive_call) {
             recursive_count += 1;
-            try std.testing.expect(std.mem.indexOf(u8, finding.message, "function 'Factory'") == null);
+            try std.testing.expect(std.mem.find(u8, finding.message, "function 'Factory'") == null);
         }
     }
     try std.testing.expectEqual(@as(usize, 2), recursive_count);
@@ -5305,7 +5271,7 @@ test "container cleanup preserves every proven owned element field" {
     var cleanup_count: usize = 0;
     for (found) |finding| if (finding.rule == .incomplete_owned_field_cleanup) {
         cleanup_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "value") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "value") != null);
     };
     try std.testing.expectEqual(@as(usize, 2), cleanup_count);
 }
@@ -5330,11 +5296,11 @@ test "owned slice sequences require cleanup and failure safe insertion" {
     var removal_count: usize = 0;
     for (found) |finding| switch (finding.rule) {
         .incomplete_owned_field_cleanup => cleanup_count += 1,
-        .missing_errdefer => if (std.mem.indexOf(u8, finding.message, "inserted inline") != null) {
+        .missing_errdefer => if (std.mem.find(u8, finding.message, "inserted inline") != null) {
             insertion_count += 1;
         },
         .overwritten_owning_value => overwrite_count += 1,
-        .unreleased_allocation => if (std.mem.indexOf(u8, finding.message, "removed from 'Pool.strings'") != null) {
+        .unreleased_allocation => if (std.mem.find(u8, finding.message, "removed from 'Pool.strings'") != null) {
             removal_count += 1;
         },
         else => {},
@@ -5365,11 +5331,11 @@ test "owned slice fields mutated through a parent container retain their obligat
     var cleanup_count: usize = 0;
     var removal_count: usize = 0;
     for (found) |finding| switch (finding.rule) {
-        .missing_errdefer => if (std.mem.indexOf(u8, finding.message, "inserted inline") != null) {
+        .missing_errdefer => if (std.mem.find(u8, finding.message, "inserted inline") != null) {
             insertion_count += 1;
         },
         .incomplete_owned_field_cleanup => cleanup_count += 1,
-        .unreleased_allocation => if (std.mem.indexOf(u8, finding.message, "removed 'Contact'") != null) {
+        .unreleased_allocation => if (std.mem.find(u8, finding.message, "removed 'Contact'") != null) {
             removal_count += 1;
         },
         else => {},
@@ -5394,7 +5360,7 @@ test "aggregate errdefer covers nested inline slice insertion" {
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     for (found) |finding| {
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "inserted inline") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "inserted inline") == null);
     }
 }
 
@@ -5411,8 +5377,8 @@ test "arena owned aggregate does not require per element rollback" {
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     for (found) |finding| {
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "inserted inline") == null);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "Options.arguments") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "inserted inline") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "Options.arguments") == null);
     }
 }
 
@@ -5437,8 +5403,8 @@ test "owned slice sequences with explicit transfers stay clean" {
     for (found) |finding| {
         try std.testing.expect(finding.rule != .incomplete_owned_field_cleanup);
         try std.testing.expect(finding.rule != .overwritten_owning_value);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "inserted inline") == null);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "removed from 'Pool.strings'") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "inserted inline") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "removed from 'Pool.strings'") == null);
     }
 }
 
@@ -5459,7 +5425,7 @@ test "fallible slice shrink after moving owned elements reports" {
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     var shrink_count: usize = 0;
     for (found) |finding| if (finding.rule == .partial_ownership_transfer and
-        std.mem.indexOf(u8, finding.message, "realloc failure leaves duplicate ownership") != null)
+        std.mem.find(u8, finding.message, "realloc failure leaves duplicate ownership") != null)
     {
         shrink_count += 1;
     };
@@ -5529,7 +5495,7 @@ test "function return types are not mistaken for aggregate constructors" {
     for (found) |finding| {
         if (finding.rule != .incomplete_owned_field_cleanup) continue;
         cleanup_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "cleanup for 'Journal'") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "cleanup for 'Journal'") == null);
     }
     try std.testing.expectEqual(@as(usize, 2), cleanup_count);
 }
@@ -5577,7 +5543,7 @@ test "discarding a local sequence element preserves project owned field evidence
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     var removal_count: usize = 0;
     for (found) |finding| if (finding.rule == .unreleased_allocation and
-        std.mem.indexOf(u8, finding.message, "discarding removed 'Item'") != null)
+        std.mem.find(u8, finding.message, "discarding removed 'Item'") != null)
     {
         removal_count += 1;
     };
@@ -5597,7 +5563,7 @@ test "inserting an owned element before removing its source transfers ownership"
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     for (found) |finding| {
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "discarding removed 'Node'") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "discarding removed 'Node'") == null);
     }
 }
 
@@ -5618,7 +5584,7 @@ test "deinitializing an owned element before removal releases its fields" {
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     for (found) |finding| {
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "discarding removed 'Record'") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "discarding removed 'Record'") == null);
     }
 }
 
@@ -5636,7 +5602,7 @@ test "removing a pointer selected by an existing parameter preserves its owner" 
     }};
     const found = try findings(arena.allocator(), &files, types.Configuration.defaults());
     for (found) |finding| {
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "discarding removed 'Node'") == null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "discarding removed 'Node'") == null);
     }
 }
 
@@ -5657,7 +5623,7 @@ test "owned fields returned directly from constructors establish element cleanup
     var removal_count: usize = 0;
     for (found) |finding| switch (finding.rule) {
         .incomplete_owned_field_cleanup => cleanup_count += 1,
-        .unreleased_allocation => if (std.mem.indexOf(u8, finding.message, "removed 'Record'") != null) {
+        .unreleased_allocation => if (std.mem.find(u8, finding.message, "removed 'Record'") != null) {
             removal_count += 1;
         },
         else => {},
@@ -5700,7 +5666,7 @@ test "owning elements cleared outside a cleanup-named method report" {
     var cleanup_count: usize = 0;
     for (found) |finding| if (finding.rule == .incomplete_owned_field_cleanup) {
         cleanup_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "bytes") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "bytes") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }
@@ -5773,7 +5739,7 @@ test "overwriting and discarding proven owned element fields report" {
     var removal_count: usize = 0;
     for (found) |finding| switch (finding.rule) {
         .overwritten_owning_value => overwrite_count += 1,
-        .unreleased_allocation => if (std.mem.indexOf(u8, finding.message, "removed 'Entry'") != null) {
+        .unreleased_allocation => if (std.mem.find(u8, finding.message, "removed 'Entry'") != null) {
             removal_count += 1;
         },
         else => {},

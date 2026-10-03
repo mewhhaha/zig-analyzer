@@ -55,8 +55,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
                 .rule = .returning_local_slice,
                 .level = level,
                 .span = context.tokens[return_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned slice '{s}' refers to a local array whose storage expires when this function returns",
                     .{binding_name},
                 ),
@@ -86,8 +85,7 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[address_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned value stores a pointer to local binding '{s}', whose storage expires when the function returns",
                     .{binding_name},
                 ),
@@ -125,8 +123,7 @@ fn findGloballyStoredLocalSlices(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[index + 2].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "slice of local array '{s}' is stored in global binding '{s}' and outlives its backing storage",
                     .{ local_name, destination },
                 ),
@@ -167,8 +164,7 @@ fn findOutputParameterStoredLocalSlices(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[equal_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "slice of local array '{s}' is stored through output parameter '{s}' and outlives its backing storage",
                     .{ local_name, output_name },
                 ),
@@ -207,8 +203,7 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[address_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "pointer to local binding '{s}' is retained by {s} beyond the binding's lifetime",
                     .{ local_name, context.tokenText(method_index) },
                 ),

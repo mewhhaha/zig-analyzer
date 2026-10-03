@@ -36,8 +36,7 @@ fn findPointerOnlyFrees(context: RuleRun) !void {
             .rule = .pointer_only_free,
             .level = level,
             .span = context.tokens[free_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "freeing slice '{s}' reconstructed from pointer '{s}' without its allocation length can pass the allocator the wrong layout",
                 .{ slice.binding, pointer_name },
             ),
@@ -61,8 +60,7 @@ fn findNullablePointerLengths(context: RuleRun) !void {
             .rule = .nullable_pointer_length,
             .level = level,
             .span = context.tokens[branch.start].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "nullable pointer '{s}' may be null while length '{s}' is positive, returning uninitialized allocation '{s}'",
                 .{ pointer_name, length_name, allocation.binding },
             ),
@@ -108,8 +106,7 @@ fn findDiscardedResources(context: RuleRun) !void {
                     .rule = .discarded_resource,
                     .level = level,
                     .span = candidate.loc,
-                    .message = try std.fmt.allocPrint(
-                        context.allocator,
+                    .message = try context.allocator.print(
                         "discarded {s} result is an owned OS resource that must be closed",
                         .{acquisition},
                     ),
@@ -148,8 +145,7 @@ fn findUnwaitedChildProcesses(context: RuleRun) !void {
             .rule = .unwaited_child_process,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "spawned child '{s}' reaches the end of the scope without wait, kill, or ownership transfer",
                 .{child_name},
             ),
@@ -310,8 +306,7 @@ fn findChildPipeDoubleClose(context: RuleRun) !void {
             .rule = .child_pipe_double_close,
             .level = level,
             .span = context.tokens[close_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "manually closing '{s}' pipe before {s}.wait can make wait close the same descriptor again",
                 .{ child_name, child_name },
             ),
@@ -675,8 +670,7 @@ fn findOverflowBeforeClamp(context: RuleRun) !void {
                 .rule = .overflow_before_clamp,
                 .level = level,
                 .span = context.tokens[operator_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "integer {s} is evaluated before {s} and can {s}; guard it or use checked or saturating arithmetic",
                     .{ operation, context.tokenText(clamp_index), failure },
                 ),

@@ -30,8 +30,7 @@ fn findQuadraticFrontRemoval(context: RuleRun) !void {
             .rule = .quadratic_front_removal,
             .level = level,
             .span = context.tokens[removal].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "draining ArrayList '{s}' with orderedRemove(0) shifts every remaining element and takes quadratic time",
                 .{path},
             ),
@@ -174,7 +173,7 @@ fn findLongFunctions(context: RuleRun) !void {
             .rule = .function_length,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "function '{s}' spans {d} lines, exceeding the configured limit of {d}", .{ name, lines, context.configuration.function_length_limit }),
+            .message = try context.allocator.print("function '{s}' spans {d} lines, exceeding the configured limit of {d}", .{ name, lines, context.configuration.function_length_limit }),
         });
     }
 }
@@ -208,7 +207,7 @@ fn findUnboundedLoops(context: RuleRun) !void {
         const condition = context.source[context.tokens[while_index + 2].loc.start..context.tokens[condition_end - 1].loc.end];
         const body_open = whileBodyOpening(context, condition_end) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        if (std.mem.indexOfAny(u8, condition, "<>") != null or
+        if (std.mem.findAny(u8, condition, "<>") != null or
             conditionStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             optionalCaptureStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             equalityConditionHasUpdate(context, while_index + 2, condition_end, body_open, body_end) or
@@ -235,7 +234,7 @@ fn findLongLines(context: RuleRun) !void {
     if (level == .off) return;
     var start: usize = 0;
     while (start < context.source.len) {
-        const relative_end = std.mem.indexOfScalar(u8, context.source[start..], '\n') orelse context.source.len - start;
+        const relative_end = std.mem.findScalar(u8, context.source[start..], '\n') orelse context.source.len - start;
         const end = start + relative_end;
         const line = context.source[start..end];
         const columns = displayColumns(line);
@@ -246,7 +245,7 @@ fn findLongLines(context: RuleRun) !void {
                 .rule = .line_length,
                 .level = level,
                 .span = .{ .start = start, .end = end },
-                .message = try std.fmt.allocPrint(context.allocator, "line is {d} display columns, exceeding the configured limit of {d}", .{ columns, context.configuration.line_length_limit }),
+                .message = try context.allocator.print("line is {d} display columns, exceeding the configured limit of {d}", .{ columns, context.configuration.line_length_limit }),
             });
         }
         if (end == context.source.len) break;
@@ -304,19 +303,19 @@ fn findTaskMarkers(context: RuleRun) !void {
     if (level == .off) return;
     var line_start: usize = 0;
     while (line_start < context.source.len) {
-        const relative_end = std.mem.indexOfScalar(u8, context.source[line_start..], '\n') orelse context.source.len - line_start;
+        const relative_end = std.mem.findScalar(u8, context.source[line_start..], '\n') orelse context.source.len - line_start;
         const line_end = line_start + relative_end;
         const line = context.source[line_start..line_end];
         if (commentStart(line)) |comment_start| {
             const comment = line[comment_start + 2 ..];
             for (context.configuration.todo_markers) |marker| {
-                const marker_offset = std.mem.indexOf(u8, comment, marker) orelse continue;
+                const marker_offset = std.mem.find(u8, comment, marker) orelse continue;
                 const absolute = line_start + comment_start + 2 + marker_offset;
                 try context.emit(.{
                     .rule = .todo_comment,
                     .level = level,
                     .span = .{ .start = absolute, .end = absolute + marker.len },
-                    .message = try std.fmt.allocPrint(context.allocator, "comment contains task marker '{s}'; track or resolve the promise before it becomes invisible debt", .{marker}),
+                    .message = try context.allocator.print("comment contains task marker '{s}'; track or resolve the promise before it becomes invisible debt", .{marker}),
                 });
                 break;
             }
@@ -944,8 +943,8 @@ fn displayColumns(line: []const u8) usize {
 
 fn singleUnsplittableToken(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r");
-    if (std.mem.indexOf(u8, trimmed, "http://") != null or std.mem.indexOf(u8, trimmed, "https://") != null) return true;
-    return std.mem.indexOfAny(u8, trimmed, " \t") == null;
+    if (std.mem.find(u8, trimmed, "http://") != null or std.mem.find(u8, trimmed, "https://") != null) return true;
+    return std.mem.findAny(u8, trimmed, " \t") == null;
 }
 
 fn commentStart(line: []const u8) ?usize {

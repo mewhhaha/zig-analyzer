@@ -20,8 +20,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .aliased_memcpy,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "@memcpy destination and source both derive from '{s}'; overlapping copies are undefined behavior, use @memmove",
                 .{destination.base},
             ),
@@ -141,7 +140,7 @@ fn boundsOrdered(upper: ?[]const u8, lower: ?[]const u8) bool {
     const upper_text = upper orelse return false;
     const lower_text = lower orelse "0";
     if (std.mem.eql(u8, upper_text, lower_text) and upper_text.len != 0 and
-        std.mem.indexOfScalar(u8, upper_text, '(') == null) return true;
+        std.mem.findScalar(u8, upper_text, '(') == null) return true;
     const upper_value = std.fmt.parseInt(u128, upper_text, 0) catch return false;
     const lower_value = std.fmt.parseInt(u128, lower_text, 0) catch return false;
     return upper_value <= lower_value;
@@ -157,9 +156,9 @@ test "memcpy between possibly overlapping slices of one base value reports the h
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'buffer'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "@memmove") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'state.bytes'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'buffer'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "@memmove") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "'state.bytes'") != null);
 }
 
 test "memcpy through a pointer dereference reports the shared base" {
@@ -170,7 +169,7 @@ test "memcpy through a pointer dereference reports the shared base" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'node.*.bytes'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'node.*.bytes'") != null);
 }
 
 test "memcpy between distinct bases or from a call result stays clean" {

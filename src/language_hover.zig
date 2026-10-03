@@ -27,7 +27,7 @@ pub fn describe(
         .syntax = spelling,
         .category = token.category,
         .summary = token.summary,
-        .reference = try std.fmt.allocPrint(allocator, "{s}{s}", .{ language_reference, token.anchor }),
+        .reference = try allocator.print("{s}{s}", .{ language_reference, token.anchor }),
     };
     if (tag != .identifier or !std.zig.isPrimitive(spelling)) return null;
     return try primitiveDescription(allocator, spelling);
@@ -39,7 +39,7 @@ fn builtinDescription(allocator: std.mem.Allocator, spelling: []const u8) !?Desc
         .syntax = builtinSyntax(builtin.tag) orelse try genericBuiltinSyntax(allocator, spelling, builtin.param_count),
         .category = "builtin function",
         .summary = builtinSummary(builtin.tag),
-        .reference = try std.fmt.allocPrint(allocator, "{s}#{s}", .{ language_reference, spelling }),
+        .reference = try allocator.print("{s}#{s}", .{ language_reference, spelling }),
     };
 }
 
@@ -239,7 +239,7 @@ fn literalDescription(spelling: []const u8, tag: std.zig.Token.Tag) ?Description
 }
 
 fn numberLiteralIsFloat(spelling: []const u8) bool {
-    return std.mem.indexOfAny(u8, spelling, ".eEpP") != null;
+    return std.mem.findAny(u8, spelling, ".eEpP") != null;
 }
 
 const TokenDescription = struct {
@@ -332,13 +332,12 @@ fn primitiveValueSummary(spelling: []const u8) ?[]const u8 {
 
 fn primitiveTypeSummary(allocator: std.mem.Allocator, spelling: []const u8) ![]const u8 {
     if (integerType(spelling)) |integer| {
-        return try std.fmt.allocPrint(
-            allocator,
+        return try allocator.print(
             "{s} {s} integer type with {s} bits.",
             .{ if (integer.signed) "A" else "An", if (integer.signed) "signed" else "unsigned", integer.bits },
         );
     }
-    if (floatBits(spelling)) |bits| return try std.fmt.allocPrint(allocator, "An IEEE-754 floating-point type with {s} bits.", .{bits});
+    if (floatBits(spelling)) |bits| return try allocator.print("An IEEE-754 floating-point type with {s} bits.", .{bits});
     const summaries = std.StaticStringMap([]const u8).initComptime(.{
         .{ "anyerror", "The global error set containing every error value in the program." },
         .{ "anyopaque", "A type-erased opaque value that is used behind pointers." },
@@ -431,7 +430,7 @@ fn keywordSummary(tag: std.zig.Token.Tag) ?[]const u8 {
 test "describes keywords and arbitrary-width integer types" {
     const keyword = (try describe(std.testing.allocator, "const", .keyword_const)).?;
     try std.testing.expectEqualStrings("keyword", keyword.category);
-    try std.testing.expect(std.mem.indexOf(u8, keyword.summary, "cannot be reassigned") != null);
+    try std.testing.expect(std.mem.find(u8, keyword.summary, "cannot be reassigned") != null);
 
     const integer = (try describe(std.testing.allocator, "i37", .identifier)).?;
     defer std.testing.allocator.free(integer.summary);
@@ -462,13 +461,13 @@ test "describes builtins operators literals and punctuation" {
 
     const addition = (try describe(arena.allocator(), "+", .plus)).?;
     try std.testing.expectEqualStrings("operator", addition.category);
-    try std.testing.expect(std.mem.indexOf(u8, addition.summary, "overflow") != null);
+    try std.testing.expect(std.mem.find(u8, addition.summary, "overflow") != null);
 
     const literal = (try describe(arena.allocator(), "0x1.fp4", .number_literal)).?;
     try std.testing.expectEqualStrings("floating-point literal", literal.category);
-    try std.testing.expect(std.mem.indexOf(u8, literal.summary, "comptime_float") != null);
+    try std.testing.expect(std.mem.find(u8, literal.summary, "comptime_float") != null);
 
     const terminator = (try describe(arena.allocator(), ";", .semicolon)).?;
     try std.testing.expectEqualStrings("punctuation", terminator.category);
-    try std.testing.expect(std.mem.indexOf(u8, terminator.summary, "Terminates") != null);
+    try std.testing.expect(std.mem.find(u8, terminator.summary, "Terminates") != null);
 }

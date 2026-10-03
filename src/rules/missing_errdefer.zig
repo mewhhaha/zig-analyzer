@@ -80,11 +80,10 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
 
         const release_statement = switch (acquisition.kind) {
             .allocation => if (acquisition.release_owner_member) |member|
-                try std.fmt.allocPrint(context.allocator, "{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, binding_name })
+                try context.allocator.print("{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, binding_name })
             else
-                try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, acquisition.release, binding_name }),
-            .network_stream => try std.fmt.allocPrint(
-                context.allocator,
+                try context.allocator.print("{s}.{s}({s})", .{ receiver, acquisition.release, binding_name }),
+            .network_stream => try context.allocator.print(
                 "{s}.close({s})",
                 .{
                     binding_name,
@@ -95,15 +94,15 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
         const indent = lineIndent(context.source, context.tokens[declaration_index].loc.start);
         const semicolon_end = context.tokens[declaration_end].loc.end;
         const edits = try context.allocator.alloc(types.Edit, 1);
-        if (std.mem.indexOfScalarPos(u8, context.source, semicolon_end, '\n')) |line_break| {
+        if (std.mem.findScalarPos(u8, context.source, semicolon_end, '\n')) |line_break| {
             edits[0] = .{
                 .span = .{ .start = line_break + 1, .end = line_break + 1 },
-                .replacement = try std.fmt.allocPrint(context.allocator, "{s}errdefer {s};\n", .{ indent, release_statement }),
+                .replacement = try context.allocator.print("{s}errdefer {s};\n", .{ indent, release_statement }),
             };
         } else {
             edits[0] = .{
                 .span = .{ .start = semicolon_end, .end = semicolon_end },
-                .replacement = try std.fmt.allocPrint(context.allocator, "\n{s}errdefer {s};", .{ indent, release_statement }),
+                .replacement = try context.allocator.print("\n{s}errdefer {s};", .{ indent, release_statement }),
             };
         }
         const fixes = try context.allocator.alloc(types.Fix, 1);
@@ -128,8 +127,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
             .rule = .missing_errdefer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "owning value '{s}' from '{s}' has no errdefer release before an error path can leave the scope",
                 .{ binding_name, callable },
             ),
@@ -184,8 +182,7 @@ fn findFallibleContainerBuilders(context: RuleRun, level: types.Level) !void {
             .rule = .missing_errdefer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "container '{s}' can retain its backing allocation if a later mutation fails before ownership transfer",
                 .{binding},
             ),
@@ -229,8 +226,7 @@ fn findFallibleSliceBuilders(context: RuleRun, level: types.Level) !void {
             .rule = .missing_errdefer,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "slice builder '{s}' can retain its reallocated storage if a later loop iteration fails",
                 .{binding},
             ),
@@ -389,14 +385,12 @@ fn findFallibleAggregateFieldInitializers(
             if (acquisitionUsesNamedArena(receiver, acquisition)) continue;
             const field = context.tokenText(equal_index - 1);
             const message = if (binding) |name|
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "owned field '{s}.{s}' can leak if a later aggregate field initialization fails",
                     .{ name, field },
                 )
             else
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "owned aggregate field '{s}' can leak if a later field initialization fails",
                     .{field},
                 );
@@ -472,22 +466,22 @@ fn findPartiallyInitializedOwnedFields(
         const field = context.tokenText(equal_index - 1);
         const owned_path = context.source[context.tokens[owner_index].loc.start..context.tokens[equal_index - 1].loc.end];
         const release_statement = if (acquisition.release_owner_member) |member|
-            try std.fmt.allocPrint(context.allocator, "{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, owned_path })
+            try context.allocator.print("{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, owned_path })
         else
-            try std.fmt.allocPrint(context.allocator, "{s}.{s}({s})", .{ receiver, acquisition.release, owned_path });
+            try context.allocator.print("{s}.{s}({s})", .{ receiver, acquisition.release, owned_path });
         defer context.allocator.free(release_statement);
         const indent = lineIndent(context.source, context.tokens[owner_index].loc.start);
         const semicolon_end = context.tokens[statement_end].loc.end;
         const edits = try context.allocator.alloc(types.Edit, 1);
-        if (std.mem.indexOfScalarPos(u8, context.source, semicolon_end, '\n')) |line_break| {
+        if (std.mem.findScalarPos(u8, context.source, semicolon_end, '\n')) |line_break| {
             edits[0] = .{
                 .span = .{ .start = line_break + 1, .end = line_break + 1 },
-                .replacement = try std.fmt.allocPrint(context.allocator, "{s}errdefer {s};\n", .{ indent, release_statement }),
+                .replacement = try context.allocator.print("{s}errdefer {s};\n", .{ indent, release_statement }),
             };
         } else {
             edits[0] = .{
                 .span = .{ .start = semicolon_end, .end = semicolon_end },
-                .replacement = try std.fmt.allocPrint(context.allocator, "\n{s}errdefer {s};", .{ indent, release_statement }),
+                .replacement = try context.allocator.print("\n{s}errdefer {s};", .{ indent, release_statement }),
             };
         }
         const fixes = try context.allocator.alloc(types.Fix, 1);
@@ -506,8 +500,7 @@ fn findPartiallyInitializedOwnedFields(
             .rule = .missing_errdefer,
             .level = level,
             .span = context.tokens[equal_index - 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "owned field '{s}.{s}' has no errdefer release before partial initialization can fail",
                 .{ owner, field },
             ),
@@ -568,8 +561,7 @@ fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level)
             fallible_index,
             "this fallible insertion leaves the value with the caller on failure",
         );
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "cleanup-capable value '{s}' is not released if its container insertion fails",
             .{binding},
         );
@@ -840,7 +832,7 @@ fn owningAcquisitionAfterEqual(
     if (call_close + 1 != declaration_end) return null;
     const callable = context.source[context.tokens[equal + 2].loc.start..context.tokens[path_end].loc.end];
     if (summary_index) |known_summaries| {
-        const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+        const separator = std.mem.findScalarLast(u8, callable, '.');
         const receiver = if (separator) |position| callable[0..position] else null;
         const name = if (separator) |position| callable[position + 1 ..] else callable;
         if (known_summaries.ownedReturnCall(context.source, receiver, name)) |owned| {
@@ -1006,8 +998,8 @@ fn declarationLooksArenaBackedAtDepth(
             !context.tokenIs(index + 1, root_name)) continue;
         const end = context.statementEnd(index) orelse continue;
         const declaration = context.source[token.loc.start..context.tokens[end].loc.end];
-        if (std.mem.indexOf(u8, declaration, "ArenaAllocator") != null or
-            std.mem.indexOf(u8, declaration, "FixedBufferAllocator") != null) return true;
+        if (std.mem.find(u8, declaration, "ArenaAllocator") != null or
+            std.mem.find(u8, declaration, "FixedBufferAllocator") != null) return true;
         var value_index = index + 2;
         while (value_index + 3 < end) : (value_index += 1) {
             if (context.tokens[value_index].tag != .identifier or context.tokens[value_index + 1].tag != .period or
@@ -1124,7 +1116,7 @@ fn functionParameterMatchesArenaContract(
         context.tokens[function.declaration + 1].tag != .identifier) return false;
     const function_name = context.tokenText(function.declaration + 1);
     for (context.configuration.arena_allocator_contracts) |contract| {
-        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, parameter_name, contract[separator + 1 ..])) continue;
         const owner_name = contract[0..separator];
         if (std.mem.eql(u8, function_name, owner_name)) return true;
@@ -1203,7 +1195,7 @@ fn acquisitionUsesArenaContract(context: RuleRun, function: ScopeRange, acquisit
         null;
 
     for (context.configuration.arena_allocator_contracts) |contract| {
-        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, member_name, contract[separator + 1 ..])) continue;
         const owner_name = contract[0..separator];
         if (owner_type) |type_name| if (std.mem.eql(u8, owner_name, type_name)) return true;
@@ -1431,7 +1423,7 @@ fn callsFallibleContainerInsertion(context: RuleRun, start: usize, end: usize) b
 }
 
 fn lineIndent(source: []const u8, offset: usize) []const u8 {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
     var end = line_start;
     while (end < source.len and (source[end] == ' ' or source[end] == '\t')) end += 1;
     return source[line_start..end];
@@ -1454,9 +1446,9 @@ test "allocation followed by another fallible operation without errdefer leaks o
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'buffer'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'buffer'") != null);
     try std.testing.expectEqualStrings("    errdefer allocator.free(buffer);\n", findings[0].fixes[0].edits[0].replacement);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'node'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "'node'") != null);
     try std.testing.expectEqualStrings("    errdefer allocator.destroy(node);\n", findings[1].fixes[0].edits[0].replacement);
     try std.testing.expect(!findings[0].fixes[0].fix_all);
 }
@@ -1659,8 +1651,8 @@ test "fallible reads borrow their destination allocation" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "payload") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "scratch") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "payload") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "scratch") != null);
 }
 
 test "plain cleanup after a fallible operation does not protect the error path" {
@@ -1686,8 +1678,8 @@ test "plain cleanup after a fallible operation does not protect the error path" 
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "buffer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "output") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "buffer") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "output") != null);
 }
 
 test "a deferred cleanup block protects allocations before later errors" {
@@ -1892,7 +1884,7 @@ test "partially initialized owned fields need error cleanup" {
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "statement.name") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "statement.name") != null);
     try std.testing.expectEqualStrings(
         "    errdefer allocator.free(statement.name);\n",
         findings[0].fixes[0].edits[0].replacement,
@@ -1913,8 +1905,8 @@ test "partially initialized created objects need field cleanup" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "object.label") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "object.payload") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "object.label") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "object.payload") != null);
 }
 
 test "fallible aggregate fields need cleanup before later field initialization" {
@@ -1935,8 +1927,8 @@ test "fallible aggregate fields need cleanup before later field initialization" 
     var aggregate_field_count: usize = 0;
     var insertion_count: usize = 0;
     for (findings) |finding| {
-        if (std.mem.indexOf(u8, finding.message, "later aggregate field") != null) aggregate_field_count += 1;
-        if (std.mem.indexOf(u8, finding.message, "container insertion") != null) insertion_count += 1;
+        if (std.mem.find(u8, finding.message, "later aggregate field") != null) aggregate_field_count += 1;
+        if (std.mem.find(u8, finding.message, "container insertion") != null) insertion_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), aggregate_field_count);
     try std.testing.expectEqual(@as(usize, 1), insertion_count);
@@ -1951,7 +1943,7 @@ test "fallible container builders need cleanup before ownership transfer" {
         "try bytes.appendSlice(allocator, second); return bytes.toOwnedSlice(allocator); }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "backing allocation") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "backing allocation") != null);
 }
 
 test "container builders with early error cleanup stay clean" {
@@ -2035,7 +2027,7 @@ test "container mutation in a loop needs cleanup before ownership transfer" {
         "return output.toOwnedSlice(allocator); }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "backing allocation") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "backing allocation") != null);
 }
 
 test "reallocated slice builders need error cleanup across loop iterations" {
@@ -2049,7 +2041,7 @@ test "reallocated slice builders need error cleanup across loop iterations" {
     const findings = try findingsFor(arena.allocator(), source);
     var builder_count: usize = 0;
     for (findings) |finding| {
-        if (std.mem.indexOf(u8, finding.message, "slice builder") != null) builder_count += 1;
+        if (std.mem.find(u8, finding.message, "slice builder") != null) builder_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), builder_count);
 }
@@ -2063,7 +2055,7 @@ test "reallocated slice builders with errdefer stay clean" {
         "output = try allocator.realloc(output, output.len + part.len); try validate(part); }" ++
         "return output; }";
     const findings = try findingsFor(arena.allocator(), source);
-    for (findings) |finding| try std.testing.expect(std.mem.indexOf(u8, finding.message, "slice builder") == null);
+    for (findings) |finding| try std.testing.expect(std.mem.find(u8, finding.message, "slice builder") == null);
 }
 
 test "anonymous fallible aggregate fields need cleanup before later fields" {
@@ -2077,7 +2069,7 @@ test "anonymous fallible aggregate fields need cleanup before later fields" {
     const findings = try findingsFor(arena.allocator(), source);
     var aggregate_field_count: usize = 0;
     for (findings) |finding| {
-        if (std.mem.indexOf(u8, finding.message, "aggregate field") != null) aggregate_field_count += 1;
+        if (std.mem.find(u8, finding.message, "aggregate field") != null) aggregate_field_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), aggregate_field_count);
 }
@@ -2099,7 +2091,7 @@ test "cleanup capable aggregates need error cleanup before insertion" {
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "statement") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "statement") != null);
 }
 
 test "block initializers do not inherit a nested call return type" {

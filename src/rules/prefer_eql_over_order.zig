@@ -57,9 +57,9 @@ pub fn run(context: RuleRun) !void {
         const b_arg = argumentSource(context, arguments[2]);
 
         const replacement = if (is_equality.?)
-            try std.fmt.allocPrint(context.allocator, "{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg })
+            try context.allocator.print("{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg })
         else
-            try std.fmt.allocPrint(context.allocator, "!{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg });
+            try context.allocator.print("!{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{

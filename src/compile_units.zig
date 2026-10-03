@@ -18,7 +18,7 @@ pub fn rootSourceForDocument(
     const source = try allocator.allocSentinel(u8, source_bytes.len, 0);
     defer allocator.free(source);
     @memcpy(source, source_bytes);
-    const build_directory = std.fs.path.dirname(build_path) orelse ".";
+    const build_directory = std.Io.Dir.path.dirname(build_path) orelse ".";
     const roots = try declaredRootSources(allocator, source, build_directory);
     defer {
         for (roots) |root| allocator.free(root);
@@ -30,7 +30,7 @@ pub fn rootSourceForDocument(
     var ambiguous = false;
     for (roots) |root| {
         if (!try pathExists(io, root)) continue;
-        const root_directory = std.fs.path.dirname(root) orelse continue;
+        const root_directory = std.Io.Dir.path.dirname(root) orelse continue;
         if (!pathIsWithin(document_path, root_directory)) continue;
         if (root_directory.len < selected_prefix_length) continue;
         if (root_directory.len == selected_prefix_length) {
@@ -58,14 +58,14 @@ fn documentReachableFromRoot(
     root_path: []const u8,
     document_path: []const u8,
 ) !bool {
-    const normalized_document = try std.fs.path.resolve(allocator, &.{document_path});
+    const normalized_document = try std.Io.Dir.path.resolveAlloc(allocator, &.{document_path});
     defer allocator.free(normalized_document);
-    var visited: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var visited: std.array_hash_map.String(void) = .empty;
     defer {
         for (visited.keys()) |path| allocator.free(path);
         visited.deinit(allocator);
     }
-    const normalized_root = try std.fs.path.resolve(allocator, &.{root_path});
+    const normalized_root = try std.Io.Dir.path.resolveAlloc(allocator, &.{root_path});
     visited.put(allocator, normalized_root, {}) catch |err| {
         allocator.free(normalized_root);
         return err;
@@ -90,7 +90,7 @@ fn documentReachableFromRoot(
         @memcpy(source, source_bytes);
         const tokens = try tokenize(allocator, source);
         defer allocator.free(tokens);
-        const current_directory = std.fs.path.dirname(current_path) orelse continue;
+        const current_directory = std.Io.Dir.path.dirname(current_path) orelse continue;
 
         for (tokens, 0..) |token, index| {
             if (token.tag != .builtin or !tokenIs(source, token, "@import") or
@@ -104,7 +104,7 @@ fn documentReachableFromRoot(
             defer allocator.free(import_path);
             if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
 
-            const resolved = try std.fs.path.resolve(allocator, &.{ current_directory, import_path });
+            const resolved = try std.Io.Dir.path.resolveAlloc(allocator, &.{ current_directory, import_path });
             if (std.mem.eql(u8, resolved, normalized_document)) {
                 allocator.free(resolved);
                 return true;
@@ -144,7 +144,7 @@ pub fn namedModuleSourceForDocument(
     return try declaredNamedModuleSource(
         allocator,
         source,
-        std.fs.path.dirname(build_path) orelse ".",
+        std.Io.Dir.path.dirname(build_path) orelse ".",
         module_name,
     );
 }
@@ -176,7 +176,7 @@ pub fn declaredRootSources(
         if (literal.len < 2) continue;
         const relative_path = literal[1 .. literal.len - 1];
         try roots.ensureUnusedCapacity(allocator, 1);
-        const resolved = try std.fs.path.resolve(allocator, &.{ build_directory, relative_path });
+        const resolved = try std.Io.Dir.path.resolveAlloc(allocator, &.{ build_directory, relative_path });
         if (containsString(roots.items, resolved)) {
             allocator.free(resolved);
             continue;
@@ -245,7 +245,7 @@ fn declaredNamedModuleSource(
                 tokens[path_call + 1].tag != .string_literal) continue;
             const path_literal = tokenText(build_source, tokens[path_call + 1]);
             if (path_literal.len < 2) return null;
-            return try std.fs.path.resolve(
+            return try std.Io.Dir.path.resolveAlloc(
                 allocator,
                 &.{ build_directory, path_literal[1 .. path_literal.len - 1] },
             );
@@ -256,16 +256,16 @@ fn declaredNamedModuleSource(
 }
 
 fn nearestBuildFile(io: std.Io, allocator: std.mem.Allocator, document_path: []const u8) !?[]const u8 {
-    var directory = std.fs.path.dirname(document_path) orelse return null;
+    var directory = std.Io.Dir.path.dirname(document_path) orelse return null;
     while (true) {
-        const candidate = try std.fs.path.join(allocator, &.{ directory, "build.zig" });
+        const candidate = try std.Io.Dir.path.join(allocator, &.{ directory, "build.zig" });
         const exists = pathExists(io, candidate) catch |err| {
             allocator.free(candidate);
             return err;
         };
         if (exists) return candidate;
         allocator.free(candidate);
-        const parent = std.fs.path.dirname(directory) orelse return null;
+        const parent = std.Io.Dir.path.dirname(directory) orelse return null;
         if (std.mem.eql(u8, parent, directory)) return null;
         directory = parent;
     }
@@ -283,8 +283,8 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
 fn pathIsWithin(path: []const u8, directory: []const u8) bool {
     if (!std.mem.startsWith(u8, path, directory)) return false;
     if (path.len == directory.len) return true;
-    if (directory.len == 0 or std.fs.path.isSep(directory[directory.len - 1])) return true;
-    return std.fs.path.isSep(path[directory.len]);
+    if (directory.len == 0 or std.Io.Dir.path.isSep(directory[directory.len - 1])) return true;
+    return std.Io.Dir.path.isSep(path[directory.len]);
 }
 
 fn containsString(strings: []const []const u8, candidate: []const u8) bool {
@@ -363,13 +363,13 @@ test "root selection follows actual imports and isolates unrelated documents" {
     try temporary.dir.writeFile(io, .{ .sub_path = "src/real.zig", .data = "pub const value = 1;\n" });
     try temporary.dir.writeFile(io, .{ .sub_path = "src/unrelated.zig", .data = "pub const value = 2;\n" });
 
-    const temporary_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    const temporary_path = try std.testing.allocator.print(".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(temporary_path);
-    const root_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/root.zig" });
+    const root_path = try std.Io.Dir.path.resolveAlloc(std.testing.allocator, &.{ temporary_path, "src/root.zig" });
     defer std.testing.allocator.free(root_path);
-    const real_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/real.zig" });
+    const real_path = try std.Io.Dir.path.resolveAlloc(std.testing.allocator, &.{ temporary_path, "src/real.zig" });
     defer std.testing.allocator.free(real_path);
-    const unrelated_path = try std.fs.path.resolve(std.testing.allocator, &.{ temporary_path, "src/unrelated.zig" });
+    const unrelated_path = try std.Io.Dir.path.resolveAlloc(std.testing.allocator, &.{ temporary_path, "src/unrelated.zig" });
     defer std.testing.allocator.free(unrelated_path);
 
     const real_root = try rootSourceForDocument(io, std.testing.allocator, real_path);
@@ -384,17 +384,17 @@ test "example root selection isolates standalone examples" {
     const io = std.testing.io;
     const repository = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repository);
-    const compiler_error = try std.fs.path.join(
+    const compiler_error = try std.Io.Dir.path.join(
         std.testing.allocator,
         &.{ repository, "examples/diagnostics/compiler_error.zig" },
     );
     defer std.testing.allocator.free(compiler_error);
-    const memory_management = try std.fs.path.join(
+    const memory_management = try std.Io.Dir.path.join(
         std.testing.allocator,
         &.{ repository, "examples/diagnostics/memory_management.zig" },
     );
     defer std.testing.allocator.free(memory_management);
-    const compiler_example = try std.fs.path.join(
+    const compiler_example = try std.Io.Dir.path.join(
         std.testing.allocator,
         &.{ repository, "examples/compiler/comptime_pipeline.zig" },
     );

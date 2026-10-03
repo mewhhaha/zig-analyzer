@@ -31,7 +31,7 @@ const ProgramBuilder = struct {
     }
 
     fn append(builder: *ProgramBuilder, comptime format: []const u8, arguments: anytype) !void {
-        const piece = try std.fmt.allocPrint(builder.allocator, format, arguments);
+        const piece = try builder.allocator.print(format, arguments);
         defer builder.allocator.free(piece);
         try builder.text.appendSlice(builder.allocator, piece);
     }
@@ -40,7 +40,7 @@ const ProgramBuilder = struct {
         builder.sequence += 1;
         const quality = quality_names[builder.random.uintLessThan(usize, quality_names.len)];
         const subject = subject_names[builder.random.uintLessThan(usize, subject_names.len)];
-        return std.fmt.allocPrint(builder.allocator, "{s}{c}{s}{d}", .{
+        return builder.allocator.print("{s}{c}{s}{d}", .{
             quality, std.ascii.toUpper(subject[0]), subject[1..], builder.sequence,
         });
     }
@@ -49,7 +49,7 @@ const ProgramBuilder = struct {
         builder.sequence += 1;
         const quality = quality_names[builder.random.uintLessThan(usize, quality_names.len)];
         const subject = subject_names[builder.random.uintLessThan(usize, subject_names.len)];
-        return std.fmt.allocPrint(builder.allocator, "{s}_{s}_{d}", .{ quality, subject, builder.sequence });
+        return builder.allocator.print("{s}_{s}_{d}", .{ quality, subject, builder.sequence });
     }
 
     fn smallLength(builder: *ProgramBuilder) u32 {
@@ -303,7 +303,7 @@ fn insertProbeComment(allocator: std.mem.Allocator, source: [:0]const u8, random
         if (byte == '\n' and index + 1 < source.len) try line_starts.append(allocator, index + 1);
     }
     const at = line_starts.items[random.uintLessThan(usize, line_starts.items.len)];
-    return std.fmt.allocPrintSentinel(allocator, "{s}// probe comment\n{s}", .{
+    return allocator.printSentinel("{s}// probe comment\n{s}", .{
         source[0..at], source[at..],
     }, 0);
 }

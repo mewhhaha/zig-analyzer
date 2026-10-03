@@ -164,7 +164,9 @@ Compiler-backed project rules are opt-in.
 - [`exposed-private-error-set`](exposed-private-error-set.md) — Reports a public
   signature that names a private local error set.
 - [`deprecated-declaration`](deprecated-declaration.md) — Reports use of a
-  declaration marked `Deprecated:` in its doc comment.
+  resolved local or imported declaration marked deprecated in its doc comments.
+- [`unreported-partial-send`](unreported-partial-send.md) — Reports socket sends
+  through an API that hides partial progress when a send fails.
 - [`mutated-container-copy`](mutated-container-copy.md) — Reports mutation of a
   by-value container field copy that is not written back.
 - [`self-assignment`](self-assignment.md) — Reports an assignment where the

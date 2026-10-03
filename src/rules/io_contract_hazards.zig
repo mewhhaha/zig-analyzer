@@ -28,8 +28,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .silent_buffer_truncation,
             .level = level,
             .span = context.tokens[copy_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "write copies only min({s}.len, available capacity) but returns no byte count or error when input is truncated",
                 .{source_name},
             ),

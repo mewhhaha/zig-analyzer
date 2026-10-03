@@ -106,7 +106,7 @@ fn formatPlaceholderCount(format: []const u8) usize {
             index += 1;
             continue;
         }
-        const closing = std.mem.indexOfScalarPos(u8, format, index + 1, '}') orelse return count;
+        const closing = std.mem.findScalarPos(u8, format, index + 1, '}') orelse return count;
         count += 1;
         index = closing;
     }
@@ -123,7 +123,7 @@ fn loneEmptyPlaceholder(format: []const u8) ?usize {
             index += 1;
             continue;
         }
-        const closing = std.mem.indexOfScalarPos(u8, format, index + 1, '}') orelse break;
+        const closing = std.mem.findScalarPos(u8, format, index + 1, '}') orelse break;
         placeholder_count += 1;
         if (closing == index + 1) empty_placeholder = index;
         index = closing;
@@ -154,7 +154,7 @@ fn addMutableCapture(context: ActionRun) !void {
             edit.* = .{ .span = .{ .start = mutated.loc.end, .end = mutated.loc.end }, .replacement = ".*" };
         }
         try context.add(
-            try std.fmt.allocPrint(context.allocator, "Capture '{s}' by pointer", .{context.tokenText(capture_index)}),
+            try context.allocator.print("Capture '{s}' by pointer", .{context.tokenText(capture_index)}),
             .quickfix,
             edits,
             .{},
@@ -282,8 +282,7 @@ fn addTaggedUnionSwitch(context: ActionRun) !void {
             "Use a tagged-union switch and payload capture",
             .refactor_rewrite,
             .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "switch ({s}) {{\n{s}    .{s} => |{s}| {{{s}}},\n{s}    else => {{}},\n{s}}}",
                 .{ value_name, indentation, tag_name, capture, rewritten_body, indentation, indentation },
             ),
@@ -296,7 +295,7 @@ fn payloadCaptureName(context: ActionRun, start: usize, end: usize) ![]const u8 
     if (!identifierWithin(context, "payload", start, end)) return "payload";
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
-        const candidate = try std.fmt.allocPrint(context.allocator, "payload{d}", .{suffix});
+        const candidate = try context.allocator.print("payload{d}", .{suffix});
         if (!identifierWithin(context, candidate, start, end)) return candidate;
     }
 }
@@ -398,13 +397,12 @@ fn addFormatRepair(context: ActionRun) !void {
         const argument_index = string_index + 4;
         if (context.tokens[argument_index + 1].tag != .r_brace) continue;
         const specifier = formatSpecifier(context, argument_index) orelse continue;
-        const replacement = try std.fmt.allocPrint(
-            context.allocator,
+        const replacement = try context.allocator.print(
             "{s}{s}{s}",
             .{ format[0..empty_placeholder], specifier, format[empty_placeholder + 2 ..] },
         );
         try context.oneEdit(
-            try std.fmt.allocPrint(context.allocator, "Use the '{s}' format specifier", .{specifier}),
+            try context.allocator.print("Use the '{s}' format specifier", .{specifier}),
             .quickfix,
             token.loc,
             replacement,
@@ -462,8 +460,7 @@ fn addInlineElseRefactor(context: ActionRun) !void {
             "Use an inline-else switch",
             .refactor_rewrite,
             .{ .start = token.loc.start, .end = replacement_end },
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "return switch ({s}) {{\n{s}    inline else => |payload| payload,\n{s}}};",
                 .{ value_name, indentation, indentation },
             ),
@@ -609,7 +606,7 @@ fn addMaterializedType(context: ActionRun) !void {
         defer context.allocator.free(explicit_name);
         const declaration = try materializedDeclaration(context, shape, explicit_name);
         try context.oneEdit(
-            try std.fmt.allocPrint(context.allocator, "Materialize resolved type as '{s}'", .{explicit_name}),
+            try context.allocator.print("Materialize resolved type as '{s}'", .{explicit_name}),
             .refactor_extract,
             .{ .start = context.tokens[declaration_end].loc.end, .end = context.tokens[declaration_end].loc.end },
             declaration,
@@ -619,10 +616,10 @@ fn addMaterializedType(context: ActionRun) !void {
 }
 
 fn collisionFreeTypeName(context: ActionRun, type_name: []const u8) ![]const u8 {
-    var candidate = try std.fmt.allocPrint(context.allocator, "Resolved{s}", .{type_name});
+    var candidate = try context.allocator.print("Resolved{s}", .{type_name});
     var suffix: usize = 2;
-    while (std.mem.indexOf(u8, context.source, candidate) != null) : (suffix += 1) {
-        const next_candidate = try std.fmt.allocPrint(context.allocator, "Resolved{s}{d}", .{ type_name, suffix });
+    while (std.mem.find(u8, context.source, candidate) != null) : (suffix += 1) {
+        const next_candidate = try context.allocator.print("Resolved{s}{d}", .{ type_name, suffix });
         context.allocator.free(candidate);
         candidate = next_candidate;
     }
@@ -664,11 +661,11 @@ fn addReflectedDeclaration(context: ActionRun) !void {
         const container_end = localPlainStructEnd(context, type_name) orelse continue;
         const indentation = context.lineIndentation(context.tokens[container_end].loc.start);
         const declaration = if (context.tokenIs(builtin_index, "@hasField"))
-            try std.fmt.allocPrint(context.allocator, "{s}    @\"{s}\": void = {{}},\n", .{ indentation, member_name })
+            try context.allocator.print("{s}    @\"{s}\": void = {{}},\n", .{ indentation, member_name })
         else
-            try std.fmt.allocPrint(context.allocator, "{s}    pub const @\"{s}\" = {{}};\n", .{ indentation, member_name });
+            try context.allocator.print("{s}    pub const @\"{s}\" = {{}};\n", .{ indentation, member_name });
         try context.oneEdit(
-            try std.fmt.allocPrint(context.allocator, "Generate reflected member '{s}'", .{member_name}),
+            try context.allocator.print("Generate reflected member '{s}'", .{member_name}),
             .refactor_rewrite,
             .{ .start = context.tokens[container_end].loc.start, .end = context.tokens[container_end].loc.start },
             declaration,
@@ -690,7 +687,7 @@ fn localPlainStructEnd(context: ActionRun, name: []const u8) ?usize {
 fn stringValue(literal: []const u8) ?[]const u8 {
     if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
     const value = literal[1 .. literal.len - 1];
-    if (std.mem.indexOfScalar(u8, value, '\\') != null) return null;
+    if (std.mem.findScalar(u8, value, '\\') != null) return null;
     return value;
 }
 
@@ -699,23 +696,23 @@ test "mutable captures format strings and reflected declarations have actions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const capture_source: [:0]const u8 = "fn run(value: ?u8) void { var current = value; if (current) |payload| { payload += 1; } }";
-    const capture = std.mem.indexOf(u8, capture_source, "payload") orelse unreachable;
+    const capture = std.mem.find(u8, capture_source, "payload") orelse unreachable;
     const capture_actions = try registry.actions(arena.allocator(), capture_source, .{ .start = capture, .end = capture + 7 }, &.{});
     try std.testing.expectEqual(@as(usize, 2), capture_actions[0].edits.len);
     try std.testing.expectEqualStrings("*", capture_actions[0].edits[0].replacement);
     try std.testing.expectEqualStrings(".*", capture_actions[0].edits[1].replacement);
-    const mutation = std.mem.lastIndexOf(u8, capture_source, "payload") orelse unreachable;
+    const mutation = std.mem.findLast(u8, capture_source, "payload") orelse unreachable;
     try std.testing.expectEqual(mutation + 7, capture_actions[0].edits[1].span.start);
 
     const format_source: [:0]const u8 = "fn run() void { std.debug.print(\"name {}\", .{\"zig\"}); }";
-    const format = std.mem.indexOf(u8, format_source, "\"name {}\"") orelse unreachable;
+    const format = std.mem.find(u8, format_source, "\"name {}\"") orelse unreachable;
     const format_actions = try registry.actions(arena.allocator(), format_source, .{ .start = format, .end = format + 9 }, &.{});
     try std.testing.expectEqualStrings("\"name {s}\"", format_actions[0].edits[0].replacement);
 
     const reflection_source: [:0]const u8 = "const Config = struct {}; comptime { _ = @hasDecl(Config, \"load\"); }";
-    const member = std.mem.indexOf(u8, reflection_source, "\"load\"") orelse unreachable;
+    const member = std.mem.find(u8, reflection_source, "\"load\"") orelse unreachable;
     const reflection_actions = try registry.actions(arena.allocator(), reflection_source, .{ .start = member, .end = member + 6 }, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, reflection_actions[0].edits[0].replacement, "pub const") != null);
+    try std.testing.expect(std.mem.find(u8, reflection_actions[0].edits[0].replacement, "pub const") != null);
 }
 
 test "format argument arity gets explicit tuple repairs" {
@@ -723,12 +720,12 @@ test "format argument arity gets explicit tuple repairs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const missing_source: [:0]const u8 = "fn run(one: u8) void { std.debug.print(\"{} {}\", .{one}); }";
-    const missing_format = std.mem.indexOf(u8, missing_source, "\"{} {}\"") orelse unreachable;
+    const missing_format = std.mem.find(u8, missing_source, "\"{} {}\"") orelse unreachable;
     const missing = try registry.actions(arena.allocator(), missing_source, .{ .start = missing_format, .end = missing_format + 7 }, &.{});
     try std.testing.expectEqualStrings(".{one, @panic(\"TODO\")}", missing[0].edits[0].replacement);
 
     const extra_source: [:0]const u8 = "fn run(one: u8, two: u8) void { std.debug.print(\"{}\", .{one, two}); }";
-    const extra_format = std.mem.indexOf(u8, extra_source, "\"{}\"") orelse unreachable;
+    const extra_format = std.mem.find(u8, extra_source, "\"{}\"") orelse unreachable;
     const extra = try registry.actions(arena.allocator(), extra_source, .{ .start = extra_format, .end = extra_format + 4 }, &.{});
     try std.testing.expectEqualStrings("Add missing format placeholders", extra[0].title);
     try std.testing.expectEqualStrings("\"{} {any}\"", extra[0].edits[0].replacement);
@@ -740,7 +737,7 @@ test "escaped format braces are counted and replaced escape-aware" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run() void { std.debug.print(\"{{}} {}\", .{\"zig\"}); }";
-    const format = std.mem.indexOf(u8, source, "\"{{}} {}\"") orelse unreachable;
+    const format = std.mem.find(u8, source, "\"{{}} {}\"") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = format, .end = format + 9 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings("\"{{}} {s}\"", actions[0].edits[0].replacement);
@@ -753,7 +750,7 @@ test "out-of-scope var bindings do not enable pointer captures" {
     const source: [:0]const u8 =
         "fn other() void { var current: ?u8 = 1; _ = current; } " ++
         "fn run(value: ?u8) void { const current = value; if (current) |payload| { payload += 1; } }";
-    const capture = std.mem.lastIndexOf(u8, source, "payload") orelse unreachable;
+    const capture = std.mem.findLast(u8, source, "payload") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = capture, .end = capture + 7 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -765,14 +762,14 @@ test "compiler shapes drive tagged union and materialization actions" {
     const fields = [_][]const u8{ "number", "text" };
     const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
     const switch_source: [:0]const u8 = "fn run(value: Value) void { if (value == .number) { _ = value.number; } }";
-    const if_start = std.mem.indexOf(u8, switch_source, "if") orelse unreachable;
+    const if_start = std.mem.find(u8, switch_source, "if") orelse unreachable;
     const switch_actions = try registry.actions(arena.allocator(), switch_source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
-    try std.testing.expect(std.mem.indexOf(u8, switch_actions[0].edits[0].replacement, "|payload|") != null);
+    try std.testing.expect(std.mem.find(u8, switch_actions[0].edits[0].replacement, "|payload|") != null);
 
     const materialize_source: [:0]const u8 = "const Value = makeValue();";
-    const type_start = std.mem.indexOf(u8, materialize_source, "Value") orelse unreachable;
+    const type_start = std.mem.find(u8, materialize_source, "Value") orelse unreachable;
     const materialize_actions = try registry.actions(arena.allocator(), materialize_source, .{ .start = type_start, .end = type_start + 5 }, &shapes);
-    try std.testing.expect(std.mem.indexOf(u8, materialize_actions[0].edits[0].replacement, "union(enum)") != null);
+    try std.testing.expect(std.mem.find(u8, materialize_actions[0].edits[0].replacement, "union(enum)") != null);
 }
 
 test "tagged union switches leave dangling else branches alone" {
@@ -782,7 +779,7 @@ test "tagged union switches leave dangling else branches alone" {
     const fields = [_][]const u8{ "number", "text" };
     const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
     const source: [:0]const u8 = "fn run(value: Value) void { if (value == .number) { _ = value.number; } else { _ = value; } }";
-    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const if_start = std.mem.find(u8, source, "if") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -796,13 +793,13 @@ test "tagged union payload rewrites spare string literals and longer identifiers
     const source: [:0]const u8 =
         "fn run(value: Value) void { if (value == .number) { " ++
         "std.debug.print(\"value.number={d}\", .{value.number}); _ = value.number_total; } }";
-    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const if_start = std.mem.find(u8, source, "if") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     const replacement = actions[0].edits[0].replacement;
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "\"value.number={d}\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replacement, ".{payload}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "value.number_total") != null);
+    try std.testing.expect(std.mem.find(u8, replacement, "\"value.number={d}\"") != null);
+    try std.testing.expect(std.mem.find(u8, replacement, ".{payload}") != null);
+    try std.testing.expect(std.mem.find(u8, replacement, "value.number_total") != null);
 }
 
 test "tagged union bodies that mutate or address the payload keep the if" {
@@ -814,13 +811,13 @@ test "tagged union bodies that mutate or address the payload keep the if" {
 
     const assign_source: [:0]const u8 =
         "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { value.number = 2; } }";
-    const assign_start = std.mem.indexOf(u8, assign_source, "if") orelse unreachable;
+    const assign_start = std.mem.find(u8, assign_source, "if") orelse unreachable;
     const assign = try registry.actions(arena.allocator(), assign_source, .{ .start = assign_start, .end = assign_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), assign.len);
 
     const address_source: [:0]const u8 =
         "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { mutate(&value.number); } }";
-    const address_start = std.mem.indexOf(u8, address_source, "if") orelse unreachable;
+    const address_start = std.mem.find(u8, address_source, "if") orelse unreachable;
     const address = try registry.actions(arena.allocator(), address_source, .{ .start = address_start, .end = address_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), address.len);
 }
@@ -834,13 +831,13 @@ test "tagged union bodies that assign through unwraps or take parenthesized addr
 
     const unwrap_source: [:0]const u8 =
         "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { value.number.? = 2; } }";
-    const unwrap_start = std.mem.indexOf(u8, unwrap_source, "if") orelse unreachable;
+    const unwrap_start = std.mem.find(u8, unwrap_source, "if") orelse unreachable;
     const unwrap = try registry.actions(arena.allocator(), unwrap_source, .{ .start = unwrap_start, .end = unwrap_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), unwrap.len);
 
     const parenthesized_source: [:0]const u8 =
         "fn run() void { var value: Value = .{ .number = 1 }; if (value == .number) { mutate(&(value.number)); } }";
-    const parenthesized_start = std.mem.indexOf(u8, parenthesized_source, "if") orelse unreachable;
+    const parenthesized_start = std.mem.find(u8, parenthesized_source, "if") orelse unreachable;
     const parenthesized = try registry.actions(arena.allocator(), parenthesized_source, .{ .start = parenthesized_start, .end = parenthesized_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), parenthesized.len);
 }
@@ -853,11 +850,11 @@ test "tagged union payload captures avoid names already used in the body" {
     const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &fields }};
     const source: [:0]const u8 =
         "fn run(value: Value) void { if (value == .number) { const payload = value.number; _ = payload; } }";
-    const if_start = std.mem.indexOf(u8, source, "if") orelse unreachable;
+    const if_start = std.mem.find(u8, source, "if") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = if_start, .end = if_start + 2 }, &shapes);
     try std.testing.expectEqual(@as(usize, 1), actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "|payload2|") != null);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "const payload = payload2;") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "|payload2|") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "const payload = payload2;") != null);
 }
 
 test "reflected fields only land in plain struct containers" {
@@ -866,13 +863,13 @@ test "reflected fields only land in plain struct containers" {
     defer arena.deinit();
     const union_source: [:0]const u8 =
         "const Value = union(enum) { number: u8 }; comptime { _ = @hasField(Value, \"text\"); }";
-    const union_member = std.mem.indexOf(u8, union_source, "\"text\"") orelse unreachable;
+    const union_member = std.mem.find(u8, union_source, "\"text\"") orelse unreachable;
     const union_actions = try registry.actions(arena.allocator(), union_source, .{ .start = union_member, .end = union_member + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), union_actions.len);
 
     const extern_source: [:0]const u8 =
         "const Raw = extern struct { a: u8 }; comptime { _ = @hasField(Raw, \"b\"); }";
-    const extern_member = std.mem.indexOf(u8, extern_source, "\"b\"") orelse unreachable;
+    const extern_member = std.mem.find(u8, extern_source, "\"b\"") orelse unreachable;
     const extern_actions = try registry.actions(arena.allocator(), extern_source, .{ .start = extern_member, .end = extern_member + 3 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), extern_actions.len);
 }
@@ -887,16 +884,16 @@ test "reflection dispatch can become an inline-else switch" {
         "const Value = union(enum) { number: u8, code: u8, }; " ++
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
-    const start = std.mem.indexOf(u8, source, "inline") orelse unreachable;
+    const start = std.mem.find(u8, source, "inline") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 1), actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "inline else") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "inline else") != null);
 
     const swapped_source: [:0]const u8 =
         "const Value = union(enum) { number: u8, code: u8, }; " ++
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "if (std.mem.eql(u8, @tagName(value), field.name)) return @field(value, field.name); } unreachable; }";
-    const swapped_start = std.mem.indexOf(u8, swapped_source, "inline") orelse unreachable;
+    const swapped_start = std.mem.find(u8, swapped_source, "inline") orelse unreachable;
     const swapped = try registry.actions(arena.allocator(), swapped_source, .{ .start = swapped_start, .end = swapped_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 1), swapped.len);
 
@@ -904,7 +901,7 @@ test "reflection dispatch can become an inline-else switch" {
         "const Value = union(enum) { number: u8, code: u16, }; " ++
         "fn get(value: Value) u16 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
-    const mixed_start = std.mem.indexOf(u8, mixed_source, "inline") orelse unreachable;
+    const mixed_start = std.mem.find(u8, mixed_source, "inline") orelse unreachable;
     const mixed_actions = try registry.actions(arena.allocator(), mixed_source, .{ .start = mixed_start, .end = mixed_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), mixed_actions.len);
 }
@@ -920,7 +917,7 @@ test "reflection dispatch loops that are not the exact guarded return stay put" 
         "const Value = union(enum) { number: u8, code: u8, }; " ++
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "if (!std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
-    const negated_start = std.mem.indexOf(u8, negated_source, "inline") orelse unreachable;
+    const negated_start = std.mem.find(u8, negated_source, "inline") orelse unreachable;
     const negated = try registry.actions(arena.allocator(), negated_source, .{ .start = negated_start, .end = negated_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), negated.len);
 
@@ -929,7 +926,7 @@ test "reflection dispatch loops that are not the exact guarded return stay put" 
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "std.debug.print(\"x\", .{}); " ++
         "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } unreachable; }";
-    const effect_start = std.mem.indexOf(u8, effect_source, "inline") orelse unreachable;
+    const effect_start = std.mem.find(u8, effect_source, "inline") orelse unreachable;
     const effect = try registry.actions(arena.allocator(), effect_source, .{ .start = effect_start, .end = effect_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), effect.len);
 
@@ -937,7 +934,7 @@ test "reflection dispatch loops that are not the exact guarded return stay put" 
         "const Value = union(enum) { number: u8, code: u8, }; " ++
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".fields) |field| { " ++
         "if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name); } return 0; }";
-    const trailing_start = std.mem.indexOf(u8, trailing_source, "inline") orelse unreachable;
+    const trailing_start = std.mem.find(u8, trailing_source, "inline") orelse unreachable;
     const trailing = try registry.actions(arena.allocator(), trailing_source, .{ .start = trailing_start, .end = trailing_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), trailing.len);
 }
@@ -951,10 +948,10 @@ test "Zig 0.17 field name reflection dispatch becomes an inline-else switch" {
         "const Value = union(enum) { number: u8, code: u8, }; " ++
         "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".field_names) |name| { " ++
         "if (std.mem.eql(u8, name, @tagName(value))) return @field(value, name); } unreachable; }";
-    const start = std.mem.indexOf(u8, source, "inline") orelse unreachable;
+    const start = std.mem.find(u8, source, "inline") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 1), actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "inline else") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "inline else") != null);
     const wrong_source = try std.mem.replaceOwned(u8, arena.allocator(), source, "field_names", "field_types");
     const wrong_z = try arena.allocator().dupeSentinel(u8, wrong_source, 0);
     const wrong_actions = try registry.actions(arena.allocator(), wrong_z, .{ .start = start, .end = start + 6 }, &shapes);

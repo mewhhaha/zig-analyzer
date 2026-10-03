@@ -39,35 +39,32 @@ pub fn run(context: RuleRun) !void {
         var automatic_fix = true;
 
         if (std.mem.eql(u8, y_text, "0.5") and is_pow) {
-            replacement = try std.fmt.allocPrint(context.allocator, "{s}sqrt(@as({s}, {s}))", .{ prefix, type_text, x_text });
+            replacement = try context.allocator.print("{s}sqrt(@as({s}, {s}))", .{ prefix, type_text, x_text });
             automatic_fix = isPositiveLiteral(context, arguments[1]);
-            message = try std.fmt.allocPrint(
-                context.allocator,
+            message = try context.allocator.print(
                 "computing square root with {s}pow(..., 0.5); consider {s}sqrt{s}",
                 .{ prefix, prefix, if (automatic_fix) "" else "; sqrt preserves negative zero while pow returns positive zero" },
             );
             fix_title = "Use std.math.sqrt";
         } else if (std.mem.eql(u8, y_text, "2") or std.mem.eql(u8, y_text, "2.0")) {
             if (isSimpleOperand(context, arguments[1])) {
-                replacement = try std.fmt.allocPrint(context.allocator, "@as({s}, {s}) * @as({s}, {s})", .{ type_text, x_text, type_text, x_text });
-                message = try std.fmt.allocPrint(
-                    context.allocator,
+                replacement = try context.allocator.print("@as({s}, {s}) * @as({s}, {s})", .{ type_text, x_text, type_text, x_text });
+                message = try context.allocator.print(
                     "squaring '{s}' with {s}{s}; use '{s} * {s}' directly",
                     .{ x_text, prefix, func_name, x_text, x_text },
                 );
                 fix_title = "Replace pow with multiplication";
             }
         } else if (std.mem.eql(u8, y_text, "1") or std.mem.eql(u8, y_text, "1.0")) {
-            replacement = try std.fmt.allocPrint(context.allocator, "@as({s}, {s})", .{ type_text, x_text });
-            message = try std.fmt.allocPrint(
-                context.allocator,
+            replacement = try context.allocator.print("@as({s}, {s})", .{ type_text, x_text });
+            message = try context.allocator.print(
                 "raising '{s}' to power 1 is redundant; use '{s}' directly",
                 .{ x_text, x_text },
             );
             fix_title = "Remove redundant pow";
         } else if (std.mem.eql(u8, y_text, "0") or std.mem.eql(u8, y_text, "0.0")) {
             if (isSimpleOperand(context, arguments[1])) {
-                replacement = try std.fmt.allocPrint(context.allocator, "@as({s}, 1)", .{type_text});
+                replacement = try context.allocator.print("@as({s}, 1)", .{type_text});
                 message = try context.allocator.dupe(
                     u8,
                     "raising to power 0 always evaluates to 1; use '1' directly",
@@ -204,7 +201,7 @@ test "prefer math pow square root keeps signed zero out of automatic fixes" {
     for (findings[0..2]) |finding| {
         try std.testing.expect(!finding.fixes[0].preferred);
         try std.testing.expect(!finding.fixes[0].fix_all);
-        try std.testing.expect(std.mem.indexOf(u8, finding.message, "negative zero") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "negative zero") != null);
     }
     try std.testing.expect(findings[2].fixes[0].preferred);
     try std.testing.expect(findings[2].fixes[0].fix_all);

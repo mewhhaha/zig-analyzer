@@ -47,8 +47,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_loop_else,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "flag '{s}' only records whether the loop broke; put the fallback in the loop's else branch",
                 .{flag},
             ),

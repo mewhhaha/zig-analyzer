@@ -129,11 +129,10 @@ fn checkAllocPrint(
             context.source[context.tokens[tuple_open].loc.end..context.tokens[tuple_close].loc.start],
             " \t\r\n,",
         );
-        if (inner_arg.len == 0 or std.mem.indexOfScalar(u8, inner_arg, ',') != null) return;
+        if (inner_arg.len == 0 or std.mem.findScalar(u8, inner_arg, ',') != null) return;
         if (containsComment(inner_arg)) return;
 
-        const replacement = try std.fmt.allocPrint(
-            context.allocator,
+        const replacement = try context.allocator.print(
             "{s}.{s}(u8, {s}{s})",
             .{ allocator_text, dupe_fn, inner_arg, sentinel_argument },
         );
@@ -147,7 +146,7 @@ fn checkAllocPrint(
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Replace with {s}.{s}", .{ allocator_text, dupe_fn }),
+            .title = try context.allocator.print("Replace with {s}.{s}", .{ allocator_text, dupe_fn }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -157,15 +156,14 @@ fn checkAllocPrint(
             .rule = .prefer_allocator_dupe,
             .level = level,
             .span = context.tokens[call_start].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "formatting '{s}' duplicates a slice; use '{s}.{s}(u8, {s}{s})' directly",
                 .{ inner_fmt, allocator_text, dupe_fn, inner_arg, sentinel_argument },
             ),
             .fixes = fixes,
         });
-    } else if (std.mem.indexOfScalar(u8, inner_fmt, '{') == null and
-        std.mem.indexOfScalar(u8, inner_fmt, '}') == null)
+    } else if (std.mem.findScalar(u8, inner_fmt, '{') == null and
+        std.mem.findScalar(u8, inner_fmt, '}') == null)
     {
         // Static string without format specifiers, tuple should be empty
         const tuple_contents = std.mem.trim(
@@ -175,8 +173,7 @@ fn checkAllocPrint(
         );
         if (tuple_contents.len != 0) return;
 
-        const replacement = try std.fmt.allocPrint(
-            context.allocator,
+        const replacement = try context.allocator.print(
             "{s}.{s}(u8, {s}{s})",
             .{ allocator_text, dupe_fn, fmt_text, sentinel_argument },
         );
@@ -190,7 +187,7 @@ fn checkAllocPrint(
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Replace with {s}.{s}", .{ allocator_text, dupe_fn }),
+            .title = try context.allocator.print("Replace with {s}.{s}", .{ allocator_text, dupe_fn }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -200,8 +197,7 @@ fn checkAllocPrint(
             .rule = .prefer_allocator_dupe,
             .level = level,
             .span = context.tokens[call_start].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "formatting static string has no specifiers; use '{s}.{s}(u8, {s}{s})' directly",
                 .{ allocator_text, dupe_fn, fmt_text, sentinel_argument },
             ),
@@ -211,7 +207,7 @@ fn checkAllocPrint(
 }
 
 fn containsComment(text: []const u8) bool {
-    return std.mem.indexOf(u8, text, "//") != null or std.mem.indexOf(u8, text, "/*") != null;
+    return std.mem.find(u8, text, "//") != null or std.mem.find(u8, text, "/*") != null;
 }
 
 test "prefer allocator dupe detects single slice format" {

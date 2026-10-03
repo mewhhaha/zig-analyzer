@@ -2,8 +2,8 @@ const std = @import("std");
 
 pub fn isTranslateCOutput(source: []const u8) bool {
     const prefix = source[0..@min(source.len, 32 * 1024)];
-    if (std.mem.indexOf(u8, prefix, "pub const __builtin_") == null or
-        std.mem.indexOf(u8, prefix, ".zig.c_builtins.") == null) return false;
+    if (std.mem.find(u8, prefix, "pub const __builtin_") == null or
+        std.mem.find(u8, prefix, ".zig.c_builtins.") == null) return false;
     return std.mem.count(u8, prefix, "pub const __builtin_") >= 3;
 }
 

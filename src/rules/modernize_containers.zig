@@ -21,7 +21,7 @@ pub fn run(context: RuleRun) !void {
         if (level == .off) continue;
         const closing = scopes.matchingToken(index + 1) orelse continue;
         const receiver_start = chainStart(context, &scopes, index - 2) orelse continue;
-        const receiver = resolve(context, &scopes, receiver_start, index - 1, 0);
+        const receiver = resolve(context, &scopes, receiver_start, index - 1, 0, .value);
         if (rule == .modernize_array_list_access and receiver != .list_value) continue;
         if (rule == .modernize_container_init and receiver != .fixed_type) continue;
 
@@ -63,6 +63,7 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+    try findDefaultInitializers(context, &scopes);
 }
 
 fn makeFix(context: RuleRun, title: []const u8, edits: []const types.Edit) ![]const types.Fix {
@@ -77,21 +78,32 @@ const Family = enum {
     array_list,
     bit_set,
     enums,
+    hash_map,
+    array_hash_map,
+    heap,
+    arena_allocator,
     list_constructor,
     fixed_constructor,
+    map_constructor,
     list_type,
     fixed_type,
+    map_type,
+    arena_state_type,
     list_value,
     fixed_value,
+    map_value,
+    arena_state_value,
     list_initializer,
 };
 
+const ProofMode = enum { value, exact_type };
+
 /// Resolve only known standard-library paths and lexical aliases of them.
 /// Unknown member access, custom constructors and arbitrary calls lose proof.
-fn resolve(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize, depth: usize) Family {
+fn resolve(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize, depth: usize, mode: ProofMode) Family {
     if (start >= end or end > context.tokens.len or depth >= 20) return .unknown;
     var cursor = start;
-    while (cursor < end and (context.tokens[cursor].tag == .keyword_try or
+    while (mode == .value and cursor < end and (context.tokens[cursor].tag == .keyword_try or
         context.tokens[cursor].tag == .asterisk or context.tokens[cursor].tag == .ampersand or
         context.tokens[cursor].tag == .keyword_const)) cursor += 1;
     if (cursor == end) return .unknown;
@@ -103,12 +115,12 @@ fn resolve(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, en
         cursor += 4;
     } else if (context.tokens[cursor].tag == .identifier) {
         const binding = scopes.findBinding(cursor) orelse return .unknown;
-        family = bindingFamily(context, scopes, binding.token_index, depth + 1);
+        family = bindingFamily(context, scopes, binding.token_index, depth + 1, mode);
         cursor += 1;
     } else if (context.tokens[cursor].tag == .l_paren) {
         const closing = scopes.matchingToken(cursor) orelse return .unknown;
         if (closing >= end) return .unknown;
-        family = resolve(context, scopes, cursor + 1, closing, depth + 1);
+        family = resolve(context, scopes, cursor + 1, closing, depth + 1, mode);
         cursor = closing + 1;
     } else return .unknown;
 
@@ -125,16 +137,25 @@ fn resolve(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, en
                 family = switch (family) {
                     .list_constructor => .list_type,
                     .fixed_constructor => .fixed_type,
+                    .map_constructor => .map_type,
                     .list_initializer => .list_value,
                     .unknown,
                     .standard,
                     .array_list,
                     .bit_set,
                     .enums,
+                    .hash_map,
+                    .array_hash_map,
+                    .heap,
+                    .arena_allocator,
                     .list_type,
                     .fixed_type,
+                    .map_type,
+                    .arena_state_type,
                     .list_value,
                     .fixed_value,
+                    .map_value,
+                    .arena_state_value,
                     => .unknown,
                 };
                 cursor = closing + 1;
@@ -156,11 +177,20 @@ const standard_members = std.StaticStringMap(Family).initComptime(.{
     .{ "array_list", .array_list },
     .{ "bit_set", .bit_set },
     .{ "enums", .enums },
+    .{ "hash_map", .hash_map },
+    .{ "array_hash_map", .array_hash_map },
+    .{ "heap", .heap },
     .{ "ArrayList", .list_constructor },
     .{ "ArrayListUnmanaged", .list_constructor },
     .{ "ArrayListAligned", .list_constructor },
     .{ "ArrayListAlignedUnmanaged", .list_constructor },
     .{ "StaticBitSet", .fixed_constructor },
+    .{ "HashMapUnmanaged", .map_constructor },
+    .{ "AutoHashMapUnmanaged", .map_constructor },
+    .{ "StringHashMapUnmanaged", .map_constructor },
+    .{ "ArrayHashMapUnmanaged", .map_constructor },
+    .{ "AutoArrayHashMapUnmanaged", .map_constructor },
+    .{ "StringArrayHashMapUnmanaged", .map_constructor },
 });
 
 fn memberFamily(family: Family, name: []const u8) Family {
@@ -168,11 +198,25 @@ fn memberFamily(family: Family, name: []const u8) Family {
         .standard => standard_members.get(name) orelse .unknown,
         .array_list => if (std.mem.eql(u8, name, "Aligned")) .list_constructor else .unknown,
         .bit_set => if (oneOf(name, &.{ "Integer", "Array", "Static", "IntegerBitSet", "ArrayBitSet", "StaticBitSet" })) .fixed_constructor else .unknown,
-        .enums => if (std.mem.eql(u8, name, "EnumSet")) .fixed_constructor else .unknown,
+        .enums => if (std.mem.eql(u8, name, "EnumSet")) .fixed_constructor else if (std.mem.eql(u8, name, "EnumMap")) .map_constructor else .unknown,
+        .hash_map => if (oneOf(name, &.{ "HashMapUnmanaged", "AutoHashMapUnmanaged", "StringHashMapUnmanaged" })) .map_constructor else .unknown,
+        .array_hash_map => if (oneOf(name, &.{ "Custom", "Auto", "String", "ArrayHashMap" })) .map_constructor else .unknown,
+        .heap => if (std.mem.eql(u8, name, "ArenaAllocator")) .arena_allocator else .unknown,
+        .arena_allocator => if (std.mem.eql(u8, name, "State")) .arena_state_type else .unknown,
         .list_type => if (std.mem.eql(u8, name, "empty")) .list_value else if (oneOf(name, &.{ "initCapacity", "initBuffer", "fromOwnedSlice", "fromOwnedSliceSentinel" })) .list_initializer else .unknown,
         .list_value => if (std.mem.eql(u8, name, "clone")) .list_initializer else .unknown,
         .fixed_type => if (oneOf(name, &.{ "empty", "full" })) .fixed_value else .unknown,
-        .unknown, .list_constructor, .fixed_constructor, .fixed_value, .list_initializer => .unknown,
+        .map_type => if (std.mem.eql(u8, name, "empty")) .map_value else .unknown,
+        .arena_state_type => if (std.mem.eql(u8, name, "init")) .arena_state_value else .unknown,
+        .unknown,
+        .list_constructor,
+        .fixed_constructor,
+        .map_constructor,
+        .fixed_value,
+        .map_value,
+        .arena_state_value,
+        .list_initializer,
+        => .unknown,
     };
 }
 
@@ -185,21 +229,30 @@ fn instanceFamily(family: Family) Family {
     return switch (family) {
         .list_type => .list_value,
         .fixed_type => .fixed_value,
+        .map_type => .map_value,
+        .arena_state_type => .arena_state_value,
         .unknown,
         .standard,
         .array_list,
         .bit_set,
         .enums,
+        .hash_map,
+        .array_hash_map,
+        .heap,
+        .arena_allocator,
         .list_constructor,
         .fixed_constructor,
+        .map_constructor,
         .list_value,
         .fixed_value,
+        .map_value,
+        .arena_state_value,
         .list_initializer,
         => .unknown,
     };
 }
 
-fn bindingFamily(context: RuleRun, scopes: *const syntax_scope.Index, binding: usize, depth: usize) Family {
+fn bindingFamily(context: RuleRun, scopes: *const syntax_scope.Index, binding: usize, depth: usize, mode: ProofMode) Family {
     if (binding + 2 >= context.tokens.len) return .unknown;
     if (context.tokens[binding + 1].tag == .colon) {
         var end = binding + 2;
@@ -215,32 +268,138 @@ fn bindingFamily(context: RuleRun, scopes: *const syntax_scope.Index, binding: u
             end < context.tokens.len and context.tokens[end].tag == .equal)
         {
             const statement_end = scopes.statementEnd(end + 1) orelse return .unknown;
-            return stableBindingFamily(context, binding, resolve(context, scopes, end + 1, statement_end, depth));
+            return stableBindingFamily(context, binding, resolve(context, scopes, end + 1, statement_end, depth, mode));
         }
-        return instanceFamily(resolve(context, scopes, binding + 2, end, depth));
+        return instanceFamily(resolve(context, scopes, binding + 2, end, depth, mode));
     }
     if (context.tokens[binding + 1].tag != .equal) return .unknown;
     const end = scopes.statementEnd(binding + 2) orelse return .unknown;
-    return stableBindingFamily(context, binding, resolve(context, scopes, binding + 2, end, depth));
+    return stableBindingFamily(context, binding, resolve(context, scopes, binding + 2, end, depth, mode));
 }
 
 fn stableBindingFamily(context: RuleRun, binding: usize, family: Family) Family {
     // A mutable container value keeps its declared type. A comptime namespace,
     // constructor, or type variable can instead be reassigned to a custom API.
     return switch (family) {
-        .list_value, .fixed_value => family,
+        .list_value, .fixed_value, .map_value, .arena_state_value => family,
         .unknown,
         .standard,
         .array_list,
         .bit_set,
         .enums,
+        .hash_map,
+        .array_hash_map,
+        .heap,
+        .arena_allocator,
         .list_constructor,
         .fixed_constructor,
+        .map_constructor,
         .list_type,
         .fixed_type,
+        .map_type,
+        .arena_state_type,
         .list_initializer,
         => if (binding > 0 and context.tokens[binding - 1].tag == .keyword_const) family else .unknown,
     };
+}
+
+const Ast = std.zig.Ast;
+const Node = Ast.Node.Index;
+
+fn findDefaultInitializers(context: RuleRun, scopes: *const syntax_scope.Index) !void {
+    if (context.level(.modernize_container_init) == .off) return;
+    var tree = try Ast.parse(context.allocator, context.source, .{ .mode = .zig });
+    defer tree.deinit(context.allocator);
+    if (tree.errors.len != 0) return;
+    const reported = try context.allocator.alloc(bool, tree.nodes.len);
+    defer context.allocator.free(reported);
+    @memset(reported, false);
+    for (1..tree.nodes.len) |raw_node| {
+        const node: Node = @fromBackingInt(@intCast(raw_node));
+        if (tree.fullVarDecl(node)) |variable| {
+            if (variable.ast.type_node.unwrap()) |type_node| {
+                if (variable.ast.init_node.unwrap()) |value_node| {
+                    try emitDefaultInitializer(context, scopes, &tree, value_node, type_node, reported);
+                }
+            }
+        }
+        if (tree.fullContainerField(node)) |field| {
+            if (field.ast.type_expr.unwrap()) |type_node| {
+                if (field.ast.value_expr.unwrap()) |value_node| {
+                    try emitDefaultInitializer(context, scopes, &tree, value_node, type_node, reported);
+                }
+            }
+        }
+        var parameters_buffer: [2]Node = undefined;
+        if (tree.builtinCallParams(&parameters_buffer, node)) |parameters| {
+            if (parameters.len == 2 and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) {
+                try emitDefaultInitializer(context, scopes, &tree, parameters[1], parameters[0], reported);
+            }
+        }
+        var initializer_buffer: [2]Node = undefined;
+        if (tree.fullStructInit(&initializer_buffer, node)) |initializer| {
+            if (initializer.ast.type_expr.unwrap()) |type_node| {
+                try emitDefaultInitializer(context, scopes, &tree, node, type_node, reported);
+            }
+        }
+    }
+}
+
+fn emitDefaultInitializer(
+    context: RuleRun,
+    scopes: *const syntax_scope.Index,
+    tree: *const Ast,
+    raw_value: Node,
+    expected_type: Node,
+    reported: []bool,
+) !void {
+    const value = ungroup(tree, raw_value);
+    if (reported[@backingInt(value)]) return;
+    var buffer: [2]Node = undefined;
+    const initializer = tree.fullStructInit(&buffer, value) orelse return;
+    if (initializer.ast.fields.len != 0) return;
+    const type_node = ungroup(tree, initializer.ast.type_expr.unwrap() orelse expected_type);
+    const start = tree.firstToken(type_node);
+    const end = tree.lastToken(type_node) + 1;
+    if (end > context.tokens.len or context.tokens[start].loc.start != tree.tokenStart(start)) return;
+    // Qualifiers such as pointers, optionals, arrays and error unions do not
+    // establish the exact container type of an anonymous initializer.
+    if (context.tokens[start].tag != .identifier and !context.tokenIs(start, "@import")) return;
+    const family = resolve(context, scopes, start, end, 0, .exact_type);
+    if (family != .map_type and family != .arena_state_type) return;
+    const lbrace = initializer.ast.lbrace;
+    const rbrace = tree.lastToken(value);
+    if (lbrace >= context.tokens.len or rbrace >= context.tokens.len or
+        context.tokens[lbrace].tag != .l_brace or context.tokens[rbrace].tag != .r_brace) return;
+    const anonymous = initializer.ast.type_expr == .none;
+    const span: std.zig.Token.Loc = .{
+        .start = context.tokens[if (anonymous) lbrace - 1 else lbrace].loc.start,
+        .end = context.tokens[rbrace].loc.end,
+    };
+    const replacement = if (family == .arena_state_type) ".init" else ".empty";
+    var fixes: []const types.Fix = &.{};
+    if (std.mem.find(u8, context.source[span.start..span.end], "//") == null) {
+        const edits = try context.allocator.alloc(types.Edit, 1);
+        edits[0] = .{ .span = span, .replacement = replacement };
+        fixes = try makeFix(context, if (family == .arena_state_type) "Use the initial arena state" else "Use the empty container value", edits);
+    }
+    reported[@backingInt(value)] = true;
+    try context.emit(.{
+        .rule = .modernize_container_init,
+        .level = context.level(.modernize_container_init),
+        .span = span,
+        .message = if (family == .arena_state_type)
+            "default ArenaAllocator.State initialization is deprecated; use its init value"
+        else
+            "default initialization of this standard map is deprecated; use its empty value",
+        .fixes = fixes,
+    });
+}
+
+fn ungroup(tree: *const Ast, raw_node: Node) Node {
+    var node = raw_node;
+    while (tree.nodeTag(node) == .grouped_expression) node = tree.nodeData(node).node_and_token[0];
+    return node;
 }
 
 fn chainStart(context: RuleRun, scopes: *const syntax_scope.Index, end: usize) ?usize {
@@ -409,6 +568,123 @@ test "container modernization replacements compile with Zig 0.17 APIs" {
     var list: std.array_list.Aligned(u8, null) = .initBuffer(&values);
     list.appendAssumeCapacity(42);
     try std.testing.expectEqual(@as(u8, 42), list.last().?);
+}
+
+test "container modernization finds deprecated default map and arena state initializers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const library = @import(\"std\"); const hm = library.hash_map; const ahm = library.array_hash_map;\n" ++
+        "const MakeMap = hm.AutoHashMapUnmanaged; const Map = MakeMap(u32, u8); const Alias: type = Map;\n" ++
+        "const Strings = hm.StringHashMapUnmanaged(u8); const Generic = library.HashMapUnmanaged(u32, u8, hm.AutoContext(u32), 80);\n" ++
+        "const Array = ahm.Auto(u32, u8); const StringArray = ahm.String(u8);\n" ++
+        "const GenericArray = ahm.Custom(u32, u8, ahm.AutoContext(u32), true);\n" ++
+        "const Legacy = library.AutoArrayHashMapUnmanaged(u32, u8); const LegacyString = library.StringArrayHashMapUnmanaged(u8);\n" ++
+        "const LegacyCustom = library.ArrayHashMapUnmanaged(u32, u8, ahm.AutoContext(u32), true);\n" ++
+        "const Enum = enum { a, b }; const Enums = library.enums.EnumMap(Enum, u8);\n" ++
+        "const State = library.heap.ArenaAllocator.State; const StateAlias = State;\n" ++
+        "var a: Alias = .{}; var b: Strings = .{}; var c: Generic = .{};\n" ++
+        "var d: Array = .{}; var e: StringArray = .{}; var f: GenericArray = .{};\n" ++
+        "var g: Legacy = .{}; var h: LegacyString = .{}; var i: LegacyCustom = .{};\n" ++
+        "var j: Enums = .{}; var k: StateAlias = .{};\n";
+    const found = try findingsFor(arena.allocator(), source, .enabled);
+    try std.testing.expectEqual(@as(usize, 11), found.len);
+    for (found, 0..) |finding, index| {
+        try std.testing.expectEqual(types.Rule.modernize_container_init, finding.rule);
+        try std.testing.expectEqualStrings(".{}", source[finding.span.start..finding.span.end]);
+        try std.testing.expectEqualStrings(if (index == 10) ".init" else ".empty", finding.fixes[0].edits[0].replacement);
+        try std.testing.expect(finding.fixes[0].fix_all);
+    }
+}
+
+test "container modernization proves typed literals field defaults and as result locations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\"); const Map = std.AutoHashMapUnmanaged(u32, u8);\n" ++
+        "const State = std.heap.ArenaAllocator.State;\n" ++
+        "const Owner = struct { map: Map = .{}, state: State = .{}, aligned: Map align(8) = .{}, };\n" ++
+        "const a = Map{}; const b = std.array_hash_map.Auto(u32, u8){};\n" ++
+        "const c: Map = Map{}; const d = @as(Map, .{}); const e = @as((State), (.{}),);\n";
+    const found = try findingsFor(arena.allocator(), source, .enabled);
+    try std.testing.expectEqual(@as(usize, 8), found.len);
+    var typed_count: usize = 0;
+    var state_count: usize = 0;
+    for (found) |finding| {
+        const replaced = source[finding.span.start..finding.span.end];
+        if (std.mem.eql(u8, replaced, "{}")) typed_count += 1;
+        if (std.mem.eql(u8, finding.fixes[0].edits[0].replacement, ".init")) state_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), typed_count);
+    try std.testing.expectEqual(@as(usize, 2), state_count);
+}
+
+test "container modernization skips nonempty custom qualified and mutable default initializers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\"); const Map = std.AutoHashMapUnmanaged(u32, u8);\n" ++
+        "const Custom = struct { size: usize = 0, const empty = @This(){}; };\n" ++
+        "const a: Custom = .{}; const b = Custom{}; const c: Unknown = .{};\n" ++
+        "const d: Map = .{ .size = 0 }; const e = Map{ .size = 0 }; const f = @as(Map, .{ .size = 0 });\n" ++
+        "const pointer: *Map = .{}; const optional: ?Map = .{}; const array: [2]Map = .{};\n" ++
+        "const Pointer = *const Map; const Optional = ?Map; const Maps = [2]Map;\n" ++
+        "const aliased_pointer: Pointer = .{}; const aliased_optional: Optional = .{}; const aliased_array: Maps = .{};\n" ++
+        "const managed: std.AutoHashMap(u32, u8) = .{}; const managed_strings: std.StringHashMap(u8) = .{};\n" ++
+        "const inferred = .{}; const state = std.heap.ArenaAllocator.State{ .used_list = null };\n" ++
+        "fn shadow() void { const Map = Custom; const a: Map = .{}; const b = Map{}; }\n" ++
+        "fn mutable() void { comptime var library: type = std; library = Custom; const a: library.AutoHashMapUnmanaged(u32, u8) = .{};\n" ++
+        "    comptime var Mutable: type = std.AutoHashMapUnmanaged(u32, u8); Mutable = Custom; const Alias = Mutable; const b: Alias = .{}; }\n" ++
+        "fn root_shadow(std: type) void { const a: std.AutoHashMapUnmanaged(u32, u8) = .{}; }\n";
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), source, .enabled)).len);
+}
+
+test "container modernization default initializer comments suppression and opt in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\"); const Map = std.AutoHashMapUnmanaged(u32, u8);\n" ++
+        "const a: Map = .{// preserve me\n}; const b = Map{// preserve me too\n};\n" ++
+        "// zig-analyzer: disable-next-line modernize-container-init\n" ++
+        "const c: Map = .{}; const d: std.heap.ArenaAllocator.State = .init;\n";
+    const found = try findingsFor(arena.allocator(), source, .enabled);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    for (found) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+    const unsuppressed: [:0]const u8 =
+        "const std = @import(\"std\"); const a: std.AutoHashMapUnmanaged(u32, u8) = .{};\n";
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), unsuppressed, .defaults)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try findingsFor(arena.allocator(), unsuppressed, .enabled)).len);
+}
+
+test "container modernization empty maps and initial arena state compile with Zig 0.17" {
+    const Enum = enum { a, b };
+    const maps = .{
+        std.AutoHashMapUnmanaged(u32, u8),
+        std.StringHashMapUnmanaged(u8),
+        std.HashMapUnmanaged(u32, u8, std.hash_map.AutoContext(u32), 80),
+        std.array_hash_map.Auto(u32, u8),
+        std.array_hash_map.String(u8),
+        std.array_hash_map.Custom(u32, u8, std.array_hash_map.AutoContext(u32), true),
+        std.array_hash_map.Auto(u32, u8),
+        std.array_hash_map.String(u8),
+        std.array_hash_map.Custom(u32, u8, std.array_hash_map.AutoContext(u32), true),
+        std.enums.EnumMap(Enum, u8),
+    };
+    inline for (maps) |Map| {
+        const map: Map = .empty;
+        try std.testing.expectEqual(@as(usize, 0), map.count());
+    }
+    const Owner = struct {
+        map: std.AutoHashMapUnmanaged(u32, u8) = .empty,
+        state: std.heap.ArenaAllocator.State = .init,
+    };
+    const owner: Owner = .{};
+    try std.testing.expectEqual(@as(usize, 0), owner.map.count());
+    try std.testing.expect(owner.state.used_list == null and owner.state.free_list == null);
+    const typed = std.array_hash_map.Auto(u32, u8).empty;
+    const converted = @as(std.heap.ArenaAllocator.State, .init);
+    try std.testing.expectEqual(@as(usize, 0), typed.count());
+    try std.testing.expect(converted.used_list == null);
 }
 
 const TestMode = enum { defaults, enabled };

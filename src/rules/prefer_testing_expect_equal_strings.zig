@@ -37,8 +37,7 @@ pub fn run(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[expression_start].loc.start, .end = context.tokens[expect_end].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "{s}expectEqualStrings({s}, {s})",
                 .{ qualification, expected, actual },
             ),

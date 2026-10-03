@@ -22,8 +22,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .directory_iteration_not_enabled,
             .level = level,
             .span = context.tokens[iterate_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "directory '{s}' is iterated after being opened without '.iterate = true'",
                 .{binding},
             ),

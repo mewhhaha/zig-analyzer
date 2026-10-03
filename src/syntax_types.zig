@@ -332,7 +332,7 @@ test "inferred locals use the called function return type" {
     const source =
         "fn make() types.Headers.View { return undefined; }\n" ++
         "fn inspect() void { const value = make(); _ = value.slice; }";
-    const binding_start = std.mem.indexOf(u8, source, "value =") orelse unreachable;
+    const binding_start = std.mem.find(u8, source, "value =") orelse unreachable;
     const type_name = (try inferredBindingType(
         arena.allocator(),
         source,
@@ -351,19 +351,19 @@ test "initializer conventions name the constructed type" {
         "    const bytes = try parent.alloc(u8, 1);\n" ++
         "    _ = .{ &values, &arena_state, bytes };\n" ++
         "}";
-    const values_start = std.mem.indexOf(u8, source, "values =") orelse unreachable;
+    const values_start = std.mem.find(u8, source, "values =") orelse unreachable;
     try std.testing.expectEqualStrings("std.ArrayList(u8)", (try initializerTypeExpression(
         arena.allocator(),
         source,
         .{ .start = values_start, .end = values_start + "values".len },
     )).?);
-    const arena_start = std.mem.indexOf(u8, source, "arena_state =") orelse unreachable;
+    const arena_start = std.mem.find(u8, source, "arena_state =") orelse unreachable;
     try std.testing.expectEqualStrings("std.heap.ArenaAllocator", (try initializerTypeExpression(
         arena.allocator(),
         source,
         .{ .start = arena_start, .end = arena_start + "arena_state".len },
     )).?);
-    const bytes_start = std.mem.indexOf(u8, source, "bytes =") orelse unreachable;
+    const bytes_start = std.mem.find(u8, source, "bytes =") orelse unreachable;
     try std.testing.expectEqual(null, try initializerTypeExpression(
         arena.allocator(),
         source,

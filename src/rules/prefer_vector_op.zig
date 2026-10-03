@@ -169,8 +169,7 @@ pub fn run(context: RuleRun) !void {
             else => continue,
         };
 
-        const replacement = try std.fmt.allocPrint(
-            context.allocator,
+        const replacement = try context.allocator.print(
             "{s} {s} {s}",
             .{ left_receiver.?, op_str, right_receiver.? },
         );
@@ -197,8 +196,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_vector_op,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "element-wise lane operation can be computed directly with vector '{s}'",
                 .{op_str},
             ),

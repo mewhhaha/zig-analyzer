@@ -53,15 +53,14 @@ pub fn run(context: RuleRun) !void {
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Remove redundant '{s} {s}'", .{ op_text, operand_text }),
+            .title = try context.allocator.print("Remove redundant '{s} {s}'", .{ op_text, operand_text }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
             .fix_all = true,
         };
 
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "logical '{s}' with identical operands '{s} {s} {s}' is redundant and likely a typo",
             .{ op_text, operand_text, op_text, operand_text },
         );
@@ -139,7 +138,7 @@ fn isLogicalBoundaryAfter(tag: std.zig.Token.Tag) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "identical logical operands reports repeated conditions in and and or" {
@@ -155,9 +154,9 @@ test "identical logical operands reports repeated conditions in and and or" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "valid and valid") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "s.ready or s.ready") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "s.ptr.* and s.ptr.*") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "valid and valid") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "s.ready or s.ready") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "s.ptr.* and s.ptr.*") != null);
     try std.testing.expectEqualStrings("", findings[0].fixes[0].edits[0].replacement);
 }
 

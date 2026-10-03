@@ -664,7 +664,7 @@ test "scoped identifier lookup follows a loop capture" {
     const source = "fn run(values: []const u32) void { for (values) |value| { _ = value; } }";
     var document = try Document.open(std.testing.allocator, "file:///capture.zig", 1, source);
     defer document.deinit();
-    const use_offset = std.mem.lastIndexOf(u8, source, "value").?;
+    const use_offset = std.mem.findLast(u8, source, "value").?;
     const spans = (try document.scopedIdentifierSpans(std.testing.allocator, use_offset)).?;
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(usize, 2), spans.len);

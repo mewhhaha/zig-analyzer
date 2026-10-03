@@ -20,8 +20,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .discarded_realloc_result,
                 .level = level,
                 .span = candidate.loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "discarding {s}'s returned slice keeps a potentially invalid pointer and the old length",
                     .{context.tokenText(method_index)},
                 ),

@@ -106,7 +106,7 @@ fn prongBodyEnd(context: RuleRun, start: usize, switch_end: usize) ?usize {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "adjacent identical switch bodies prefer one combined prong" {

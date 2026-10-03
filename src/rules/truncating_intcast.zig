@@ -32,8 +32,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .truncating_intcast,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "@intCast converts '{s}' from {s} to {s} without a range guard; an out-of-range value is safety-checked illegal behavior",
                 .{
                     context.source[context.tokens[value.binding_index].loc.start..context.tokens[value.value_end_index].loc.end],
@@ -342,11 +341,11 @@ test "narrowing intCast of a wider declared value is flagged in both cast shapes
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'count'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "u64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "u32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'total'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "u16") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'count'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "u64") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "u32") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "'total'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "u16") != null);
 }
 
 test "writeInt result context exposes unchecked slice length narrowing" {
@@ -362,9 +361,9 @@ test "writeInt result context exposes unchecked slice length narrowing" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "message.payload.len") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "usize") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "u16") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "message.payload.len") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "usize") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "u16") != null);
 }
 
 test "captured slice lengths retain usize narrowing evidence" {
@@ -378,7 +377,7 @@ test "captured slice lengths retain usize narrowing evidence" {
         "const length: u16 = @intCast(record.payload.len); _ = length; } }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "record.payload.len") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "record.payload.len") != null);
 }
 
 test "a guard mentioning the value before the cast keeps it clean" {
@@ -471,7 +470,7 @@ test "signed C length fields require a nonnegative guard before unsigned casts" 
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "c_int") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "c_int") != null);
 }
 
 test "unknown ambiguous or shadowed value types stay clean" {

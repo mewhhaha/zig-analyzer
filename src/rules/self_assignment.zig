@@ -53,7 +53,7 @@ pub fn run(context: RuleRun) !void {
             };
             const f = try context.allocator.alloc(types.Fix, 1);
             f[0] = .{
-                .title = try std.fmt.allocPrint(context.allocator, "Discard '{s}' with '_ = {s};'", .{ path_text, path_text }),
+                .title = try context.allocator.print("Discard '{s}' with '_ = {s};'", .{ path_text, path_text }),
                 .kind = .quickfix,
                 .edits = edits,
                 .preferred = true,
@@ -65,8 +65,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .self_assignment,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "self-assignment of '{s}' has no effect and is likely a typo",
                 .{path_text},
             ),
@@ -120,7 +119,7 @@ fn isStatementStart(tokens: []const std.zig.Token, index: usize) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "self-assignment reports simple and dotted paths" {
@@ -136,10 +135,10 @@ test "self-assignment reports simple and dotted paths" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "self-assignment of 'a'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "self-assignment of 'a'") != null);
     try std.testing.expectEqualStrings("_", findings[0].fixes[0].edits[0].replacement);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "self-assignment of 'self.field'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "self-assignment of 'self.ptr.*'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "self-assignment of 'self.field'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "self-assignment of 'self.ptr.*'") != null);
 }
 
 test "shadowing variable declarations and modifications stay unchanged" {

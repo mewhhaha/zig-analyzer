@@ -194,6 +194,22 @@ fn findDeprecatedStdlib(context: RuleRun, scopes: *const syntax_scope.Index) !vo
     }
     try findLegacyReflection(context, scopes, level);
     try findLegacyAllocatorDupe(context, scopes, level);
+    try findRuntimeSafety(context, scopes, level);
+}
+
+fn findRuntimeSafety(context: RuleRun, scopes: *const syntax_scope.Index, level: types.Level) !void {
+    for (context.tokens, 0..) |token, index| {
+        if (index > 0 and context.tokens[index - 1].tag == .period) continue;
+        const end = simplePathEnd(context, scopes, index) orelse continue;
+        if (end <= index or !context.tokenIs(end, "runtime_safety") or
+            !provenStdPath(context, scopes, index, end, "debug.runtime_safety", 0)) continue;
+        try context.emit(.{
+            .rule = .modernize_deprecated_stdlib,
+            .level = level,
+            .span = .{ .start = token.loc.start, .end = context.tokens[end].loc.end },
+            .message = "std.debug.runtime_safety is deprecated; use @import(\"builtin\").mode.runtimeSafety() to query the caller's module rather than std's module",
+        });
+    }
 }
 
 fn findLegacyReflection(context: RuleRun, scopes: *const syntax_scope.Index, level: types.Level) !void {
@@ -469,14 +485,24 @@ fn findBuildApi(context: RuleRun, scopes: *const syntax_scope.Index) !void {
         const is_root_resource = index + 4 < context.tokens.len and
             context.tokenIs(index + 2, "root_module") and context.tokens[index + 3].tag == .period and
             context.tokenIs(index + 4, "addWin32ResourceFile");
-        if (!is_args and !is_translate and !is_resource and !is_basename and !is_root_resource) continue;
+        const is_lazy_dependency = context.tokenIs(index + 2, "lazyDependency");
+        const is_find_program = context.tokenIs(index + 2, "findProgram");
+        const run_argument = runArgumentReplacement(context, index + 2);
+        if (!is_args and !is_translate and !is_resource and !is_basename and !is_root_resource and
+            !is_lazy_dependency and !is_find_program and run_argument == null) continue;
         const receiver_kind = buildReceiverKind(context, scopes, index, 0) orelse continue;
-        if ((is_args or is_translate) and receiver_kind != .build) continue;
+        if ((is_args or is_translate or is_lazy_dependency or is_find_program) and receiver_kind != .build) continue;
         if (is_resource and receiver_kind != .module) continue;
         if (is_root_resource and receiver_kind != .compile_step) continue;
         if (is_basename and receiver_kind != .lazy_path) continue;
+        if (run_argument != null and receiver_kind != .run_step) continue;
         const member_index = index + @as(usize, if (is_root_resource) 4 else 2);
         if (!is_args and (member_index + 1 >= context.tokens.len or context.tokens[member_index + 1].tag != .l_paren)) continue;
+        if (is_find_program and callArgumentCount(context, scopes, member_index + 1) != 2) continue;
+        if (run_argument) |entry| {
+            try emitRunArgument(context, scopes, level, index, member_index, entry);
+            continue;
+        }
         try context.emit(.{
             .rule = .modernize_build_api,
             .level = level,
@@ -487,13 +513,106 @@ fn findBuildApi(context: RuleRun, scopes: *const syntax_scope.Index) !void {
                 "std.Build.addTranslateC uses the deprecated TranslateC step; add the official translate-c package and use its Translator API"
             else if (is_basename)
                 "std.Build.LazyPath.basename was removed; lazy path names are unavailable during configuration, so resolve them in a make step"
+            else if (is_lazy_dependency)
+                "std.Build.lazyDependency is deprecated; use dependencyLazy and propagate error.LazyDependencyNeeded to build(), replacing optional handling with error-union handling"
+            else if (is_find_program)
+                "std.Build.findProgram now takes a .{ .names = ... } options struct and returns an optional; review old search-path handling, or use findProgramLazy when configure-time lookup is unnecessary to avoid poisoning the configuration cache"
             else
                 "std.Build.Module.addWin32ResourceFile is deprecated in Zig 0.17; plan migration to the external Windows resource package before Zig 0.18",
         });
     }
 }
 
-const BuildReceiverKind = enum { build, module, lazy_path, compile_step };
+const RunArgumentReplacement = struct {
+    old: []const u8,
+    new: []const u8,
+    plain: bool = true,
+};
+
+// The plain wrappers pass their argument and .{} straight through in Zig 0.17.
+// Prefix/decorated wrappers reorder arguments; those migrations need review.
+const run_argument_replacements = [_]RunArgumentReplacement{
+    .{ .old = "addArtifactArg", .new = "addArtifactArg2" },
+    .{ .old = "addFileArg", .new = "addFileArg2" },
+    .{ .old = "addOutputFileArg", .new = "addOutputFileArg2" },
+    .{ .old = "addFileContentArg", .new = "addFileContentArg2" },
+    .{ .old = "addOutputDirectoryArg", .new = "addOutputDirectoryArg2" },
+    .{ .old = "addDirectoryArg", .new = "addDirectoryArg2" },
+    .{ .old = "addDepFileOutputArg", .new = "addDepFileOutputArg2" },
+    .{ .old = "addPrefixedArtifactArg", .new = "addArtifactArg2", .plain = false },
+    .{ .old = "addPrefixedFileArg", .new = "addFileArg2", .plain = false },
+    .{ .old = "addPrefixedOutputFileArg", .new = "addOutputFileArg2", .plain = false },
+    .{ .old = "addPrefixedFileContentArg", .new = "addFileContentArg2", .plain = false },
+    .{ .old = "addPrefixedOutputDirectoryArg", .new = "addOutputDirectoryArg2", .plain = false },
+    .{ .old = "addPrefixedDirectoryArg", .new = "addDirectoryArg2", .plain = false },
+    .{ .old = "addPrefixedDepFileOutputArg", .new = "addDepFileOutputArg2", .plain = false },
+    .{ .old = "addDecoratedDirectoryArg", .new = "addDirectoryArg2", .plain = false },
+};
+
+fn runArgumentReplacement(context: RuleRun, member: usize) ?RunArgumentReplacement {
+    for (run_argument_replacements) |entry| if (context.tokenIs(member, entry.old)) return entry;
+    return null;
+}
+
+fn emitRunArgument(context: RuleRun, scopes: *const syntax_scope.Index, level: types.Level, receiver: usize, member: usize, entry: RunArgumentReplacement) !void {
+    var fixes: []const types.Fix = &.{};
+    const opening = member + 1;
+    if (entry.plain and callArgumentCount(context, scopes, opening) == 1) {
+        const closing = scopes.matchingToken(opening).?;
+        // Insert before an existing trailing comma, or after the argument's
+        // last token. All original whitespace, comments and expressions stay.
+        const insertion = if (context.tokens[closing - 1].tag == .comma)
+            context.tokens[closing - 1].loc.start
+        else
+            context.tokens[closing - 1].loc.end;
+        const edits = try context.allocator.alloc(types.Edit, 2);
+        edits[0] = .{ .span = context.tokens[member].loc, .replacement = entry.new };
+        edits[1] = .{ .span = .{ .start = insertion, .end = insertion }, .replacement = ", .{}" };
+        const new_fixes = try context.allocator.alloc(types.Fix, 1);
+        new_fixes[0] = .{
+            .title = "Use Run argument options",
+            .kind = .quickfix,
+            .edits = edits,
+            .preferred = true,
+            .fix_all = true,
+        };
+        fixes = new_fixes;
+    }
+    try context.emit(.{
+        .rule = .modernize_build_api,
+        .level = level,
+        .span = .{ .start = context.tokens[receiver].loc.start, .end = context.tokens[member].loc.end },
+        .message = if (entry.plain)
+            try context.allocator.print("std.Build.Step.Run.{s} is a legacy argument wrapper; use {s} with .{{}} options", .{ entry.old, entry.new })
+        else
+            try context.allocator.print("std.Build.Step.Run.{s} is a legacy argument wrapper; use {s} with prefix/suffix options and review argument evaluation order", .{ entry.old, entry.new }),
+        .fixes = fixes,
+    });
+}
+
+fn callArgumentCount(context: RuleRun, scopes: *const syntax_scope.Index, opening: usize) ?usize {
+    const closing = scopes.matchingToken(opening) orelse return null;
+    var count: usize = 0;
+    var cursor = opening + 1;
+    var argument_start = cursor;
+    while (cursor < closing) : (cursor += 1) {
+        switch (context.tokens[cursor].tag) {
+            .l_paren, .l_brace, .l_bracket => {
+                cursor = scopes.matchingToken(cursor) orelse return null;
+                if (cursor >= closing) return null;
+            },
+            .comma => {
+                if (cursor == argument_start) return null;
+                count += 1;
+                argument_start = cursor + 1;
+            },
+            else => {},
+        }
+    }
+    return count + @as(usize, if (argument_start < closing) 1 else 0);
+}
+
+const BuildReceiverKind = enum { build, module, lazy_path, compile_step, run_step };
 
 fn buildReceiverKind(context: RuleRun, scopes: *const syntax_scope.Index, index: usize, depth: usize) ?BuildReceiverKind {
     if (depth == 6) return null;
@@ -505,38 +624,85 @@ fn buildReceiverKind(context: RuleRun, scopes: *const syntax_scope.Index, index:
         if (context.tokens[root_index].tag == .asterisk) root_index += 1;
         if (root_index < context.tokens.len and context.tokens[root_index].tag == .keyword_const) root_index += 1;
         if (root_index >= context.tokens.len) return null;
-        const std_binding = scopes.findBinding(root_index) orelse return null;
-        if (!isModuleImport(context, std_binding.token_index, "\"std\"")) return null;
+        const path_end = simplePathEnd(context, scopes, root_index) orelse return null;
+        if (path_end + 1 >= context.tokens.len) return null;
+        switch (context.tokens[path_end + 1].tag) {
+            .comma, .r_paren, .equal, .semicolon => {},
+            else => return null,
+        }
         const paths = [_]struct { path: []const u8, kind: BuildReceiverKind }{
+            .{ .path = "Build.Step.Run", .kind = .run_step },
             .{ .path = "Build.Step.Compile", .kind = .compile_step },
             .{ .path = "Build.LazyPath", .kind = .lazy_path },
             .{ .path = "Build.Module", .kind = .module },
             .{ .path = "Build", .kind = .build },
         };
         for (paths) |entry| {
-            const path_end = matchedStdPathEnd(context, root_index, entry.path) orelse continue;
-            if (path_end + 1 >= context.tokens.len) continue;
-            switch (context.tokens[path_end + 1].tag) {
-                .comma, .r_paren, .equal, .semicolon => return entry.kind,
-                else => {},
-            }
+            if (provenStdPath(context, scopes, root_index, path_end, entry.path, 0)) return entry.kind;
         }
         return null;
     }
     if (declaration == 0 or context.tokens[declaration - 1].tag != .keyword_const or
-        context.tokens[declaration + 1].tag != .equal or context.tokens[declaration + 2].tag != .identifier) return null;
+        context.tokens[declaration + 1].tag != .equal) return null;
     const initializer = declaration + 2;
     const end = scopes.statementEnd(declaration) orelse return null;
-    if (end == initializer + 1) return buildReceiverKind(context, scopes, initializer, depth + 1);
-    if (initializer + 3 >= context.tokens.len or context.tokens[initializer + 1].tag != .period or
-        context.tokens[initializer + 3].tag != .l_paren) return null;
-    if (buildReceiverKind(context, scopes, initializer, depth + 1) != .build) return null;
-    const closing = scopes.matchingToken(initializer + 3) orelse return null;
+    if (end == initializer + 1 and context.tokens[initializer].tag == .identifier) {
+        return buildReceiverKind(context, scopes, initializer, depth + 1);
+    }
+    const method = simplePathEnd(context, scopes, initializer) orelse return null;
+    if (method <= initializer or method + 1 >= context.tokens.len or context.tokens[method + 1].tag != .l_paren) return null;
+    const closing = scopes.matchingToken(method + 1) orelse return null;
     if (closing + 1 != end) return null;
-    if (context.tokenIs(initializer + 2, "createModule") or context.tokenIs(initializer + 2, "addModule")) return .module;
+    if (context.tokenIs(method, "create") and provenStdPath(context, scopes, initializer, method - 2, "Build.Step.Run", 0)) return .run_step;
+    if (method != initializer + 2 or buildReceiverKind(context, scopes, initializer, depth + 1) != .build) return null;
+    if (context.tokenIs(method, "createModule") or context.tokenIs(method, "addModule")) return .module;
+    const run_factories = [_][]const u8{ "addSystemCommand", "addRunArtifact", "addRunFile" };
+    for (run_factories) |factory| if (context.tokenIs(method, factory)) return .run_step;
     const factories = [_][]const u8{ "addExecutable", "addLibrary", "addObject", "addTest", "addSharedLibrary", "addStaticLibrary" };
-    for (factories) |factory| if (context.tokenIs(initializer + 2, factory)) return .compile_step;
+    for (factories) |factory| if (context.tokenIs(method, factory)) return .compile_step;
     return null;
+}
+
+/// A dotted identifier path, optionally rooted in a direct @import("std").
+fn simplePathEnd(context: RuleRun, scopes: *const syntax_scope.Index, start: usize) ?usize {
+    if (start >= context.tokens.len) return null;
+    var end = start;
+    if (context.tokens[start].tag == .builtin and context.tokenIs(start, "@import") and
+        start + 1 < context.tokens.len and context.tokens[start + 1].tag == .l_paren)
+    {
+        end = scopes.matchingToken(start + 1) orelse return null;
+        if (end != start + 3 or !context.tokenIs(start + 2, "\"std\"")) return null;
+    } else if (context.tokens[start].tag != .identifier) return null;
+    while (end + 2 < context.tokens.len and context.tokens[end + 1].tag == .period and
+        context.tokens[end + 2].tag == .identifier) end += 2;
+    return end;
+}
+
+/// Resolve immutable namespace aliases without accepting custom or mutable
+/// namespaces that merely spell the same type/member names.
+fn provenStdPath(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize, expected: []const u8, depth: usize) bool {
+    if (depth == 8 or start > end) return false;
+    var cursor = end;
+    var remaining = expected;
+    while (cursor >= start + 2 and context.tokens[cursor - 1].tag == .period) {
+        const separator = std.mem.findScalarLast(u8, remaining, '.');
+        const member = if (separator) |at| remaining[at + 1 ..] else remaining;
+        if (!context.tokenIs(cursor, member)) return false;
+        remaining = if (separator) |at| remaining[0..at] else "";
+        cursor -= 2;
+    }
+    if (context.tokens[start].tag == .builtin) return remaining.len == 0 and cursor == start + 3 and
+        context.tokenIs(start, "@import") and context.tokens[start + 1].tag == .l_paren and
+        context.tokenIs(start + 2, "\"std\"") and context.tokens[cursor].tag == .r_paren;
+    if (cursor != start or context.tokens[start].tag != .identifier) return false;
+    const binding = scopes.findBinding(start) orelse return false;
+    const declaration = binding.token_index;
+    if (declaration == 0 or declaration + 2 >= context.tokens.len or
+        context.tokens[declaration - 1].tag != .keyword_const or context.tokens[declaration + 1].tag != .equal) return false;
+    const initializer = declaration + 2;
+    const initializer_end = simplePathEnd(context, scopes, initializer) orelse return false;
+    if (scopes.statementEnd(declaration) != initializer_end + 1) return false;
+    return provenStdPath(context, scopes, initializer, initializer_end, remaining, depth + 1);
 }
 
 fn findBitcastChanges(context: RuleRun, scopes: *const syntax_scope.Index) !void {
@@ -951,6 +1117,245 @@ test "modernize build API leaves shadowed imports and unknown factory results al
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
+test "modernize Run argument wrappers offer fixes only without argument reordering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const library = @import("std");
+        \\fn configure(run: *library.Build.Step.Run, artifact: *library.Build.Step.Compile, path: library.Build.LazyPath) void {
+        \\    run.addArtifactArg(artifact);
+        \\    run.addFileArg(path);
+        \\    _ = run.addOutputFileArg("out");
+        \\    run.addFileContentArg(path);
+        \\    _ = run.addOutputDirectoryArg("dir");
+        \\    run.addDirectoryArg(path);
+        \\    _ = run.addDepFileOutputArg("deps");
+        \\    run.addPrefixedArtifactArg("--artifact=", artifact);
+        \\    run.addPrefixedFileArg("--file=", path);
+        \\    _ = run.addPrefixedOutputFileArg("--out=", "out");
+        \\    run.addPrefixedFileContentArg("--content=", path);
+        \\    _ = run.addPrefixedOutputDirectoryArg("--dir=", "dir");
+        \\    run.addPrefixedDirectoryArg("--dir=", path);
+        \\    _ = run.addPrefixedDepFileOutputArg("--deps=", "deps");
+        \\    run.addDecoratedDirectoryArg("--dir=", path, "/tail");
+        \\    run.addFileArg2(path, .{});
+        \\    run.addArg("plain");
+        \\}
+    ;
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(run_argument_replacements.len, findings.len);
+    for (findings, run_argument_replacements) |finding, entry| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, finding.message, 1, entry.new));
+        try std.testing.expectEqual(@as(usize, if (entry.plain) 1 else 0), finding.fixes.len);
+        if (entry.plain) {
+            try std.testing.expectEqualStrings(entry.new, finding.fixes[0].edits[0].replacement);
+            try std.testing.expect(finding.fixes[0].fix_all);
+        } else {
+            try std.testing.expect(std.mem.containsAtLeast(u8, finding.message, 1, "evaluation order"));
+        }
+    }
+}
+
+test "modernize Run argument fixes preserve expressions comments and trailing commas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn configure(run: *std.Build.Step.Run) void {
+        \\    run.addFileArg(nextPath(.{ .a = 1, .b = 2 }) // keep argument comment
+        \\    );
+        \\    run.addDirectoryArg(
+        \\        paths[index(1, 2)], // keep trailing comma comment
+        \\    );
+        \\    _ = run.addOutputFileArg("out" // keep comment before comma
+        \\        ,
+        \\    );
+        \\}
+    ;
+    const expected =
+        \\const std = @import("std");
+        \\fn configure(run: *std.Build.Step.Run) void {
+        \\    run.addFileArg2(nextPath(.{ .a = 1, .b = 2 }), .{} // keep argument comment
+        \\    );
+        \\    run.addDirectoryArg2(
+        \\        paths[index(1, 2)], .{}, // keep trailing comma comment
+        \\    );
+        \\    _ = run.addOutputFileArg2("out" // keep comment before comma
+        \\        , .{},
+        \\    );
+        \\}
+    ;
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    const fixed = try arena.allocator().dupeSentinel(u8, try applyFindingFixes(arena.allocator(), source, findings), 0);
+    try std.testing.expectEqualStrings(expected, fixed);
+    var tree = try std.zig.Ast.parse(arena.allocator(), fixed, .{});
+    defer tree.deinit(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+}
+
+test "modernize Build receivers prove immutable namespace aliases and Run factories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const library = @import("std");
+        \\const Build = library.Build;
+        \\const Step = Build.Step;
+        \\const Run = Step.Run;
+        \\const OtherRun = @import("std").Build.Step.Run;
+        \\fn configure(b: *Build, run: *const Run, direct: *@import("std").Build.Step.Run, other: *OtherRun) void {
+        \\    run.addFileArg(path);
+        \\    direct.addFileArg(path);
+        \\    other.addFileArg(path);
+        \\    const command = b.addSystemCommand(&.{"tool"});
+        \\    const alias = command;
+        \\    alias.addFileArg(path);
+        \\    const artifact = b.addRunArtifact(exe);
+        \\    artifact.addFileArg(path);
+        \\    const file = b.addRunFile(path);
+        \\    file.addFileArg(path);
+        \\    const created = Run.create(b, "run");
+        \\    created.addFileArg(path);
+        \\    const directly_created = @import("std").Build.Step.Run.create(b, "run");
+        \\    directly_created.addFileArg(path);
+        \\}
+    ;
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 8), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(@as(usize, 1), finding.fixes.len);
+}
+
+test "modernize Run arguments reject custom mutable shadowed and incomplete proof" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Run = std.Build.Step.Run;
+        \\fn custom(run: *Custom, std: Custom, fake: *std.Build.Step.Run) void {
+        \\    run.addFileArg(path); fake.addFileArg(path);
+        \\}
+        \\fn configure(b: *std.Build) void {
+        \\    const unknown = b.customFactory(.{}); unknown.addFileArg(path);
+        \\    const selected = b.addSystemCommand(&.{"tool"}).custom; selected.addFileArg(path);
+        \\    var mutable = b.addSystemCommand(&.{"tool"}); mutable.addFileArg(path);
+        \\    { const Run = Custom; const fake = Run.create(b, "run"); fake.addFileArg(path); }
+        \\    { var Namespace = @import("std"); const fake: *Namespace.Build.Step.Run = undefined; fake.addFileArg(path); }
+        \\    { var Namespace = Run; const fake: *Namespace = undefined; fake.addFileArg(path); }
+        \\    wrapper.run.addFileArg(path);
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try findingsForRule(arena.allocator(), source, .modernize_build_api)).len);
+    const malformed: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn configure(run: *std.Build.Step.Run) void {
+        \\    run.addFileArg();
+        \\    run.addFileArg(path, extra);
+        \\    run.addFileArg(,);
+        \\}
+    ;
+    const findings = try findingsForRule(arena.allocator(), malformed, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+}
+
+test "modernize lazy dependencies and legacy program lookup explain semantic changes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Build = std.Build;
+        \\fn configure(b: *Build) void {
+        \\    const alias = b;
+        \\    _ = alias.lazyDependency("package", .{});
+        \\    _ = b.findProgram(&.{"tool", "other"}, &.{"/usr/bin"});
+        \\    _ = b.dependencyLazy("package", .{});
+        \\    _ = b.findProgram(.{ .names = &.{"tool"} });
+        \\    _ = b.findProgramLazy(.{ .names = &.{"tool"} });
+        \\    { const b = Custom{}; _ = b.lazyDependency("package", .{}); _ = b.findProgram(names, paths); }
+        \\}
+    ;
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expect(std.mem.containsAtLeast(u8, findings[0].message, 1, "propagate error.LazyDependencyNeeded to build()"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, findings[1].message, 1, "returns an optional"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, findings[1].message, 1, "configuration cache"));
+    for (findings) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+}
+
+test "modernize runtime safety requires a proven std debug namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const library = std;
+        \\const debug = library.debug;
+        \\const debug_alias = debug;
+        \\const safety = std.debug.runtime_safety;
+        \\const aliased_safety = debug_alias.runtime_safety;
+        \\const direct_safety = @import("std").debug.runtime_safety;
+        \\fn configure(std: Custom) void { _ = std.debug.runtime_safety; }
+        \\comptime {
+        \\    var mutable = @import("std"); _ = mutable.debug.runtime_safety;
+        \\    var mutable_debug = debug; _ = mutable_debug.runtime_safety;
+        \\    const debug = Custom; _ = debug.runtime_safety;
+        \\    _ = safety;
+        \\}
+    ;
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    for (findings) |finding| {
+        try std.testing.expect(std.mem.containsAtLeast(u8, finding.message, 1, "@import(\"builtin\").mode.runtimeSafety()"));
+        try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), "const value = std.debug.runtime_safety;")).len);
+}
+
+test "modernize Run wrapper replacements compile against Zig 0.17" {
+    const Example = struct {
+        fn migrated(run_step: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, path: std.Build.LazyPath) void {
+            run_step.addArtifactArg2(artifact, .{});
+            run_step.addFileArg2(path, .{});
+            _ = run_step.addOutputFileArg2("out", .{});
+            run_step.addFileContentArg2(path, .{});
+            _ = run_step.addOutputDirectoryArg2("dir", .{});
+            run_step.addDirectoryArg2(path, .{});
+            _ = run_step.addDepFileOutputArg2("deps", .{});
+        }
+    };
+    // Compile the body without constructing or executing a build graph.
+    std.mem.doNotOptimizeAway(&Example.migrated);
+}
+
+test "modernize additional Build and runtime safety migrations honor suppression and defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn configure(b: *std.Build, run_step: *std.Build.Step.Run) void {
+        \\    // zig-analyzer: disable-next-line modernize-build-api
+        \\    run_step.addFileArg(path);
+        \\    // zig-analyzer: disable-next-line modernize-build-api
+        \\    _ = b.lazyDependency("package", .{});
+        \\    // zig-analyzer: disable-next-line modernize-build-api
+        \\    _ = b.findProgram(names, paths);
+        \\    // zig-analyzer: disable-next-line modernize-deprecated-stdlib
+        \\    _ = std.debug.runtime_safety;
+        \\}
+    ;
+    inline for (.{ types.Rule.modernize_build_api, .modernize_deprecated_stdlib }) |rule| {
+        try std.testing.expectEqual(@as(usize, 0), (try findingsForRule(arena.allocator(), source, rule)).len);
+    }
+    var findings: std.ArrayList(types.Finding) = .empty;
+    try run(.{
+        .allocator = arena.allocator(),
+        .source = source,
+        .tokens = try tokenize(arena.allocator(), source),
+        .configuration = types.Configuration.defaults(),
+        .findings = &findings,
+    });
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
 test "modernize bitCast audits proven array and vector types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1016,6 +1421,21 @@ test "modernize new rules honor suppression and remain disabled by default" {
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
     return findingsForRule(allocator, source, .modernize_deprecated_stdlib);
+}
+
+fn applyFindingFixes(allocator: std.mem.Allocator, source: []const u8, findings: []const types.Finding) ![]const u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+    var cursor: usize = 0;
+    for (findings) |finding| {
+        for (finding.fixes[0].edits) |edit| {
+            try output.appendSlice(allocator, source[cursor..edit.span.start]);
+            try output.appendSlice(allocator, edit.replacement);
+            cursor = edit.span.end;
+        }
+    }
+    try output.appendSlice(allocator, source[cursor..]);
+    return try output.toOwnedSlice(allocator);
 }
 
 fn findingsForRule(allocator: std.mem.Allocator, source: [:0]const u8, rule: types.Rule) ![]const types.Finding {

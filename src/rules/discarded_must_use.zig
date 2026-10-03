@@ -17,8 +17,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .discarded_must_use,
             .level = level,
             .span = context.tokens[call_open - 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "return value from '{s}' is discarded, but contract '{s}' requires callers to use it",
                 .{ callable, contract },
             ),

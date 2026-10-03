@@ -60,7 +60,7 @@ pub fn run(context: RuleRun) !void {
                 .start = context.tokens[i].loc.start,
                 .end = context.tokens[last_end].loc.end,
             },
-            .replacement = try std.fmt.allocPrint(context.allocator, "@reduce({s}, {s})", .{ reduce_op, v_name }),
+            .replacement = try context.allocator.print("@reduce({s}, {s})", .{ reduce_op, v_name }),
         };
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
@@ -76,8 +76,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_vector_reduce,
             .level = level,
             .span = context.tokens[i].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "serial lane accumulation over '{s}'; use @reduce for parallel tree reduction",
                 .{v_name},
             ),

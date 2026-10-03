@@ -27,14 +27,12 @@ pub fn run(context: RuleRun) !void {
                 .level = level,
                 .span = candidate.loc,
                 .message = if (partial_read.complete_method) |complete_method|
-                    try std.fmt.allocPrint(
-                        context.allocator,
+                    try context.allocator.print(
                         "discarding {s}'s byte count loses how much of the destination was initialized; use {s} when the destination must be filled",
                         .{ method, complete_method },
                     )
                 else
-                    try std.fmt.allocPrint(
-                        context.allocator,
+                    try context.allocator.print(
                         "discarding {s}'s byte count loses how much of the destination was initialized",
                         .{method},
                     ),
@@ -106,8 +104,8 @@ test "discarded partial read counts report" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "readVecAll") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "readSliceAll") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "readVecAll") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "readSliceAll") != null);
 }
 
 test "discarded reads used only for their side effect stay clean" {
