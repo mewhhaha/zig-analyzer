@@ -67,9 +67,9 @@ pub fn run(context: RuleRun) !void {
         const parens = needsParens(context.tokens, slice_arg);
         const op = if (negated) "!=" else "==";
         const replacement = if (parens)
-            try std.fmt.allocPrint(context.allocator, "({s}).len {s} 0", .{ slice_text, op })
+            try context.allocator.print("({s}).len {s} 0", .{ slice_text, op })
         else
-            try std.fmt.allocPrint(context.allocator, "{s}.len {s} 0", .{ slice_text, op });
+            try context.allocator.print("{s}.len {s} 0", .{ slice_text, op });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -82,15 +82,14 @@ pub fn run(context: RuleRun) !void {
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Use '{s}'", .{replacement}),
+            .title = try context.allocator.print("Use '{s}'", .{replacement}),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
             .fix_all = true,
         };
 
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "comparing slice '{s}' to an empty slice with std.mem.eql; use '{s}'",
             .{ slice_text, replacement },
         );
@@ -211,7 +210,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_empty_slice_len)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_empty_slice_len)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

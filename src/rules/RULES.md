@@ -164,7 +164,9 @@ Compiler-backed project rules are opt-in.
 - [`exposed-private-error-set`](exposed-private-error-set.md) — Reports a public
   signature that names a private local error set.
 - [`deprecated-declaration`](deprecated-declaration.md) — Reports use of a
-  declaration marked `Deprecated:` in its doc comment.
+  resolved local or imported declaration marked deprecated in its doc comments.
+- [`unreported-partial-send`](unreported-partial-send.md) — Reports socket sends
+  through an API that hides partial progress when a send fails.
 - [`mutated-container-copy`](mutated-container-copy.md) — Reports mutation of a
   by-value container field copy that is not written back.
 - [`self-assignment`](self-assignment.md) — Reports an assignment where the
@@ -325,7 +327,7 @@ Compiler-backed project rules are opt-in.
   fallback work when a loop does not break.
 - [`prefer-orelse`](prefer-orelse.md) — Reports optional `if` expressions that
   return their capture unchanged or choose a fallback.
-- [`prefer-starts-with`](prefer-starts-with.md) — Reports `indexOf(...) == 0`
+- [`prefer-starts-with`](prefer-starts-with.md) — Reports `find(...) == 0` (including legacy `indexOf`)
   prefix tests.
 - [`prefer-ends-with`](prefer-ends-with.md) — Reports guarded manual suffix
   comparisons.
@@ -376,7 +378,7 @@ Compiler-backed project rules are opt-in.
 - [`prefer-empty-slice-len`](prefer-empty-slice-len.md) — Reports comparing a
   slice with an empty slice literal using `std.mem.eql` instead of checking `.len`.
 - [`prefer-index-of-scalar`](prefer-index-of-scalar.md) — Reports searching
-  for a single character using `indexOf` or `lastIndexOf` instead of `indexOfScalar`.
+  for a single byte using sequence searches instead of `findScalar` or `findScalarLast`.
 - [`prefer-split-scalar`](prefer-split-scalar.md) — Reports splitting by a
   single character delimiter using sequence iterators instead of `splitScalar`.
 - [`pointer-to-allocator`](pointer-to-allocator.md) — Reports passing or
@@ -384,7 +386,7 @@ Compiler-backed project rules are opt-in.
 - [`expect-equal-argument-order`](expect-equal-argument-order.md) — Reports
   `std.testing.expectEqual` called with literal expected constants in the second argument.
 - [`prefer-allocator-dupe`](prefer-allocator-dupe.md) — Reports
-  `std.fmt.allocPrint` duplicating slices or string literals instead of `allocator.dupe`.
+  allocator `print` calls duplicating slices or string literals instead of `allocator.dupe`.
 - [`prefer-append-slice`](prefer-append-slice.md) — Reports loops appending
   slice elements one-by-one into an `ArrayList` instead of `appendSlice`.
 - [`prefer-eql-over-order`](prefer-eql-over-order.md) — Reports testing
@@ -410,6 +412,10 @@ Compiler-backed project rules are opt-in.
 - [`prefer-simd-iota`](prefer-simd-iota.md) — Reports vector literals initialized
   with sequential integers instead of `std.simd.iota`.
 
+- [`prefer-div-ceil`](prefer-div-ceil.md) — Reports manual ceiling division and
+  standard-library division calls that can be reviewed for Zig 0.17's
+  `@divCeil` builtin.
+
 ## Modernization profile
 
 - [`modernize-managed-container`](modernize-managed-container.md) — Reports
@@ -419,6 +425,23 @@ Compiler-backed project rules are opt-in.
 - [`modernize-deprecated-stdlib`](modernize-deprecated-stdlib.md) — Reports
   `std` declarations deprecated or removed in the pinned release and names the
   current replacement.
+
+- [`modernize-deprecated-builtin`](modernize-deprecated-builtin.md) — Reports
+  deprecated enum conversion builtins and builtin target constants.
+- [`modernize-removed-syntax`](modernize-removed-syntax.md) — Reports language
+  constructs removed in Zig 0.17.0, including C imports and errdefer captures.
+- [`modernize-build-api`](modernize-build-api.md) — Reports removed build argument
+  and lazy-path access, deprecated C translation, and Windows resource APIs.
+- [`modernize-bitcast`](modernize-bitcast.md) — Reports array and vector bit casts
+  to review for Zig 0.17.0's endian-independent logical bit representation.
+- [`modernize-extern-bitcast`](modernize-extern-bitcast.md) — Reports bit casts
+  involving proven extern structs or unions, which Zig 0.17 no longer permits.
+- [`modernize-global-linkage`](modernize-global-linkage.md) — Reports removed
+  `internal` and `link_once` linkage values in proven linkage contexts.
+- [`modernize-array-list-access`](modernize-array-list-access.md) — Reports
+  deprecated list last-element methods and migrates them to `last`.
+- [`modernize-container-init`](modernize-container-init.md) — Reports removed
+  fixed bitset and enum-set initialization methods.
 
 ## Disciplined profile
 

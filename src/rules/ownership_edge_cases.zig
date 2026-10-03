@@ -36,8 +36,7 @@ fn findOptionalBindingOverwritesInLoops(context: RuleRun) !void {
                 .rule = .overwritten_owning_value,
                 .level = level,
                 .span = context.tokens[index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "loop assignment can replace owned optional '{s}' before its previous value is cleaned up",
                     .{binding},
                 ),
@@ -115,8 +114,7 @@ fn findReallocFallbackLeaks(context: RuleRun) !void {
             .rule = .unreleased_allocation,
             .level = level,
             .span = context.tokens[method_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "realloc fallback returns replacement '{s}' without releasing original allocation '{s}' after realloc fails",
                 .{ replacement, original },
             ),
@@ -148,8 +146,7 @@ fn findOptionalOwnershipOverwrites(context: RuleRun) !void {
             .rule = .overwritten_owning_value,
             .level = level,
             .span = context.tokens[equal_index - 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "assignment replaces non-null owned field '{s}.{s}' without releasing captured allocation '{s}'",
                 .{ base_name, field_name, capture },
             ),
@@ -182,8 +179,7 @@ fn findShortenedAllocationReturns(context: RuleRun) !void {
                 .rule = .mismatched_allocation_release,
                 .level = level,
                 .span = context.tokens[index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "allocation '{s}' is returned as a shortened slice, so ordinary allocator.free receives the wrong allocation length",
                     .{binding},
                 ),
@@ -241,8 +237,7 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
                 .rule = .unreleased_allocation,
                 .level = level,
                 .span = context.tokens[removal].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "discarding {s}'s removed slice from '{s}' leaks its allocation",
                     .{ context.tokenText(removal), field },
                 ),
@@ -256,8 +251,7 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
             .rule = .unreleased_allocation,
             .level = level,
             .span = context.tokens[removal].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "discarding {s}'s removed '{s}' value drops owned field '{s}' without cleanup",
                 .{ context.tokenText(removal), element_type, owned_field },
             ),
@@ -379,8 +373,7 @@ fn findPartialOwnershipTransfers(context: RuleRun) !void {
                 .rule = .partial_ownership_transfer,
                 .level = level,
                 .span = context.tokens[index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "return transfers '{s}.{s}' but drops owner '{s}' without cleaning its remaining field '{s}'",
                     .{ binding, transferred_field, binding, omitted_field },
                 ),

@@ -131,6 +131,15 @@ pub const Rule = enum {
     modernize_managed_container,
     modernize_deprecated_io,
     modernize_deprecated_stdlib,
+    modernize_deprecated_builtin,
+    modernize_removed_syntax,
+    modernize_build_api,
+    modernize_bitcast,
+    modernize_extern_bitcast,
+    modernize_global_linkage,
+    modernize_array_list_access,
+    modernize_container_init,
+    prefer_div_ceil,
     function_length,
     assertion_free_branching,
     unbounded_loop,
@@ -149,6 +158,7 @@ pub const Rule = enum {
     discarded_read_count,
     discarded_realloc_result,
     discarded_write_count,
+    unreported_partial_send,
     unchecked_first_element,
     unsequenced_state_access,
     unchecked_slice_reinterpretation,
@@ -253,6 +263,7 @@ pub const Rule = enum {
             .discarded_read_count,
             .discarded_realloc_result,
             .discarded_write_count,
+            .unreported_partial_send,
             .unchecked_first_element,
             .unsequenced_state_access,
             .unchecked_slice_reinterpretation,
@@ -354,6 +365,7 @@ pub const Rule = enum {
             .prefer_append_slice,
             .prefer_eql_over_order,
             .prefer_math_pow,
+            .prefer_div_ceil,
             .prefer_vector_splat,
             .prefer_vector_load,
             .prefer_vector_op,
@@ -367,6 +379,14 @@ pub const Rule = enum {
             .modernize_managed_container,
             .modernize_deprecated_io,
             .modernize_deprecated_stdlib,
+            .modernize_deprecated_builtin,
+            .modernize_removed_syntax,
+            .modernize_build_api,
+            .modernize_bitcast,
+            .modernize_extern_bitcast,
+            .modernize_global_linkage,
+            .modernize_array_list_access,
+            .modernize_container_init,
             => .modernize,
             .function_length,
             .assertion_free_branching,
@@ -408,7 +428,7 @@ pub const ResourceContract = struct {
 };
 
 pub const Configuration = struct {
-    levels: [std.meta.fields(Rule).len]Level,
+    levels: [@typeInfo(Rule).@"enum".field_names.len]Level,
     lint_profile: LintProfile = .none,
     banned: []const BannedIdentifier = &.{},
     import_boundaries: []const ImportBoundary = &.{},
@@ -423,9 +443,9 @@ pub const Configuration = struct {
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {
-        var levels: [std.meta.fields(Rule).len]Level = undefined;
+        var levels: [@typeInfo(Rule).@"enum".field_names.len]Level = undefined;
         for (std.enums.values(Rule)) |rule| {
-            levels[@intFromEnum(rule)] = if (rule == .import_boundary or rule == .discarded_must_use or
+            levels[@backingInt(rule)] = if (rule == .import_boundary or rule == .discarded_must_use or
                 rule == .configuration_divergent_api or rule == .unreachable_public_declaration)
                 .off
             else switch (rule.tier()) {
@@ -438,7 +458,7 @@ pub const Configuration = struct {
     }
 
     pub fn level(configuration: Configuration, rule: Rule) Level {
-        return configuration.levels[@intFromEnum(rule)];
+        return configuration.levels[@backingInt(rule)];
     }
 };
 
@@ -521,25 +541,25 @@ test "rule reference documents every rule" {
     @setEvalBranchQuota(10_000);
     const reference = @embedFile("RULES.md");
     try std.testing.expectEqual(
-        std.meta.fields(Rule).len,
+        @typeInfo(Rule).@"enum".field_names.len,
         std.mem.count(u8, reference, "\n- [`"),
     );
 
     for (std.enums.values(Rule)) |rule| {
         var heading_bytes: [128]u8 = undefined;
-        const link = try std.fmt.bufPrint(&heading_bytes, "]({s}.md)", .{rule.code()});
+        const link = try std.mem.print(&heading_bytes, "]({s}.md)", .{rule.code()});
         if (std.mem.count(u8, reference, link) != 1) {
             std.debug.print("rule reference needs exactly one '{s}' link\n", .{link});
             return error.IncompleteRuleReference;
         }
     }
 
-    inline for (std.meta.fields(Rule)) |enum_field| {
-        const document = @embedFile(comptime derivedRuleDocumentPath(enum_field.name));
-        if (std.mem.indexOf(u8, document, "**Why it matters.**") == null or
-            std.mem.indexOf(u8, document, "**When it matters.**") == null)
+    inline for (@typeInfo(Rule).@"enum".field_names) |enum_name| {
+        const document = @embedFile(comptime derivedRuleDocumentPath(enum_name));
+        if (std.mem.find(u8, document, "**Why it matters.**") == null or
+            std.mem.find(u8, document, "**When it matters.**") == null)
         {
-            std.debug.print("rule document '{s}' needs why and when explanations\n", .{enum_field.name});
+            std.debug.print("rule document '{s}' needs why and when explanations\n", .{enum_name});
             return error.IncompleteRuleReference;
         }
     }

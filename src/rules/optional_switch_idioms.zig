@@ -32,15 +32,14 @@ fn findOptionalPresenceTests(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[index + 9].loc.end },
-            .replacement = try std.fmt.allocPrint(context.allocator, "{s} {s} null", .{ optional_name, operator }),
+            .replacement = try context.allocator.print("{s} {s} null", .{ optional_name, operator }),
         };
         const fixes = try oneFix(context, "Use an optional presence comparison", edits);
         try context.emit(.{
             .rule = .prefer_optional_presence_test,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional capture is used only to test whether '{s}' is null",
                 .{optional_name},
             ),
@@ -57,7 +56,7 @@ fn endsExpression(tag: std.zig.Token.Tag) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 fn findUnusedElseCaptures(context: RuleRun) !void {
@@ -93,7 +92,7 @@ fn findUnusedElseCaptures(context: RuleRun) !void {
             .rule = .needless_switch_else_capture,
             .level = level,
             .span = context.tokens[else_index + 3].loc,
-            .message = try std.fmt.allocPrint(context.allocator, "switch else capture '{s}' is never used", .{capture_name}),
+            .message = try context.allocator.print("switch else capture '{s}' is never used", .{capture_name}),
             .fixes = fixes,
         });
     }
@@ -140,9 +139,8 @@ fn findManualSentinels(context: RuleRun) !void {
             .rule = .prefer_sentinel_termination,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
-                "buffer '{s}' manually allocates one extra element and writes a zero terminator; allocSentinel or dupeZ expresses the sentinel contract",
+            .message = try context.allocator.print(
+                "buffer '{s}' manually allocates one extra element and writes a zero terminator; allocSentinel or dupeSentinel expresses the sentinel contract",
                 .{binding_name},
             ),
             .fixes = fixes,
@@ -264,8 +262,8 @@ test "optional presence and sentinel idioms are recognized" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_optional_presence_test)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_optional_presence_test)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
 }
@@ -277,7 +275,7 @@ test "a compared presence test keeps its capture form" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_optional_presence_test)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_optional_presence_test)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
@@ -290,7 +288,7 @@ test "writing a value at an unrelated index is not a manual sentinel" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
@@ -306,7 +304,7 @@ test "manual sentinel rewrite fixes alloc and removes the terminator write" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     const fixes = findings.items[0].fixes;
@@ -340,7 +338,7 @@ test "sentinel writes that cannot be rewritten mechanically keep the diagnostic 
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_sentinel_termination)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_sentinel_termination)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(@as(usize, 0), findings.items[0].fixes.len);
@@ -353,7 +351,7 @@ test "unused switch else captures are removable" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.needless_switch_else_capture)] = .information;
+    configuration.levels[@backingInt(types.Rule.needless_switch_else_capture)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
 }

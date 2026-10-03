@@ -39,7 +39,7 @@ pub fn warningsWithConfiguration(
     source: [:0]const u8,
     configuration: types.Configuration,
 ) ![]Warning {
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     defer tree.deinit(allocator);
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
@@ -84,7 +84,7 @@ pub fn warningsWithSummaries(
     }
 
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const declaration = tree.fullVarDecl(node) orelse continue;
         const initializer = declaration.ast.init_node.unwrap() orelse continue;
         const declaration_index: usize = declaration.ast.mut_token;
@@ -96,9 +96,9 @@ pub fn warningsWithSummaries(
         const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
         const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
         const arena_backed = valueReceivesBuildArena(tree, tokens, scope_index, initializer) or if (allocation.allocator_source) |allocator_name|
-            std.ascii.indexOfIgnoreCase(allocator_name, "arena") != null or
+            std.ascii.findIgnoreCase(allocator_name, "arena") != null or
                 (allocation.allocator_member != null and
-                    std.ascii.indexOfIgnoreCase(allocation.allocator_member.?, "arena") != null) or
+                    std.ascii.findIgnoreCase(allocation.allocator_member.?, "arena") != null) or
                 allocatorIsArenaBacked(source, tokens, allocator_name) or
                 allocatorMatchesArenaContract(
                     source,
@@ -188,20 +188,17 @@ pub fn warningsWithSummaries(
 
         const message = switch (cleanup) {
             .released => unreachable,
-            .errdefer_only => try std.fmt.allocPrint(
-                allocator,
+            .errdefer_only => try allocator.print(
                 "allocation '{s}' from {s} is released by errdefer only; the success path has no visible {s} or ownership return",
                 .{ binding_name, allocation.method, allocation.release },
             ),
             .missing => if (ownership_is_path_incomplete)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "allocation '{s}' from {s} is not released or transferred on every path before leaving this scope",
                     .{ binding_name, allocation.method },
                 )
             else
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "allocation '{s}' from {s} has no visible {s} or ownership return before leaving this scope",
                     .{ binding_name, allocation.method, allocation.release },
                 ),
@@ -293,8 +290,7 @@ fn findOverlappingAggregateErrdefers(
             try found.append(allocator, .{
                 .rule = .double_release,
                 .span = tokens[aggregate_cleanup].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "errdefer cleanup for '{s}' releases owned field '{s}' after an earlier errdefer already releases '{s}'",
                     .{ owner_name, field_name, binding_name },
                 ),
@@ -499,6 +495,8 @@ fn allocationFromCall(
     const receiver, const method_token = tree.nodeData(call.ast.fn_expr).node_and_token;
     const method = tree.tokenSlice(method_token);
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
+    if ((std.mem.eql(u8, method, "print") or std.mem.eql(u8, method, "printSentinel")) and
+        !owned_call.printReceiverIsAllocator(source, tokens, tree.lastToken(receiver))) return null;
     const callable = source[tokens[tree.firstToken(call.ast.fn_expr)].loc.start..tokens[tree.lastToken(call.ast.fn_expr)].loc.end];
     if (owned_call.standardAllocatorArgument(callable)) |parameter| {
         if (parameter >= call.ast.params.len) return null;
@@ -555,8 +553,8 @@ fn expressionLooksLikeAllocationOwner(
 ) bool {
     if (expressionLooksLikeAllocator(source, tokens, tree, expression)) return true;
     return switch (tree.nodeTag(expression)) {
-        .identifier => std.ascii.indexOfIgnoreCase(tree.tokenSlice(tree.nodeMainToken(expression)), "pool") != null,
-        .field_access => std.ascii.indexOfIgnoreCase(tree.tokenSlice(tree.nodeData(expression).node_and_token[1]), "pool") != null,
+        .identifier => std.ascii.findIgnoreCase(tree.tokenSlice(tree.nodeMainToken(expression)), "pool") != null,
+        .field_access => std.ascii.findIgnoreCase(tree.tokenSlice(tree.nodeData(expression).node_and_token[1]), "pool") != null,
         else => false,
     };
 }
@@ -570,8 +568,8 @@ fn expressionLooksLikeAllocator(
     return switch (tree.nodeTag(expression)) {
         .identifier => identifier: {
             const name = tree.tokenSlice(tree.nodeMainToken(expression));
-            break :identifier std.ascii.indexOfIgnoreCase(name, "alloc") != null or
-                std.ascii.indexOfIgnoreCase(name, "arena") != null or
+            break :identifier std.ascii.findIgnoreCase(name, "alloc") != null or
+                std.ascii.findIgnoreCase(name, "arena") != null or
                 std.mem.eql(u8, name, "gpa") or identifierHasAllocatorType(source, tokens, name);
         },
         .field_access => field: {
@@ -669,14 +667,14 @@ fn allocatorMatchesArenaContract(
         .{ allocator_source, member }
     else provider: {
         const provider = std.mem.trimEnd(u8, allocator_source, "()");
-        const separator = std.mem.indexOfScalar(u8, provider, '.') orelse return false;
+        const separator = std.mem.findScalar(u8, provider, '.') orelse return false;
         break :provider .{ provider[0..separator], provider[separator + 1 ..] };
     };
     const binding = scope_index.findBindingNamed(receiver_name, use_index) orelse return false;
     const type_name = declaredBindingTypeName(source, tokens, binding.token_index) orelse return false;
 
     for (contracts) |contract| {
-        const contract_separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const contract_separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, field_name, contract[contract_separator + 1 ..])) continue;
         const owner_type = contract[0..contract_separator];
         if (std.mem.eql(u8, type_name, owner_type)) return true;
@@ -786,14 +784,14 @@ fn parameterIsAlwaysArenaBacked(
                 tokenIsIdentifier(source, tokens[argument.start + 2], "allocator"))
             {
                 const receiver = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
-                break :arena_backed std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+                break :arena_backed std.ascii.findIgnoreCase(receiver, "arena") != null or
                     allocatorIsArenaBacked(source, tokens, receiver);
             }
             if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) {
                 break :arena_backed false;
             }
             const argument_name = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
-            break :arena_backed std.ascii.indexOfIgnoreCase(argument_name, "arena") != null or
+            break :arena_backed std.ascii.findIgnoreCase(argument_name, "arena") != null or
                 allocatorIsArenaBacked(source, tokens, argument_name);
         };
         if (!arena_backed) {
@@ -824,7 +822,7 @@ fn functionParameterMatchesArenaContract(
     contracts: []const []const u8,
 ) bool {
     for (contracts) |contract| {
-        const separator = std.mem.indexOfScalar(u8, contract, '.') orelse continue;
+        const separator = std.mem.findScalar(u8, contract, '.') orelse continue;
         if (!std.mem.eql(u8, parameter_name, contract[separator + 1 ..])) continue;
         const function_name = contract[0..separator];
         if (std.mem.eql(u8, function.name, function_name)) return true;
@@ -889,20 +887,17 @@ fn findMismatchedRelease(
         if (!wrong_method and !wrong_allocator) continue;
         mismatched = true;
         const message = if (wrong_method)
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' from {s} must use {s}, not {s}",
                 .{ binding_name, allocation.method, allocation.release, actual_release },
             )
         else if (allocation.allocator_member) |member|
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' created by allocator '{s}.{s}' is released through different allocator '{s}'",
                 .{ binding_name, expected_allocator.?, member, receiver_name.? },
             )
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "allocation '{s}' created by allocator '{s}' is released through different allocator '{s}'",
                 .{ binding_name, expected_allocator.?, receiver_name.? },
             );
@@ -978,8 +973,7 @@ fn findReleaseOrderingIssues(
             try found.append(allocator, .{
                 .rule = .cleanup_after_fallible_operation,
                 .span = tokens[binding_index].loc,
-                .message = try std.fmt.allocPrint(
-                    allocator,
+                .message = try allocator.print(
                     "cleanup for allocation '{s}' is registered after a fallible operation; an earlier error can leak it",
                     .{binding_name},
                 ),
@@ -991,8 +985,7 @@ fn findReleaseOrderingIssues(
                 for (fixes) |fix| allocator.free(fix.edits);
                 allocator.free(fixes);
             }
-            const message = try std.fmt.allocPrint(
-                allocator,
+            const message = try allocator.print(
                 "allocation '{s}' has more than one visible {s} in the same control-flow scope",
                 .{ binding_name, allocation.release },
             );
@@ -1012,8 +1005,7 @@ fn findReleaseOrderingIssues(
                 try found.append(allocator, .{
                     .rule = .use_after_release,
                     .span = tokens[use_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        allocator,
+                    .message = try allocator.print(
                         "allocation '{s}' is used after its visible {s}",
                         .{ binding_name, allocation.release },
                     ),
@@ -1027,8 +1019,7 @@ fn findReleaseOrderingIssues(
         try found.append(allocator, .{
             .rule = .overwritten_owning_value,
             .span = tokens[assignment_index].loc,
-            .message = try std.fmt.allocPrint(
-                allocator,
+            .message = try allocator.print(
                 "assignment replaces owning value '{s}' before its original allocation is released",
                 .{binding_name},
             ),
@@ -1312,7 +1303,7 @@ fn ownershipLeavesAllPaths(
 
 fn blockNodeForOpening(tree: *const std.zig.Ast, opening: usize) ?std.zig.Ast.Node.Index {
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         if (tree.nodeMainToken(node) != opening) continue;
         switch (tree.nodeTag(node)) {
             .block_two, .block_two_semicolon, .block, .block_semicolon => return node,
@@ -1578,10 +1569,7 @@ fn analyzeOwnershipNode(
             return .{ .continuing = 0, .exiting = initial_states };
         },
         .@"defer", .@"errdefer" => {
-            const deferred = if (tree.nodeTag(node) == .@"defer")
-                tree.nodeData(node).node
-            else
-                tree.nodeData(node).opt_token_and_node[1];
+            const deferred = tree.nodeData(node).node;
             if (!nodeMakesOwnershipSafe(
                 source,
                 tree,
@@ -2511,7 +2499,7 @@ fn localCallOwnership(
         tokens[callable_start - 2].tag == .identifier) callable_start -= 2;
     const callable = source[tokens[callable_start].loc.start..tokens[call_open - 1].loc.end];
     const argument_count = callArgumentCount(tokens, call_open + 1, call_close);
-    const method = if (std.mem.lastIndexOfScalar(u8, callable, '.')) |separator| callable[separator + 1 ..] else callable;
+    const method = if (std.mem.findScalarLast(u8, callable, '.')) |separator| callable[separator + 1 ..] else callable;
     if (containing_argument == 2 and argument_count >= 6 and
         std.mem.eql(u8, method, "write") and
         asyncWriteCallbackReleasesBuffer(source, tokens, scope_index, call_open, call_close)) return .released;
@@ -2616,7 +2604,7 @@ fn bindingArgumentIndex(
 }
 
 fn conventionalBorrowingCall(callable: []const u8, argument_index: usize, argument_count: usize) bool {
-    const separator = std.mem.lastIndexOfScalar(u8, callable, '.');
+    const separator = std.mem.findScalarLast(u8, callable, '.');
     const method = if (separator) |index| callable[index + 1 ..] else callable;
     const methods = [_][]const u8{ "appendSlice", "writeAll", "writeStreamingAll", "print" };
     for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) return argument_index + 1 == argument_count;
@@ -2853,7 +2841,7 @@ test "warns when an allocation has no release" {
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "buffer") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "buffer") != null);
 }
 
 test "accepts deferred and explicit releases" {
@@ -3168,7 +3156,7 @@ test "nested labeled allocation expressions do not cross their enclosing scope" 
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "sha") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "sha") != null);
 }
 
 test "cleanup registered after a fallible operation warns" {
@@ -3327,6 +3315,18 @@ test "standard allocation helpers use their allocator argument" {
         "const joined = try std.mem.concat(allocator, u8, parts);" ++
         "_ = joined.len;" ++
         "}";
+    const found = try warnings(std.testing.allocator, source);
+    defer freeWarnings(std.testing.allocator, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
+}
+
+test "allocator printing and sentinel duplication retain ownership" {
+    const source =
+        "fn leak(a: std.mem.Allocator) !void { const text = try a.print(\"{s}\", .{\"name\"}); _ = text.len; }" ++
+        "fn clean(a: std.mem.Allocator) !void { const text = try a.printSentinel(\"literal\", .{}, 0); defer a.free(text); }" ++
+        "fn cleanDuplicate(a: std.mem.Allocator) !void { const text = try a.dupeSentinel(u8, \"name\", 0); defer a.free(text); }" ++
+        "fn write(allocator: *std.Io.Writer) !void { try allocator.print(\"literal\", .{}); }";
     const found = try warnings(std.testing.allocator, source);
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
@@ -3846,7 +3846,7 @@ test "aggregate errdefer cannot overlap direct field cleanup" {
     var double_release_count: usize = 0;
     for (found) |warning| if (warning.rule == .double_release) {
         double_release_count += 1;
-        try std.testing.expect(std.mem.indexOf(u8, warning.message, "owned field 'payload'") != null);
+        try std.testing.expect(std.mem.find(u8, warning.message, "owned field 'payload'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), double_release_count);
 }
@@ -4079,7 +4079,7 @@ test "cleanup in only one conditional branch leaves an allocation unreleased" {
     defer freeWarnings(std.testing.allocator, found);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.unreleased_allocation, found[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, found[0].message, "not released or transferred on every path") != null);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "not released or transferred on every path") != null);
 }
 
 test "cleanup in every conditional branch releases an allocation" {

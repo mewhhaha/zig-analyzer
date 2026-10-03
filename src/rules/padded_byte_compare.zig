@@ -26,8 +26,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .padded_byte_compare,
             .level = level,
             .span = .{ .start = context.tokens[path_start].loc.start, .end = context.tokens[closing].loc.end },
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "byte comparison of '{s}' values includes padding bytes whose contents are undefined, so equal values can compare unequal; compare fields directly or use std.meta.eql",
                 .{padded},
             ),
@@ -214,8 +213,8 @@ test "byte comparison of a provably padded struct is reported" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'Pair'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "std.meta.eql") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'Pair'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "std.meta.eql") != null);
 }
 
 test "tightly packed structs compare their bytes cleanly" {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const deprecated_declarations = @import("rules/deprecated_declarations.zig");
+const deprecation_loader = @import("deprecation_loader.zig");
 const build_options = @import("build_options");
 const lsp = @import("lsp");
 
@@ -65,6 +67,7 @@ pub const Server = struct {
     workspace_create_file: bool = false,
     compiler_worker: ?*CompilerWorker = null,
     compiler_type_shapes: std.StringHashMapUnmanaged(CompilerTypeShapes) = .empty,
+    deprecation_dependencies: std.StringHashMapUnmanaged(DeprecationDependencies) = .empty,
 
     pub fn init(
         io: std.Io,
@@ -87,6 +90,7 @@ pub const Server = struct {
         if (server.compiler_root_uri) |uri| server.allocator.free(uri);
         if (server.zig_lib_directory) |directory| server.allocator.free(directory);
         server.clearCompilerTypeShapes();
+        server.clearDeprecationDependencies();
         server.documents.deinit();
         server.* = undefined;
     }
@@ -201,6 +205,7 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        try server.publishDeprecationDependents(arena, params.textDocument.uri);
         if (server.compiler_worker) |worker| {
             try server.publishDiagnostics(arena, params.textDocument.uri);
             const document = server.documents.getConst(params.textDocument.uri).?;
@@ -222,6 +227,7 @@ pub const Server = struct {
             params.textDocument.version,
             params.contentChanges,
         );
+        try server.publishDeprecationDependents(arena, params.textDocument.uri);
         if (server.compiler_worker) |worker| {
             try server.publishDiagnostics(arena, params.textDocument.uri);
             const document = server.documents.getConst(params.textDocument.uri).?;
@@ -240,7 +246,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didClose"),
     ) !void {
-        if (server.compiler_worker) |worker| worker.cancel(params.textDocument.uri);
+        if (server.compiler_worker) |worker| try worker.cancel(params.textDocument.uri);
         if (server.compiler) |*compiler| {
             compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err, params.textDocument.uri);
         }
@@ -251,6 +257,11 @@ pub const Server = struct {
             }
         }
         _ = server.documents.close(params.textDocument.uri);
+        if (server.deprecation_dependencies.fetchRemove(params.textDocument.uri)) |removed| {
+            server.allocator.free(removed.key);
+            removed.value.storage.deinit();
+        }
+        try server.publishDeprecationDependents(arena, params.textDocument.uri);
         try server.transport.writeNotification(
             server.io,
             arena,
@@ -266,11 +277,26 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didSave"),
     ) !void {
+        try server.publishDeprecationDependents(arena, params.textDocument.uri);
         const document = server.analysisDocumentAfterSave(params.textDocument.uri) orelse return;
+        const build_configuration_changed = std.mem.endsWith(u8, params.textDocument.uri, "/build.zig") or
+            std.mem.endsWith(u8, params.textDocument.uri, "/build.zig.zon");
         if (server.compiler_worker) |worker| {
-            try worker.schedule(document, .restart);
+            try worker.schedule(document, if (build_configuration_changed) .restart else .save);
             return;
         }
+        if (build_configuration_changed or server.compiler == null) server.restartCompiler();
+        try server.ensureCompiler(arena, document.uri);
+        try server.syncCompilerOverlay(document.uri);
+        if (server.compiler != null and !server.compilerAnalysisCurrent(document)) {
+            server.restartCompiler();
+            try server.ensureCompiler(arena, document.uri);
+            try server.syncCompilerOverlay(document.uri);
+        }
+        try server.publishDiagnostics(arena, document.uri);
+    }
+
+    fn restartCompiler(server: *Server) void {
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
         server.clearCompilerTypeShapes();
@@ -278,9 +304,6 @@ pub const Server = struct {
         server.compiler_root_uri = null;
         server.compiler_start_attempted = false;
         server.compiler_restart_available = true;
-        try server.ensureCompiler(arena, document.uri);
-        try server.syncCompilerOverlay(document.uri);
-        try server.publishDiagnostics(arena, document.uri);
     }
 
     pub fn @"textDocument/completion"(
@@ -418,7 +441,7 @@ pub const Server = struct {
                     if (std.mem.eql(u8, name, member_name)) break true;
                 } else false;
                 if (resolved) {
-                    const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+                    const separator = std.mem.findScalarLast(u8, receiver, '.') orelse 0;
                     const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
                     const type_name = try declaredTypeName(arena, document.source, receiver_name) orelse receiver_name;
                     if (document.declarationNamed(type_name)) |declaration| {
@@ -474,7 +497,7 @@ pub const Server = struct {
         }
 
         if (memberReceiver(document.source, token.loc.start)) |receiver| {
-            const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+            const separator = std.mem.findScalarLast(u8, receiver, '.') orelse 0;
             const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
             const receiver_type = try declaredTypeName(arena, document.source, receiver_name) orelse receiver_name;
             const members = try structMembers(arena, document.source, receiver_type);
@@ -581,7 +604,7 @@ pub const Server = struct {
         var iterator = server.documents.documents.valueIterator();
         while (iterator.next()) |document| {
             for (document.declarations) |declaration| {
-                if (params.query.len != 0 and std.mem.indexOf(u8, declaration.name, params.query) == null) continue;
+                if (params.query.len != 0 and std.mem.find(u8, declaration.name, params.query) == null) continue;
                 try symbols.append(arena, .{
                     .name = declaration.name,
                     .kind = symbolKind(declaration.kind),
@@ -638,8 +661,7 @@ pub const Server = struct {
             try lenses.append(arena, .{
                 .range = document.range(declaration.span),
                 .command = .{
-                    .title = try std.fmt.allocPrint(
-                        arena,
+                    .title = try arena.print(
                         "resolved {s}: {d} {s}",
                         .{
                             resolvedShapeKindName(shape.kind),
@@ -849,7 +871,7 @@ pub const Server = struct {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
         var lint_configuration = try server.loadConfiguration(arena);
         if (action_lsp.isRequested(params.context.only, .@"source.organizeImports")) {
-            lint_configuration.levels[@intFromEnum(analysis.Rule.unsorted_imports)] = .warning;
+            lint_configuration.levels[@backingInt(analysis.Rule.unsorted_imports)] = .warning;
         }
         const document_findings = try server.documentFindings(arena, document, lint_configuration);
         const requested_span = std.zig.Token.Loc{
@@ -901,7 +923,7 @@ pub const Server = struct {
                                 action_lsp.isRequested(params.context.only, .quickfix);
                             if (can_offer) {
                                 try actions.append(arena, .{ .code_action = .{
-                                    .title = try std.fmt.allocPrint(arena, "Fix all '{s}' in this file", .{finding.rule.code()}),
+                                    .title = try arena.print("Fix all '{s}' in this file", .{finding.rule.code()}),
                                     .kind = .@"source.fixAll",
                                     .isPreferred = false,
                                     .edit = try action_lsp.documentEdit(arena, document, safe_rule_edits),
@@ -916,8 +938,7 @@ pub const Server = struct {
             {
                 if (try generateFunctionEdit(arena, document.source, finding.span)) |generated| {
                     try actions.append(arena, .{ .code_action = .{
-                        .title = try std.fmt.allocPrint(
-                            arena,
+                        .title = try arena.print(
                             "Generate function '{s}'",
                             .{document.source[finding.span.start..finding.span.end]},
                         ),
@@ -934,8 +955,7 @@ pub const Server = struct {
                     if (server.renameWorkspaceEdit(arena, document, finding.span, new_name)) |maybe_edit| {
                         if (maybe_edit) |edit| {
                             try actions.append(arena, .{ .code_action = .{
-                                .title = try std.fmt.allocPrint(
-                                    arena,
+                                .title = try arena.print(
                                     "Rename '{s}' to '{s}'",
                                     .{ document.source[finding.span.start..finding.span.end], new_name },
                                 ),
@@ -974,7 +994,7 @@ pub const Server = struct {
                 if (!suppressionOffered(offered_line_suppressions.items, finding.rule, suppression.line.span.start)) {
                     try offered_line_suppressions.append(arena, .{ .rule = finding.rule, .at = suppression.line.span.start });
                     try actions.append(arena, .{ .code_action = .{
-                        .title = try std.fmt.allocPrint(arena, "Suppress '{s}' on this line", .{finding.rule.code()}),
+                        .title = try arena.print("Suppress '{s}' on this line", .{finding.rule.code()}),
                         .kind = .quickfix,
                         .isPreferred = false,
                         .edit = try action_lsp.documentEdit(arena, document, &.{suppression.line}),
@@ -983,7 +1003,7 @@ pub const Server = struct {
                 if (!suppressionOffered(offered_file_suppressions.items, finding.rule, suppression.file.span.start)) {
                     try offered_file_suppressions.append(arena, .{ .rule = finding.rule, .at = suppression.file.span.start });
                     try actions.append(arena, .{ .code_action = .{
-                        .title = try std.fmt.allocPrint(arena, "Suppress '{s}' in this file", .{finding.rule.code()}),
+                        .title = try arena.print("Suppress '{s}' in this file", .{finding.rule.code()}),
                         .kind = .quickfix,
                         .isPreferred = false,
                         .edit = try action_lsp.documentEdit(arena, document, &.{suppression.file}),
@@ -1033,7 +1053,7 @@ pub const Server = struct {
         if (action_lsp.isRequested(params.context.only, .@"refactor.extract")) {
             if (try extractExpressionEdits(arena, document, requested_span)) |extraction| {
                 try actions.append(arena, .{ .code_action = .{
-                    .title = try std.fmt.allocPrint(arena, "Extract into const '{s}'", .{extraction.name}),
+                    .title = try arena.print("Extract into const '{s}'", .{extraction.name}),
                     .kind = .@"refactor.extract",
                     .isPreferred = true,
                     .edit = try action_lsp.documentEdit(arena, document, &.{ extraction.declaration, extraction.replacement }),
@@ -1081,7 +1101,7 @@ pub const Server = struct {
                 .severity = .Warning,
                 .code = .{ .string = "invalid-configuration" },
                 .source = "zig-analyzer configuration",
-                .message = warning,
+                .message = .{ .string = warning },
             });
         }
         if (try analysis.suppressionWarning(arena, document.source)) |warning| {
@@ -1090,7 +1110,7 @@ pub const Server = struct {
                 .severity = .Warning,
                 .code = .{ .string = "invalid-configuration" },
                 .source = "zig-analyzer configuration",
-                .message = warning,
+                .message = .{ .string = warning },
             });
         }
         const document_findings = try server.documentFindings(arena, document, lint_configuration);
@@ -1120,8 +1140,7 @@ pub const Server = struct {
             error.FileNotFound => return analysis.Configuration.defaults(),
             else => {
                 var lint_configuration = analysis.Configuration.defaults();
-                lint_configuration.warning = try std.fmt.allocPrint(
-                    allocator,
+                lint_configuration.warning = try allocator.print(
                     "could not read zig-analyzer.json: {t}",
                     .{err},
                 );
@@ -1205,8 +1224,9 @@ pub const Server = struct {
     }
 
     fn analysisDocumentAfterSave(server: *const Server, saved_uri: []const u8) ?*const Document {
-        if (!std.mem.endsWith(u8, saved_uri, "/build.zig")) return server.documents.getConst(saved_uri);
-        const directory_end = (std.mem.lastIndexOfScalar(u8, saved_uri, '/') orelse return null) + 1;
+        if (!std.mem.endsWith(u8, saved_uri, "/build.zig") and
+            !std.mem.endsWith(u8, saved_uri, "/build.zig.zon")) return server.documents.getConst(saved_uri);
+        const directory_end = (std.mem.findScalarLast(u8, saved_uri, '/') orelse return null) + 1;
         const directory_uri = saved_uri[0..directory_end];
         if (server.compiler_worker) |worker| {
             worker.analysis_mutex.lockUncancelable(server.io);
@@ -1225,7 +1245,8 @@ pub const Server = struct {
         var documents = server.documents.documents.valueIterator();
         while (documents.next()) |document| {
             if (std.mem.startsWith(u8, document.uri, directory_uri) and
-                !std.mem.endsWith(u8, document.uri, "/build.zig")) return document;
+                !std.mem.endsWith(u8, document.uri, "/build.zig") and
+                !std.mem.endsWith(u8, document.uri, "/build.zig.zon")) return document;
         }
         return null;
     }
@@ -1242,7 +1263,7 @@ pub const Server = struct {
         receiver: []const u8,
     ) ![]const SyntaxMember {
         if (try server.moduleView(allocator, document, receiver)) |view| return view.members;
-        const receiver_name = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+        const receiver_name = std.mem.findScalarLast(u8, receiver, '.') orelse 0;
         const name = if (receiver_name == 0) receiver else receiver[receiver_name + 1 ..];
         const type_name = try declaredTypeName(allocator, document.source, name);
         return try structMembers(allocator, document.source, type_name orelse return &.{});
@@ -1259,7 +1280,7 @@ pub const Server = struct {
         for (view.members) |member| {
             if (!std.mem.eql(u8, member.name, name)) continue;
             return .{
-                .uri = try std.fmt.allocPrint(allocator, "file://{s}", .{view.path}),
+                .uri = try allocator.print("file://{s}", .{view.path}),
                 .range = lsp.offsets.locToRange(view.source, member.span, .@"utf-16"),
             };
         }
@@ -1511,7 +1532,7 @@ pub const Server = struct {
                     .documentation = origin.documentation,
                 };
                 return .{
-                    .declaration = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{
+                    .declaration = try allocator.print("{s}\n{s}", .{
                         origin.declaration,
                         try renderResolvedShape(allocator, name, shape),
                     }),
@@ -1525,8 +1546,7 @@ pub const Server = struct {
             };
         }
         if (try server.resolvedValueForName(allocator, document, name)) |resolved| {
-            const type_summary = try std.fmt.allocPrint(
-                allocator,
+            const type_summary = try allocator.print(
                 "{s} = {s}",
                 .{ resolved.type_name, resolved.value },
             );
@@ -1552,7 +1572,7 @@ pub const Server = struct {
                     return try describeBinding(allocator, view.source, member.span);
                 }
             }
-            const receiver_separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+            const receiver_separator = std.mem.findScalarLast(u8, receiver, '.') orelse 0;
             const receiver_name = if (receiver_separator == 0) receiver else receiver[receiver_separator + 1 ..];
             const type_name = try declaredTypeName(allocator, document.source, receiver_name);
             if (type_name) |resolved_type| {
@@ -1621,7 +1641,7 @@ pub const Server = struct {
             return description;
         }
         const type_name = namedTypeExpression(inferred_type) orelse return null;
-        if (std.mem.indexOfScalar(u8, type_name, '.')) |separator| {
+        if (std.mem.findScalar(u8, type_name, '.')) |separator| {
             const import_alias = type_name[0..separator];
             if (try server.moduleView(allocator, document, import_alias)) |view| {
                 const field_span = syntax_types.memberSpanWithTokens(
@@ -1650,16 +1670,16 @@ pub const Server = struct {
         name: []const u8,
     ) !?hover.Content {
         const import_prefix = "@import(\"std\").";
-        const prefix_start = std.mem.lastIndexOf(u8, document.source[0..identifier_start], import_prefix) orelse return null;
+        const prefix_start = std.mem.findLast(u8, document.source[0..identifier_start], import_prefix) orelse return null;
         const module_expression = document.source[prefix_start + import_prefix.len .. identifier_start];
         if (module_expression.len != 0 and module_expression[module_expression.len - 1] != '.') return null;
         const module_name = if (module_expression.len == 0) "" else module_expression[0 .. module_expression.len - 1];
         if (module_name.len != 0 and !isDottedIdentifier(module_name)) return null;
         const path = if (module_name.len == 0)
-            try std.fmt.allocPrint(allocator, "{s}/std/std.zig", .{try server.zigLibDirectory()})
+            try allocator.print("{s}/std/std.zig", .{try server.zigLibDirectory()})
         else path: {
-            const relative_path = try std.mem.replaceOwned(u8, allocator, module_name, ".", std.fs.path.sep_str);
-            break :path try std.fmt.allocPrint(allocator, "{s}/std/{s}.zig", .{
+            const relative_path = try std.mem.replaceOwned(u8, allocator, module_name, ".", std.Io.Dir.path.sep_str);
+            break :path try allocator.print("{s}/std/{s}.zig", .{
                 try server.zigLibDirectory(),
                 relative_path,
             });
@@ -1694,7 +1714,7 @@ pub const Server = struct {
     ) !?hover.Content {
         if (document.declarationNamed(name)) |declaration| {
             if (try describeBinding(allocator, document.source, declaration.span)) |description| {
-                if (std.mem.indexOf(u8, description.declaration, "@import") != null) return description;
+                if (std.mem.find(u8, description.declaration, "@import") != null) return description;
             }
         }
         const receiver = memberReceiver(document.source, identifier_span.start) orelse return null;
@@ -1702,7 +1722,7 @@ pub const Server = struct {
         for (view.members) |member| {
             if (!std.mem.eql(u8, member.name, name)) continue;
             const description = try describeBinding(allocator, view.source, member.span) orelse return null;
-            if (std.mem.indexOf(u8, description.declaration, "@import") == null) return null;
+            if (std.mem.find(u8, description.declaration, "@import") == null) return null;
             return description;
         }
         return null;
@@ -1861,7 +1881,7 @@ pub const Server = struct {
             else => return err,
         };
         defer allocator.free(bytes);
-        const source = try allocator.dupeZ(u8, bytes);
+        const source = try allocator.dupeSentinel(u8, bytes, 0);
         errdefer allocator.free(source);
         return .{ .path = path, .source = source, .tokens = try tokenize(allocator, source) };
     }
@@ -1873,7 +1893,7 @@ pub const Server = struct {
         import_string: []const u8,
     ) !?[]const u8 {
         if (std.mem.eql(u8, import_string, "std")) {
-            return try std.fmt.allocPrint(allocator, "{s}/std/std.zig", .{try server.zigLibDirectory()});
+            return try allocator.print("{s}/std/std.zig", .{try server.zigLibDirectory()});
         }
         if (!std.mem.endsWith(u8, import_string, ".zig")) {
             return try compile_units.namedModuleSourceForDocument(
@@ -1883,8 +1903,8 @@ pub const Server = struct {
                 import_string,
             );
         }
-        const directory = std.fs.path.dirname(current_path) orelse return null;
-        return try std.fs.path.resolve(allocator, &.{ directory, import_string });
+        const directory = std.Io.Dir.path.dirname(current_path) orelse return null;
+        return try std.Io.Dir.path.resolveAlloc(allocator, &.{ directory, import_string });
     }
 
     fn compilerWorkspaceDeclarations(
@@ -1919,7 +1939,7 @@ pub const Server = struct {
             return worker.server.compilerTypeMembers(allocator, compiled_document, receiver);
         }
         const compiler = if (server.compiler) |*active| active else return null;
-        const separator = std.mem.lastIndexOfScalar(u8, receiver, '.') orelse 0;
+        const separator = std.mem.findScalarLast(u8, receiver, '.') orelse 0;
         const receiver_name = if (separator == 0) receiver else receiver[separator + 1 ..];
         const type_name = try declaredTypeName(allocator, document.source, receiver_name) orelse receiver_name;
         const declarations = compiler.workspaceDeclarations(allocator) catch |err| {
@@ -2048,6 +2068,7 @@ pub const Server = struct {
             allocator,
             try server.moduleMemberFindings(allocator, document, lint_configuration),
         );
+        try server.appendImportedDeprecations(allocator, document, lint_configuration, &document_findings);
         if (try analysis.fileNameFindingWithTokens(
             allocator,
             document.source,
@@ -2058,6 +2079,87 @@ pub const Server = struct {
             try document_findings.append(allocator, finding);
         }
         return try document_findings.toOwnedSlice(allocator);
+    }
+
+    fn appendImportedDeprecations(
+        server: *Server,
+        allocator: std.mem.Allocator,
+        document: *const Document,
+        configuration: analysis.Configuration,
+        findings: *std.ArrayList(analysis.Finding),
+    ) !void {
+        if (configuration.level(.deprecated_declaration) == .off or
+            @import("rules/generated_source.zig").isTranslateCOutput(document.source)) return;
+        const path = try filePathFromUri(allocator, document.uri) orelse return;
+        defer allocator.free(path);
+        var loader: deprecation_loader.Context = .{ .io = server.io, .std_directory = server.zig_lib_directory };
+        defer loader.deinit(allocator);
+        var index: deprecated_declarations.Index = .init(allocator, loader.loader());
+        defer index.deinit();
+        // Open buffers take precedence over disk, including unsaved dependencies.
+        var documents = server.documents.documents.valueIterator();
+        while (documents.next()) |open_document| {
+            const open_path = try filePathFromUri(allocator, open_document.uri) orelse continue;
+            defer allocator.free(open_path);
+            try index.addSource(.{ .path = open_path, .source = open_document.source, .tokens = open_document.tokens });
+        }
+        try index.run(.{
+            .allocator = allocator,
+            .source = document.source,
+            .tokens = document.tokens,
+            .configuration = configuration,
+            .findings = findings,
+        }, path, true);
+        const dependencies = try index.dependencyPaths(allocator);
+        defer allocator.free(dependencies);
+        try server.storeDeprecationDependencies(document.uri, dependencies);
+        if (server.zig_lib_directory == null) if (loader.std_directory) |directory| {
+            server.zig_lib_directory = try server.allocator.dupe(u8, directory);
+        };
+    }
+
+    fn storeDeprecationDependencies(server: *Server, uri: []const u8, paths: []const []const u8) !void {
+        var storage = std.heap.ArenaAllocator.init(server.allocator);
+        errdefer storage.deinit();
+        const copies = try storage.allocator().alloc([]const u8, paths.len);
+        for (paths, copies) |path, *copy| copy.* = try storage.allocator().dupe(u8, path);
+        const dependencies: DeprecationDependencies = .{ .storage = storage, .paths = copies };
+        if (server.deprecation_dependencies.getPtr(uri)) |previous| {
+            previous.storage.deinit();
+            previous.* = dependencies;
+        } else {
+            const key = try server.allocator.dupe(u8, uri);
+            errdefer server.allocator.free(key);
+            try server.deprecation_dependencies.put(server.allocator, key, dependencies);
+        }
+    }
+
+    fn clearDeprecationDependencies(server: *Server) void {
+        var entries = server.deprecation_dependencies.iterator();
+        while (entries.next()) |entry| {
+            entry.value_ptr.storage.deinit();
+            server.allocator.free(entry.key_ptr.*);
+        }
+        server.deprecation_dependencies.deinit(server.allocator);
+    }
+
+    fn publishDeprecationDependents(server: *Server, allocator: std.mem.Allocator, changed_uri: []const u8) !void {
+        const path = try filePathFromUri(allocator, changed_uri) orelse return;
+        defer allocator.free(path);
+        var affected: std.ArrayList([]const u8) = .empty;
+        defer affected.deinit(allocator);
+        var entries = server.deprecation_dependencies.iterator();
+        while (entries.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, changed_uri)) continue;
+            for (entry.value_ptr.paths) |dependency| {
+                if (!std.mem.eql(u8, dependency, path)) continue;
+                try affected.append(allocator, entry.key_ptr.*);
+                break;
+            }
+        }
+        // Publishing recomputes and replaces dependency snapshots. Finish the
+        // map iteration first so updates cannot invalidate the iterator.
+        for (affected.items) |uri| if (server.documents.getConst(uri) != null) try server.publishDiagnostics(allocator, uri);
     }
 
     fn moduleMemberFindings(
@@ -2101,8 +2203,7 @@ pub const Server = struct {
                 break;
             }
             if (exists or analysis.isSuppressed(document.source, .unresolved_member, member_token.loc.start)) continue;
-            const message = try std.fmt.allocPrint(
-                allocator,
+            const message = try allocator.print(
                 "module '{s}' has no public member named '{s}'",
                 .{ receiver, member_name },
             );
@@ -2263,24 +2364,24 @@ pub const Server = struct {
         document: *const Document,
         receiver: []const u8,
     ) !?[]const u8 {
-        const separator = std.mem.indexOfScalar(u8, receiver, '.');
+        const separator = std.mem.findScalar(u8, receiver, '.');
         const alias = if (separator) |index| receiver[0..index] else receiver;
         const import_name = (try importName(allocator, document.source, alias)) orelse return null;
         if (std.mem.eql(u8, import_name, "std")) {
             const module_name = if (separator) |index| receiver[index + 1 ..] else {
-                return try std.fmt.allocPrint(allocator, "{s}/std/std.zig", .{try server.zigLibDirectory()});
+                return try allocator.print("{s}/std/std.zig", .{try server.zigLibDirectory()});
             };
             if (!isDottedIdentifier(module_name)) return null;
-            const relative_path = try std.mem.replaceOwned(u8, allocator, module_name, ".", std.fs.path.sep_str);
-            return try std.fmt.allocPrint(allocator, "{s}/std/{s}.zig", .{
+            const relative_path = try std.mem.replaceOwned(u8, allocator, module_name, ".", std.Io.Dir.path.sep_str);
+            return try allocator.print("{s}/std/{s}.zig", .{
                 try server.zigLibDirectory(),
                 relative_path,
             });
         }
-        if (separator != null or std.fs.path.isAbsolute(import_name)) return null;
+        if (separator != null or std.Io.Dir.path.isAbsolute(import_name)) return null;
         const document_path = try filePathFromUri(allocator, document.uri) orelse return null;
-        const directory = std.fs.path.dirname(document_path) orelse return null;
-        return try std.fs.path.resolve(allocator, &.{ directory, import_name });
+        const directory = std.Io.Dir.path.dirname(document_path) orelse return null;
+        return try std.Io.Dir.path.resolveAlloc(allocator, &.{ directory, import_name });
     }
 
     fn importPathCompletions(
@@ -2291,7 +2392,7 @@ pub const Server = struct {
     ) ![]const lsp.types.completion.Item {
         var completions: std.ArrayList(lsp.types.completion.Item) = .empty;
         errdefer completions.deinit(allocator);
-        if (std.mem.indexOfScalar(u8, prefix, '/') == null) {
+        if (std.mem.findScalar(u8, prefix, '/') == null) {
             for ([_][]const u8{ "std", "builtin", "root" }) |name| {
                 if (!std.mem.startsWith(u8, name, prefix)) continue;
                 try completions.append(allocator, .{ .label = name, .kind = .Module, .detail = "Zig module" });
@@ -2299,10 +2400,10 @@ pub const Server = struct {
         }
         const document_path = try filePathFromUri(allocator, document.uri) orelse return try completions.toOwnedSlice(allocator);
         defer allocator.free(document_path);
-        const document_directory = std.fs.path.dirname(document_path) orelse return try completions.toOwnedSlice(allocator);
-        const prefix_directory = std.fs.path.dirname(prefix) orelse "";
-        if (std.fs.path.isAbsolute(prefix_directory)) return try completions.toOwnedSlice(allocator);
-        const directory_path = try std.fs.path.join(allocator, &.{ document_directory, prefix_directory });
+        const document_directory = std.Io.Dir.path.dirname(document_path) orelse return try completions.toOwnedSlice(allocator);
+        const prefix_directory = std.Io.Dir.path.dirname(prefix) orelse "";
+        if (std.Io.Dir.path.isAbsolute(prefix_directory)) return try completions.toOwnedSlice(allocator);
+        const directory_path = try std.Io.Dir.path.join(allocator, &.{ document_directory, prefix_directory });
         defer allocator.free(directory_path);
         var directory = std.Io.Dir.openDirAbsolute(server.io, directory_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return try completions.toOwnedSlice(allocator),
@@ -2310,13 +2411,13 @@ pub const Server = struct {
         };
         defer directory.close(server.io);
         var iterator = directory.iterateAssumeFirstIteration();
-        const basename_prefix = std.fs.path.basename(prefix);
+        const basename_prefix = std.Io.Dir.path.basename(prefix);
         while (try iterator.next(server.io)) |entry| {
             if (!std.mem.startsWith(u8, entry.name, basename_prefix)) continue;
             if (entry.kind != .directory and (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig"))) continue;
             try completions.append(allocator, .{
                 .label = if (entry.kind == .directory)
-                    try std.fmt.allocPrint(allocator, "{s}/", .{entry.name})
+                    try allocator.print("{s}/", .{entry.name})
                 else
                     try allocator.dupe(u8, entry.name),
                 .kind = if (entry.kind == .directory) .Folder else .File,
@@ -2341,6 +2442,10 @@ const CompilerWorker = struct {
     queue_condition: std.Io.Condition = .init,
     analysis_mutex: std.Io.Mutex = .init,
     pending: ?Job = null,
+    // The aggregate cleanup proof selects nested Job.deinit. Worker.deinit
+    // joins the worker, frees these owned URIs, and then releases this list.
+    // zig-analyzer: disable-next-line incomplete-owned-field-cleanup
+    closed_uris: std.ArrayList([]u8) = .empty,
     latest_generation: u64 = 0,
     stopping: bool = false,
     future: ?std.Io.Future(void) = null,
@@ -2351,6 +2456,7 @@ const CompilerWorker = struct {
         version: i32,
         generation: u64,
         restart: bool,
+        refresh_root: bool,
 
         fn deinit(job: *Job, allocator: std.mem.Allocator) void {
             allocator.free(job.uri);
@@ -2359,7 +2465,7 @@ const CompilerWorker = struct {
         }
     };
 
-    const ScheduleMode = enum { update, restart };
+    const ScheduleMode = enum { update, save, restart };
 
     fn create(
         io: std.Io,
@@ -2389,6 +2495,8 @@ const CompilerWorker = struct {
         if (worker.future) |*future| {
             future.cancel(worker.io);
         }
+        for (worker.closed_uris.items) |uri| worker.allocator.free(uri);
+        worker.closed_uris.deinit(worker.allocator);
         worker.server.deinit();
         const allocator = worker.allocator;
         worker.* = undefined;
@@ -2402,6 +2510,7 @@ const CompilerWorker = struct {
             .version = document.version,
             .generation = 0,
             .restart = mode == .restart,
+            .refresh_root = mode == .save,
         };
         errdefer worker.allocator.free(job.uri);
         job.source = try worker.allocator.dupe(u8, document.source);
@@ -2414,13 +2523,14 @@ const CompilerWorker = struct {
         job.generation = worker.latest_generation;
         if (worker.pending) |*previous| {
             job.restart = job.restart or previous.restart;
+            job.refresh_root = job.refresh_root or previous.refresh_root;
             previous.deinit(worker.allocator);
         }
         worker.pending = job;
         worker.queue_condition.signal(worker.io);
     }
 
-    fn cancel(worker: *CompilerWorker, uri: []const u8) void {
+    fn cancel(worker: *CompilerWorker, uri: []const u8) !void {
         worker.queue_mutex.lockUncancelable(worker.io);
         defer worker.queue_mutex.unlock(worker.io);
         worker.latest_generation +%= 1;
@@ -2429,8 +2539,16 @@ const CompilerWorker = struct {
             if (std.mem.eql(u8, job.uri, uri)) {
                 job.deinit(worker.allocator);
                 worker.pending = null;
+            } else {
+                job.generation = worker.latest_generation;
             }
         }
+        for (worker.closed_uris.items) |closed_uri| {
+            if (std.mem.eql(u8, closed_uri, uri)) return;
+        }
+        const owned_uri = try worker.allocator.dupe(u8, uri);
+        errdefer worker.allocator.free(owned_uri);
+        try worker.closed_uris.append(worker.allocator, owned_uri);
     }
 
     fn run(worker: *CompilerWorker) void {
@@ -2480,11 +2598,17 @@ const CompilerWorker = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        if (job.restart) worker.restartCompiler();
+        if (job.restart or (job.refresh_root and worker.server.compiler == null)) worker.restartCompiler();
+        try worker.removeClosedDocuments();
         try worker.server.documents.open(job.uri, job.version, job.source);
         try worker.server.ensureCompiler(arena, job.uri);
         try worker.server.syncCompilerOverlay(job.uri);
         const document = worker.server.documents.getConst(job.uri).?;
+        if (job.refresh_root and worker.server.compiler != null and !worker.server.compilerAnalysisCurrent(document)) {
+            worker.restartCompiler();
+            try worker.server.ensureCompiler(arena, job.uri);
+            try worker.server.syncCompilerOverlay(job.uri);
+        }
         if (!worker.server.compilerAnalysisCurrent(document)) return;
 
         worker.queue_mutex.lockUncancelable(worker.io);
@@ -2494,17 +2618,44 @@ const CompilerWorker = struct {
     }
 
     fn restartCompiler(worker: *CompilerWorker) void {
-        if (worker.server.compiler) |*compiler| compiler.deinit();
-        worker.server.compiler = null;
-        worker.server.clearCompilerTypeShapes();
-        if (worker.server.compiler_root_uri) |uri| worker.server.allocator.free(uri);
-        worker.server.compiler_root_uri = null;
-        worker.server.compiler_start_attempted = false;
-        worker.server.compiler_restart_available = true;
+        worker.server.restartCompiler();
+    }
+
+    /// Called with analysis_mutex held. Close notifications only enqueue URI
+    /// ownership so the foreground server never waits for compiler requests.
+    fn removeClosedDocuments(worker: *CompilerWorker) !void {
+        worker.queue_mutex.lockUncancelable(worker.io);
+        var closed_uris = worker.closed_uris;
+        worker.closed_uris = .empty;
+        worker.queue_mutex.unlock(worker.io);
+        defer {
+            for (closed_uris.items) |uri| worker.allocator.free(uri);
+            closed_uris.deinit(worker.allocator);
+        }
+        if (closed_uris.items.len != 0) worker.server.clearCompilerTypeShapes();
+        for (closed_uris.items) |uri| {
+            _ = worker.server.documents.close(uri);
+            if (worker.server.compiler_root_uri) |root_uri| {
+                if (std.mem.eql(u8, root_uri, uri)) {
+                    worker.allocator.free(root_uri);
+                    worker.server.compiler_root_uri = null;
+                }
+            }
+        }
+        for (closed_uris.items) |uri| {
+            if (worker.server.compiler) |*compiler| try compiler.removeOverlay(uri);
+        }
     }
 
     fn lockCurrent(worker: *CompilerWorker, document: *const Document) bool {
         if (!worker.analysis_mutex.tryLock()) return false;
+        worker.queue_mutex.lockUncancelable(worker.io);
+        const closed_documents_pending = worker.closed_uris.items.len != 0;
+        worker.queue_mutex.unlock(worker.io);
+        if (closed_documents_pending) {
+            worker.analysis_mutex.unlock(worker.io);
+            return false;
+        }
         const compiled_document = worker.server.documents.getConst(document.uri) orelse {
             worker.analysis_mutex.unlock(worker.io);
             return false;
@@ -2517,6 +2668,11 @@ const CompilerWorker = struct {
         }
         return true;
     }
+};
+
+const DeprecationDependencies = struct {
+    storage: std.heap.ArenaAllocator,
+    paths: []const []const u8,
 };
 
 const CompilerTypeShapes = struct {
@@ -2698,7 +2854,7 @@ fn sourceLocation(
     span: std.zig.Token.Loc,
 ) !lsp.types.Location {
     return .{
-        .uri = try std.fmt.allocPrint(allocator, "file://{s}", .{source.path}),
+        .uri = try allocator.print("file://{s}", .{source.path}),
         .range = lsp.offsets.locToRange(source.source, span, .@"utf-16"),
     };
 }
@@ -2746,7 +2902,7 @@ fn functionReturnTypeText(
     if (body_start == tokens.len) return null;
     const return_type = std.mem.trim(u8, source[tokens[parameters_end].loc.end..tokens[body_start].loc.start], " \t\r\n");
     if (return_type.len == 0) return null;
-    if (std.mem.lastIndexOfScalar(u8, return_type, '!')) |error_union| {
+    if (std.mem.findScalarLast(u8, return_type, '!')) |error_union| {
         return std.mem.trim(u8, return_type[error_union + 1 ..], " \t\r\n");
     }
     return return_type;
@@ -2766,7 +2922,7 @@ fn dottedPathSegments(allocator: std.mem.Allocator, type_expression: []const u8)
     errdefer segments.deinit(allocator);
     var rest = std.mem.trim(u8, type_expression, " \t\r\n");
     while (true) {
-        const boundary = std.mem.indexOfAny(u8, rest, ".(") orelse rest.len;
+        const boundary = std.mem.findAny(u8, rest, ".(") orelse rest.len;
         if (boundary == 0) return null;
         const segment = rest[0..boundary];
         if (!isDottedIdentifier(segment)) return null;
@@ -3084,7 +3240,7 @@ fn describeCaptureBinding(
         return null;
     const name = source[tokens[binding_index].loc.start..tokens[binding_index].loc.end];
     return .{
-        .declaration = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, element_type }),
+        .declaration = try allocator.print("{s}: {s}", .{ name, element_type }),
         .type_summary = element_type,
     };
 }
@@ -3124,7 +3280,7 @@ fn describeEnumTagNamed(
         if (opening_brace < 3 or tokens[opening_brace - 2].tag != .equal or tokens[opening_brace - 3].tag != .identifier) continue;
         const enum_name = source_bytes[tokens[opening_brace - 3].loc.start..tokens[opening_brace - 3].loc.end];
         return .{
-            .declaration = try std.fmt.allocPrint(allocator, ".{s}", .{name}),
+            .declaration = try allocator.print(".{s}", .{name}),
             .type_summary = enum_name,
         };
     }
@@ -3289,7 +3445,7 @@ fn describeVariableBinding(
     const type_summary = if (inferred_type) |type_name| summary: {
         if (value_token) |token| {
             const value = source[token.loc.start..token.loc.end];
-            if (value.len <= 64) break :summary try std.fmt.allocPrint(allocator, "{s} = {s}", .{ type_name, value });
+            if (value.len <= 64) break :summary try allocator.print("{s} = {s}", .{ type_name, value });
         }
         break :summary type_name;
     } else null;
@@ -3338,7 +3494,7 @@ fn describeTypedBinding(
 
 fn inferredLiteralType(source: []const u8, tag: std.zig.Token.Tag) ?[]const u8 {
     return switch (tag) {
-        .number_literal => if (std.mem.indexOfScalar(u8, source, '.') == null) "comptime_int" else "comptime_float",
+        .number_literal => if (std.mem.findScalar(u8, source, '.') == null) "comptime_int" else "comptime_float",
         .string_literal => "string",
         .char_literal => "comptime_int",
         .identifier => if (std.mem.eql(u8, source, "true") or std.mem.eql(u8, source, "false")) "bool" else null,
@@ -3364,7 +3520,7 @@ fn isTypeDeclaration(source: []const u8, span: std.zig.Token.Loc) bool {
 
 fn extractTypeNameFromSummary(summary: []const u8) []const u8 {
     var trimmed = std.mem.trim(u8, summary, " \t\r\n");
-    if (std.mem.indexOfScalar(u8, trimmed, '=')) |equal| {
+    if (std.mem.findScalar(u8, trimmed, '=')) |equal| {
         trimmed = std.mem.trim(u8, trimmed[0..equal], " \t\r\n");
     }
     while (trimmed.len > 0 and (trimmed[0] == '?' or trimmed[0] == '*')) {
@@ -3383,13 +3539,13 @@ fn documentationBefore(
     source: []const u8,
     declaration_start: usize,
 ) !?[]const u8 {
-    const declaration_line_start = std.mem.lastIndexOfScalar(u8, source[0..declaration_start], '\n') orelse 0;
+    const declaration_line_start = std.mem.findScalarLast(u8, source[0..declaration_start], '\n') orelse 0;
     var block_start = if (declaration_line_start == 0) 0 else declaration_line_start;
     var cursor = block_start;
     var found = false;
     while (cursor > 0) {
         const previous_end = cursor - 1;
-        const previous_start = if (std.mem.lastIndexOfScalar(u8, source[0..previous_end], '\n')) |nl| nl + 1 else 0;
+        const previous_start = if (std.mem.findScalarLast(u8, source[0..previous_end], '\n')) |nl| nl + 1 else 0;
         const line = std.mem.trim(u8, source[previous_start..previous_end], " \t\r");
         if (!std.mem.startsWith(u8, line, "///")) break;
         found = true;
@@ -3507,7 +3663,7 @@ fn receiverIdentifierSpan(source: []const u8, member_start: usize) ?std.zig.Toke
 
 fn namedTypeExpression(type_expression: []const u8) ?[]const u8 {
     var type_name = std.mem.trim(u8, type_expression, " \t\r\n");
-    if (std.mem.lastIndexOfScalar(u8, type_name, '!')) |error_separator| {
+    if (std.mem.findScalarLast(u8, type_name, '!')) |error_separator| {
         type_name = std.mem.trimStart(u8, type_name[error_separator + 1 ..], " \t\r\n");
     }
     while (type_name.len != 0 and type_name[0] == '?') type_name = type_name[1..];
@@ -3760,7 +3916,7 @@ fn findingDiagnostic(
         .code = .{ .string = finding.rule.code() },
         .codeDescription = if (ruleDocumentationUri(finding.rule)) |uri| .{ .href = uri } else null,
         .source = "zig-analyzer",
-        .message = finding.message,
+        .message = .{ .string = finding.message },
         .relatedInformation = related,
     };
 }
@@ -3837,14 +3993,14 @@ fn allocationCleanupEdit(
     source: []const u8,
     binding_span: std.zig.Token.Loc,
 ) !?CleanupAction {
-    const statement_start = if (std.mem.lastIndexOfScalar(u8, source[0..binding_span.start], '\n')) |nl| nl + 1 else 0;
-    const relative_end = std.mem.indexOfScalar(u8, source[binding_span.end..], ';') orelse return null;
+    const statement_start = if (std.mem.findScalarLast(u8, source[0..binding_span.start], '\n')) |nl| nl + 1 else 0;
+    const relative_end = std.mem.findScalar(u8, source[binding_span.end..], ';') orelse return null;
     const statement_end = binding_span.end + relative_end + 1;
     const statement = source[statement_start..statement_end];
-    const equal = std.mem.indexOfScalar(u8, statement, '=') orelse return null;
-    const allocation_methods = [_][]const u8{ ".alloc(", ".allocSentinel(", ".alignedAlloc(", ".dupe(", ".dupeZ(", ".realloc(", ".create(" };
+    const equal = std.mem.findScalar(u8, statement, '=') orelse return null;
+    const allocation_methods = [_][]const u8{ ".alloc(", ".allocSentinel(", ".alignedAlloc(", ".dupe(", ".dupeSentinel(", ".realloc(", ".create(" };
     const method_offset, const release = for (allocation_methods) |method| {
-        if (std.mem.indexOf(u8, statement[equal + 1 ..], method)) |offset| {
+        if (std.mem.find(u8, statement[equal + 1 ..], method)) |offset| {
             break .{ equal + 1 + offset, if (std.mem.eql(u8, method, ".create(")) "destroy" else "free" };
         }
     } else return null;
@@ -3859,9 +4015,9 @@ fn allocationCleanupEdit(
         if (character != ' ' and character != '\t') break offset;
     } else statement_start;
     const indentation = source[statement_start..indentation_end];
-    const title = try std.fmt.allocPrint(allocator, "Insert defer {s}.{s}({s})", .{ receiver, release, binding_name });
+    const title = try allocator.print("Insert defer {s}.{s}({s})", .{ receiver, release, binding_name });
     errdefer allocator.free(title);
-    const replacement = try std.fmt.allocPrint(allocator, "\n{s}defer {s}.{s}({s});", .{ indentation, receiver, release, binding_name });
+    const replacement = try allocator.print("\n{s}defer {s}.{s}({s});", .{ indentation, receiver, release, binding_name });
     return .{
         .title = title,
         .edit = .{
@@ -3913,11 +4069,11 @@ fn moveCleanupAfterAcquisition(
         defer_index = candidate_end + 1;
     } else return null;
 
-    const cleanup_line_start = if (std.mem.lastIndexOfScalar(u8, source[0..tokens[defer_index].loc.start], '\n')) |nl| nl + 1 else 0;
+    const cleanup_line_start = if (std.mem.findScalarLast(u8, source[0..tokens[defer_index].loc.start], '\n')) |nl| nl + 1 else 0;
     const cleanup_prefix = source[cleanup_line_start..tokens[defer_index].loc.start];
     if (std.mem.trim(u8, cleanup_prefix, " \t\r").len != 0) return null;
     const cleanup_statement_end = tokens[defer_end].loc.end;
-    const cleanup_line_end = if (std.mem.indexOfScalar(u8, source[cleanup_statement_end..], '\n')) |relative|
+    const cleanup_line_end = if (std.mem.findScalar(u8, source[cleanup_statement_end..], '\n')) |relative|
         cleanup_statement_end + relative + 1
     else
         source.len;
@@ -3927,7 +4083,7 @@ fn moveCleanupAfterAcquisition(
     const edits = try allocator.alloc(analysis.Edit, 2);
     edits[0] = .{
         .span = .{ .start = tokens[allocation_end].loc.end, .end = tokens[allocation_end].loc.end },
-        .replacement = try std.fmt.allocPrint(allocator, "\n{s}", .{cleanup_line}),
+        .replacement = try allocator.print("\n{s}", .{cleanup_line}),
     };
     edits[1] = .{
         .span = .{ .start = cleanup_line_start, .end = cleanup_line_end },
@@ -3946,16 +4102,16 @@ fn generateFunctionEdit(
     while (opening < source.len and std.ascii.isWhitespace(source[opening])) : (opening += 1) {}
     if (opening >= source.len or source[opening] != '(') return null;
     const closing = matchingByte(source, opening, '(', ')') orelse return null;
-    const statement_start = (std.mem.lastIndexOfScalar(u8, source[0..name_span.start], ';') orelse
-        std.mem.lastIndexOfScalar(u8, source[0..name_span.start], '{') orelse 0) + 1;
+    const statement_start = (std.mem.findScalarLast(u8, source[0..name_span.start], ';') orelse
+        std.mem.findScalarLast(u8, source[0..name_span.start], '{') orelse 0) + 1;
     const prefix = source[statement_start..name_span.start];
-    const equal = std.mem.lastIndexOfScalar(u8, prefix, '=') orelse return null;
-    const colon = std.mem.lastIndexOfScalar(u8, prefix[0..equal], ':') orelse return null;
+    const equal = std.mem.findScalarLast(u8, prefix, '=') orelse return null;
+    const colon = std.mem.findScalarLast(u8, prefix[0..equal], ':') orelse return null;
     const return_type = std.mem.trim(u8, prefix[colon + 1 .. equal], " \t\r\n");
     if (return_type.len == 0) return null;
     const function_name = source[name_span.start..name_span.end];
     const arguments_source = source[opening + 1 .. closing];
-    if (std.mem.indexOfAny(u8, arguments_source, "([{") != null) return null;
+    if (std.mem.findAny(u8, arguments_source, "([{") != null) return null;
     var parameter_names: std.ArrayList([]const u8) = .empty;
     defer {
         for (parameter_names.items) |name| {
@@ -3975,7 +4131,7 @@ fn generateFunctionEdit(
         const parameter_name = if (isIdentifier(argument) and !seen_names.contains(argument))
             argument
         else
-            try std.fmt.allocPrint(allocator, "arg{d}", .{parameter_index});
+            try allocator.print("arg{d}", .{parameter_index});
         try seen_names.put(allocator, parameter_name, {});
         try parameter_names.append(allocator, parameter_name);
         try parameter_types.append(
@@ -4064,7 +4220,7 @@ fn extractExpressionEdits(
     if (selection.start == selection.end) return null;
     var exact_node = false;
     for (1..document.tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const first = document.tree.firstToken(node);
         const last = document.tree.lastToken(node);
         const start = document.tree.tokenStart(first);
@@ -4075,7 +4231,7 @@ fn extractExpressionEdits(
         }
     }
     if (!exact_node) return null;
-    const line_start = if (std.mem.lastIndexOfScalar(u8, document.source[0..selection.start], '\n')) |nl| nl + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, document.source[0..selection.start], '\n')) |nl| nl + 1 else 0;
     var indentation_end = line_start;
     while (indentation_end < document.source.len and
         (document.source[indentation_end] == ' ' or document.source[indentation_end] == '\t')) : (indentation_end += 1)
@@ -4084,14 +4240,13 @@ fn extractExpressionEdits(
     var suffix: usize = 1;
     var name: []const u8 = "value";
     while (identifierOccurs(document.source, name)) : (suffix += 1) {
-        name = try std.fmt.allocPrint(allocator, "value{d}", .{suffix + 1});
+        name = try allocator.print("value{d}", .{suffix + 1});
     }
     return .{
         .name = name,
         .declaration = .{
             .span = .{ .start = line_start, .end = line_start },
-            .replacement = try std.fmt.allocPrint(
-                allocator,
+            .replacement = try allocator.print(
                 "{s}const {s} = {s};\n",
                 .{ indentation, name, document.source[selection.start..selection.end] },
             ),
@@ -4362,14 +4517,14 @@ fn deduplicateAndSortDiagnostics(diagnostics: []lsp.types.Diagnostic) usize {
         fn lessThan(_: void, left: lsp.types.Diagnostic, right: lsp.types.Diagnostic) bool {
             if (left.range.start.line != right.range.start.line) return left.range.start.line < right.range.start.line;
             if (left.range.start.character != right.range.start.character) return left.range.start.character < right.range.start.character;
-            return std.mem.lessThan(u8, left.message, right.message);
+            return std.mem.lessThan(u8, left.message.string, right.message.string);
         }
     }.lessThan);
     if (diagnostics.len < 2) return diagnostics.len;
     var write_index: usize = 1;
     for (diagnostics[1..]) |diagnostic| {
         const previous = diagnostics[write_index - 1];
-        if (std.meta.eql(previous.range, diagnostic.range) and std.mem.eql(u8, previous.message, diagnostic.message)) {
+        if (std.meta.eql(previous.range, diagnostic.range) and std.mem.eql(u8, previous.message.string, diagnostic.message.string)) {
             if (previous.relatedInformation == null and diagnostic.relatedInformation != null) {
                 diagnostics[write_index - 1] = diagnostic;
             }
@@ -4385,7 +4540,7 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
     const diagnostics = try allocator.alloc(lsp.types.Diagnostic, document.tree.errors.len);
     var initialized: usize = 0;
     errdefer {
-        for (diagnostics[0..initialized]) |diagnostic| allocator.free(diagnostic.message);
+        for (diagnostics[0..initialized]) |diagnostic| allocator.free(diagnostic.message.string);
         allocator.free(diagnostics);
     }
     for (document.tree.errors, diagnostics) |parse_error, *diagnostic| {
@@ -4400,7 +4555,7 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
             .severity = if (parse_error.is_note) .Information else .Error,
             .code = .{ .string = "syntax-error" },
             .source = "zig-analyzer parser",
-            .message = try message.toOwnedSlice(),
+            .message = .{ .string = try message.toOwnedSlice() },
         };
         initialized += 1;
     }
@@ -4415,12 +4570,12 @@ pub fn compilerDiagnostics(
     if (bundle.errorMessageCount() == 0) return &.{};
     const document_path = try filePathFromUri(allocator, document.uri) orelse return &.{};
     defer allocator.free(document_path);
-    const absolute_document_path = try std.fs.path.resolve(allocator, &.{document_path});
+    const absolute_document_path = try std.Io.Dir.path.resolveAlloc(allocator, &.{document_path});
     defer allocator.free(absolute_document_path);
     var diagnostics: std.ArrayList(lsp.types.Diagnostic) = .empty;
     errdefer {
         for (diagnostics.items) |diagnostic| {
-            allocator.free(diagnostic.message);
+            allocator.free(diagnostic.message.string);
             if (diagnostic.relatedInformation) |related_information| {
                 for (related_information) |information| {
                     allocator.free(information.location.uri);
@@ -4472,7 +4627,7 @@ pub fn compilerDiagnostics(
                     .start = .{ .line = note_location.line, .character = note_location.column },
                     .end = .{ .line = note_location.line, .character = note_location.column + 1 },
                 },
-                try std.fmt.allocPrint(allocator, "file://{s}", .{note_path}),
+                try allocator.print("file://{s}", .{note_path}),
             };
             errdefer allocator.free(note_uri);
             const note_message = try allocator.dupe(u8, bundle.nullTerminatedString(note.msg));
@@ -4497,7 +4652,7 @@ pub fn compilerDiagnostics(
             .severity = .Error,
             .code = .{ .string = "compiler-error" },
             .source = "zig compiler",
-            .message = diagnostic_message,
+            .message = .{ .string = diagnostic_message },
             .relatedInformation = related_information,
         });
     }
@@ -4509,12 +4664,12 @@ fn sourcePathMatchesDocument(
     source_path: []const u8,
     absolute_document_path: []const u8,
 ) !bool {
-    if (!std.fs.path.isAbsolute(source_path)) {
+    if (!std.Io.Dir.path.isAbsolute(source_path)) {
         if (!std.mem.endsWith(u8, absolute_document_path, source_path)) return false;
         const prefix_length = absolute_document_path.len - source_path.len;
-        return prefix_length == 0 or std.fs.path.isSep(absolute_document_path[prefix_length - 1]);
+        return prefix_length == 0 or std.Io.Dir.path.isSep(absolute_document_path[prefix_length - 1]);
     }
-    const absolute_source_path = try std.fs.path.resolve(allocator, &.{source_path});
+    const absolute_source_path = try std.Io.Dir.path.resolveAlloc(allocator, &.{source_path});
     defer allocator.free(absolute_source_path);
     return std.mem.eql(u8, absolute_document_path, absolute_source_path);
 }
@@ -4523,7 +4678,7 @@ fn lineStartOffset(source: []const u8, target_line: u32) ?usize {
     var line: u32 = 0;
     var offset: usize = 0;
     while (line < target_line) {
-        const newline = std.mem.indexOfScalarPos(u8, source, offset, '\n') orelse return null;
+        const newline = std.mem.findScalarPos(u8, source, offset, '\n') orelse return null;
         offset = newline + 1;
         line += 1;
     }
@@ -4672,7 +4827,7 @@ fn typeInlayHints(
             if (!positionInRange(position, requested_range)) continue;
             try hints.append(allocator, .{
                 .position = position,
-                .label = .{ .string = try std.fmt.allocPrint(allocator, " = {d}", .{next_value}) },
+                .label = .{ .string = try allocator.print(" = {d}", .{next_value}) },
                 .kind = .Type,
                 .paddingLeft = true,
             });
@@ -4707,7 +4862,7 @@ fn typeInlayHints(
                         if (!positionInRange(position, requested_range)) continue;
                         try hints.append(allocator, .{
                             .position = position,
-                            .label = .{ .string = try std.fmt.allocPrint(allocator, "{s}:", .{parameter_name}) },
+                            .label = .{ .string = try allocator.print("{s}:", .{parameter_name}) },
                             .kind = .Parameter,
                             .paddingRight = true,
                         });
@@ -4777,9 +4932,9 @@ fn semanticTokenModifiers(document: *const Document, token: std.zig.Token) u32 {
     const declaration = document.declarationNamed(document.source[token.loc.start..token.loc.end]) orelse return modifiers;
     if (!std.meta.eql(declaration.span, token.loc) or declaration.kind != .constant) return modifiers;
     modifiers |= 1 << 1;
-    const line_end = std.mem.indexOfScalarPos(u8, document.source, token.loc.end, '\n') orelse document.source.len;
+    const line_end = std.mem.findScalarPos(u8, document.source, token.loc.end, '\n') orelse document.source.len;
     const declaration_tail = std.mem.trim(u8, document.source[token.loc.end..line_end], " \t\r");
-    const equal = std.mem.indexOfScalar(u8, declaration_tail, '=') orelse return modifiers;
+    const equal = std.mem.findScalar(u8, declaration_tail, '=') orelse return modifiers;
     const initializer = std.mem.trim(u8, declaration_tail[equal + 1 ..], " \t\r");
     if (initializer.len != 0 and (std.ascii.isDigit(initializer[0]) or initializer[0] == '\'' or initializer[0] == '"' or
         std.mem.startsWith(u8, initializer, "true") or std.mem.startsWith(u8, initializer, "false")))
@@ -4797,7 +4952,7 @@ fn isDeclarationSpan(document: *const Document, span: std.zig.Token.Loc) bool {
 }
 
 fn declarationBaseName(fully_qualified_name: []const u8) []const u8 {
-    const separator = std.mem.lastIndexOfScalar(u8, fully_qualified_name, '.') orelse return fully_qualified_name;
+    const separator = std.mem.findScalarLast(u8, fully_qualified_name, '.') orelse return fully_qualified_name;
     return fully_qualified_name[separator + 1 ..];
 }
 
@@ -4805,7 +4960,7 @@ fn isRelatedCompilerDeclaration(document: *const Document, fully_qualified_name:
     for (document.declarations) |declaration| {
         if (declaration.brace_depth != 0 or declaration.name.len < 3) continue;
         if (std.mem.eql(u8, declaration.name, "std")) continue;
-        if (std.mem.indexOf(u8, fully_qualified_name, declaration.name) != null) return true;
+        if (std.mem.find(u8, fully_qualified_name, declaration.name) != null) return true;
     }
     return false;
 }
@@ -4953,11 +5108,11 @@ test "syntax diagnostics describe malformed source" {
     defer document.deinit();
     const diagnostics = try syntaxDiagnostics(&document, std.testing.allocator);
     defer {
-        for (diagnostics) |diagnostic| std.testing.allocator.free(diagnostic.message);
+        for (diagnostics) |diagnostic| std.testing.allocator.free(diagnostic.message.string);
         std.testing.allocator.free(diagnostics);
     }
     try std.testing.expect(diagnostics.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, "expected") != null);
+    try std.testing.expect(std.mem.find(u8, diagnostics[0].message.string, "expected") != null);
 }
 
 test "hover descriptions cover fields and loop captures" {
@@ -4966,7 +5121,7 @@ test "hover descriptions cover fields and loop captures" {
     try std.testing.expectEqualStrings("value: u32", field.declaration);
     try std.testing.expectEqualStrings("u32", field.type_summary.?);
 
-    const source_z = try std.testing.allocator.dupeZ(u8, source);
+    const source_z = try std.testing.allocator.dupeSentinel(u8, source, 0);
     defer std.testing.allocator.free(source_z);
     const tokens = try tokenize(std.testing.allocator, source_z);
     defer std.testing.allocator.free(tokens);
@@ -5028,8 +5183,8 @@ test "LSP formatting delegates to zig fmt without applying lint fixes" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "var value = if (enabled) true else false;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const value") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "var value = if (enabled) true else false;") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "const value") == null);
 }
 
 test "late allocation cleanup action moves the existing defer" {
@@ -5042,15 +5197,15 @@ test "late allocation cleanup action moves the existing defer" {
         "    defer finishOtherWork(buffer);\n" ++
         "    defer allocator.free(buffer);\n" ++
         "}\n";
-    const binding_start = std.mem.indexOf(u8, source, "buffer =") orelse unreachable;
+    const binding_start = std.mem.find(u8, source, "buffer =") orelse unreachable;
     const edits = (try moveCleanupAfterAcquisition(arena_state.allocator(), source, .{
         .start = binding_start,
         .end = binding_start + "buffer".len,
     })).?;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
-    try std.testing.expect(std.mem.indexOf(u8, edits[0].replacement, "defer allocator.free(buffer);") != null);
+    try std.testing.expect(std.mem.find(u8, edits[0].replacement, "defer allocator.free(buffer);") != null);
     try std.testing.expectEqualStrings("", edits[1].replacement);
-    try std.testing.expect(std.mem.indexOf(u8, source[edits[1].span.start..edits[1].span.end], "finishOtherWork") == null);
+    try std.testing.expect(std.mem.find(u8, source[edits[1].span.start..edits[1].span.end], "finishOtherWork") == null);
 }
 
 test "late resource cleanup action moves close after acquisition" {
@@ -5062,13 +5217,13 @@ test "late resource cleanup action moves close after acquisition" {
         "    try validate();\n" ++
         "    defer file.close();\n" ++
         "}\n";
-    const binding_start = std.mem.indexOf(u8, source, "file =") orelse unreachable;
+    const binding_start = std.mem.find(u8, source, "file =") orelse unreachable;
     const edits = (try moveCleanupAfterAcquisition(arena_state.allocator(), source, .{
         .start = binding_start,
         .end = binding_start + "file".len,
     })).?;
     try std.testing.expectEqual(@as(usize, 2), edits.len);
-    try std.testing.expect(std.mem.indexOf(u8, edits[0].replacement, "defer file.close();") != null);
+    try std.testing.expect(std.mem.find(u8, edits[0].replacement, "defer file.close();") != null);
     try std.testing.expectEqualStrings("", edits[1].replacement);
 }
 
@@ -5091,7 +5246,7 @@ test "semantic tokens encode keywords declarations and numbers" {
 
 test "signature help finds the active argument" {
     const source: [:0]const u8 = "fn add(left: u32, right: u32) u32 { return left + right; }\nconst sum = add(1, 2);\n";
-    const second_argument = std.mem.indexOf(u8, source, "2);").? + 1;
+    const second_argument = std.mem.find(u8, source, "2);").? + 1;
     const call = callAt(source, second_argument).?;
     try std.testing.expectEqualStrings("add", call.name);
     try std.testing.expectEqual(@as(u32, 1), call.active_parameter);
@@ -5156,12 +5311,12 @@ test "comptime calls show parameter-name hints" {
 
 test "format and import string contexts are recognized precisely" {
     const format_source: [:0]const u8 = "std.debug.print(\"value {}\", .{42});\n";
-    const format_offset = std.mem.indexOf(u8, format_source, "{}") orelse unreachable;
+    const format_offset = std.mem.find(u8, format_source, "{}") orelse unreachable;
     try std.testing.expect(formatStringAt(format_source, format_offset + 1));
     try std.testing.expect(!formatStringAt(format_source, format_source.len));
 
     const import_source: [:0]const u8 = "const module = @import(\"dir/mod\");\n";
-    const import_offset = std.mem.indexOf(u8, import_source, "dir/mod") orelse unreachable;
+    const import_offset = std.mem.find(u8, import_source, "dir/mod") orelse unreachable;
     try std.testing.expectEqualStrings("dir/mo", importStringPrefix(import_source, import_offset + "dir/mo".len).?);
 }
 
@@ -5183,9 +5338,9 @@ test "field rename classification excludes typed locals" {
         "const State = struct { value: u32 };\n" ++
         "const Event = union(enum) { ready: u32 };\n" ++
         "fn inspect() void { var local: u32 = 1; _ = local; }\n";
-    const struct_field_start = std.mem.indexOf(u8, source, "value: u32") orelse unreachable;
-    const union_field_start = std.mem.indexOf(u8, source, "ready: u32") orelse unreachable;
-    const local_start = std.mem.indexOf(u8, source, "local: u32") orelse unreachable;
+    const struct_field_start = std.mem.find(u8, source, "value: u32") orelse unreachable;
+    const union_field_start = std.mem.find(u8, source, "ready: u32") orelse unreachable;
+    const local_start = std.mem.find(u8, source, "local: u32") orelse unreachable;
 
     try std.testing.expect(try isContainerField(arena.allocator(), source, .{
         .start = struct_field_start,
@@ -5208,9 +5363,9 @@ test "style rename preserves type-producing declaration semantics" {
         "const inferred_type = @TypeOf(1);\n" ++
         "const reflected_type = @typeInfo(@TypeOf(make)).@\"fn\".return_type.?;\n" ++
         "const external_state = extern struct { value: u32 };\n";
-    const inferred_start = std.mem.indexOf(u8, source, "inferred_type") orelse unreachable;
-    const reflected_start = std.mem.indexOf(u8, source, "reflected_type") orelse unreachable;
-    const external_start = std.mem.indexOf(u8, source, "external_state") orelse unreachable;
+    const inferred_start = std.mem.find(u8, source, "inferred_type") orelse unreachable;
+    const reflected_start = std.mem.find(u8, source, "reflected_type") orelse unreachable;
+    const external_start = std.mem.find(u8, source, "external_state") orelse unreachable;
 
     const inferred_name = (try suggestedDeclarationName(arena.allocator(), source, .{
         .start = inferred_start,
@@ -5292,7 +5447,7 @@ test "compiler-generated member definitions return the generating type declarati
         .limited(1024 * 1024),
     );
     defer std.testing.allocator.free(source);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{fixture_path});
+    const uri = try std.testing.allocator.print("file://{s}", .{fixture_path});
     defer std.testing.allocator.free(uri);
     const incoming = [_][]const u8{};
     var transport = TestTransport.init(&incoming);
@@ -5312,7 +5467,7 @@ test "compiler-generated member definitions return the generating type declarati
     server.compiler_root_uri = try std.testing.allocator.dupe(u8, uri);
     server.compiler_root_version = 1;
     const document = server.documents.getConst(uri).?;
-    const member_start = std.mem.lastIndexOf(u8, source, "trace();").?;
+    const member_start = std.mem.findLast(u8, source, "trace();").?;
     const member_position = document.range(.{ .start = member_start, .end = member_start + "trace".len }).start;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -5339,7 +5494,7 @@ test "member resolution finds explicit struct fields" {
     const source: [:0]const u8 =
         "const Profile = struct { display_name: []const u8, login_count: u32 };\n" ++
         "fn show(profile: Profile) []const u8 { return profile.display_name; }\n";
-    const receiver_offset = std.mem.indexOf(u8, source, "profile.").? + "profile.".len;
+    const receiver_offset = std.mem.find(u8, source, "profile.").? + "profile.".len;
     try std.testing.expectEqualStrings("profile", memberReceiver(source, receiver_offset).?);
     const type_name = (try declaredTypeName(std.testing.allocator, source, "profile")).?;
     try std.testing.expectEqualStrings("Profile", type_name);
@@ -5462,7 +5617,7 @@ test "definition follows a constant alias into an imported declaration" {
     defer server.deinit();
     try server.documents.open("file://examples/lsp/imports/alias.zig", 1, source);
     const document = server.documents.getConst("file://examples/lsp/imports/alias.zig").?;
-    const usage_start = std.mem.lastIndexOf(u8, source, "Alias").?;
+    const usage_start = std.mem.findLast(u8, source, "Alias").?;
     const identifier_span = document.identifierAt(usage_start).?;
 
     const location = (try server.aliasTargetDefinition(arena, document, identifier_span)).?;
@@ -5515,14 +5670,14 @@ test "LSP member completion and rename respect syntax context" {
     );
 
     try std.testing.expectEqual(@as(usize, 8), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "display_name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "login_count") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"eql\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "display_name") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "login_count") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"eql\"") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, transport.output(4), "\"newText\":\"number\""));
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "```zig\\ndisplay_name: []const u8\\n```\\n```zig\\n([]const u8)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "fn eql(comptime T: type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "Returns true if and only if") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "```zig\\ndisplay_name: []const u8\\n```\\n```zig\\n([]const u8)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "fn eql(comptime T: type") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "Returns true if and only if") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(7), "\"result\":null") != null);
 }
 
 test "LSP import completion and definition resolve another file" {
@@ -5558,11 +5713,11 @@ test "LSP import completion and definition resolve another file" {
     );
 
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "default_limit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "clampToLimit") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "catalog.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "fn clampToLimit(value: u32) u32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "default_limit") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "clampToLimit") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "catalog.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "fn clampToLimit(value: u32) u32") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "\"result\":null") != null);
 }
 
 test "LSP resolves import paths and nested imported definitions" {
@@ -5602,14 +5757,14 @@ test "LSP resolves import paths and nested imported definitions" {
     );
 
     try std.testing.expectEqual(@as(usize, 8), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "unresolved-member") == null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"Ping\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "catalog.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"line\":0,\"character\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"line\":2,\"character\":10") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"line\":3,\"character\":14") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"line\":4,\"character\":18") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "unresolved-member") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "\"Ping\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "catalog.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"line\":0,\"character\":0") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "\"line\":2,\"character\":10") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "\"line\":3,\"character\":14") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "\"line\":4,\"character\":18") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(7), "\"result\":null") != null);
 }
 
 test "LSP hover describes parameters locals functions and bounded constants" {
@@ -5646,14 +5801,14 @@ test "LSP hover describes parameters locals functions and bounded constants" {
     );
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"kind\":\"markdown\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "```zig\\nincoming: u32\\n```\\n```zig\\n(u32)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "```zig\\nconst doubled: u32 = incoming * 2\\n```\\n```zig\\n(u32)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "```zig\\nfn addSample(accumulated: u32, incoming: u32) u32\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "Adds an incoming sample") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "```zig\\nconst retry_limit: u8 = 3\\n```\\n```zig\\n(u8 = 3)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Maximum number of attempts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "\"kind\":\"markdown\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "```zig\\nincoming: u32\\n```\\n```zig\\n(u32)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "```zig\\nconst doubled: u32 = incoming * 2\\n```\\n```zig\\n(u32)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "```zig\\nfn addSample(accumulated: u32, incoming: u32) u32\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "Adds an incoming sample") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "```zig\\nconst retry_limit: u8 = 3\\n```\\n```zig\\n(u8 = 3)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "Maximum number of attempts") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "\"result\":null") != null);
 }
 
 test "LSP hover documents Zig keywords primitive types and values" {
@@ -5686,15 +5841,15 @@ test "LSP hover documents Zig keywords primitive types and values" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 8), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "```zig\\nconst\\n```\\n```zig\\n(keyword)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "cannot be reassigned") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "#Keyword-Reference") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "An unsigned integer type with 8 bits") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "mutable binding") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "boolean type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "```zig\\ntrue\\n```\\n```zig\\n(bool)\\n```") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "#Primitive-Values") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "```zig\\nconst\\n```\\n```zig\\n(keyword)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "cannot be reassigned") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "#Keyword-Reference") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "An unsigned integer type with 8 bits") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "mutable binding") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "boolean type") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "```zig\\ntrue\\n```\\n```zig\\n(bool)\\n```") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "#Primitive-Values") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(7), "\"result\":null") != null);
 }
 
 test "LSP hover documents builtins operators literals and semicolons" {
@@ -5725,15 +5880,15 @@ test "LSP hover documents builtins operators literals and semicolons" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "@as(comptime T: type, expression: anytype) T") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "builtin function") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "#@as") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "integer literal") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "comptime_int") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "(operator)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Terminates a declaration") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "#Grammar") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "@as(comptime T: type, expression: anytype) T") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "builtin function") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "#@as") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "integer literal") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "comptime_int") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "(operator)") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "Terminates a declaration") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "#Grammar") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "\"result\":null") != null);
 }
 
 test "LSP hover follows inferred returns through imported type aliases" {
@@ -5767,11 +5922,11 @@ test "LSP hover follows inferred returns through imported type aliases" {
     );
 
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const view = make()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "types.Headers.View") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "slice: []const u8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Headers decoded from the used message body") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "const view = make()") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "types.Headers.View") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "slice: []const u8") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "Headers decoded from the used message body") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "\"result\":null") != null);
 }
 
 test "LSP hover resolves constructed types through imports and type functions" {
@@ -5805,10 +5960,10 @@ test "LSP hover resolves constructed types through imports and type functions" {
     );
 
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "fn close(self: *Store) void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Releases every resource owned by the store.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "fn push(self: *@This(), entry: T) void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Appends one entry to the queue tail.") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "fn close(self: *Store) void") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Releases every resource owned by the store.") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "fn push(self: *@This(), entry: T) void") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "Appends one entry to the queue tail.") != null);
 }
 
 test "LSP publishes memory ownership warnings" {
@@ -5838,11 +5993,11 @@ test "LSP publishes memory ownership warnings" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "unreleased-allocation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "no visible free") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"severity\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Insert defer allocator.free(buffer)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"isPreferred\":false") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "unreleased-allocation") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "no visible free") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"severity\":2") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Insert defer allocator.free(buffer)") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "\"isPreferred\":false") != null);
 }
 
 test "LSP publishes unresolved calls before the document is saved" {
@@ -5872,9 +6027,9 @@ test "LSP publishes unresolved calls before the document is saved" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"diagnostics\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved-call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved function 'compute'") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"diagnostics\":[]") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "unresolved-call") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "unresolved function 'compute'") != null);
 }
 
 test "LSP publishes unresolved type references after an unsaved rename" {
@@ -5904,9 +6059,9 @@ test "LSP publishes unresolved type references after an unsaved rename" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"diagnostics\":[]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved-identifier") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "unresolved identifier 'Message'") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"diagnostics\":[]") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "unresolved-identifier") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "unresolved identifier 'Message'") != null);
 }
 
 test "LSP advertises and returns complete filtered code actions" {
@@ -5942,25 +6097,25 @@ test "LSP advertises and returns complete filtered code actions" {
     );
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "source.organizeImports") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "resolveProvider\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "codeLensProvider") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "zig-analyzer.peekResolvedType") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "callHierarchyProvider") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "missing-switch-prong") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "never-mutated-var") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Change 'value' to const") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"newText\":\"const\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "Fill missing switch prongs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), ".safe => @panic") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "Generate function 'missing'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "fn missing(input: u32, arg2: anytype) u32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fix all safe zig-analyzer findings") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Fill missing switch prongs") == null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"const\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "value == 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "cleanup();") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "\"newText\":\"\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "source.organizeImports") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "resolveProvider\":false") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "codeLensProvider") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "zig-analyzer.peekResolvedType") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "callHierarchyProvider") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "missing-switch-prong") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "never-mutated-var") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Change 'value' to const") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "\"newText\":\"const\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "Fill missing switch prongs") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), ".safe => @panic") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "Generate function 'missing'") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "fn missing(input: u32, arg2: anytype) u32") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "Fix all safe zig-analyzer findings") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "Fill missing switch prongs") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "\"newText\":\"const\"") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "value == 1") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "cleanup();") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "\"newText\":\"\"") != null);
 }
 
 test "LSP offers line and file suppression quickfixes for a finding" {
@@ -5991,10 +6146,10 @@ test "LSP offers line and file suppression quickfixes for a finding" {
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
     const response = transport.output(2);
-    try std.testing.expect(std.mem.indexOf(u8, response, "Suppress 'never-mutated-var' on this line") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "Suppress 'never-mutated-var' in this file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "    // zig-analyzer: disable-next-line never-mutated-var\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "// zig-analyzer: disable-file never-mutated-var\\n") != null);
+    try std.testing.expect(std.mem.find(u8, response, "Suppress 'never-mutated-var' on this line") != null);
+    try std.testing.expect(std.mem.find(u8, response, "Suppress 'never-mutated-var' in this file") != null);
+    try std.testing.expect(std.mem.find(u8, response, "    // zig-analyzer: disable-next-line never-mutated-var\\n") != null);
+    try std.testing.expect(std.mem.find(u8, response, "// zig-analyzer: disable-file never-mutated-var\\n") != null);
     try std.testing.expect(std.mem.count(u8, response, "Suppress 'never-mutated-var' on this line") == 1);
 }
 
@@ -6019,9 +6174,9 @@ test "LSP returns Zig error recovery actions" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Propagate the error with try") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Handle the error with catch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Handle every error with a switch") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Propagate the error with try") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Handle the error with catch") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Handle every error with a switch") != null);
 }
 
 test "LSP returns build repair and c import extraction workspace actions" {
@@ -6051,11 +6206,11 @@ test "LSP returns build repair and c import extraction workspace actions" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 7), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "Add module 'feature' to build.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "root_module.addImport") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "Extract repeated @cImport") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "documentChanges") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "c_imports.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "Add module 'feature' to build.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "root_module.addImport") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "Extract repeated @cImport") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "documentChanges") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "c_imports.zig") != null);
 }
 
 test "LSP call hierarchy connects callers and callees" {
@@ -6089,9 +6244,9 @@ test "LSP call hierarchy connects callers and callees" {
     );
 
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "\"name\":\"callee\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"name\":\"callee\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"name\":\"caller\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "\"name\":\"callee\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"name\":\"callee\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "\"name\":\"caller\"") != null);
 }
 
 test "LSP extracts an exact UTF-16 expression selection" {
@@ -6121,8 +6276,8 @@ test "LSP extracts an exact UTF-16 expression selection" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Extract into const 'value'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "const value = 20 + 22;") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Extract into const 'value'") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "const value = 20 + 22;") != null);
 }
 
 test "LSP organizes imports when the style lint is disabled" {
@@ -6152,10 +6307,10 @@ test "LSP organizes imports when the style lint is disabled" {
     );
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "Organize imports") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "source.organizeImports") != null);
-    const standard_comment = std.mem.indexOf(u8, transport.output(2), "// standard").?;
-    const package_comment = std.mem.indexOf(u8, transport.output(2), "// package").?;
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "Organize imports") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "source.organizeImports") != null);
+    const standard_comment = std.mem.find(u8, transport.output(2), "// standard").?;
+    const package_comment = std.mem.find(u8, transport.output(2), "// package").?;
     try std.testing.expect(standard_comment < package_comment);
 }
 
@@ -6178,10 +6333,10 @@ test "LSP diagnostics map positions past astral-plane characters in UTF-16" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 3), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "syntax-error") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "syntax-error") != null);
     // The error sits at the end of the line: 32 bytes but 30 UTF-16 units.
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"character\":30") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "\"character\":32") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"character\":30") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"character\":32") == null);
 }
 
 test "LSP keeps answering after an edit deletes the import behind a member access" {
@@ -6210,8 +6365,8 @@ test "LSP keeps answering after an edit deletes the import behind a member acces
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 6), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "\"result\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "\"result\":[]") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "\"result\":[]") != null);
 }
 
 test "saving a build script reanalyzes the active source document" {
@@ -6233,6 +6388,129 @@ test "saving a build script reanalyzes the active source document" {
 
     try std.testing.expectEqualStrings("file:///workspace/src/main.zig", document.uri);
     try std.testing.expectEqual(@as(i32, 4), document.version);
+    const manifest_document = server.analysisDocumentAfterSave("file:///workspace/build.zig.zon").?;
+    try std.testing.expectEqualStrings("file:///workspace/src/main.zig", manifest_document.uri);
+}
+
+test "source saves retain the compiler worker and refresh imported diagnostics" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const source = "const dependency = @import(\"dependency.zig\");\nexport fn result() u32 { return dependency.value; }\n";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = source });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const value: u32 = 1;\n" });
+    const root_path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(root_path);
+    const uri = try std.testing.allocator.print("file://{s}", .{root_path});
+    defer std.testing.allocator.free(uri);
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open(uri, 1, source);
+    try server.startCompilerWorker();
+    const worker = server.compiler_worker.?;
+    const original_process_id, var generation = setup: {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        worker.server.compiler = compiler_session.Session.start(std.testing.io, std.testing.allocator, .empty, root_path) catch |err| switch (err) {
+            error.CompilerBackendNotFound => return,
+            else => return err,
+        };
+        try worker.server.documents.open(uri, 1, source);
+        try worker.server.syncCompilerOverlay(uri);
+        break :setup .{ worker.server.compiler.?.child.id, (try worker.server.compiler.?.workspaceSummary()).last_generation };
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const changes = [_]struct { source: []const u8, error_count: u32 }{
+        .{ .source = "pub const value = true;\n", .error_count = 1 },
+        .{ .source = "pub const value: u32 = 42;\n", .error_count = 0 },
+    };
+    for (changes) |change| {
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = change.source });
+        try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = uri } });
+        var update_processed = false;
+        for (0..200) |_| {
+            try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+            worker.analysis_mutex.lockUncancelable(std.testing.io);
+            defer worker.analysis_mutex.unlock(std.testing.io);
+            const compiler = if (worker.server.compiler) |*active| active else continue;
+            const next_generation = (try compiler.workspaceSummary()).last_generation;
+            if (next_generation <= generation) continue;
+            try std.testing.expectEqual(original_process_id, compiler.child.id);
+            var diagnostics = try compiler.diagnostics(std.testing.allocator);
+            defer diagnostics.deinit(std.testing.allocator);
+            try std.testing.expectEqual(change.error_count, diagnostics.errorMessageCount());
+            generation = next_generation;
+            update_processed = true;
+            break;
+        }
+        try std.testing.expect(update_processed);
+    }
+
+    const dependency_path = try temporary.dir.realPathFileAlloc(std.testing.io, "dependency.zig", std.testing.allocator);
+    defer std.testing.allocator.free(dependency_path);
+    const dependency_uri = try std.testing.allocator.print("file://{s}", .{dependency_path});
+    defer std.testing.allocator.free(dependency_uri);
+    const unsaved_dependency = "pub const value = true;\n";
+    try server.documents.open(dependency_uri, 1, unsaved_dependency);
+    {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        try worker.server.documents.open(dependency_uri, 1, unsaved_dependency);
+        try worker.server.syncCompilerOverlay(dependency_uri);
+        try worker.server.syncCompilerOverlay(uri);
+        generation = (try worker.server.compiler.?.workspaceSummary()).last_generation;
+        var diagnostics = try worker.server.compiler.?.diagnostics(std.testing.allocator);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u32, 1), diagnostics.errorMessageCount());
+    }
+    {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        try server.@"textDocument/didClose"(arena_state.allocator(), .{ .textDocument = .{ .uri = dependency_uri } });
+    }
+    try std.testing.expect(!worker.lockCurrent(server.documents.getConst(uri).?));
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const value: u32 = 77;\n" });
+    try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = uri } });
+    var closed_overlay_removed = false;
+    for (0..200) |_| {
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        const compiler = if (worker.server.compiler) |*active| active else continue;
+        if ((try compiler.workspaceSummary()).last_generation <= generation) continue;
+        try std.testing.expectEqual(original_process_id, compiler.child.id);
+        try std.testing.expect(worker.server.documents.getConst(dependency_uri) == null);
+        var diagnostics = try compiler.diagnostics(std.testing.allocator);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u32, 0), diagnostics.errorMessageCount());
+        closed_overlay_removed = true;
+        break;
+    }
+    try std.testing.expect(closed_overlay_removed);
+
+    const other_source = "export fn independent() u32 { return 7; }\n";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = other_source });
+    const other_path = try temporary.dir.realPathFileAlloc(std.testing.io, "other.zig", std.testing.allocator);
+    defer std.testing.allocator.free(other_path);
+    const other_uri = try std.testing.allocator.print("file://{s}", .{other_path});
+    defer std.testing.allocator.free(other_uri);
+    try server.documents.open(other_uri, 1, other_source);
+    try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = other_uri } });
+    var root_switched = false;
+    for (0..200) |_| {
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        const document = worker.server.documents.getConst(other_uri) orelse continue;
+        if (!worker.server.compilerAnalysisCurrent(document)) continue;
+        try std.testing.expect(original_process_id != worker.server.compiler.?.child.id);
+        root_switched = true;
+        break;
+    }
+    try std.testing.expect(root_switched);
 }
 
 test "compiler failures preserve syntax and allow one controlled restart" {
@@ -6287,10 +6565,10 @@ test "LSP answers from current syntax while the compiler worker is busy" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "publishDiagnostics") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "publishDiagnostics") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "second") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "first") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "second") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "first") == null);
 
     worker.analysis_mutex.unlock(std.testing.io);
     worker_locked = false;
@@ -6322,8 +6600,8 @@ test "LSP discards an out-of-order document version instead of clobbering newer 
 
     // The stale version publishes nothing: open, newer change, symbols, shutdown.
     try std.testing.expectEqual(@as(usize, 5), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "third") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "second") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "third") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "second") == null);
 }
 
 test "LSP survives a save notification for a document that was never opened" {
@@ -6348,7 +6626,7 @@ test "LSP survives a save notification for a document that was never opened" {
     try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
 
     try std.testing.expectEqual(@as(usize, 4), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "answer") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "answer") != null);
 }
 
 test "LSP session covers lifecycle synchronization and broad features" {
@@ -6395,16 +6673,16 @@ test "LSP session covers lifecycle synchronization and broad features" {
     );
 
     try std.testing.expectEqual(@as(usize, 10), transport.output_count);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(0), "zig-analyzer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(1), "publishDiagnostics") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(2), "expected") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(3), "answer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(4), "broken") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(5), "answer") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(6), "\"data\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(7), "\"data\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(8), "comptime_int") != null);
-    try std.testing.expect(std.mem.indexOf(u8, transport.output(9), "\"result\":null") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(0), "zig-analyzer") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "expected") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "answer") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "broken") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "answer") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(6), "\"data\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(7), "\"data\"") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(8), "comptime_int") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(9), "\"result\":null") != null);
 }
 
 test "LSP textDocument/typeDefinition resolves variable type definition" {
@@ -6426,7 +6704,7 @@ test "LSP textDocument/typeDefinition resolves variable type definition" {
     try server.documents.open(uri, 1, source);
     const document = server.documents.getConst(uri).?;
 
-    const cfg_start = std.mem.indexOf(u8, source, "cfg: Config").?;
+    const cfg_start = std.mem.find(u8, source, "cfg: Config").?;
     const cfg_pos = document.range(.{ .start = cfg_start, .end = cfg_start + 3 }).start;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6470,7 +6748,7 @@ test "LSP workspace/executeCommand zig-analyzer.typeAtPosition returns type desc
     try server.documents.open(uri, 1, source);
     const document = server.documents.getConst(uri).?;
 
-    const cfg_start = std.mem.indexOf(u8, source, "cfg: Config").?;
+    const cfg_start = std.mem.find(u8, source, "cfg: Config").?;
     const cfg_pos = document.range(.{ .start = cfg_start, .end = cfg_start + 3 }).start;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6489,6 +6767,64 @@ test "LSP workspace/executeCommand zig-analyzer.typeAtPosition returns type desc
     try std.testing.expectEqualStrings("Config", result.string);
 }
 
+test "LSP imported deprecations use current unsaved dependency documents" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const source = "const api = @import(\"dependency.zig\"); pub fn run() void { api.old(); }";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = source });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub fn old() void {}" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const dependency_path = try temporary.dir.realPathFileAlloc(std.testing.io, "dependency.zig", std.testing.allocator);
+    defer std.testing.allocator.free(dependency_path);
+    const uri = try std.testing.allocator.print("file://{s}", .{path});
+    defer std.testing.allocator.free(uri);
+    const dependency_uri = try std.testing.allocator.print("file://{s}", .{dependency_path});
+    defer std.testing.allocator.free(dependency_uri);
+    var transport = TestTransport.init(&.{});
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open(uri, 1, source);
+    try server.documents.open(dependency_uri, 1, "/// Deprecated, use current\npub fn old() void {}");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var deprecated_count: usize = 0;
+    const first = try server.documentFindings(arena.allocator(), server.documents.getConst(uri).?, .defaults());
+    for (first) |finding| if (finding.rule == .deprecated_declaration) {
+        deprecated_count += 1;
+        try std.testing.expect(std.mem.find(u8, finding.message, "use current") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), deprecated_count);
+    server.compiler_start_attempted = true;
+    try server.publishDiagnostics(arena.allocator(), uri);
+    try server.@"textDocument/didChange"(arena.allocator(), .{
+        .textDocument = .{ .uri = dependency_uri, .version = 2 },
+        .contentChanges = &.{.{ .text_document_content_change_whole_document = .{ .text = "pub fn old() void {}" } }},
+    });
+    try std.testing.expect(std.mem.find(u8, transport.output(1), uri) != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "deprecated-declaration") == null);
+    try server.@"textDocument/didChange"(arena.allocator(), .{
+        .textDocument = .{ .uri = dependency_uri, .version = 3 },
+        .contentChanges = &.{.{ .text_document_content_change_whole_document = .{ .text = "/// Deprecated: updated advice\npub fn old() void {}" } }},
+    });
+    try std.testing.expect(std.mem.find(u8, transport.output(3), uri) != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "updated advice") != null);
+    try server.@"textDocument/didClose"(arena.allocator(), .{ .textDocument = .{ .uri = dependency_uri } });
+    try std.testing.expect(std.mem.find(u8, transport.output(5), uri) != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "deprecated-declaration") == null);
+
+    // Generated imports may reference deprecated APIs; retain the generated-file
+    // policy even when their dependency now carries a deprecation marker.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "/// Deprecated: use current\npub fn old() void {}" });
+    const generated_source =
+        "pub const __builtin_bswap16 = @import(\"std\").zig.c_builtins.__builtin_bswap16;\n" ++
+        "pub const __builtin_bswap32 = @import(\"std\").zig.c_builtins.__builtin_bswap32;\n" ++
+        "pub const __builtin_bswap64 = @import(\"std\").zig.c_builtins.__builtin_bswap64;\n" ++ source;
+    try server.documents.change(uri, 2, &.{.{ .text_document_content_change_whole_document = .{ .text = generated_source } }});
+    const generated_findings = try server.documentFindings(arena.allocator(), server.documents.getConst(uri).?, .defaults());
+    for (generated_findings) |finding| try std.testing.expect(finding.rule != .deprecated_declaration);
+}
+
 test "LSP code action offers rule-wide fix-all for deterministic rule" {
     var transport = TestTransport.init(&.{});
     var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
@@ -6505,7 +6841,7 @@ test "LSP code action offers rule-wide fix-all for deterministic rule" {
     try server.documents.open(uri, 1, source);
     const document = server.documents.getConst(uri).?;
 
-    const first_call = std.mem.indexOf(u8, source, "std.fmt.allocPrint(allocator, \"{s}\", .{a})").?;
+    const first_call = std.mem.find(u8, source, "std.fmt.allocPrint(allocator, \"{s}\", .{a})").?;
     const action_range = document.range(.{ .start = first_call, .end = first_call + 10 });
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

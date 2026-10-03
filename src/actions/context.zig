@@ -100,7 +100,7 @@ pub const ActionRun = struct {
     }
 
     pub fn lineIndentation(context: ActionRun, offset: usize) []const u8 {
-        const line_start = if (std.mem.lastIndexOfScalar(u8, context.source[0..offset], '\n')) |nl| nl + 1 else 0;
+        const line_start = if (std.mem.findScalarLast(u8, context.source[0..offset], '\n')) |nl| nl + 1 else 0;
         var indentation_end = line_start;
         while (indentation_end < context.source.len and
             (context.source[indentation_end] == ' ' or context.source[indentation_end] == '\t')) : (indentation_end += 1)

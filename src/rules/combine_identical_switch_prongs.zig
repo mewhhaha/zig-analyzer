@@ -106,7 +106,7 @@ fn prongBodyEnd(context: RuleRun, start: usize, switch_end: usize) ?usize {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "adjacent identical switch bodies prefer one combined prong" {
@@ -180,7 +180,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.combine_identical_switch_prongs)] = .information;
+    configuration.levels[@backingInt(types.Rule.combine_identical_switch_prongs)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

@@ -29,8 +29,7 @@ fn findCollapsedErrors(context: RuleRun) !void {
             .rule = .error_collapsed_to_absence,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "catch converts every error to '{s}', making failure indistinguishable from a valid empty result",
                 .{fallback},
             ),
@@ -92,8 +91,7 @@ fn findRedundantCaptures(context: RuleRun) !void {
             .rule = .redundant_error_capture,
             .level = level,
             .span = context.tokens[catch_index + 2].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "caught error '{s}' is never used; remove the capture",
                 .{capture_name},
             ),
@@ -115,12 +113,12 @@ test "immediately tested catch null is deliberate absence handling" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.error_collapsed_to_absence)] = .warning;
+    configuration.levels[@backingInt(types.Rule.error_collapsed_to_absence)] = .warning;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     var collapsed_count: usize = 0;
     for (findings.items) |finding| if (finding.rule == .error_collapsed_to_absence) {
         collapsed_count += 1;
-        try std.testing.expect(finding.span.start > std.mem.indexOf(u8, source, "leaked").?);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "leaked").?);
     };
     try std.testing.expectEqual(@as(usize, 1), collapsed_count);
 }
@@ -132,8 +130,8 @@ test "collapsed errors and unused captures are distinguished" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.error_collapsed_to_absence)] = .warning;
-    configuration.levels[@intFromEnum(types.Rule.redundant_error_capture)] = .information;
+    configuration.levels[@backingInt(types.Rule.error_collapsed_to_absence)] = .warning;
+    configuration.levels[@backingInt(types.Rule.redundant_error_capture)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
 }

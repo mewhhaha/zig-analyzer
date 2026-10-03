@@ -17,7 +17,7 @@ pub fn run(context: RuleRun) !void {
             const edits = try context.allocator.alloc(types.Edit, 1);
             edits[0] = .{
                 .span = .{ .start = token.loc.start, .end = context.tokens[expression_end].loc.end },
-                .replacement = try std.fmt.allocPrint(context.allocator, "comptime !({s})", .{expression}),
+                .replacement = try context.allocator.print("comptime !({s})", .{expression}),
             };
             const fixes = try context.allocator.alloc(types.Fix, 1);
             fixes[0] = .{
@@ -30,8 +30,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .negated_comptime_expression,
                 .level = level,
                 .span = span,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "'!comptime {s}' applies the negation with surprising precedence; write 'comptime !({s})'",
                     .{ expression, expression },
                 ),
@@ -74,7 +73,7 @@ test "negated comptime call warns and rewrites into the comptime expression" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "builtin.isDebug()") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "builtin.isDebug()") != null);
     try std.testing.expectEqualStrings("comptime !(builtin.isDebug())", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expect(!findings[0].fixes[0].fix_all);
 }
@@ -116,7 +115,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.negated_comptime_expression)] = .information;
+    configuration.levels[@backingInt(types.Rule.negated_comptime_expression)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

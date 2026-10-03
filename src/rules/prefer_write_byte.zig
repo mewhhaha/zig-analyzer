@@ -47,7 +47,7 @@ fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_e
 
     const fixes = try context.allocator.alloc(types.Fix, 1);
     fixes[0] = .{
-        .title = try std.fmt.allocPrint(context.allocator, "Use 'writeByte({s})'", .{char_lit}),
+        .title = try context.allocator.print("Use 'writeByte({s})'", .{char_lit}),
         .kind = .quickfix,
         .edits = edits,
         .preferred = true,
@@ -58,8 +58,7 @@ fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_e
         .rule = .prefer_write_byte,
         .level = level,
         .span = context.tokens[call_index].loc,
-        .message = try std.fmt.allocPrint(
-            context.allocator,
+        .message = try context.allocator.print(
             "writing a single character via 'writeAll' incurs slice overhead; use 'writeByte({s})'",
             .{char_lit},
         ),
@@ -95,7 +94,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
 
             const fixes = try context.allocator.alloc(types.Fix, 1);
             fixes[0] = .{
-                .title = try std.fmt.allocPrint(context.allocator, "Use 'writeByte({s})'", .{char_lit}),
+                .title = try context.allocator.print("Use 'writeByte({s})'", .{char_lit}),
                 .kind = .quickfix,
                 .edits = edits,
                 .preferred = true,
@@ -106,8 +105,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
                 .rule = .prefer_write_byte,
                 .level = level,
                 .span = context.tokens[call_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "writing a single character via 'print' incurs format parsing overhead; use 'writeByte({s})'",
                     .{char_lit},
                 ),
@@ -135,7 +133,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
 
             const fixes = try context.allocator.alloc(types.Fix, 1);
             fixes[0] = .{
-                .title = try std.fmt.allocPrint(context.allocator, "Use 'writeByte({s})'", .{val_expr}),
+                .title = try context.allocator.print("Use 'writeByte({s})'", .{val_expr}),
                 .kind = .quickfix,
                 .edits = edits,
                 .preferred = true,
@@ -146,8 +144,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
                 .rule = .prefer_write_byte,
                 .level = level,
                 .span = context.tokens[call_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "formatting a single character via 'print(\"{{c}}\", ...)' incurs format parsing overhead; use 'writeByte({s})'",
                     .{val_expr},
                 ),
@@ -227,18 +224,18 @@ fn parseSingleByteLiteral(allocator: std.mem.Allocator, text: []const u8) ?[]con
     if (inner.len == 1) {
         if (inner[0] == '\\') return null;
         if (inner[0] == '\'') return allocator.dupe(u8, "'\\''") catch null;
-        return std.fmt.allocPrint(allocator, "'{c}'", .{inner[0]}) catch null;
+        return allocator.print("'{c}'", .{inner[0]}) catch null;
     }
     if (inner.len == 2 and inner[0] == '\\') {
         switch (inner[1]) {
-            'n', 'r', 't', '\\', '0' => return std.fmt.allocPrint(allocator, "'\\{c}'", .{inner[1]}) catch null,
+            'n', 'r', 't', '\\', '0' => return allocator.print("'\\{c}'", .{inner[1]}) catch null,
             '\'' => return allocator.dupe(u8, "'\\''") catch null,
             '"' => return allocator.dupe(u8, "'\"'") catch null,
             else => return null,
         }
     }
     if (inner.len == 4 and inner[0] == '\\' and inner[1] == 'x') {
-        return std.fmt.allocPrint(allocator, "'{s}'", .{inner}) catch null;
+        return allocator.print("'{s}'", .{inner}) catch null;
     }
     return null;
 }
@@ -358,6 +355,6 @@ fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token
 
 fn testConfiguration() types.Configuration {
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_write_byte)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_write_byte)] = .warning;
     return configuration;
 }

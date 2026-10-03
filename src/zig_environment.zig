@@ -21,9 +21,9 @@ pub fn libDirectory(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
 
 fn parseLibDirectory(allocator: std.mem.Allocator, environment: []const u8) ![]u8 {
     const prefix = ".lib_dir = \"";
-    const start = std.mem.indexOf(u8, environment, prefix) orelse return error.ZigEnvironmentMalformed;
+    const start = std.mem.find(u8, environment, prefix) orelse return error.ZigEnvironmentMalformed;
     const value_start = start + prefix.len;
-    const value_end = std.mem.indexOfScalarPos(u8, environment, value_start, '"') orelse {
+    const value_end = std.mem.findScalarPos(u8, environment, value_start, '"') orelse {
         return error.ZigEnvironmentMalformed;
     };
     return allocator.dupe(u8, environment[value_start..value_end]);

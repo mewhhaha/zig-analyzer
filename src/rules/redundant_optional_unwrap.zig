@@ -44,8 +44,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .redundant_optional_unwrap,
             .level = level,
             .span = context.tokens[condition_index + 2].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional '{s}' is already available as capture '{s}'; forcing it again obscures the proven non-null value",
                 .{ optional_name, capture_name },
             ),
@@ -106,7 +105,7 @@ test "optional captures replace repeated force unwraps" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -125,7 +124,7 @@ test "reassigned optionals do not produce capture rewrites" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -143,7 +142,7 @@ test "a field named like the optional binding is not the binding" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -161,7 +160,7 @@ test "assigning through the forced unwrap disqualifies the capture rewrite" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,

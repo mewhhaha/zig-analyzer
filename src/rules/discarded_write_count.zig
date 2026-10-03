@@ -43,7 +43,7 @@ fn receiverIsAllocatingWriter(context: RuleRun, receiver: []const u8, before: us
         const scope_end = context.enclosingScopeEnd(candidate - 1) orelse continue;
         if (scope_end < before) continue;
         const declaration = context.source[context.tokens[candidate - 1].loc.start..context.tokens[declaration_end].loc.end];
-        if (std.mem.indexOf(u8, declaration, "Writer.Allocating") != null) return true;
+        if (std.mem.find(u8, declaration, "Writer.Allocating") != null) return true;
 
         var equal_index = candidate + 1;
         while (equal_index < declaration_end and context.tokens[equal_index].tag != .equal) : (equal_index += 1) {}

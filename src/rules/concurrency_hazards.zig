@@ -52,8 +52,7 @@ fn findLockOrderCycles(context: RuleRun) !void {
                             .rule = .lock_order_cycle,
                             .level = level,
                             .span = context.tokens[index].loc,
-                            .message = try std.fmt.allocPrint(
-                                context.allocator,
+                            .message = try context.allocator.print(
                                 "lock order '{s}' then '{s}' conflicts with an earlier '{s}' then '{s}' acquisition and can deadlock",
                                 .{ earlier.field, field, field, earlier.field },
                             ),
@@ -117,8 +116,7 @@ fn findWaitsWhileHoldingLocks(context: RuleRun) !void {
                     .rule = .wait_while_holding_lock,
                     .level = level,
                     .span = context.tokens[while_index].loc,
-                    .message = try std.fmt.allocPrint(
-                        context.allocator,
+                    .message = try context.allocator.print(
                         "loop waits for '{s}' while holding '{s}', but another operation needs that lock to update the state",
                         .{ state_field, lock_field },
                     ),

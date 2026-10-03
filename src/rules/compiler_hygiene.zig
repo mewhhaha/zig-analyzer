@@ -6,7 +6,7 @@ const types = @import("types.zig");
 pub fn run(context: RuleRun) !void {
     try findUselessErrorReturns(context);
     try findExposedPrivateTypes(context);
-    try findDeprecatedReferences(context);
+    try @import("deprecated_declarations.zig").runLocal(context);
     try findMutatedContainerCopies(context);
 }
 
@@ -29,8 +29,7 @@ fn findUselessErrorReturns(context: RuleRun) !void {
             .rule = .useless_error_return,
             .level = level,
             .span = context.tokens[error_separator].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "function '{s}' returns an error union, but its fully visible body has no operation that can fail",
                 .{name},
             ),
@@ -77,6 +76,7 @@ fn bodyIsProvenInfallible(context: RuleRun, start: usize, end: usize) bool {
             !context.tokenIs(index, "@as") and !context.tokenIs(index, "@intCast") and
             !context.tokenIs(index, "@floatCast") and !context.tokenIs(index, "@ptrCast") and
             !context.tokenIs(index, "@enumFromInt") and !context.tokenIs(index, "@intFromEnum") and
+            !context.tokenIs(index, "@fromBackingInt") and !context.tokenIs(index, "@backingInt") and
             !context.tokenIs(index, "@TypeOf")) return false,
         else => {},
     };
@@ -140,8 +140,7 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             const level = if (declaration.error_set) error_level else type_level;
             if (level == .off) continue;
             const related = try relatedDeclaration(context, declaration);
-            const message = try std.fmt.allocPrint(
-                context.allocator,
+            const message = try context.allocator.print(
                 "public declaration exposes private {s} '{s}', which callers cannot name",
                 .{ if (declaration.error_set) "error set" else "type", declaration.name },
             );
@@ -208,55 +207,6 @@ fn relatedDeclaration(context: RuleRun, declaration: PrivateDeclaration) ![]cons
     return related;
 }
 
-const DeprecatedDeclaration = struct {
-    name: []const u8,
-    declaration_index: usize,
-    advice: []const u8,
-};
-
-fn findDeprecatedReferences(context: RuleRun) !void {
-    const level = context.level(.deprecated_declaration);
-    if (level == .off) return;
-    var declarations: std.ArrayList(DeprecatedDeclaration) = .empty;
-    defer declarations.deinit(context.allocator);
-    for (context.tokens, 0..) |token, doc_index| {
-        if (token.tag != .doc_comment and token.tag != .container_doc_comment) continue;
-        const comment = std.mem.trim(u8, context.tokenText(doc_index), "/!< \t\r\n");
-        if (!startsWithIgnoreCase(comment, "Deprecated:")) continue;
-        var declaration_index = doc_index + 1;
-        while (declaration_index < context.tokens.len and
-            (context.tokens[declaration_index].tag == .doc_comment or context.tokens[declaration_index].tag == .container_doc_comment or
-                context.tokens[declaration_index].tag == .keyword_pub or context.tokens[declaration_index].tag == .keyword_export or
-                context.tokens[declaration_index].tag == .keyword_extern)) : (declaration_index += 1)
-        {}
-        if (declaration_index + 1 >= context.tokens.len) continue;
-        if (context.tokens[declaration_index].tag != .keyword_fn and context.tokens[declaration_index].tag != .keyword_const and
-            context.tokens[declaration_index].tag != .keyword_var) continue;
-        if (context.tokens[declaration_index + 1].tag != .identifier) continue;
-        try declarations.append(context.allocator, .{
-            .name = context.tokenText(declaration_index + 1),
-            .declaration_index = declaration_index + 1,
-            .advice = std.mem.trim(u8, comment["Deprecated:".len..], " \t\r\n"),
-        });
-    }
-    for (declarations.items) |declaration| {
-        if (identifierDeclarationCount(context, declaration.name) != 1) continue;
-        for (context.tokens, 0..) |token, index| {
-            if (token.tag != .identifier or index == declaration.declaration_index or
-                !context.tokenIs(index, declaration.name)) continue;
-            try context.emit(.{
-                .rule = .deprecated_declaration,
-                .level = level,
-                .span = token.loc,
-                .message = if (declaration.advice.len == 0)
-                    try std.fmt.allocPrint(context.allocator, "declaration '{s}' is deprecated", .{declaration.name})
-                else
-                    try std.fmt.allocPrint(context.allocator, "declaration '{s}' is deprecated: {s}", .{ declaration.name, declaration.advice }),
-            });
-        }
-    }
-}
-
 fn findMutatedContainerCopies(context: RuleRun) !void {
     const level = context.level(.mutated_container_copy);
     if (level == .off) return;
@@ -278,8 +228,7 @@ fn findMutatedContainerCopies(context: RuleRun) !void {
             .rule = .mutated_container_copy,
             .level = level,
             .span = context.tokens[mutation].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "local copy '{s}' mutates standard container metadata, but field '{s}' is never updated",
                 .{ copy_name, original },
             ),
@@ -418,14 +367,6 @@ fn insideStandardFormatterType(context: RuleRun, start: usize, end: usize, refer
     return false;
 }
 
-fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
-    if (value.len < prefix.len) return false;
-    for (value[0..prefix.len], prefix) |actual, expected| {
-        if (std.ascii.toLower(actual) != std.ascii.toLower(expected)) return false;
-    }
-    return true;
-}
-
 fn nextTag(tokens: []const std.zig.Token, start: usize, tag: std.zig.Token.Tag) ?usize {
     for (tokens[start..], start..) |token, index| if (token.tag == tag) return index;
     return null;
@@ -458,10 +399,10 @@ test "compiler hygiene rules report only locally proven contracts and ownership 
         "pub fn fail() Failure!void { return error.Bad; }\n" ++
         "fn use(self: *State) void { _ = old; var copy: std.ArrayList(u8) = self.list; _ = copy.pop(); }\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.exposed_private_type)] = .warning;
-    configuration.levels[@intFromEnum(types.Rule.exposed_private_error_set)] = .warning;
+    configuration.levels[@backingInt(types.Rule.exposed_private_type)] = .warning;
+    configuration.levels[@backingInt(types.Rule.exposed_private_error_set)] = .warning;
     const found = try findingsFor(arena.allocator(), source, configuration);
-    var seen = [_]bool{false} ** 5;
+    var seen: [5]bool = @splat(false);
     for (found) |finding| switch (finding.rule) {
         .useless_error_return => seen[0] = true,
         .exposed_private_type => seen[1] = true,
@@ -507,7 +448,7 @@ test "private containers do not expose their private receiver types" {
         "pub fn formatter() std.fmt.Alt(FormatContext, render) { return .{}; }\n" ++
         "pub fn qualified() types.Secret { return .{}; }\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.exposed_private_type)] = .warning;
+    configuration.levels[@backingInt(types.Rule.exposed_private_type)] = .warning;
     const found = try findingsFor(arena.allocator(), source, configuration);
     var exposed_count: usize = 0;
     for (found) |finding| {
@@ -522,7 +463,7 @@ test "public aliases publish private components under a name callers can use" {
     const source: [:0]const u8 =
         "const Failure = error{Bad}; pub const PublicFailure = Failure || error{Other}; pub fn main() Failure!void {}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.exposed_private_error_set)] = .warning;
+    configuration.levels[@backingInt(types.Rule.exposed_private_error_set)] = .warning;
     const found = try findingsFor(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .exposed_private_error_set);
 }

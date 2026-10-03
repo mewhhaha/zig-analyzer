@@ -58,8 +58,7 @@ pub fn run(context: RuleRun) !void {
                     .start = context.tokens[declaration_end].loc.end,
                     .end = context.tokens[declaration_end].loc.end,
                 },
-                .replacement = try std.fmt.allocPrint(
-                    context.allocator,
+                .replacement = try context.allocator.print(
                     "\n{s}defer {s}.deinit({s});",
                     .{ indent, container_name, alloc_expr },
                 ),
@@ -67,8 +66,7 @@ pub fn run(context: RuleRun) !void {
 
             const allocated_fixes = try context.allocator.alloc(types.Fix, 1);
             allocated_fixes[0] = .{
-                .title = try std.fmt.allocPrint(
-                    context.allocator,
+                .title = try context.allocator.print(
                     "Insert 'defer {s}.deinit({s});'",
                     .{ container_name, alloc_expr },
                 ),
@@ -86,14 +84,12 @@ pub fn run(context: RuleRun) !void {
             .span = context.tokens[declaration_index + 1].loc,
             .fixes = fixes,
             .message = if (allocator_name) |alloc_expr|
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "unmanaged container '{s}' is mutated without visible 'deinit({s})' or ownership transfer",
                     .{ container_name, alloc_expr },
                 )
             else
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "unmanaged container '{s}' is mutated without visible 'deinit' or ownership transfer",
                     .{container_name},
                 ),
@@ -181,7 +177,7 @@ fn isAllocatingMethod(name: []const u8) bool {
 
 fn isArenaAllocator(allocator_name: ?[]const u8) bool {
     const name = allocator_name orelse return false;
-    return std.ascii.indexOfIgnoreCase(name, "arena") != null;
+    return std.ascii.findIgnoreCase(name, "arena") != null;
 }
 
 fn isContainerDeclaration(
@@ -361,7 +357,7 @@ fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool 
 
 fn testConfiguration() types.Configuration {
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.missing_container_deinit)] = .warning;
+    configuration.levels[@backingInt(types.Rule.missing_container_deinit)] = .warning;
     return configuration;
 }
 
@@ -401,10 +397,10 @@ test "missing container deinit detects mutated unmanaged list without deinit" {
 
     try std.testing.expectEqual(1, findings.items.len);
     try std.testing.expectEqual(types.Rule.missing_container_deinit, findings.items[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "list") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "deinit(allocator)") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "list") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "deinit(allocator)") != null);
     try std.testing.expectEqual(1, findings.items[0].fixes.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].fixes[0].edits[0].replacement, "defer list.deinit(allocator);") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].fixes[0].edits[0].replacement, "defer list.deinit(allocator);") != null);
 }
 
 test "missing container deinit detects mutated unmanaged map without deinit" {
@@ -430,7 +426,7 @@ test "missing container deinit detects mutated unmanaged map without deinit" {
 
     try std.testing.expectEqual(1, findings.items.len);
     try std.testing.expectEqual(types.Rule.missing_container_deinit, findings.items[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "map") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "map") != null);
 }
 
 test "missing container deinit ignores container with defer deinit" {

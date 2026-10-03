@@ -30,7 +30,7 @@ pub fn run(context: RuleRun) !void {
         const expected_text = argumentSource(context, arguments[1]);
         if (actual_text.len == 0 or expected_text.len == 0) continue;
 
-        const replacement = try std.fmt.allocPrint(context.allocator, "{s}, {s}", .{ expected_text, actual_text });
+        const replacement = try context.allocator.print("{s}, {s}", .{ expected_text, actual_text });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -50,8 +50,7 @@ pub fn run(context: RuleRun) !void {
             .fix_all = true,
         };
 
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "std.testing.expectEqual expects '(expected, actual)', but literal '{s}' is passed as the second argument",
             .{expected_text},
         );
@@ -171,7 +170,7 @@ fn isLiteralArgument(context: RuleRun, range: ArgumentRange) bool {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 test "expect equal argument order detects swapped literals" {
@@ -227,7 +226,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.expect_equal_argument_order)] = .warning;
+    configuration.levels[@backingInt(types.Rule.expect_equal_argument_order)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

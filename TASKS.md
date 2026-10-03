@@ -335,3 +335,36 @@ Acceptance:
 - [x] Compiler facts enter project analysis as domain values; opt-in findings
   report divergent public shapes across analyzed roots and public declarations
   outside every successfully analyzed root's import graph.
+
+## ZA-020 — Zig 0.17.0 release preparation
+
+Status: complete
+Depends on: ZA-002, ZA-006, ZA-014, ZA-019
+
+Outcome: zig-analyzer `0.17.0-1` supports the pinned Zig 0.17.0 toolchain and
+compiler backend, with all previous lints audited and incremental diagnostics
+reused across ordinary source saves.
+
+Acceptance:
+
+- [x] Toolchain, source commit, backend patch, dependency, release version, and
+  CI/download checksums are pinned to compatible inputs.
+- [x] All 190 original lint IDs have an evidence-backed relevance audit;
+  updated API fixes and ownership models preserve current Zig behavior.
+- [x] Eight opt-in modernization rules cover deprecated builtins, removed
+  syntax, build APIs, changed bit casts, linkage, and container APIs; idiomatic
+  ceiling-division guidance preserves the checked helper's error contract.
+- [x] Imported deprecation warnings, build and target migration coverage,
+  explicit container initialization, Reader renames, module runtime safety,
+  and partial network-send guidance cover the remaining release gaps.
+- [x] Incremental sessions survive ordinary saves while imported edits and
+  closed overlays refresh diagnostics; changed build configuration or an
+  independent saved source root restarts the appropriate compilation.
+- [x] Host and compiler-backed suites, formatting, the optimized build, and
+  analyzer self-check pass on Zig 0.17.0.
+- [x] The Linux archive contains a compatible analyzer/backend pair and
+  passes version, doctor, and compilation checks from a temporary workspace.
+
+Release notes and the exhaustive rule audit are in
+[`docs/release-0.17.0-1.md`](docs/release-0.17.0-1.md) and
+[`docs/zig-0.17.0-lint-audit.md`](docs/zig-0.17.0-lint-audit.md).

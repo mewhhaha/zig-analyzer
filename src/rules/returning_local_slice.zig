@@ -55,8 +55,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
                 .rule = .returning_local_slice,
                 .level = level,
                 .span = context.tokens[return_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned slice '{s}' refers to a local array whose storage expires when this function returns",
                     .{binding_name},
                 ),
@@ -86,8 +85,7 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[address_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned value stores a pointer to local binding '{s}', whose storage expires when the function returns",
                     .{binding_name},
                 ),
@@ -125,8 +123,7 @@ fn findGloballyStoredLocalSlices(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[index + 2].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "slice of local array '{s}' is stored in global binding '{s}' and outlives its backing storage",
                     .{ local_name, destination },
                 ),
@@ -167,8 +164,7 @@ fn findOutputParameterStoredLocalSlices(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[equal_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "slice of local array '{s}' is stored through output parameter '{s}' and outlives its backing storage",
                     .{ local_name, output_name },
                 ),
@@ -207,8 +203,7 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
                 .rule = .local_storage_escape,
                 .level = level,
                 .span = context.tokens[address_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "pointer to local binding '{s}' is retained by {s} beyond the binding's lifetime",
                     .{ local_name, context.tokenText(method_index) },
                 ),
@@ -222,7 +217,7 @@ fn declarationStoresPointer(context: RuleRun, declaration_index: usize, declarat
     if (declaration_index + 2 < declaration_end and context.tokens[declaration_index + 2].tag == .colon) {
         for (context.tokens[declaration_index + 3 .. declaration_end]) |token| {
             if (token.tag == .equal) break;
-            if (token.tag == .asterisk or token.tag == .asterisk_asterisk) return true;
+            if (token.tag == .asterisk) return true;
         }
     }
     return initializedByAllocatorCreate(context, declaration_index, declaration_end);
@@ -236,8 +231,8 @@ fn initializedByAllocatorCreate(context: RuleRun, declaration_index: usize, decl
             context.tokens[create_index + 1].tag == .l_paren)
         {
             const receiver = context.tokenText(create_index - 2);
-            if (std.ascii.indexOfIgnoreCase(receiver, "alloc") != null or
-                std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+            if (std.ascii.findIgnoreCase(receiver, "alloc") != null or
+                std.ascii.findIgnoreCase(receiver, "arena") != null or
                 std.mem.eql(u8, receiver, "gpa")) return true;
         }
     }
@@ -558,7 +553,7 @@ test "returning a slice of a local array expires its storage" {
     try run(context);
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
 
-    configuration.levels[@intFromEnum(@import("types.zig").Rule.returning_local_slice)] = .off;
+    configuration.levels[@backingInt(@import("types.zig").Rule.returning_local_slice)] = .off;
     var disabled: std.ArrayList(@import("types.zig").Finding) = .empty;
     var disabled_context = context;
     disabled_context.configuration = configuration;

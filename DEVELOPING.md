@@ -6,13 +6,13 @@ and manual editor testing. The user-facing motivation and behavior live in
 
 ## Build and verify
 
-The project pins Zig 0.16.0 at commit
-`24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8`.
+The project pins Zig 0.17.0 at commit
+`7647adab80dd088f4de3610fd245915a912eb6ad`.
 
 ```sh
-zig version # must print 0.16.0
+zig version # must print 0.17.0
 git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zig build backend
 zig build test
 zig build backend-test
@@ -30,6 +30,20 @@ commit, patch hash, and protocol version in
 `zig-out/backend/zig-analyzer-backend.json`. Repeating the command reuses the
 verified checkout and compiler caches.
 
+On x86_64 Linux, keep a compiler running while editing to reuse Zig 0.17.0's
+incremental analysis and receive build errors after each saved change:
+
+```sh
+zig build -fincremental --watch
+# Or keep the test build running:
+zig build test -fincremental --watch
+```
+
+Stop the watch process with Ctrl-C. A one-shot `zig build` still uses its normal
+file caches; in-memory incremental state is reused by the running watch process.
+See the [Zig 0.17.0 release notes](https://ziglang.org/download/0.17.0/release-notes.html#Incremental-Compilation)
+for supported targets.
+
 `TASKS.md` is the authoritative implementation ledger. A feature appearing in
 the repository does not make an unchecked acceptance criterion complete.
 
@@ -40,6 +54,14 @@ protocol added to the pinned Zig compiler. Syntax-backed answers remain
 available while a document is incomplete; compiler-resolved shapes, members,
 and top-level constant values augment them when the saved program can be
 analyzed.
+
+Editor diagnostics keep the patched compiler running with `-fincremental` and
+reuse its analysis state across unsaved edits and ordinary source saves. Each
+update also checks saved imports for changes. Saving `build.zig` or
+`build.zig.zon` restarts analysis so a changed build configuration can select
+the appropriate source root. Syntax diagnostics remain available while the
+debounced compiler worker updates; compiler diagnostics publish only for the
+current document generation.
 
 The project separates thin transport/composition modules from thick proof and
 policy modules. Core rules and actions return byte-span domain values and do
@@ -60,7 +82,7 @@ support for the opinionated profile.
 Build the analyzer before opening this repository in Helix:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 hx --health zig
 ```
 
@@ -79,8 +101,10 @@ generates clean-by-construction programs that must produce no default
 findings, checks that formatting, comments, and consistent renames leave
 findings unchanged, and feeds byte mutations and generated token soup through
 every rule. The same tests run under `zig build test`; the continuous
-`--fuzz` mode is blocked by a `test_runner.zig` compile error in the shipped
-Zig 0.16.0.
+`--fuzz` mode compiles and passes the seed tests, but Zig 0.17.0's continuous
+fuzz driver then panics with `start index 1 is larger than end index 0`. The
+same failure reproduces with a standalone no-op fuzz probe. The normal test
+suite still runs the deterministic fuzz cases.
 
 See [examples/README.md](examples/README.md) for exact completion, hover,
 navigation, rename, diagnostic, and code-action cases.
@@ -92,7 +116,7 @@ configuration:
 
 ```sh
 zig build backend-test
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 hx fixtures/comptime/main.zig
 ```
 
@@ -147,8 +171,8 @@ create and push an annotated tag with the same version:
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.16.0-6 -m "zig-analyzer 0.16.0-6"
-git push origin v0.16.0-6
+git tag -a v0.17.0-1 -m "zig-analyzer 0.17.0-1"
+git push origin v0.17.0-1
 ```
 
 The Release workflow rejects a tag that differs from `build.zig.zon`, reruns

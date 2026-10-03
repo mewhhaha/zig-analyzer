@@ -36,7 +36,7 @@ pub const Session = struct {
         const port = 20_000 + std.mem.readInt(u16, random_bytes[0..2], .little) % 30_000;
         const authentication_token = std.fmt.bytesToHex(random_bytes[2..], .lower);
         var port_buffer: [5]u8 = undefined;
-        const port_text = try std.fmt.bufPrint(&port_buffer, "{d}", .{port});
+        const port_text = try std.mem.print(&port_buffer, "{d}", .{port});
 
         var environ_map = try std.process.Environ.createMap(environ, allocator);
         defer environ_map.deinit();

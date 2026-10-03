@@ -46,7 +46,7 @@ pub const Cache = struct {
         root_dir: std.Io.Dir,
         configuration: analysis.Configuration,
     ) Cache {
-        var executable_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var executable_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const executable_path_length = std.process.executablePath(io, &executable_path_buffer) catch return .{};
         const executable_stat = std.Io.Dir.cwd().statFile(io, executable_path_buffer[0..executable_path_length], .{}) catch return .{};
 
@@ -281,7 +281,7 @@ test "cache invalidates source path and configuration changes" {
     try std.testing.expect(cache.load(io, allocator, "src/main.zig", "fn changed") == null);
     try std.testing.expect(cache.load(io, allocator, "src/other.zig", "fn missing") == null);
 
-    configuration.levels[@intFromEnum(analysis.Rule.discarded_error)] = .information;
+    configuration.levels[@backingInt(analysis.Rule.discarded_error)] = .information;
     var changed_cache = Cache.init(io, temporary.dir, configuration);
     defer changed_cache.deinit(io);
     try std.testing.expect(changed_cache.load(io, allocator, "src/main.zig", "fn missing") == null);

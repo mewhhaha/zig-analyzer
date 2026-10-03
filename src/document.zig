@@ -246,9 +246,14 @@ pub const Store = struct {
     ) !void {
         var document = try Document.open(store.allocator, uri, version, source);
         errdefer document.deinit();
-        if (try store.documents.fetchPut(store.allocator, document.uri, document)) |previous| {
-            var previous_document = previous.value;
+        const entry = try store.documents.getOrPut(store.allocator, document.uri);
+        if (entry.found_existing) {
+            var previous_document = entry.value_ptr.*;
+            entry.key_ptr.* = document.uri;
+            entry.value_ptr.* = document;
             previous_document.deinit();
+        } else {
+            entry.value_ptr.* = document;
         }
     }
 
@@ -291,7 +296,7 @@ const ParsedSource = struct {
 };
 
 fn parseSource(allocator: std.mem.Allocator, source: [:0]const u8) !ParsedSource {
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     errdefer tree.deinit(allocator);
     var tokens: std.ArrayList(std.zig.Token) = .empty;
     errdefer tokens.deinit(allocator);
@@ -600,6 +605,12 @@ test "store owns URI keys and closes documents" {
     defer store.deinit();
     try store.open("file:///fixture.zig", 1, "const value = 1;\n");
     try std.testing.expect(store.get("file:///fixture.zig") != null);
+    for (2..5) |version| {
+        try store.open("file:///fixture.zig", @intCast(version), "const replacement = 2;\n");
+        const reopened = store.get("file:///fixture.zig").?;
+        try std.testing.expectEqual(@as(i32, @intCast(version)), reopened.version);
+        try std.testing.expectEqualStrings("const replacement = 2;\n", reopened.source);
+    }
     try std.testing.expect(store.close("file:///fixture.zig"));
     try std.testing.expect(store.get("file:///fixture.zig") == null);
 }
@@ -653,7 +664,7 @@ test "scoped identifier lookup follows a loop capture" {
     const source = "fn run(values: []const u32) void { for (values) |value| { _ = value; } }";
     var document = try Document.open(std.testing.allocator, "file:///capture.zig", 1, source);
     defer document.deinit();
-    const use_offset = std.mem.lastIndexOf(u8, source, "value").?;
+    const use_offset = std.mem.findLast(u8, source, "value").?;
     const spans = (try document.scopedIdentifierSpans(std.testing.allocator, use_offset)).?;
     defer std.testing.allocator.free(spans);
     try std.testing.expectEqual(@as(usize, 2), spans.len);

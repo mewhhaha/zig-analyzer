@@ -15,8 +15,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .unchecked_slice_reinterpretation,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "reinterpreting plain slice '{s}' as an aligned pointer can panic for alignment and read beyond short input; validate length and copy into aligned storage",
                 .{slice_name},
             ),

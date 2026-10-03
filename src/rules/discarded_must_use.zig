@@ -17,8 +17,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .discarded_must_use,
             .level = level,
             .span = context.tokens[call_open - 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "return value from '{s}' is discarded, but contract '{s}' requires callers to use it",
                 .{ callable, contract },
             ),
@@ -59,7 +58,7 @@ test "must-use contracts reject explicit result discards" {
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
     configuration.must_use_contracts = &.{"Builder.finish"};
-    configuration.levels[@intFromEnum(types.Rule.discarded_must_use)] = .warning;
+    configuration.levels[@backingInt(types.Rule.discarded_must_use)] = .warning;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,

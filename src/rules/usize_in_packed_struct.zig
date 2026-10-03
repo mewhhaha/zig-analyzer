@@ -48,8 +48,7 @@ pub fn run(context: RuleRun) !void {
                         .rule = .usize_in_packed_struct,
                         .level = level,
                         .span = context.tokens[type_index].loc,
-                        .message = try std.fmt.allocPrint(
-                            context.allocator,
+                        .message = try context.allocator.print(
                             "field '{s}' of this {s} {s} uses pointer-sized '{s}'; its width and the layout vary by target",
                             .{ context.tokenText(index - 1), layout, container, context.tokenText(type_index) },
                         ),
@@ -99,12 +98,12 @@ test "pointer-sized fields in packed containers report the layout hazard" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'count'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "packed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'base'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'isize'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "'address'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[2].message, "packed union") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'count'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "packed") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "'base'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "'isize'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "'address'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[2].message, "packed union") != null);
 }
 
 test "pointer-sized fields after methods and declarations report the hazard" {
@@ -121,7 +120,7 @@ test "pointer-sized fields after methods and declarations report the hazard" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'base'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'base'") != null);
 }
 
 test "public pointer-sized fields report the hazard" {
@@ -134,7 +133,7 @@ test "public pointer-sized fields report the hazard" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'count'") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "'count'") != null);
 }
 
 test "plain and extern containers stay clean" {

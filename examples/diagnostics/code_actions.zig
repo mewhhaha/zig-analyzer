@@ -89,8 +89,8 @@ fn pointerCasts(source: *const u8) void {
 }
 
 fn reflectedDispatch(value: Payload) u8 {
-    inline for (@typeInfo(Payload).@"union".fields) |field| {
-        if (std.mem.eql(u8, field.name, @tagName(value))) return @field(value, field.name);
+    inline for (@typeInfo(Payload).@"union".field_names) |field_name| {
+        if (std.mem.eql(u8, field_name, @tagName(value))) return @field(value, field_name);
     }
     unreachable;
 }

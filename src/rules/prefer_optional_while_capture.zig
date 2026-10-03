@@ -33,8 +33,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_optional_while_capture,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "loop unwraps '{s}' into '{s}' and breaks on null; capture the optional in the while condition",
                 .{ optional_source, capture },
             ),
@@ -58,7 +57,7 @@ test "manual iterator unwrapping prefers a while capture" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "iterator.next()") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "iterator.next()") != null);
 }
 
 test "labeled breaks and nonleading unwraps stay unchanged" {
@@ -87,7 +86,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_optional_while_capture)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_optional_while_capture)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

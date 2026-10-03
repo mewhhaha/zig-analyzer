@@ -217,7 +217,7 @@ fn findOperandBefore(context: RuleRun, before: usize) ?TokenSpan {
 }
 
 fn containsComment(source: []const u8) bool {
-    return std.mem.indexOf(u8, source, "//") != null or std.mem.indexOf(u8, source, "/*") != null;
+    return std.mem.find(u8, source, "//") != null or std.mem.find(u8, source, "/*") != null;
 }
 
 fn emitFinding(
@@ -254,14 +254,14 @@ fn emitFinding(
 
     if (is_equality or is_inequality) {
         const replacement = if (is_equality)
-            try std.fmt.allocPrint(context.allocator, "{s}({s})", .{ prefix, operand_text })
+            try context.allocator.print("{s}({s})", .{ prefix, operand_text })
         else
-            try std.fmt.allocPrint(context.allocator, "!{s}({s})", .{ prefix, operand_text });
+            try context.allocator.print("!{s}({s})", .{ prefix, operand_text });
 
         const fix_title = if (is_equality)
-            try std.fmt.allocPrint(context.allocator, "Use '{s}({s})'", .{ prefix, operand_text })
+            try context.allocator.print("Use '{s}({s})'", .{ prefix, operand_text })
         else
-            try std.fmt.allocPrint(context.allocator, "Use '!{s}({s})'", .{ prefix, operand_text });
+            try context.allocator.print("Use '!{s}({s})'", .{ prefix, operand_text });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -279,14 +279,12 @@ fn emitFinding(
         };
 
         const message = if (is_equality)
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "comparison '{s}' always evaluates to false; use '{s}({s})' to test for NaN",
                 .{ whole_source, prefix, operand_text },
             )
         else
-            try std.fmt.allocPrint(
-                context.allocator,
+            try context.allocator.print(
                 "comparison '{s}' always evaluates to true; use '!{s}({s})' to test for NaN",
                 .{ whole_source, prefix, operand_text },
             );
@@ -299,8 +297,7 @@ fn emitFinding(
             .fixes = fixes,
         });
     } else {
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "comparison '{s}' always evaluates to false; NaN values are unordered",
             .{whole_source},
         );
@@ -366,7 +363,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]types.Find
 const Configuration = struct {
     fn defaults() types.Configuration {
         var cfg = types.Configuration.defaults();
-        cfg.levels[@intFromEnum(types.Rule.nan_comparison)] = .warning;
+        cfg.levels[@backingInt(types.Rule.nan_comparison)] = .warning;
         return cfg;
     }
 };

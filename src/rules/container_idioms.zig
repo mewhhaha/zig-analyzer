@@ -23,14 +23,14 @@ fn findMembershipLookups(context: RuleRun) !void {
             !context.tokenIs(call_end + 2, "null")) continue;
         if (!bindingHasStandardMapType(context, get_index - 2)) continue;
         const expression = context.source[context.tokens[get_index - 2].loc.start..context.tokens[call_end + 2].loc.end];
-        if (std.mem.indexOf(u8, expression, "//") != null or std.mem.indexOf(u8, expression, "/*") != null) continue;
+        if (std.mem.find(u8, expression, "//") != null or std.mem.find(u8, expression, "/*") != null) continue;
 
         const receiver = context.tokenText(get_index - 2);
         const arguments = context.source[context.tokens[get_index + 1].loc.end..context.tokens[call_end].loc.start];
         const replacement = if (context.tokens[call_end + 1].tag == .bang_equal)
-            try std.fmt.allocPrint(context.allocator, "{s}.contains({s})", .{ receiver, arguments })
+            try context.allocator.print("{s}.contains({s})", .{ receiver, arguments })
         else
-            try std.fmt.allocPrint(context.allocator, "!{s}.contains({s})", .{ receiver, arguments });
+            try context.allocator.print("!{s}.contains({s})", .{ receiver, arguments });
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[get_index - 2].loc.start, .end = context.tokens[call_end + 2].loc.end },
@@ -48,7 +48,7 @@ fn findMembershipLookups(context: RuleRun) !void {
             .rule = .prefer_map_contains,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "'{s}.get' is used only to test key membership; use '{s}.contains'", .{ receiver, receiver }),
+            .message = try context.allocator.print("'{s}.get' is used only to test key membership; use '{s}.contains'", .{ receiver, receiver }),
             .fixes = fixes,
         });
     }
@@ -73,11 +73,11 @@ fn findLastElementIndexing(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[receiver_index + 11].loc.end },
-            .replacement = try std.fmt.allocPrint(context.allocator, "{s}.getLast()", .{receiver}),
+            .replacement = try context.allocator.print("{s}.last().?", .{receiver}),
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = "Use ArrayList.getLast",
+            .title = "Use ArrayList.last",
             .kind = .refactor_rewrite,
             .edits = edits,
             .preferred = true,
@@ -87,7 +87,7 @@ fn findLastElementIndexing(context: RuleRun) !void {
             .rule = .prefer_array_list_last,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "last-element indexing repeats '{s}'; use '{s}.getLast()'", .{ receiver, receiver }),
+            .message = try context.allocator.print("last-element indexing repeats '{s}'; use '{s}.last().?'", .{ receiver, receiver }),
             .fixes = fixes,
         });
     }
@@ -138,7 +138,7 @@ fn findGuardedDiscardedPops(context: RuleRun) !void {
             .rule = .prefer_optional_pop,
             .level = level,
             .span = context.tokens[guard.start].loc,
-            .message = try std.fmt.allocPrint(context.allocator, "'{s}.pop()' already returns null when the list is empty; remove the length guard", .{receiver}),
+            .message = try context.allocator.print("'{s}.pop()' already returns null when the list is empty; remove the length guard", .{receiver}),
             .fixes = fixes,
         });
     }
@@ -172,8 +172,8 @@ fn discardedPopGuard(context: RuleRun, start: usize, end: usize, receiver: []con
 
 fn bindingHasStandardArrayListType(context: RuleRun, use_index: usize) bool {
     const type_name = explicitBindingType(context, use_index) orelse return false;
-    return std.mem.indexOf(u8, type_name, "std.ArrayList(") != null or
-        std.mem.indexOf(u8, type_name, "std.ArrayListUnmanaged(") != null;
+    return std.mem.find(u8, type_name, "std.ArrayList(") != null or
+        std.mem.find(u8, type_name, "std.ArrayListUnmanaged(") != null;
 }
 
 fn bindingHasStandardMapType(context: RuleRun, use_index: usize) bool {
@@ -193,7 +193,7 @@ fn bindingHasStandardMapType(context: RuleRun, use_index: usize) bool {
         "std.ArrayHashMapUnmanaged(",
         "std.json.ObjectMap",
     };
-    for (standard_maps) |standard_map| if (std.mem.indexOf(u8, type_name, standard_map) != null) return true;
+    for (standard_maps) |standard_map| if (std.mem.find(u8, type_name, standard_map) != null) return true;
     return false;
 }
 
@@ -232,15 +232,14 @@ test "standard container operations replace representation-level idioms" {
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expectEqualStrings("map.contains(key)", findings[0].fixes[0].edits[0].replacement);
-    try std.testing.expectEqualStrings("values.getLast()", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("values.last().?", findings[1].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("", findings[2].fixes[0].edits[0].replacement);
     const pop_edit = findings[2].fixes[0].edits[0];
-    const fixed = try std.fmt.allocPrint(
-        arena.allocator(),
+    const fixed = try arena.allocator().print(
         "{s}{s}{s}",
         .{ source[0..pop_edit.span.start], pop_edit.replacement, source[pop_edit.span.end..] },
     );
-    try std.testing.expect(std.mem.indexOf(u8, fixed, "if (ready) _ = values.pop();") != null);
+    try std.testing.expect(std.mem.find(u8, fixed, "if (ready) _ = values.pop();") != null);
 }
 
 test "custom containers and meaningful pop results remain unchanged" {
@@ -266,12 +265,11 @@ test "negative membership and sole pop guards keep their behavior" {
     try std.testing.expectEqual(@as(usize, 2), findings.len);
     try std.testing.expectEqualStrings("!map.contains(key)", findings[0].fixes[0].edits[0].replacement);
     const pop_edit = findings[1].fixes[0].edits[0];
-    const fixed = try std.fmt.allocPrint(
-        arena.allocator(),
+    const fixed = try arena.allocator().print(
         "{s}{s}{s}",
         .{ source[0..pop_edit.span.start], pop_edit.replacement, source[pop_edit.span.end..] },
     );
-    try std.testing.expect(std.mem.indexOf(u8, fixed, "{ _ = values.pop(); }") != null);
+    try std.testing.expect(std.mem.find(u8, fixed, "{ _ = values.pop(); }") != null);
 }
 
 test "container preferences respect source suppression" {
@@ -291,9 +289,9 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_map_contains)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_array_list_last)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_optional_pop)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_map_contains)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_array_list_last)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_optional_pop)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

@@ -1,40 +1,26 @@
 # `prefer-allocator-dupe`
 
-Reports `std.fmt.allocPrint` (or `allocPrintSentinel` with a `0` sentinel) calls
-where the format string has no format specifiers or only contains a single `{s}`
-specifier, recommending `allocator.dupe(u8, ...)` or `allocator.dupeZ(u8, ...)`
-instead.
+[Rule index](RULES.md)
 
-**Why it matters.**
+Reports allocator `print` and `printSentinel` calls, and legacy
+`std.fmt.allocPrint` and `allocPrintSentinel` calls, that only duplicate a string.
+The replacement uses `allocator.dupe(u8, ...)` or `allocator.dupeSentinel(u8, ..., 0)`.
 
-`std.fmt.allocPrint` executes a two-pass formatting routine:
-1. It formats through a counting writer to measure the required buffer length.
-2. It allocates the measured capacity from the allocator.
-3. It formats a second time into the allocated buffer.
+**Why it matters.** Direct duplication allocates the required bytes and copies
+once, avoiding the formatter and its growing output buffer.
 
-When duplicating an existing slice or static string, `allocator.dupe` calculates
-the slice length in $O(1)$, allocates the buffer directly, and copies the bytes
-using SIMD `@memcpy`. Using `allocator.dupe` avoids runtime format string parsing,
-eliminates the counting pass, and reduces binary size.
-
-**When it matters.**
-
-This rule flags:
-- `std.fmt.allocPrint(allocator, "{s}", .{slice})`
-- `std.fmt.allocPrint(allocator, "literal", .{})`
-- `std.fmt.allocPrintSentinel(allocator, 0, "{s}", .{slice})`
-- `std.fmt.allocPrintSentinel(allocator, 0, "literal", .{})`
-
-It leaves format calls with multiple parameters or formatting specifiers untouched.
-
-## Example
+**When it matters.** The format must be a brace-free literal or exactly `"{s}"` with
+one argument. Sentinel calls are rewritten only when their final argument is
+`0`. Allocator methods require an explicitly typed allocator binding or a
+receiver with a recognized allocator role; writer `print` calls stay unchanged.
+Calls with other formatting specifiers or escaped format braces stay unchanged.
 
 ```zig
 // Before
-const copy = try std.fmt.allocPrint(allocator, "{s}", .{name});
-const static_copy = try std.fmt.allocPrint(allocator, "initial_value", .{});
+const copy = try allocator.print("{s}", .{name});
+const terminated = try allocator.printSentinel("literal", .{}, 0);
 
 // After
 const copy = try allocator.dupe(u8, name);
-const static_copy = try allocator.dupe(u8, "initial_value");
+const terminated = try allocator.dupeSentinel(u8, "literal", 0);
 ```

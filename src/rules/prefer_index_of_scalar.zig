@@ -16,12 +16,16 @@ pub fn run(context: RuleRun) !void {
             lastIndexOf,
             indexOfAny,
             lastIndexOfAny,
+            find,
+            findLast,
+            findAny,
+            findLastAny,
             count,
         };
         const func = std.meta.stringToEnum(SearchFunc, func_name) orelse continue;
         const replacement_func: []const u8 = switch (func) {
-            .indexOf, .indexOfAny => "indexOfScalar",
-            .lastIndexOf, .lastIndexOfAny => "lastIndexOfScalar",
+            .indexOf, .indexOfAny, .find, .findAny => "findScalar",
+            .lastIndexOf, .lastIndexOfAny, .findLast, .findLastAny => "findScalarLast",
             .count => "countScalar",
         };
 
@@ -54,7 +58,7 @@ pub fn run(context: RuleRun) !void {
 
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = try std.fmt.allocPrint(context.allocator, "Use '{s}' with {s}", .{ replacement_func, char_lit }),
+            .title = try context.allocator.print("Use '{s}' with {s}", .{ replacement_func, char_lit }),
             .kind = .quickfix,
             .edits = edits,
             .preferred = true,
@@ -62,8 +66,7 @@ pub fn run(context: RuleRun) !void {
         };
 
         const prefix = if (is_std_mem) "std.mem." else "mem.";
-        const message = try std.fmt.allocPrint(
-            context.allocator,
+        const message = try context.allocator.print(
             "searching for single character '{s}' using {s}{s}; use {s}{s} with {s}",
             .{ needle_text, prefix, func_name, prefix, replacement_func, char_lit },
         );
@@ -118,18 +121,18 @@ fn parseSingleByteLiteral(allocator: std.mem.Allocator, text: []const u8) ?[]con
     if (inner.len == 1) {
         if (inner[0] == '\\') return null;
         if (inner[0] == '\'') return allocator.dupe(u8, "'\\''") catch null;
-        return std.fmt.allocPrint(allocator, "'{c}'", .{inner[0]}) catch null;
+        return allocator.print("'{c}'", .{inner[0]}) catch null;
     }
     if (inner.len == 2 and inner[0] == '\\') {
         switch (inner[1]) {
-            'n', 'r', 't', '\\', '0' => return std.fmt.allocPrint(allocator, "'\\{c}'", .{inner[1]}) catch null,
+            'n', 'r', 't', '\\', '0' => return allocator.print("'\\{c}'", .{inner[1]}) catch null,
             '\'' => return allocator.dupe(u8, "'\\''") catch null,
             '"' => return allocator.dupe(u8, "'\"'") catch null,
             else => return null,
         }
     }
     if (inner.len == 4 and inner[0] == '\\' and inner[1] == 'x') {
-        return std.fmt.allocPrint(allocator, "'{s}'", .{inner}) catch null;
+        return allocator.print("'{s}'", .{inner}) catch null;
     }
     return null;
 }
@@ -147,12 +150,30 @@ test "prefer index of scalar detects single-character search" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
-    try std.testing.expectEqualStrings("indexOfScalar", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalar", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("'/'", findings[0].fixes[0].edits[1].replacement);
-    try std.testing.expectEqualStrings("lastIndexOfScalar", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalarLast", findings[1].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("':'", findings[1].fixes[0].edits[1].replacement);
-    try std.testing.expectEqualStrings("indexOfScalar", findings[2].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalar", findings[2].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("'\\n'", findings[2].fixes[0].edits[1].replacement);
+}
+
+test "current find spellings use current scalar replacements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn check(path: []const u8) void {\n" ++
+        "    _ = std.mem.find(u8, path, \"/\");\n" ++
+        "    _ = std.mem.findLast(u8, path, \"/\");\n" ++
+        "    _ = std.mem.findAny(u8, path, \"/\");\n" ++
+        "    _ = std.mem.findLastAny(u8, path, \"/\");\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 4), findings.len);
+    try std.testing.expectEqualStrings("findScalar", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalarLast", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalar", findings[2].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("findScalarLast", findings[3].fixes[0].edits[0].replacement);
 }
 
 test "multi-character or scalar search stays unchanged" {
@@ -201,7 +222,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_index_of_scalar)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_index_of_scalar)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

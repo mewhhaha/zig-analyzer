@@ -38,8 +38,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .invalidated_container_view,
                 .level = level,
                 .span = context.tokens[view.name_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "{s} '{s}' into container '{s}' is used after {s}, which may invalidate the view or its backing storage",
                     .{ if (view.kind == .items) "slice" else "iterator", view_name, container_name, invalidation.method },
                 ),
@@ -68,8 +67,7 @@ fn findArenaResetViews(context: RuleRun, level: rule_types.Level) !void {
             .rule = .invalidated_container_view,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "arena allocation '{s}' is used after {s}.reset invalidates it",
                 .{ binding, arena },
             ),
@@ -89,7 +87,7 @@ fn bindingUsedAfterReset(context: RuleRun, binding: []const u8, start: usize, en
 }
 
 fn allocationReceiver(context: RuleRun, start: usize, end: usize) ?[]const u8 {
-    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ" };
+    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "dupeSentinel", "print", "printSentinel" };
     for (context.tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or method_index < 2 or context.tokens[method_index - 1].tag != .period or
             context.tokens[method_index - 2].tag != .identifier or method_index + 1 >= end or
@@ -178,8 +176,7 @@ fn findFieldContainerViews(context: RuleRun, level: rule_types.Level) !void {
             .rule = .invalidated_container_view,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "slice '{s}' into container field '{s}.{s}' is used after {s}, which may invalidate its backing storage",
                 .{ view_name, base_name, field_name, invalidation.method },
             ),
@@ -279,8 +276,7 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
                 .rule = .invalidated_container_view,
                 .level = level,
                 .span = context.tokens[declaration_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "view '{s}' is used after realloc invalidates its source allocation",
                     .{view_name},
                 ),
@@ -318,7 +314,7 @@ fn reallocationReplacesBorrowedField(context: RuleRun, view_name: []const u8, me
 }
 
 fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
-    if (std.ascii.indexOfIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
+    if (std.ascii.findIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
     var name_index = before;
     while (name_index > 0) {
         name_index -= 1;
@@ -484,7 +480,7 @@ test "container views used after possible reallocation warn" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "append") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "append") != null);
 }
 
 test "arena allocations used after reset warn" {
@@ -506,6 +502,22 @@ test "arena allocations used after reset warn" {
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.invalidated_container_view, findings.items[0].rule);
+}
+
+test "arena printing and sentinel copies are invalidated by reset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(backing: std.mem.Allocator) !void { var scratch = std.heap.ArenaAllocator.init(backing);" ++
+        "defer scratch.deinit(); const allocator = scratch.allocator();" ++
+        "const printed = try allocator.print(\"literal\", .{});" ++
+        "const copied = try allocator.dupeSentinel(u8, \"before\", 0);" ++
+        "_ = scratch.reset(.free_all); consume(printed, copied); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var found: std.ArrayList(rule_types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &found });
+    try std.testing.expectEqual(@as(usize, 2), found.items.len);
+    for (found.items) |finding| try std.testing.expectEqual(rule_types.Rule.invalidated_container_view, finding.rule);
 }
 
 test "arena allocations consumed before reset stay clean" {
@@ -568,7 +580,7 @@ test "container field views used after possible reallocation warn" {
         .findings = &findings,
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "self.output") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "self.output") != null);
 }
 
 test "views not used after mutation stay clean" {

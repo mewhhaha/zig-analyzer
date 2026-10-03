@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 env:
-  ZIG_VERSION: 0.16.0
-  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+  ZIG_VERSION: 0.17.0
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -40,6 +40,6 @@ jobs:
       - name: Run compiler-backed tests
         run: zig build backend-test --summary all
       - name: Build release analyzer
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=fast
       - name: Check analyzer sources
         run: zig-out/bin/zig-analyzer check --no-cache .

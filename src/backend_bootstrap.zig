@@ -3,11 +3,11 @@ const std = @import("std");
 
 const build_options = @import("build_options");
 
-pub const source_directory = ".zig-analyzer/zig-0.16.0";
+pub const source_directory = ".zig-analyzer/zig-0.17.0";
 pub const backend_directory = "zig-out/backend";
 pub const backend_binary = backend_directory ++ "/bin/zig";
 pub const manifest_path = backend_directory ++ "/zig-analyzer-backend.json";
-pub const patch_path = "compiler/zig-0.16.0-analysis.patch";
+pub const patch_path = "compiler/zig-0.17.0-analysis.patch";
 
 const upstream_url = "https://codeberg.org/ziglang/zig";
 
@@ -37,9 +37,9 @@ pub fn findBackend(io: std.Io, allocator: std.mem.Allocator) !?Backend {
     defer allocator.free(installed_directory);
     if (try findBackendInDirectories(io, allocator, installed_directory, installed_directory)) |backend| return backend;
 
-    const source_install_directory = try std.fs.path.resolve(allocator, &.{ executable_directory, "../backend" });
+    const source_install_directory = try std.Io.Dir.path.resolveAlloc(allocator, &.{ executable_directory, "../backend" });
     defer allocator.free(source_install_directory);
-    const source_install_binary_directory = try std.fs.path.join(allocator, &.{ source_install_directory, "bin" });
+    const source_install_binary_directory = try std.Io.Dir.path.join(allocator, &.{ source_install_directory, "bin" });
     defer allocator.free(source_install_binary_directory);
     if (try findBackendInDirectories(io, allocator, source_install_binary_directory, source_install_directory)) |backend| return backend;
 
@@ -52,9 +52,9 @@ fn findBackendInDirectories(
     binary_directory: []const u8,
     manifest_directory: []const u8,
 ) !?Backend {
-    const binary_path = try std.fs.path.join(allocator, &.{ binary_directory, backendExecutableName() });
+    const binary_path = try std.Io.Dir.path.join(allocator, &.{ binary_directory, backendExecutableName() });
     errdefer allocator.free(binary_path);
-    const backend_manifest_path = try std.fs.path.join(allocator, &.{ manifest_directory, "zig-analyzer-backend.json" });
+    const backend_manifest_path = try std.Io.Dir.path.join(allocator, &.{ manifest_directory, "zig-analyzer-backend.json" });
     errdefer allocator.free(backend_manifest_path);
     if (try pathExists(io, binary_path) and try pathExists(io, backend_manifest_path)) {
         return .{
@@ -68,14 +68,14 @@ fn findBackendInDirectories(
 }
 
 fn installedBackendDirectory(allocator: std.mem.Allocator, executable_directory: []const u8) ![]u8 {
-    return std.fs.path.resolve(allocator, &.{ executable_directory, "../libexec/zig-analyzer" });
+    return std.Io.Dir.path.resolveAlloc(allocator, &.{ executable_directory, "../libexec/zig-analyzer" });
 }
 
 fn backendExecutableName() []const u8 {
-    return if (builtin.os.tag == .windows) "zig.exe" else "zig";
+    return if (builtin.target.os.tag == .windows) "zig.exe" else "zig";
 }
 
-pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator) !void {
+pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) !void {
     try verifyBootstrapCompiler(io, allocator);
     try std.Io.Dir.cwd().createDirPath(io, ".zig-analyzer");
 
@@ -84,7 +84,8 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator) !void {
     if (readManifest(io, allocator)) |manifest_result| {
         var manifest = manifest_result;
         defer manifest.deinit();
-        if (!std.mem.eql(u8, manifest.value.patch_sha256, expected_patch_sha256) and
+        if (std.mem.eql(u8, manifest.value.zig_version, build_options.zig_version) and
+            !std.mem.eql(u8, manifest.value.patch_sha256, expected_patch_sha256) and
             try pathExists(io, source_directory))
         {
             try std.Io.Dir.cwd().deleteTree(io, source_directory);
@@ -151,22 +152,25 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator) !void {
     const absolute_global_cache = try std.Io.Dir.path.join(allocator, &.{ project_root, ".zig-analyzer/compiler-global-cache" });
     defer allocator.free(absolute_global_cache);
 
-    try runChecked(io, allocator, source_directory, &.{
+    var build_environment = try environ.createMap(allocator);
+    defer build_environment.deinit();
+    try build_environment.put("ZIG_GLOBAL_CACHE_DIR", absolute_global_cache);
+    try build_environment.put("ZIG_LOCAL_CACHE_DIR", absolute_local_cache);
+
+    try runCheckedWithEnvironment(io, allocator, source_directory, &.{
         "zig",
         "build",
         "-Dno-lib",
         "-Denable-llvm=false",
         "-Ddebug-extensions=true",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dstrip=true",
-        "-Dversion-string=0.16.0+zig-analyzer.1",
+        "-Dversion-string=0.17.0+zig-analyzer.1",
         "--cache-dir",
         absolute_local_cache,
-        "--global-cache-dir",
-        absolute_global_cache,
         "--prefix",
         absolute_backend_directory,
-    });
+    }, &build_environment);
 
     if (!try pathExists(io, backend_binary)) {
         return printFailure(io, "compiler build completed without producing {s}\n", .{backend_binary});
@@ -247,7 +251,7 @@ fn patchSha256(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(bytes);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(digest, .lower)});
+    return try allocator.print("{s}", .{std.fmt.bytesToHex(digest, .lower)});
 }
 
 fn commandOutput(
@@ -276,8 +280,19 @@ fn runChecked(
     cwd: ?[]const u8,
     arguments: []const []const u8,
 ) !void {
+    return runCheckedWithEnvironment(io, allocator, cwd, arguments, null);
+}
+
+fn runCheckedWithEnvironment(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    arguments: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !void {
     const result = try std.process.run(allocator, io, .{
         .argv = arguments,
+        .environ_map = environ_map,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .stdout_limit = .limited(32 * 1024 * 1024),
         .stderr_limit = .limited(32 * 1024 * 1024),
@@ -331,12 +346,12 @@ fn printFailure(io: std.Io, comptime format: []const u8, arguments: anytype) any
 test "manifest captures the compatibility boundary" {
     const manifest = Manifest{
         .analyzer_version = "0.1.0-dev",
-        .zig_version = "0.16.0",
+        .zig_version = "0.17.0",
         .zig_commit = build_options.zig_commit,
         .patch_sha256 = "abc",
         .compiler_protocol_version = 1,
     };
-    try std.testing.expectEqualStrings("0.16.0", manifest.zig_version);
+    try std.testing.expectEqualStrings("0.17.0", manifest.zig_version);
     try std.testing.expectEqual(@as(u16, 1), manifest.compiler_protocol_version);
 }
 

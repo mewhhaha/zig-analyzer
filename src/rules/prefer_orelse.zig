@@ -24,8 +24,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_orelse,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "optional capture '{s}' is returned unchanged; use orelse for the fallback value",
                 .{capture},
             ),
@@ -97,7 +96,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_orelse)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_orelse)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

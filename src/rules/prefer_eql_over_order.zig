@@ -57,9 +57,9 @@ pub fn run(context: RuleRun) !void {
         const b_arg = argumentSource(context, arguments[2]);
 
         const replacement = if (is_equality.?)
-            try std.fmt.allocPrint(context.allocator, "{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg })
+            try context.allocator.print("{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg })
         else
-            try std.fmt.allocPrint(context.allocator, "!{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg });
+            try context.allocator.print("!{s}eql({s}, {s}, {s})", .{ prefix, type_arg, a_arg, b_arg });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -209,7 +209,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_eql_over_order)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_eql_over_order)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

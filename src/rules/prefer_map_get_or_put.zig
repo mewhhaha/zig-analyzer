@@ -30,8 +30,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .prefer_map_get_or_put,
                 .level = level,
                 .span = context.tokens[put_token_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "'{s}.{s}' followed by '{s}.put' repeats key hashing and bucket probing; use '{s}.getOrPut'",
                     .{ check.map_name, method_name, check.map_name, check.map_name },
                 ),
@@ -207,7 +206,7 @@ test "prefer map get or put detects !map.contains then map.put" {
 
     try std.testing.expectEqual(1, findings.items.len);
     try std.testing.expectEqual(types.Rule.prefer_map_get_or_put, findings.items[0].rule);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "getOrPut") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "getOrPut") != null);
 }
 
 test "prefer map get or put detects map.get == null then map.put" {
@@ -298,6 +297,6 @@ fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token
 
 fn testConfiguration() types.Configuration {
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_map_get_or_put)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_map_get_or_put)] = .warning;
     return configuration;
 }

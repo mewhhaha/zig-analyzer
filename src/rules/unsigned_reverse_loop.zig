@@ -36,8 +36,7 @@ pub fn run(context: RuleRun) !void {
             const update_end = context.matchingToken(update_opening, .l_paren, .r_paren) orelse continue;
             if (!decrementsByOne(context, index_name, update_opening + 1, update_end)) continue;
             const fixes = try reverseLoopFix(context, index_name, declaration_end, while_index, update_end);
-            const message = try std.fmt.allocPrint(
-                context.allocator,
+            const message = try context.allocator.print(
                 "unsigned loop index '{s}' is always greater than or equal to zero; decrementing it in the loop update underflows after zero",
                 .{index_name},
             );
@@ -91,7 +90,7 @@ fn reverseLoopFix(
     const body_opening = context.tokens[update_end + 1];
     edits[2] = .{
         .span = .{ .start = body_opening.loc.end, .end = body_opening.loc.end },
-        .replacement = try std.fmt.allocPrint(context.allocator, " {s} -= 1;", .{index_name}),
+        .replacement = try context.allocator.print(" {s} -= 1;", .{index_name}),
     };
     const fixes = try context.allocator.alloc(types.Fix, 1);
     fixes[0] = .{
@@ -135,7 +134,7 @@ test "unsigned reverse loops report their non-terminating bound" {
     var findings: std.ArrayList(types.Finding) = .empty;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = types.Configuration.defaults(), .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings.items[0].message, "underflows") != null);
+    try std.testing.expect(std.mem.find(u8, findings.items[0].message, "underflows") != null);
 }
 
 test "a braced reverse loop offers a body decrement rewrite" {

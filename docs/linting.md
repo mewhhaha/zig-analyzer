@@ -10,11 +10,16 @@ zig-analyzer check --no-cache . # reanalyzes files with cached findings
 ```
 
 Findings for unchanged files are cached between runs; `--no-cache` forces a
-full reanalysis.
+full reanalysis. Imported deprecation warnings always use the current dependency
+source. In the editor, edits and closes also refresh warnings in open importers.
+
+The default [`deprecated-declaration`](../src/rules/deprecated-declaration.md)
+warning follows local declarations, literal file imports, and the standard
+library. It skips named build modules whose compilation bindings are unresolved.
 
 ## Rules, tiers, and profiles
 
-There are 190 rules. Each has a stable kebab-case code, such as
+There are 200 rules. Each has a stable kebab-case code, such as
 `missing-errdefer` or `discarded-error`, used consistently in configuration,
 diagnostics, and suppression directives. The full index, with one document
 per rule explaining why it exists and when it fires, is

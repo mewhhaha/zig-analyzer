@@ -25,8 +25,8 @@ pub const Index = struct {
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
-    bindings: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Binding)) = .empty,
-    usingnamespace_scopes: std.ArrayListUnmanaged(std.zig.Token.Loc) = .empty,
+    bindings: std.StringHashMapUnmanaged(std.ArrayList(Binding)) = .empty,
+    usingnamespace_scopes: std.ArrayList(std.zig.Token.Loc) = .empty,
     matching_tokens: []u32 = &.{},
     enclosing_braces: []u32 = &.{},
 
@@ -37,13 +37,13 @@ pub const Index = struct {
     ) !Index {
         var index: Index = .{ .allocator = allocator, .source = source, .tokens = tokens };
         errdefer index.deinit();
-        var scope_openings: std.ArrayListUnmanaged(u32) = .empty;
+        var scope_openings: std.ArrayList(u32) = .empty;
         defer scope_openings.deinit(allocator);
         try scope_openings.ensureTotalCapacity(allocator, 32);
-        var parenthesis_openings: std.ArrayListUnmanaged(u32) = .empty;
+        var parenthesis_openings: std.ArrayList(u32) = .empty;
         defer parenthesis_openings.deinit(allocator);
         try parenthesis_openings.ensureTotalCapacity(allocator, 32);
-        var bracket_openings: std.ArrayListUnmanaged(u32) = .empty;
+        var bracket_openings: std.ArrayList(u32) = .empty;
         defer bracket_openings.deinit(allocator);
         try bracket_openings.ensureTotalCapacity(allocator, 32);
         index.matching_tokens = try allocator.alloc(u32, tokens.len);
@@ -457,7 +457,7 @@ fn braceStartsReturnType(tokens: []const std.zig.Token, opening: usize, return_t
             .keyword_switch,
             .keyword_if,
             => return true,
-            .bang, .question_mark, .asterisk, .asterisk_asterisk, .identifier, .builtin, .l_paren, .r_paren, .comma => {},
+            .bang, .question_mark, .asterisk, .identifier, .builtin, .l_paren, .r_paren, .comma => {},
             else => return false,
         }
     }
@@ -508,6 +508,7 @@ fn destructureDeclarationIndex(tokens: []const std.zig.Token, index: usize) ?usi
         cursor -= 1;
         switch (tokens[cursor].tag) {
             .keyword_const, .keyword_var => {
+                if (!declarationKeywordStartsStatement(tokens, cursor)) return null;
                 declaration_index = cursor;
                 break;
             },
@@ -680,8 +681,8 @@ test "bindings respect lexical scopes and local declaration order" {
     var later_use: ?usize = null;
     var foreign_use: ?usize = null;
     for (tokens, 0..) |token, index| {
-        if (later_use == null and token.loc.start >= std.mem.indexOf(u8, source, "_ = later").? and std.mem.eql(u8, tokenText(source, token), "later")) later_use = index;
-        if (token.loc.start >= std.mem.indexOf(u8, source, "_ = foreign").? and token.loc.start < std.mem.indexOf(u8, source, "fn second").? and std.mem.eql(u8, tokenText(source, token), "foreign")) foreign_use = index;
+        if (later_use == null and token.loc.start >= std.mem.find(u8, source, "_ = later").? and std.mem.eql(u8, tokenText(source, token), "later")) later_use = index;
+        if (token.loc.start >= std.mem.find(u8, source, "_ = foreign").? and token.loc.start < std.mem.find(u8, source, "fn second").? and std.mem.eql(u8, tokenText(source, token), "foreign")) foreign_use = index;
     }
     try std.testing.expect(findBinding(source, tokens, later_use.?) == null);
     try std.testing.expect(findBinding(source, tokens, foreign_use.?) == null);
@@ -696,7 +697,7 @@ test "indexed bindings select the innermost alias" {
     var index = try Index.init(std.testing.allocator, source, tokens);
     defer index.deinit();
 
-    const use_start = std.mem.indexOf(u8, source, "_ = Alias").?;
+    const use_start = std.mem.find(u8, source, "_ = Alias").?;
     var use_index: ?usize = null;
     for (tokens, 0..) |token, token_index| {
         if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "Alias")) {
@@ -775,7 +776,7 @@ test "parameters remain visible after an error set return type" {
     var io_use: ?usize = null;
     var delay_use: ?usize = null;
     for (tokens, 0..) |token, index| {
-        if (token.loc.start < std.mem.indexOf(u8, source, "try io").?) continue;
+        if (token.loc.start < std.mem.find(u8, source, "try io").?) continue;
         if (std.mem.eql(u8, tokenText(source, token), "io")) io_use = index;
         if (std.mem.eql(u8, tokenText(source, token), "delay")) delay_use = index;
     }
@@ -790,7 +791,7 @@ test "comptime parameters are visible in later parameter and return types" {
     var resolved_type_uses: usize = 0;
     for (tokens, 0..) |token, index| {
         if (!std.mem.eql(u8, tokenText(source, token), "T") or
-            token.loc.start <= std.mem.indexOf(u8, source, "T: type").?) continue;
+            token.loc.start <= std.mem.find(u8, source, "T: type").?) continue;
         if (findBinding(source, tokens, index) != null) resolved_type_uses += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), resolved_type_uses);
@@ -801,7 +802,7 @@ test "parameters remain visible after a labeled return type" {
         "fn call(self: u8, function: u8) result: { break :result u8; } { return self + function; }\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const body_start = std.mem.lastIndexOf(u8, source, "{ return").?;
+    const body_start = std.mem.findLast(u8, source, "{ return").?;
     var resolved_uses: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.loc.start < body_start or token.tag != .identifier) continue;
@@ -815,7 +816,7 @@ test "parameters remain visible after earlier anonymous struct parameters" {
         "fn run(first: struct { value: u8 }, options: struct { ready: bool }) void { _ = first; _ = options; }\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const body_start = std.mem.indexOf(u8, source, "_ = first").?;
+    const body_start = std.mem.find(u8, source, "_ = first").?;
     var resolved_uses: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.loc.start < body_start or token.tag != .identifier) continue;
@@ -824,12 +825,24 @@ test "parameters remain visible after earlier anonymous struct parameters" {
     try std.testing.expectEqual(@as(usize, 2), resolved_uses);
 }
 
+test "pointer const qualifiers do not introduce destructuring bindings" {
+    const source: [:0]const u8 = "const Target = struct {}; fn f(target: *const Target) void { const value = 1; _ = Target; _ = target; _ = value; }";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    for (tokens, 0..) |token, use| {
+        if (!std.mem.eql(u8, source[token.loc.start..token.loc.end], "Target") or use == 1) continue;
+        try std.testing.expectEqual(@as(usize, 1), index.findBinding(use).?.token_index);
+    }
+}
+
 test "typed destructuring declarations introduce each binding" {
     const source: [:0]const u8 =
         "fn run(pair: struct { u8, u8 }) void { const first: u8, const second: u8 = pair; _ = first; _ = second; }\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const uses_start = std.mem.indexOf(u8, source, "_ = first").?;
+    const uses_start = std.mem.find(u8, source, "_ = first").?;
     var resolved_uses: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.loc.start < uses_start or token.tag != .identifier) continue;
@@ -845,8 +858,8 @@ test "container declarations remain visible after fields" {
     defer std.testing.allocator.free(tokens);
     var state_use: ?usize = null;
     for (tokens, 0..) |token, index| {
-        if (token.loc.start < std.mem.indexOf(u8, source, "value: State").? or
-            token.loc.start >= std.mem.indexOf(u8, source, "const State").?) continue;
+        if (token.loc.start < std.mem.find(u8, source, "value: State").? or
+            token.loc.start >= std.mem.find(u8, source, "const State").?) continue;
         if (std.mem.eql(u8, tokenText(source, token), "State")) state_use = index;
     }
     try std.testing.expect(findBinding(source, tokens, state_use.?) != null);
@@ -858,7 +871,7 @@ test "aligned and ABI-named container declarations resolve before their declarat
         "const aligned_table align(64) = [_]u8{1}; extern \"c\" var external_value: u8;\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const declarations_start = std.mem.indexOf(u8, source, "const aligned_table").?;
+    const declarations_start = std.mem.find(u8, source, "const aligned_table").?;
     var resolved_uses: usize = 0;
     for (tokens, 0..) |token, index| {
         if (token.loc.start >= declarations_start or token.tag != .identifier) continue;
@@ -874,7 +887,7 @@ test "captures span an unbraced loop expression with another capture" {
         "fn run(optional: ?u8, values: []u8) void { if (optional) |name| for (values, 0..) |value, index| { _ = name + value + index; }; }\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const use_start = std.mem.indexOf(u8, source, "_ = name").?;
+    const use_start = std.mem.find(u8, source, "_ = name").?;
     var name_use: ?usize = null;
     for (tokens, 0..) |token, index| {
         if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "name")) name_use = index;
@@ -887,7 +900,7 @@ test "captures span an unbraced destructuring assignment" {
         "fn run(optional: ?Pair) void { var x: u8 = 0; var y: u8 = 0; if (optional) |pair| x, y = pair.values(); _ = x + y; }\n";
     const tokens = try tokenize(std.testing.allocator, source);
     defer std.testing.allocator.free(tokens);
-    const use_start = std.mem.indexOf(u8, source, "pair.values").?;
+    const use_start = std.mem.find(u8, source, "pair.values").?;
     var pair_use: ?usize = null;
     for (tokens, 0..) |token, index| {
         if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "pair")) pair_use = index;

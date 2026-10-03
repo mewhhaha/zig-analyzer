@@ -30,8 +30,7 @@ fn findQuadraticFrontRemoval(context: RuleRun) !void {
             .rule = .quadratic_front_removal,
             .level = level,
             .span = context.tokens[removal].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "draining ArrayList '{s}' with orderedRemove(0) shifts every remaining element and takes quadratic time",
                 .{path},
             ),
@@ -174,7 +173,7 @@ fn findLongFunctions(context: RuleRun) !void {
             .rule = .function_length,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "function '{s}' spans {d} lines, exceeding the configured limit of {d}", .{ name, lines, context.configuration.function_length_limit }),
+            .message = try context.allocator.print("function '{s}' spans {d} lines, exceeding the configured limit of {d}", .{ name, lines, context.configuration.function_length_limit }),
         });
     }
 }
@@ -208,7 +207,7 @@ fn findUnboundedLoops(context: RuleRun) !void {
         const condition = context.source[context.tokens[while_index + 2].loc.start..context.tokens[condition_end - 1].loc.end];
         const body_open = whileBodyOpening(context, condition_end) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        if (std.mem.indexOfAny(u8, condition, "<>") != null or
+        if (std.mem.findAny(u8, condition, "<>") != null or
             conditionStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             optionalCaptureStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             equalityConditionHasUpdate(context, while_index + 2, condition_end, body_open, body_end) or
@@ -235,7 +234,7 @@ fn findLongLines(context: RuleRun) !void {
     if (level == .off) return;
     var start: usize = 0;
     while (start < context.source.len) {
-        const relative_end = std.mem.indexOfScalar(u8, context.source[start..], '\n') orelse context.source.len - start;
+        const relative_end = std.mem.findScalar(u8, context.source[start..], '\n') orelse context.source.len - start;
         const end = start + relative_end;
         const line = context.source[start..end];
         const columns = displayColumns(line);
@@ -246,7 +245,7 @@ fn findLongLines(context: RuleRun) !void {
                 .rule = .line_length,
                 .level = level,
                 .span = .{ .start = start, .end = end },
-                .message = try std.fmt.allocPrint(context.allocator, "line is {d} display columns, exceeding the configured limit of {d}", .{ columns, context.configuration.line_length_limit }),
+                .message = try context.allocator.print("line is {d} display columns, exceeding the configured limit of {d}", .{ columns, context.configuration.line_length_limit }),
             });
         }
         if (end == context.source.len) break;
@@ -304,19 +303,19 @@ fn findTaskMarkers(context: RuleRun) !void {
     if (level == .off) return;
     var line_start: usize = 0;
     while (line_start < context.source.len) {
-        const relative_end = std.mem.indexOfScalar(u8, context.source[line_start..], '\n') orelse context.source.len - line_start;
+        const relative_end = std.mem.findScalar(u8, context.source[line_start..], '\n') orelse context.source.len - line_start;
         const line_end = line_start + relative_end;
         const line = context.source[line_start..line_end];
         if (commentStart(line)) |comment_start| {
             const comment = line[comment_start + 2 ..];
             for (context.configuration.todo_markers) |marker| {
-                const marker_offset = std.mem.indexOf(u8, comment, marker) orelse continue;
+                const marker_offset = std.mem.find(u8, comment, marker) orelse continue;
                 const absolute = line_start + comment_start + 2 + marker_offset;
                 try context.emit(.{
                     .rule = .todo_comment,
                     .level = level,
                     .span = .{ .start = absolute, .end = absolute + marker.len },
-                    .message = try std.fmt.allocPrint(context.allocator, "comment contains task marker '{s}'; track or resolve the promise before it becomes invisible debt", .{marker}),
+                    .message = try context.allocator.print("comment contains task marker '{s}'; track or resolve the promise before it becomes invisible debt", .{marker}),
                 });
                 break;
             }
@@ -944,8 +943,8 @@ fn displayColumns(line: []const u8) usize {
 
 fn singleUnsplittableToken(line: []const u8) bool {
     const trimmed = std.mem.trim(u8, line, " \t\r");
-    if (std.mem.indexOf(u8, trimmed, "http://") != null or std.mem.indexOf(u8, trimmed, "https://") != null) return true;
-    return std.mem.indexOfAny(u8, trimmed, " \t") == null;
+    if (std.mem.find(u8, trimmed, "http://") != null or std.mem.find(u8, trimmed, "https://") != null) return true;
+    return std.mem.findAny(u8, trimmed, " \t") == null;
 }
 
 fn commentStart(line: []const u8) ?usize {
@@ -1009,7 +1008,7 @@ test "disciplined and policy rules report their bounded local shapes" {
     for (0..70) |_| try source_writer.writer.writeAll("_ = 1;\n");
     try source_writer.writer.writeAll("}\n");
     const bytes = try source_writer.toOwnedSlice();
-    const source = try arena.allocator().dupeZ(u8, bytes);
+    const source = try arena.allocator().dupeSentinel(u8, bytes, 0);
     var configuration = types.Configuration.defaults();
     const expected_rules = [_]types.Rule{
         .function_length,
@@ -1021,7 +1020,7 @@ test "disciplined and policy rules report their bounded local shapes" {
         .todo_comment,
         .assertion_free_test,
     };
-    for (expected_rules) |rule| configuration.levels[@intFromEnum(rule)] = .information;
+    for (expected_rules) |rule| configuration.levels[@backingInt(rule)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     for (expected_rules) |rule| {
         var seen = false;
@@ -1042,7 +1041,7 @@ test "ordinary calls do not turn smoke tests into assertions" {
         "test \"fallible smoke\" { try setup(); }\n" ++
         "test \"expectation\" { try std.testing.expect(value); }\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_test)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_test)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1060,7 +1059,7 @@ test "a queue pop loop states exhaustion through its optional capture" {
         "}\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1076,7 +1075,7 @@ test "optional-producing calls state exhaustion through their captures" {
         "while (try parseOneItem(iterator)) |value| consume(value);\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1093,7 +1092,7 @@ test "boolean next calls and orelse exits state iterator exhaustion" {
         "while (true) { const value = (try iterator.nextValue()) orelse break; consume(value); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1109,7 +1108,7 @@ test "consuming camel case next calls state exhaustion" {
         "while (cursor.hasNext()) {}\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1127,7 +1126,7 @@ test "optional traversal must visibly advance its condition" {
         "while (first) |value| { consume(value); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1144,7 +1143,7 @@ test "equality loop updates state used by its condition" {
         "while (bytes.len == end) { consume(bytes); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1164,7 +1163,7 @@ test "body guards and blocking waits state loop termination" {
         "while (!pipeline.isClosed()) { pipeline.handleOne(); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1185,7 +1184,7 @@ test "input exhaustion and compound sentinel updates state loop termination" {
         "drain: while (true) { if (state.expired()) { _ = state.entries.swapRemove(0); continue :drain; } break :drain; }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1200,7 +1199,7 @@ test "unbraced while expressions do not borrow nested braces as their body" {
         "while (true) switch (reader.readByte() catch ',') { ',' => break, else => {}, };\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1215,7 +1214,7 @@ test "an unrelated equality assertion does not bound a loop" {
         "while (true) { assert(value == value); consume(value); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1232,7 +1231,7 @@ test "derived bounds readers and interrupted calls state loop termination" {
         "while (true) { switch (posix.errno(retry())) { .SUCCESS => break, .INTR => continue, else => return error.Failed, } }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unbounded_loop)] = .information;
+    configuration.levels[@backingInt(types.Rule.unbounded_loop)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1254,7 +1253,7 @@ test "a matching while condition establishes the bound for its first indexed acc
         "}\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1273,7 +1272,7 @@ test "a matching while bound remains visible inside a borrowing call" {
         "_ = one; _ = two; _ = three;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1295,7 +1294,7 @@ test "a fixed array length establishes a literal while bound" {
         "_ = three;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1320,7 +1319,7 @@ test "a shadowed slice does not inherit an outer fixed array bound" {
         "_ = three;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1342,7 +1341,7 @@ test "a matching for range establishes the bound for its indexed access" {
         "_ = three;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1364,7 +1363,7 @@ test "an index capture establishes the bound for an equally sized array" {
         "return result;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1382,7 +1381,7 @@ test "an allocation sized from the iterated slice establishes its index bound" {
         "return copy;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1404,7 +1403,7 @@ test "an early loop exit establishes the bound for following indexing" {
         "return null;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1426,7 +1425,7 @@ test "an unrelated or invalidated loop bound does not establish index safety" {
         "return 0;\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1447,7 +1446,7 @@ test "array types are not computed indexing" {
         "};\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1473,7 +1472,7 @@ test "nested function indexing is reported once" {
         "};\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.assertion_free_branching)] = .information;
+    configuration.levels[@backingInt(types.Rule.assertion_free_branching)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1488,7 +1487,7 @@ test "draining an array list with ordered front removal reports" {
         "var queue: std.ArrayList(u32) = .empty; defer queue.deinit(allocator); " ++
         "while (queue.items.len > 0) { consume(queue.orderedRemove(0)); } }";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.quadratic_front_removal)] = .information;
+    configuration.levels[@backingInt(types.Rule.quadratic_front_removal)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 
@@ -1510,7 +1509,7 @@ test "one-off and non-front array list removals remain clean" {
         "fn empty(queue: *std.ArrayList(u32)) void { " ++
         "while (queue.items.len <= 0) { _ = queue.orderedRemove(0); } }";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.quadratic_front_removal)] = .information;
+    configuration.levels[@backingInt(types.Rule.quadratic_front_removal)] = .information;
 
     const found = try findingsFor(arena.allocator(), source, configuration);
 

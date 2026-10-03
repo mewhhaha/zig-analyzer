@@ -5,14 +5,14 @@ const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catc
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const strip = optimize != .Debug;
+    const strip = optimize != .debug;
 
     const build_options = b.addOptions();
     build_options.addOption(std.SemanticVersion, "version", version);
     build_options.addOption([]const u8, "version_string", @import("build.zig.zon").version);
-    build_options.addOption([]const u8, "zig_version", "0.16.0");
-    build_options.addOption([]const u8, "zig_commit", "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8");
-    build_options.addOption([]const u8, "compiler_patch_sha256", "bc9111e57720fe54ec086f5cd723c63adf74a3c0212f1946c54f609b5b28485f");
+    build_options.addOption([]const u8, "zig_version", "0.17.0");
+    build_options.addOption([]const u8, "zig_commit", "7647adab80dd088f4de3610fd245915a912eb6ad");
+    build_options.addOption([]const u8, "compiler_patch_sha256", "8a049ce36246a0854097d1bb4a230922b8ab9ff47a260d62d91c2cf60e2a02ab");
     build_options.addOption(u16, "compiler_protocol_version", 5);
 
     const lsp_module = b.dependency("lsp_kit", .{
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
     const run_command = b.addRunArtifact(executable);
     run_command.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_command.addArgs(args);
+    run_command.addPassthruArgs();
     const run_step = b.step("run", "Run zig-analyzer");
     run_step.dependOn(&run_command.step);
 

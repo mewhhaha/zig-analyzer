@@ -47,8 +47,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .cleanup_after_fallible_operation,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "cleanup for resource '{s}' is registered after a fallible operation; an earlier error can skip {s}",
                 .{ binding_name, resource.release },
             ),
@@ -74,8 +73,7 @@ fn findExpiredInsertionRollback(context: RuleRun, level: types.Level) !void {
             .rule = .cleanup_after_fallible_operation,
             .level = level,
             .span = context.tokens[errdefer_index].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "rollback for insertion into '{s}' expires at the end of this block before a later fallible operation",
                 .{rollback.path},
             ),
@@ -192,8 +190,7 @@ fn findLateDirectCleanup(context: RuleRun, level: types.Level) !void {
             .rule = .cleanup_after_fallible_operation,
             .level = level,
             .span = context.tokens[declaration_index + 1].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "resource '{s}' is closed only after a fallible operation; an earlier error can skip {s}",
                 .{ binding_name, resource.release },
             ),

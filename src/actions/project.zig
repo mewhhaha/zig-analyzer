@@ -52,9 +52,9 @@ fn buildImportAction(
     const import_name = try selectedPackageImport(allocator, current_source, selection) orelse return null;
     const module_document = uniqueModuleDocument(import_name, current_uri, documents) orelse return null;
     const build_document = uniqueBuildDocument(documents) orelse return null;
-    const existing_import = try std.fmt.allocPrint(allocator, "addImport(\"{s}\"", .{import_name});
+    const existing_import = try allocator.print("addImport(\"{s}\"", .{import_name});
     defer allocator.free(existing_import);
-    if (std.mem.indexOf(u8, build_document.source, existing_import) != null) return null;
+    if (std.mem.find(u8, build_document.source, existing_import) != null) return null;
     const build_tokens = try action_context.tokenize(allocator, build_document.source);
     defer allocator.free(build_tokens);
     const build_body = buildFunctionBody(build_tokens, build_document.source) orelse return null;
@@ -66,26 +66,28 @@ fn buildImportAction(
     ) orelse return null;
     const build_path = uriPath(build_document.uri) orelse return null;
     const module_path = uriPath(module_document.uri) orelse return null;
-    const build_directory = std.fs.path.dirname(build_path) orelse return null;
-    const relative_path = try std.fs.path.relative(allocator, "/", null, build_directory, module_path);
+    const build_directory = std.Io.Dir.path.dirname(build_path) orelse return null;
+    const relative_path = try std.Io.Dir.path.relativeAlloc(allocator, "/", null, build_directory, module_path);
     defer allocator.free(relative_path);
     const insertion = build_tokens[build_body.end].loc.start;
     // Ownership is transferred through the returned Candidate.edits slice.
     // zig-analyzer: disable-next-line unreleased-allocation
     const edits = try allocator.alloc(FileEdit, 1);
+    errdefer allocator.free(edits);
+    const replacement = try allocator.print(
+        "    {s}.root_module.addImport(\"{s}\", b.createModule(.{{ .root_source_file = b.path(\"{s}\") }}));\n",
+        .{ artifact_name, import_name, relative_path },
+    );
+    errdefer allocator.free(replacement);
     edits[0] = .{
         .uri = build_document.uri,
         .edit = .{
             .span = .{ .start = insertion, .end = insertion },
-            .replacement = try std.fmt.allocPrint(
-                allocator,
-                "    {s}.root_module.addImport(\"{s}\", b.createModule(.{{ .root_source_file = b.path(\"{s}\") }}));\n",
-                .{ artifact_name, import_name, relative_path },
-            ),
+            .replacement = replacement,
         },
     };
     return .{
-        .title = try std.fmt.allocPrint(allocator, "Add module '{s}' to build.zig", .{import_name}),
+        .title = try allocator.print("Add module '{s}' to build.zig", .{import_name}),
         .edits = edits,
     };
 }
@@ -103,7 +105,7 @@ fn selectedPackageImport(
             !action_context.spansOverlap(selection, tokens[index + 2].loc)) continue;
         const name = stringValue(source[tokens[index + 2].loc.start..tokens[index + 2].loc.end]) orelse continue;
         if (std.mem.eql(u8, name, "std") or std.mem.eql(u8, name, "root") or std.mem.eql(u8, name, "builtin") or
-            std.mem.endsWith(u8, name, ".zig") or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+            std.mem.endsWith(u8, name, ".zig") or std.mem.findScalar(u8, name, '/') != null) return null;
         return name;
     }
     return null;
@@ -114,7 +116,7 @@ fn uniqueModuleDocument(name: []const u8, current_uri: []const u8, documents: []
     for (documents) |document| {
         if (std.mem.eql(u8, document.uri, current_uri)) continue;
         const path = uriPath(document.uri) orelse continue;
-        const basename = std.fs.path.basename(path);
+        const basename = std.Io.Dir.path.basename(path);
         if (!std.mem.endsWith(u8, basename, ".zig") or basename.len != name.len + 4 or
             !std.mem.eql(u8, basename[0..name.len], name)) continue;
         if (selected != null) return null;
@@ -127,7 +129,7 @@ fn uniqueBuildDocument(documents: []const OpenDocument) ?OpenDocument {
     var selected: ?OpenDocument = null;
     for (documents) |document| {
         const path = uriPath(document.uri) orelse continue;
-        if (!std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) continue;
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(path), "build.zig")) continue;
         if (selected != null) return null;
         selected = document;
     }
@@ -184,23 +186,23 @@ fn cImportAction(
     if (occurrences.items.len < 2) return null;
 
     const current_path = uriPath(current_uri) orelse return null;
-    const wrapper_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(current_path) orelse return null, "c_imports.zig" });
+    const wrapper_path = try std.Io.Dir.path.join(allocator, &.{ std.Io.Dir.path.dirname(current_path) orelse return null, "c_imports.zig" });
     defer allocator.free(wrapper_path);
-    const wrapper_uri = try std.fmt.allocPrint(allocator, "file://{s}", .{wrapper_path});
+    const wrapper_uri = try allocator.print("file://{s}", .{wrapper_path});
     for (documents) |document| if (std.mem.eql(u8, document.uri, wrapper_uri)) return null;
     for (occurrences.items) |*occurrence| {
         const document_path = uriPath(occurrence.uri) orelse return null;
-        const document_directory = std.fs.path.dirname(document_path) orelse return null;
-        const relative_path = try std.fs.path.relative(allocator, "/", null, document_directory, wrapper_path);
+        const document_directory = std.Io.Dir.path.dirname(document_path) orelse return null;
+        const relative_path = try std.Io.Dir.path.relativeAlloc(allocator, "/", null, document_directory, wrapper_path);
         defer allocator.free(relative_path);
         const import_path = if (relative_path.len > 0 and relative_path[0] == '.')
             relative_path
         else
-            try std.fmt.allocPrint(allocator, "./{s}", .{relative_path});
+            try allocator.print("./{s}", .{relative_path});
         defer if (import_path.ptr != relative_path.ptr) allocator.free(import_path);
-        occurrence.edit.replacement = try std.fmt.allocPrint(allocator, "@import(\"{s}\").c", .{import_path});
+        occurrence.edit.replacement = try allocator.print("@import(\"{s}\").c", .{import_path});
     }
-    const created_source = try std.fmt.allocPrint(allocator, "pub const c = {s};\n", .{c_import_source});
+    const created_source = try allocator.print("pub const c = {s};\n", .{c_import_source});
     errdefer allocator.free(created_source);
     return .{
         .title = "Extract repeated @cImport into c_imports.zig",
@@ -271,15 +273,33 @@ fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool 
 fn stringValue(literal: []const u8) ?[]const u8 {
     if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
     const value = literal[1 .. literal.len - 1];
-    if (std.mem.indexOfScalar(u8, value, '\\') != null) return null;
+    if (std.mem.findScalar(u8, value, '\\') != null) return null;
     return value;
 }
 
 fn uriPath(uri: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, uri, "file://")) return null;
     const path = uri["file://".len..];
-    if (std.mem.indexOfScalar(u8, path, '%') != null) return null;
+    if (std.mem.findScalar(u8, path, '%') != null) return null;
     return path;
+}
+
+test "build import quick fixes release partial results on allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const main: [:0]const u8 = "const feature = @import(\"feature\");";
+            const documents = [_]OpenDocument{
+                .{ .uri = "file:///project/build.zig", .source = "pub fn build(b: *std.Build) void { const exe = b.addExecutable(.{ .name = \"app\" }); _ = exe.root_module; }" },
+                .{ .uri = "file:///project/src/main.zig", .source = main },
+                .{ .uri = "file:///project/src/feature.zig", .source = "pub const value = 1;" },
+            };
+            const start = std.mem.find(u8, main, "\"feature\"").?;
+            const action = try buildImportAction(allocator, documents[1].uri, main, .{ .start = start, .end = start + 9 }, &documents) orelse return error.MissingBuildAction;
+            defer allocator.free(action.title);
+            defer allocator.free(action.edits);
+            for (action.edits) |edit| allocator.free(edit.edit.replacement);
+        }
+    }.run, .{});
 }
 
 test "project actions repair build imports and consolidate c imports" {
@@ -296,15 +316,15 @@ test "project actions repair build imports and consolidate c imports" {
         .{ .uri = "file:///project/src/main.zig", .source = main },
         .{ .uri = "file:///project/src/feature.zig", .source = feature },
     };
-    const import_start = std.mem.indexOf(u8, main, "\"feature\"") orelse unreachable;
+    const import_start = std.mem.find(u8, main, "\"feature\"") orelse unreachable;
     const build_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = import_start, .end = import_start + 9 }, &documents);
     try std.testing.expectEqual(@as(usize, 1), build_actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, build_actions[0].edits[0].edit.replacement, "root_module.addImport") != null);
-    const build_close = (std.mem.indexOf(u8, build, "} fn helper") orelse unreachable);
+    try std.testing.expect(std.mem.find(u8, build_actions[0].edits[0].edit.replacement, "root_module.addImport") != null);
+    const build_close = (std.mem.find(u8, build, "} fn helper") orelse unreachable);
     try std.testing.expectEqual(build_close, build_actions[0].edits[0].edit.span.start);
     try std.testing.expectEqualStrings("exe", build_actions[0].edits[0].edit.replacement[4..7]);
 
-    const c_import = std.mem.indexOf(u8, main, "@cImport") orelse unreachable;
+    const c_import = std.mem.find(u8, main, "@cImport") orelse unreachable;
     const c_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = c_import, .end = c_import + 8 }, &documents);
     try std.testing.expectEqual(@as(usize, 1), c_actions.len);
     try std.testing.expect(c_actions[0].created_file != null);

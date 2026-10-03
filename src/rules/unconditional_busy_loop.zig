@@ -142,7 +142,7 @@ test "while true without any exit or call reports the guaranteed hang" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 2), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "never exit") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "never exit") != null);
 }
 
 test "loops with calls breaks returns or fallible bodies stay clean" {

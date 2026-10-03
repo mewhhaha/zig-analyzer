@@ -42,8 +42,7 @@ fn findDeinitializedViews(context: RuleRun) !void {
                 .rule = .returning_deinitialized_view,
                 .level = level,
                 .span = context.tokens[index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned view '{s}' borrows container '{s}', but deferred deinit destroys its backing storage before the caller can use it",
                     .{ returned_name, container_name },
                 ),
@@ -95,14 +94,12 @@ fn findArenaReturns(context: RuleRun) !void {
                 .level = level,
                 .span = context.tokens[index].loc,
                 .message = if (returned_binding) |name|
-                    try std.fmt.allocPrint(
-                        context.allocator,
+                    try context.allocator.print(
                         "returned value '{s}' is allocated by local arena '{s}', which is deinitialized before return completes",
                         .{ name, arena_name },
                     )
                 else
-                    try std.fmt.allocPrint(
-                        context.allocator,
+                    try context.allocator.print(
                         "returned value is allocated by local arena '{s}', which is deinitialized before the caller can use it",
                         .{arena_name},
                     ),

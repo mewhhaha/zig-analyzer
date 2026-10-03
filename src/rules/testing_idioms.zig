@@ -31,8 +31,7 @@ fn findSliceExpectations(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[call_start].loc.start, .end = context.tokens[expect_end].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "{s}expectEqualSlices({s}, {s}, {s})",
                 .{ qualification, element_type, expected, actual },
             ),
@@ -42,8 +41,7 @@ fn findSliceExpectations(context: RuleRun) !void {
             .rule = .prefer_testing_expect_equal_slices,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "slice comparison for element type '{s}' produces a less useful failure than expectEqualSlices",
                 .{element_type},
             ),
@@ -81,8 +79,7 @@ fn findManualErrorExpectations(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[expression_start].loc.start, .end = context.tokens[body_end + 6].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "try std.testing.expectError({s}, {s});",
                 .{ expected_error, operation },
             ),
@@ -210,8 +207,8 @@ test "testing idioms produce framework-specific fixes" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_slices)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_approx)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_equal_slices)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_approx)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 2), findings.items.len);
 }
@@ -228,7 +225,7 @@ test "manual catch assertion becomes expectError" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_error)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_error)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqualStrings(
@@ -249,7 +246,7 @@ test "a discarded operation loses its discard in the expectError rewrite" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_error)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_error)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     const edit = findings.items[0].fixes[0].edits[0];
@@ -272,7 +269,7 @@ test "an operation bound to a name is not rewritten to expectError" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_error)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_error)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
@@ -284,7 +281,7 @@ test "a custom expect harness is not rewritten to expectEqualSlices" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_slices)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_equal_slices)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }

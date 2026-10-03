@@ -35,8 +35,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .inclusive_index_bound,
             .level = level,
             .span = operator.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "inclusive assertion for index '{s}' does not itself establish the strict bound required by the following '{s}' indexing operation",
                 .{ pathText(context, index_path), pathText(context, sequence_path) },
             ),
@@ -125,7 +124,7 @@ test "inclusive bounds immediately followed by indexing warn and offer a fix" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.inclusive_index_bound)] = .information;
+    configuration.levels[@backingInt(types.Rule.inclusive_index_bound)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqualStrings("<", findings.items[0].fixes[0].edits[0].replacement);
@@ -141,7 +140,7 @@ test "slice bounds and already strict index guards remain valid" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.inclusive_index_bound)] = .information;
+    configuration.levels[@backingInt(types.Rule.inclusive_index_bound)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
@@ -153,7 +152,7 @@ test "sentinel-terminated sequences may be indexed at their length" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.inclusive_index_bound)] = .information;
+    configuration.levels[@backingInt(types.Rule.inclusive_index_bound)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }
@@ -168,7 +167,7 @@ test "inclusive bound diagnostics honor suppression" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.inclusive_index_bound)] = .information;
+    configuration.levels[@backingInt(types.Rule.inclusive_index_bound)] = .information;
     try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = configuration, .findings = &findings });
     try std.testing.expectEqual(@as(usize, 0), findings.items.len);
 }

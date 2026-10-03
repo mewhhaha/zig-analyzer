@@ -37,8 +37,7 @@ pub fn run(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = context.tokens[expression_start].loc.start, .end = context.tokens[expect_end].loc.end },
-            .replacement = try std.fmt.allocPrint(
-                context.allocator,
+            .replacement = try context.allocator.print(
                 "{s}expectEqualStrings({s}, {s})",
                 .{ qualification, expected, actual },
             ),
@@ -103,7 +102,7 @@ test "byte equality assertions use string-aware failures" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_strings)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_equal_strings)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -125,7 +124,7 @@ test "a custom expect harness is not rewritten to expectEqualStrings" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_strings)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_equal_strings)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -143,7 +142,7 @@ test "non-byte equality assertions do not use string expectations" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_testing_expect_equal_strings)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_testing_expect_equal_strings)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,

@@ -1,0 +1,44 @@
+# `modernize-container-init`
+
+Reports removed `initEmpty()` and `initFull()` calls on proven fixed-size
+`std.bit_set.Integer`, `Array`, `Static` and `std.enums.EnumSet` types, including
+their legacy aliases. Fixes use the type's `empty` and `full` values.
+
+Also reports deprecated empty default initializers on standard unmanaged hash
+maps, `std.array_hash_map.Custom` / `Auto` / `String`, their legacy unmanaged
+aliases, and `std.enums.EnumMap`, replacing empty default initializers with
+`.empty`.
+`std.heap.ArenaAllocator.State` uses `.init` instead.
+
+**Why it matters.** Zig 0.17 replaces these zero-argument constructors with
+constants, and the standard containers document explicit initial values rather
+than default field initialization. Dynamic bitsets still require allocator and
+length arguments; `EnumMap.initFull(value)` also remains supported. Managed hash
+maps with allocator fields require their own initialization and are excluded.
+
+**When it matters.** Enabled by the `modernize` profile. Proof follows scoped
+constant type/namespace aliases rooted in `@import("std")`; custom, mutable and
+shadowed aliases are skipped. Explicit variable types, typed literals, field
+defaults and `@as` result types can establish the type of an empty initializer.
+Initializers with fields, pointer/optional/array result types and unknown types
+are skipped. Zero-argument calls and clean empty initializers receive safe quick
+fixes; comments inside removed parentheses or braces receive advice without an
+edit.
+
+```zig
+const Bits = std.bit_set.Integer(8);
+
+// Before
+const cleared = Bits.initEmpty();
+const filled = Bits.initFull();
+var map: std.AutoHashMapUnmanaged(u32, u8) = .{};
+var state: std.heap.ArenaAllocator.State = .{};
+
+// After
+const cleared = Bits.empty;
+const filled = Bits.full;
+var map: std.AutoHashMapUnmanaged(u32, u8) = .empty;
+var state: std.heap.ArenaAllocator.State = .init;
+```
+
+See the [Zig 0.17 standard-library changes](https://ziglang.org/download/0.17.0/release-notes.html#Standard-Library).

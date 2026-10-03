@@ -31,7 +31,7 @@ const ProgramBuilder = struct {
     }
 
     fn append(builder: *ProgramBuilder, comptime format: []const u8, arguments: anytype) !void {
-        const piece = try std.fmt.allocPrint(builder.allocator, format, arguments);
+        const piece = try builder.allocator.print(format, arguments);
         defer builder.allocator.free(piece);
         try builder.text.appendSlice(builder.allocator, piece);
     }
@@ -40,7 +40,7 @@ const ProgramBuilder = struct {
         builder.sequence += 1;
         const quality = quality_names[builder.random.uintLessThan(usize, quality_names.len)];
         const subject = subject_names[builder.random.uintLessThan(usize, subject_names.len)];
-        return std.fmt.allocPrint(builder.allocator, "{s}{c}{s}{d}", .{
+        return builder.allocator.print("{s}{c}{s}{d}", .{
             quality, std.ascii.toUpper(subject[0]), subject[1..], builder.sequence,
         });
     }
@@ -49,7 +49,7 @@ const ProgramBuilder = struct {
         builder.sequence += 1;
         const quality = quality_names[builder.random.uintLessThan(usize, quality_names.len)];
         const subject = subject_names[builder.random.uintLessThan(usize, subject_names.len)];
-        return std.fmt.allocPrint(builder.allocator, "{s}_{s}_{d}", .{ quality, subject, builder.sequence });
+        return builder.allocator.print("{s}_{s}_{d}", .{ quality, subject, builder.sequence });
     }
 
     fn smallLength(builder: *ProgramBuilder) u32 {
@@ -264,7 +264,7 @@ fn reportFindings(source: []const u8, label: []const u8, found: []const analysis
 
 fn sortedRules(allocator: std.mem.Allocator, found: []const analysis.Finding) ![]u16 {
     const rules = try allocator.alloc(u16, found.len);
-    for (found, rules) |finding, *rule| rule.* = @intFromEnum(finding.rule);
+    for (found, rules) |finding, *rule| rule.* = @backingInt(finding.rule);
     std.mem.sort(u16, rules, {}, std.sort.asc(u16));
     return rules;
 }
@@ -288,11 +288,11 @@ fn expectSameRules(
 }
 
 fn parseAndRender(allocator: std.mem.Allocator, source: [:0]const u8) ![:0]const u8 {
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     defer tree.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
     const rendered = try tree.renderAlloc(allocator);
-    return try allocator.dupeZ(u8, rendered);
+    return try allocator.dupeSentinel(u8, rendered, 0);
 }
 
 fn insertProbeComment(allocator: std.mem.Allocator, source: [:0]const u8, random: std.Random) ![:0]const u8 {
@@ -303,7 +303,7 @@ fn insertProbeComment(allocator: std.mem.Allocator, source: [:0]const u8, random
         if (byte == '\n' and index + 1 < source.len) try line_starts.append(allocator, index + 1);
     }
     const at = line_starts.items[random.uintLessThan(usize, line_starts.items.len)];
-    return std.fmt.allocPrintSentinel(allocator, "{s}// probe comment\n{s}", .{
+    return allocator.printSentinel("{s}// probe comment\n{s}", .{
         source[0..at], source[at..],
     }, 0);
 }

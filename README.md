@@ -1,7 +1,7 @@
 # zig-analyzer
 
 A language server and linter for Zig. Instead of reimplementing Zig's
-semantics, zig-analyzer builds a patched Zig 0.16.0 compiler and asks it what
+semantics, zig-analyzer builds a patched Zig 0.17.0 compiler and asks it what
 each expression resolved to, falling back to syntax-based analysis when a
 file does not compile.
 
@@ -66,6 +66,9 @@ Compiler updates run on a debounced background worker. The server answers from
 the latest syntax immediately, then publishes compiler-enriched diagnostics
 only if that result still matches the current document version. If the backend
 hangs, a watchdog disconnects it without blocking foreground requests.
+Ordinary source saves reuse the running incremental compiler and its analysis
+state. Build configuration changes restart analysis to discover the current
+source roots.
 
 ## Linter
 
@@ -98,12 +101,20 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 190 rules with stable codes, organized into five named profiles,
+There are 200 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings
 can be suppressed with source directives;
 [docs/linting.md](docs/linting.md) documents all of it.
+
+The [Zig 0.17.0 audit](docs/zig-0.17.0-lint-audit.md) reviews every existing
+rule. Eight new checks in the `modernize` profile cover removed syntax,
+deprecated builtins and build APIs, changed bit casts, linkage values, and
+container APIs. The idiomatic profile also offers `@divCeil` guidance.
+Deprecation warnings follow standard-library and literal file imports, including
+unsaved editor buffers. A new correctness check flags batch network sends whose
+error result hides partial progress.
 
 The engine runs without crashes over TigerBeetle (244 files), the complete
 Zig standard library (550 files), and roughly 6,100 mangled fuzzing variants
@@ -113,13 +124,13 @@ Worst-case single-file `check` time on that corpus is about 0.3 s
 
 ## Installation
 
-The `0.16.0-6` release provides a relocatable x86_64 Linux archive containing
+The `0.17.0-1` release provides a relocatable x86_64 Linux archive containing
 both zig-analyzer and its patched compiler backend. Verify the published
 SHA-256 checksum before installing it. Building from source requires Zig
-0.16.0 exactly:
+0.17.0 exactly:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zig build backend                    # builds the patched compiler
 zig-out/bin/zig-analyzer doctor      # verifies the setup
 ```
@@ -132,7 +143,7 @@ projects.
 
 Release versions track the supported Zig release: the base version names the
 Zig version the analyzer targets, and a numeric suffix increments with each
-zig-analyzer release, as in `0.16.0-1`. The suffix carries no compatibility
+zig-analyzer release, as in `0.17.0-1`. The suffix carries no compatibility
 meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
 ## Project status
@@ -141,7 +152,7 @@ zig-analyzer is pre-1.0 software with a narrow compatibility boundary: each
 release supports exactly one Zig version. The lint rules combine token-level
 file analysis, conservative cross-file summaries, and compiler-backed project
 facts; they stay opaque when a relationship cannot be proven. The compiler
-backend is pinned to exactly Zig 0.16.0 and requires porting work for each new
+backend is pinned to exactly Zig 0.17.0 and requires porting work for each new
 Zig release. [TASKS.md](TASKS.md) records which planned work is complete.
 
 The project's claim is narrow: querying the compiler produces better editor

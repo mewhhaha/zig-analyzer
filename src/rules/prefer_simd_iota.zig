@@ -90,7 +90,7 @@ pub fn run(context: RuleRun) !void {
 
         if (!is_iota) continue;
 
-        const replacement = try std.fmt.allocPrint(context.allocator, "std.simd.iota({s}, {s})", .{ type_str, len_str });
+        const replacement = try context.allocator.print("std.simd.iota({s}, {s})", .{ type_str, len_str });
 
         const edits = try context.allocator.alloc(types.Edit, 1);
         if (whole_call_start) |as_start| {
@@ -125,8 +125,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_simd_iota,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "vector literal initializes sequential integers 0..{d}; use 'std.simd.iota({s}, {s})'",
                 .{ elements.len - 1, type_str, len_str },
             ),
@@ -204,7 +203,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_simd_iota)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_simd_iota)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

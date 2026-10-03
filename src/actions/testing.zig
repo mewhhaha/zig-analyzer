@@ -11,10 +11,10 @@ pub fn run(context: ActionRun) !void {
     if (context.tokens[selected_index - 1].tag == .keyword_fn) {
         if (testNamed(context, name)) return;
         try context.oneEdit(
-            try std.fmt.allocPrint(context.allocator, "Generate test for '{s}'", .{name}),
+            try context.allocator.print("Generate test for '{s}'", .{name}),
             .refactor_rewrite,
             .{ .start = context.source.len, .end = context.source.len },
-            try std.fmt.allocPrint(context.allocator, "\n\ntest \"{s}\" {{\n    _ = {s};\n}}\n", .{ name, name }),
+            try context.allocator.print("\n\ntest \"{s}\" {{\n    _ = {s};\n}}\n", .{ name, name }),
             .{},
         );
         return;
@@ -22,11 +22,10 @@ pub fn run(context: ActionRun) !void {
     if (context.tokens[selected_index - 1].tag != .keyword_const or !isContainerDeclaration(context, selected_index)) return;
     if (testNamed(context, name)) return;
     try context.oneEdit(
-        try std.fmt.allocPrint(context.allocator, "Generate declaration smoke test for '{s}'", .{name}),
+        try context.allocator.print("Generate declaration smoke test for '{s}'", .{name}),
         .refactor_rewrite,
         .{ .start = context.source.len, .end = context.source.len },
-        try std.fmt.allocPrint(
-            context.allocator,
+        try context.allocator.print(
             "\n\ntest \"{s} declarations compile\" {{\n    @import(\"std\").testing.refAllDecls({s});\n}}\n",
             .{ name, name },
         ),
@@ -58,7 +57,7 @@ fn testNamed(context: ActionRun, name: []const u8) bool {
     for (context.tokens, 0..) |token, index| {
         if (token.tag != .keyword_test or index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .string_literal) continue;
         const literal = context.tokenText(index + 1);
-        if (std.mem.indexOf(u8, literal, name) != null) return true;
+        if (std.mem.find(u8, literal, name) != null) return true;
     }
     return false;
 }
@@ -68,14 +67,14 @@ test "functions and containers get Zig test harnesses" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const function_source: [:0]const u8 = "fn parse() !void {}";
-    const function_start = std.mem.indexOf(u8, function_source, "parse") orelse unreachable;
+    const function_start = std.mem.find(u8, function_source, "parse") orelse unreachable;
     const function_actions = try registry.actions(arena.allocator(), function_source, .{ .start = function_start, .end = function_start + 5 }, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, function_actions[0].edits[0].replacement, "test \"parse\"") != null);
+    try std.testing.expect(std.mem.find(u8, function_actions[0].edits[0].replacement, "test \"parse\"") != null);
 
     const container_source: [:0]const u8 = "const Config = struct { value: u8 };";
-    const container_start = std.mem.indexOf(u8, container_source, "Config") orelse unreachable;
+    const container_start = std.mem.find(u8, container_source, "Config") orelse unreachable;
     const container_actions = try registry.actions(arena.allocator(), container_source, .{ .start = container_start, .end = container_start + 6 }, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, container_actions[0].edits[0].replacement, "refAllDecls") != null);
+    try std.testing.expect(std.mem.find(u8, container_actions[0].edits[0].replacement, "refAllDecls") != null);
 }
 
 test "nested declarations get no file-scope test harness" {
@@ -83,7 +82,7 @@ test "nested declarations get no file-scope test harness" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "const S = struct { fn parse() void {} };";
-    const start = std.mem.indexOf(u8, source, "parse") orelse unreachable;
+    const start = std.mem.find(u8, source, "parse") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 5 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }

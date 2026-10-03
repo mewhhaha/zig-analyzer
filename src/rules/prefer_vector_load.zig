@@ -126,7 +126,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .prefer_vector_load,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "manually unpacking array '{s}' into vector; use direct vector coercion/cast", .{array_receiver.?}),
+            .message = try context.allocator.print("manually unpacking array '{s}' into vector; use direct vector coercion/cast", .{array_receiver.?}),
             .fixes = fixes,
         });
     }
@@ -188,7 +188,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_vector_load)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_vector_load)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

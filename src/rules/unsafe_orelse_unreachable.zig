@@ -169,7 +169,7 @@ test "orelse unreachable warns only when the idiomatic rule is enabled" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unsafe_orelse_unreachable)] = .information;
+    configuration.levels[@backingInt(types.Rule.unsafe_orelse_unreachable)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -188,7 +188,7 @@ test "test fixtures may use orelse unreachable as an assertion" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unsafe_orelse_unreachable)] = .information;
+    configuration.levels[@backingInt(types.Rule.unsafe_orelse_unreachable)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -209,7 +209,7 @@ test "modular rules honor source suppressions" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unsafe_orelse_unreachable)] = .information;
+    configuration.levels[@backingInt(types.Rule.unsafe_orelse_unreachable)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -232,7 +232,7 @@ test "orelse unreachable does not warn when preceded by assert non-null" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unsafe_orelse_unreachable)] = .information;
+    configuration.levels[@backingInt(types.Rule.unsafe_orelse_unreachable)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -255,7 +255,7 @@ test "orelse unreachable does not warn when preceded by std.debug.assert non-nul
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unsafe_orelse_unreachable)] = .information;
+    configuration.levels[@backingInt(types.Rule.unsafe_orelse_unreachable)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,

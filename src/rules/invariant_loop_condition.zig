@@ -32,8 +32,7 @@ pub fn run(context: RuleRun) !void {
             .rule = .invariant_loop_condition,
             .level = level,
             .span = context.tokens[while_index + 2].loc,
-            .message = try std.fmt.allocPrint(
-                context.allocator,
+            .message = try context.allocator.print(
                 "while condition is invariant and always {s} because '{s}' is a constant; express the actual exit condition directly",
                 .{ if (result) "true" else "false", name },
             ),
@@ -113,7 +112,7 @@ test "a loop condition over a literal constant reports its invariant result" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "always true") != null);
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "always true") != null);
 }
 
 test "variables and constants used in runtime conditions stay clean" {
@@ -143,7 +142,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.invariant_loop_condition)] = .information;
+    configuration.levels[@backingInt(types.Rule.invariant_loop_condition)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

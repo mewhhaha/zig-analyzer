@@ -39,7 +39,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 "Propagate the error with try",
                 .refactor_rewrite,
                 expression.span,
-                try std.fmt.allocPrint(context.allocator, "try {s}", .{source_expression}),
+                try context.allocator.print("try {s}", .{source_expression}),
                 .{},
             );
         }
@@ -48,7 +48,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
             "Handle the error with catch",
             .refactor_rewrite,
             expression.span,
-            try std.fmt.allocPrint(context.allocator, "{s} catch @panic(\"TODO\")", .{source_expression}),
+            try context.allocator.print("{s} catch @panic(\"TODO\")", .{source_expression}),
             .{},
         );
         if (return_kind.errors.len != 0 and !return_kind.merged_error_sets) {
@@ -67,7 +67,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
             "Unwrap the optional or stop",
             .refactor_rewrite,
             expression.span,
-            try std.fmt.allocPrint(context.allocator, "{s}.?", .{source_expression}),
+            try context.allocator.print("{s}.?", .{source_expression}),
             .{},
         );
         if (function != null and function.?.returnsVoid(context)) {
@@ -75,7 +75,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 "Return when the optional is null",
                 .refactor_rewrite,
                 expression.span,
-                try std.fmt.allocPrint(context.allocator, "({s} orelse return)", .{source_expression}),
+                try context.allocator.print("({s} orelse return)", .{source_expression}),
                 .{},
             );
         }
@@ -85,8 +85,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 "Capture the optional payload",
                 .refactor_rewrite,
                 statement_span,
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "if ({s}) |value| {{\n{s}    _ = value;\n{s}}}",
                     .{ source_expression, indentation, indentation },
                 ),
@@ -181,7 +180,7 @@ fn errorCaptureName(context: ActionRun) ![]const u8 {
     if (!identifierExists(context, "err")) return "err";
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
-        const candidate = try std.fmt.allocPrint(context.allocator, "err{d}", .{suffix});
+        const candidate = try context.allocator.print("err{d}", .{suffix});
         if (!identifierExists(context, candidate)) return candidate;
     }
 }
@@ -231,7 +230,7 @@ fn standaloneStatement(context: ActionRun, expression_span: std.zig.Token.Loc) ?
     var end = expression_span.end;
     while (end < context.source.len and (context.source[end] == ' ' or context.source[end] == '\t')) : (end += 1) {}
     if (end >= context.source.len or context.source[end] != ';') return null;
-    const line_start = if (std.mem.lastIndexOfScalar(u8, context.source[0..expression_span.start], '\n')) |nl| nl + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, context.source[0..expression_span.start], '\n')) |nl| nl + 1 else 0;
     if (std.mem.trim(u8, context.source[line_start..expression_span.start], " \t").len != 0) return null;
     return .{ .start = expression_span.start, .end = end + 1 };
 }
@@ -241,18 +240,18 @@ fn addPointerCastAction(context: ActionRun) !void {
     if (expression.call_name != null) return;
     const assignment = typedAssignmentBefore(context, expression.token_index) orelse return;
     const source_type = declaredType(context, context.tokenText(expression.token_index), expression.token_index) orelse return;
-    if (std.mem.indexOfScalar(u8, source_type, '*') == null or std.mem.indexOfScalar(u8, assignment.target_type, '*') == null) return;
-    const needs_alignment = std.mem.indexOf(u8, assignment.target_type, "align(") != null and
-        std.mem.indexOf(u8, source_type, "align(") == null;
+    if (std.mem.findScalar(u8, source_type, '*') == null or std.mem.findScalar(u8, assignment.target_type, '*') == null) return;
+    const needs_alignment = std.mem.find(u8, assignment.target_type, "align(") != null and
+        std.mem.find(u8, source_type, "align(") == null;
     const needs_const_removal = try constQualified(context, source_type) and
         !try constQualified(context, assignment.target_type);
     const needs_pointer_cast = !std.mem.eql(u8, pointeeName(source_type), pointeeName(assignment.target_type));
     if (!needs_alignment and !needs_const_removal and !needs_pointer_cast) return;
 
     var replacement = context.source[expression.span.start..expression.span.end];
-    if (needs_alignment) replacement = try std.fmt.allocPrint(context.allocator, "@alignCast({s})", .{replacement});
-    if (needs_pointer_cast) replacement = try std.fmt.allocPrint(context.allocator, "@ptrCast({s})", .{replacement});
-    if (needs_const_removal) replacement = try std.fmt.allocPrint(context.allocator, "@constCast({s})", .{replacement});
+    if (needs_alignment) replacement = try context.allocator.print("@alignCast({s})", .{replacement});
+    if (needs_pointer_cast) replacement = try context.allocator.print("@ptrCast({s})", .{replacement});
+    if (needs_const_removal) replacement = try context.allocator.print("@constCast({s})", .{replacement});
     const title = if (needs_const_removal)
         "Insert pointer casts including @constCast (removes const — verify writes are safe)"
     else
@@ -261,7 +260,7 @@ fn addPointerCastAction(context: ActionRun) !void {
 }
 
 fn constQualified(context: ActionRun, type_text: []const u8) !bool {
-    const buffer = try context.allocator.dupeZ(u8, type_text);
+    const buffer = try context.allocator.dupeSentinel(u8, type_text, 0);
     defer context.allocator.free(buffer);
     var tokenizer = std.zig.Tokenizer.init(buffer);
     while (true) {
@@ -273,7 +272,7 @@ fn constQualified(context: ActionRun, type_text: []const u8) !bool {
 
 fn pointeeName(pointer_type: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, pointer_type, " \t\r\n");
-    const separator = std.mem.lastIndexOfAny(u8, trimmed, " \t") orelse return trimmed;
+    const separator = std.mem.findLastAny(u8, trimmed, " \t") orelse return trimmed;
     return std.mem.trim(u8, trimmed[separator + 1 ..], " \t\r\n");
 }
 
@@ -310,7 +309,7 @@ fn addSplitCompoundAssertion(context: ActionRun) !void {
         // A line comment inside an operand would comment out the inserted ');',
         // and one next to an 'and' or a parenthesis would be dropped silently.
         const argument_text = context.source[context.tokens[name_index + 1].loc.end..context.tokens[closing].loc.start];
-        if (std.mem.indexOf(u8, argument_text, "//") != null) continue;
+        if (std.mem.find(u8, argument_text, "//") != null) continue;
         const callee = context.source[context.tokens[callee_start].loc.start..context.tokens[name_index].loc.end];
         const indentation = context.lineIndentation(statement_span.start);
         var writer: std.Io.Writer.Allocating = .init(context.allocator);
@@ -377,7 +376,7 @@ fn addOrelseUnreachableUnwrap(context: ActionRun) !void {
             "Unwrap with '.?' instead of orelse unreachable",
             .refactor_rewrite,
             span,
-            try std.fmt.allocPrint(context.allocator, "{s}.?", .{
+            try context.allocator.print("{s}.?", .{
                 context.source[span.start..context.tokens[orelse_index - 1].loc.end],
             }),
             .{},
@@ -474,7 +473,7 @@ fn reverseMatchingToken(
 fn commentBetweenTokens(context: ActionRun, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
         const gap = context.source[token.loc.end..context.tokens[index + 1].loc.start];
-        if (std.mem.indexOf(u8, gap, "//") != null) return true;
+        if (std.mem.find(u8, gap, "//") != null) return true;
     }
     return false;
 }
@@ -499,10 +498,10 @@ test "fallible and optional expressions get Zig recovery actions" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn load() error{Missing, Invalid}!u8 { return 1; } fn maybe() ?u8 { return 1; } fn run() !void { _ = load(); maybe(); }";
-    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const load_start = std.mem.findLast(u8, source, "load()") orelse unreachable;
     const fallible = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
     try std.testing.expectEqual(@as(usize, 3), fallible.len);
-    const maybe_start = std.mem.lastIndexOf(u8, source, "maybe()") orelse unreachable;
+    const maybe_start = std.mem.findLast(u8, source, "maybe()") orelse unreachable;
     const optional = try registry.actions(arena.allocator(), source, .{ .start = maybe_start, .end = maybe_start + 5 }, &.{});
     try std.testing.expect(optional.len >= 2);
     try std.testing.expectEqualStrings("maybe().?", optional[0].edits[0].replacement);
@@ -514,7 +513,7 @@ test "fallible calls embedded in larger expressions get no rewrite" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn load() error{Missing}!u8 { return 1; } fn run() !void { const x = load() + 1; _ = x; }";
-    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const load_start = std.mem.findLast(u8, source, "load()") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -526,7 +525,7 @@ test "ambiguous same-named functions get no error rewrite" {
     const source: [:0]const u8 =
         "const A = struct { fn get() !u8 { return 1; } }; " ++
         "const B = struct { fn get() u8 { return 2; } fn run() void { _ = get(); } };";
-    const get_start = std.mem.lastIndexOf(u8, source, "get()") orelse unreachable;
+    const get_start = std.mem.findLast(u8, source, "get()") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = get_start, .end = get_start + 3 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -537,14 +536,14 @@ test "error switch captures avoid shadowing an existing err binding" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn load() error{Missing}!u8 { return 1; } fn run() void { const err = 1; _ = err; _ = load(); }";
-    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const load_start = std.mem.findLast(u8, source, "load()") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
     var found_switch = false;
     for (actions) |action| {
         const replacement = action.edits[0].replacement;
-        if (std.mem.indexOf(u8, replacement, "switch") == null) continue;
+        if (std.mem.find(u8, replacement, "switch") == null) continue;
         found_switch = true;
-        try std.testing.expect(std.mem.indexOf(u8, replacement, "catch |err2| switch (err2)") != null);
+        try std.testing.expect(std.mem.find(u8, replacement, "catch |err2| switch (err2)") != null);
     }
     try std.testing.expect(found_switch);
 }
@@ -555,11 +554,11 @@ test "merged error sets get no exhaustive switch" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn load() (error{A} || error{B})!u8 { return 1; } fn run() !void { _ = load(); }";
-    const load_start = std.mem.lastIndexOf(u8, source, "load()") orelse unreachable;
+    const load_start = std.mem.findLast(u8, source, "load()") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = load_start, .end = load_start + 4 }, &.{});
     try std.testing.expect(actions.len >= 1);
     for (actions) |action| {
-        try std.testing.expect(std.mem.indexOf(u8, action.edits[0].replacement, "switch") == null);
+        try std.testing.expect(std.mem.find(u8, action.edits[0].replacement, "switch") == null);
     }
 }
 
@@ -568,11 +567,11 @@ test "pointer casts are composed in Zig order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run(source: *const u8) void { const target: *align(8) u16 = source; _ = target; }";
-    const start = std.mem.indexOfPos(u8, source, 20, "source;") orelse unreachable;
+    const start = std.mem.findPos(u8, source, 20, "source;") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "@constCast(@ptrCast(@alignCast(source)))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, actions[0].title, "@constCast") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].edits[0].replacement, "@constCast(@ptrCast(@alignCast(source)))") != null);
+    try std.testing.expect(std.mem.find(u8, actions[0].title, "@constCast") != null);
 }
 
 test "type paths containing 'const' letters get no spurious @constCast" {
@@ -580,7 +579,7 @@ test "type paths containing 'const' letters get no spurious @constCast" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run(source: *constants.Config) void { const target: *config.Config = source; _ = target; }";
-    const start = std.mem.indexOfPos(u8, source, 30, "source;") orelse unreachable;
+    const start = std.mem.findPos(u8, source, 30, "source;") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings("@ptrCast(source)", actions[0].edits[0].replacement);
@@ -593,7 +592,7 @@ test "compound assertions split into one assert per condition" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn run(a: bool, b: bool, c: bool) void {\n    std.debug.assert(a and b and c);\n}";
-    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const start = std.mem.find(u8, source, "assert") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), actions.len);
     try std.testing.expectEqualStrings(
@@ -608,7 +607,7 @@ test "assertions with a comment inside an operand are not split" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn run(a: bool, b: bool) void {\n    assert(a // invariant\n    and b);\n}";
-    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const start = std.mem.find(u8, source, "assert") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -619,7 +618,7 @@ test "assertions with a comment between and and an operand are not split" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn run(a: bool, b: bool) void {\n    assert(a and // invariant\n    b);\n}";
-    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const start = std.mem.find(u8, source, "assert") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -629,7 +628,7 @@ test "assertions mixing or at the top level stay together" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn run(a: bool, b: bool, c: bool) void {\n    assert(a and b or c);\n}";
-    const start = std.mem.indexOf(u8, source, "assert") orelse unreachable;
+    const start = std.mem.find(u8, source, "assert") orelse unreachable;
     const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), actions.len);
 }
@@ -639,14 +638,14 @@ test "orelse unreachable becomes a .? unwrap" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const call_source: [:0]const u8 = "fn get(map: Map, key: u32) u8 { return map.get(key) orelse unreachable; }";
-    const call_start = std.mem.indexOf(u8, call_source, "unreachable") orelse unreachable;
+    const call_start = std.mem.find(u8, call_source, "unreachable") orelse unreachable;
     const call = try registry.actions(arena.allocator(), call_source, .{ .start = call_start, .end = call_start + 11 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), call.len);
     try std.testing.expectEqualStrings("map.get(key).?", call[0].edits[0].replacement);
-    try std.testing.expectEqual(std.mem.indexOf(u8, call_source, "map.get").?, call[0].edits[0].span.start);
+    try std.testing.expectEqual(std.mem.find(u8, call_source, "map.get").?, call[0].edits[0].span.start);
 
     const binding_source: [:0]const u8 = "fn run(maybe: ?u8) u8 { const value = maybe orelse unreachable; return value; }";
-    const binding_start = std.mem.indexOf(u8, binding_source, "unreachable") orelse unreachable;
+    const binding_start = std.mem.find(u8, binding_source, "unreachable") orelse unreachable;
     const binding = try registry.actions(arena.allocator(), binding_source, .{ .start = binding_start, .end = binding_start + 11 }, &.{});
     try std.testing.expectEqual(@as(usize, 1), binding.len);
     try std.testing.expectEqualStrings("maybe.?", binding[0].edits[0].replacement);
@@ -658,13 +657,13 @@ test "orelse unreachable with a comment or a larger operand is not rewritten" {
     defer arena.deinit();
     const comment_source: [:0]const u8 =
         "fn run(maybe: ?u8) u8 { return maybe orelse // proven non-null\n    unreachable; }";
-    const comment_start = std.mem.indexOf(u8, comment_source, "unreachable") orelse unreachable;
+    const comment_start = std.mem.find(u8, comment_source, "unreachable") orelse unreachable;
     const commented = try registry.actions(arena.allocator(), comment_source, .{ .start = comment_start, .end = comment_start + 11 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), commented.len);
 
     const operand_source: [:0]const u8 =
         "fn run(flag: bool, maybe: ?bool) bool { return flag == maybe orelse unreachable; }";
-    const operand_start = std.mem.indexOf(u8, operand_source, "unreachable") orelse unreachable;
+    const operand_start = std.mem.find(u8, operand_source, "unreachable") orelse unreachable;
     const operand = try registry.actions(arena.allocator(), operand_source, .{ .start = operand_start, .end = operand_start + 11 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), operand.len);
 }

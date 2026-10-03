@@ -32,8 +32,7 @@ pub fn run(context: RuleRun) !void {
             const related = try context.allocator.alloc(types.RelatedSpan, 1);
             related[0] = .{
                 .span = context.tokens[deferred_release.method_index].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "deferred {s} runs as this scope exits",
                     .{release_method},
                 ),
@@ -42,8 +41,7 @@ pub fn run(context: RuleRun) !void {
                 .rule = .returning_released_value,
                 .level = level,
                 .span = context.tokens[return_index + 1].loc,
-                .message = try std.fmt.allocPrint(
-                    context.allocator,
+                .message = try context.allocator.print(
                     "returned value '{s}' is released by deferred {s} before the caller can use it",
                     .{ binding_name, release_method },
                 ),

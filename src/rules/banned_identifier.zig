@@ -18,13 +18,12 @@ pub fn run(context: RuleRun) !void {
                 .end = context.tokens[path_end].loc.end,
             };
             const message = if (banned.hint) |hint|
-                try std.fmt.allocPrint(
-                    context.allocator,
+                try context.allocator.print(
                     "'{s}' is banned by zig-analyzer.json; {s}",
                     .{ banned.path, hint },
                 )
             else
-                try std.fmt.allocPrint(context.allocator, "'{s}' is banned by zig-analyzer.json", .{banned.path});
+                try context.allocator.print("'{s}' is banned by zig-analyzer.json", .{banned.path});
             try context.emit(.{
                 .rule = .banned_identifier,
                 .level = level,
@@ -42,7 +41,7 @@ fn matchedPathEnd(context: RuleRun, start: usize, path: []const u8) ?usize {
     var cursor = start;
     var remaining = path;
     while (true) {
-        const segment_end = std.mem.indexOfScalar(u8, remaining, '.') orelse remaining.len;
+        const segment_end = std.mem.findScalar(u8, remaining, '.') orelse remaining.len;
         if (context.tokens[cursor].tag != .identifier or
             !context.tokenIs(cursor, remaining[0..segment_end])) return null;
         if (segment_end == remaining.len) return cursor;
@@ -67,7 +66,7 @@ test "banned dotted paths are reported with their hint" {
         "'std.BoundedArray' is banned by zig-analyzer.json; use stdx.BoundedArrayType",
         findings[0].message,
     );
-    try std.testing.expectEqual(std.mem.indexOf(u8, source, "std.BoundedArray").?, findings[0].span.start);
+    try std.testing.expectEqual(std.mem.find(u8, source, "std.BoundedArray").?, findings[0].span.start);
     try std.testing.expectEqualStrings("'sleep' is banned by zig-analyzer.json", findings[2].message);
 }
 
@@ -122,7 +121,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.banned_identifier)] = .warning;
+    configuration.levels[@backingInt(types.Rule.banned_identifier)] = .warning;
     configuration.banned = &test_banned;
     try run(.{
         .allocator = allocator,
