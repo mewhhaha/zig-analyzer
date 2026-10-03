@@ -55,6 +55,9 @@ const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "ascii.indexOfIgnoreCasePosLinear", .advice = "std.ascii.findIgnoreCasePosLinear", .removed = true, .drop_in = true },
     .{ .path = "mem.copyForwards", .advice = "@memmove" },
     .{ .path = "mem.copyBackwards", .advice = "@memmove" },
+    .{ .path = "Build.Step.TranslateC", .advice = "the official translate-c package's Translator API" },
+    .{ .path = "Build.Module.addWin32ResourceFile", .advice = "the external Windows resource package before Zig 0.18" },
+    .{ .path = "Build.LazyPath.basename", .advice = "path resolution during a make step", .removed = true },
     .{ .path = "fmt.bufPrintZ", .advice = "std.mem.printSentinel with a 0 sentinel", .removed = true },
     .{ .path = "fmt.bufPrint", .advice = "std.mem.print", .drop_in = true },
     .{ .path = "fmt.bufPrintSentinel", .advice = "std.mem.printSentinel", .drop_in = true },
@@ -313,7 +316,8 @@ fn isStdRoot(context: RuleRun, scopes: *const syntax_scope.Index, index: usize) 
 }
 
 fn isModuleImport(context: RuleRun, declaration: usize, module_literal: []const u8) bool {
-    return declaration + 5 < context.tokens.len and context.tokens[declaration + 1].tag == .equal and
+    return declaration > 0 and context.tokens[declaration - 1].tag == .keyword_const and
+        declaration + 5 < context.tokens.len and context.tokens[declaration + 1].tag == .equal and
         context.tokenIs(declaration + 2, "@import") and context.tokens[declaration + 3].tag == .l_paren and
         context.tokens[declaration + 4].tag == .string_literal and context.tokenIs(declaration + 4, module_literal) and
         context.tokens[declaration + 5].tag == .r_paren and
@@ -460,28 +464,79 @@ fn findBuildApi(context: RuleRun, scopes: *const syntax_scope.Index) !void {
             index + 2 >= context.tokens.len or context.tokens[index + 1].tag != .period) continue;
         const is_args = context.tokenIs(index + 2, "args");
         const is_translate = context.tokenIs(index + 2, "addTranslateC");
-        if (!is_args and !is_translate) continue;
-        const binding = scopes.findBinding(index) orelse continue;
-        const declaration = binding.token_index;
-        if (declaration + 6 >= context.tokens.len or context.tokens[declaration + 1].tag != .colon or
-            context.tokens[declaration + 2].tag != .asterisk) continue;
-        const root_index = declaration + 3 + @as(usize, if (context.tokens[declaration + 3].tag == .keyword_const) 1 else 0);
-        const std_binding = scopes.findBinding(root_index) orelse continue;
-        if (!isModuleImport(context, std_binding.token_index, "\"std\"")) continue;
-        if (!isStdRoot(context, scopes, root_index) or
-            matchedStdPathEnd(context, root_index, "Build") == null or
-            root_index + 3 >= context.tokens.len or
-            (context.tokens[root_index + 3].tag != .comma and context.tokens[root_index + 3].tag != .r_paren)) continue;
+        const is_resource = context.tokenIs(index + 2, "addWin32ResourceFile");
+        const is_basename = context.tokenIs(index + 2, "basename");
+        const is_root_resource = index + 4 < context.tokens.len and
+            context.tokenIs(index + 2, "root_module") and context.tokens[index + 3].tag == .period and
+            context.tokenIs(index + 4, "addWin32ResourceFile");
+        if (!is_args and !is_translate and !is_resource and !is_basename and !is_root_resource) continue;
+        const receiver_kind = buildReceiverKind(context, scopes, index, 0) orelse continue;
+        if ((is_args or is_translate) and receiver_kind != .build) continue;
+        if (is_resource and receiver_kind != .module) continue;
+        if (is_root_resource and receiver_kind != .compile_step) continue;
+        if (is_basename and receiver_kind != .lazy_path) continue;
+        const member_index = index + @as(usize, if (is_root_resource) 4 else 2);
+        if (!is_args and (member_index + 1 >= context.tokens.len or context.tokens[member_index + 1].tag != .l_paren)) continue;
         try context.emit(.{
             .rule = .modernize_build_api,
             .level = level,
-            .span = .{ .start = token.loc.start, .end = context.tokens[index + 2].loc.end },
+            .span = .{ .start = token.loc.start, .end = context.tokens[member_index].loc.end },
             .message = if (is_args)
                 "std.Build.args was removed in Zig 0.17; call addPassthruArgs() on the Run step, since configure-time code can no longer observe passthru arguments"
+            else if (is_translate)
+                "std.Build.addTranslateC uses the deprecated TranslateC step; add the official translate-c package and use its Translator API"
+            else if (is_basename)
+                "std.Build.LazyPath.basename was removed; lazy path names are unavailable during configuration, so resolve them in a make step"
             else
-                "std.Build.addTranslateC uses the deprecated TranslateC step; add the official translate-c package and use its Translator API",
+                "std.Build.Module.addWin32ResourceFile is deprecated in Zig 0.17; plan migration to the external Windows resource package before Zig 0.18",
         });
     }
+}
+
+const BuildReceiverKind = enum { build, module, lazy_path, compile_step };
+
+fn buildReceiverKind(context: RuleRun, scopes: *const syntax_scope.Index, index: usize, depth: usize) ?BuildReceiverKind {
+    if (depth == 6) return null;
+    const binding = scopes.findBinding(index) orelse return null;
+    const declaration = binding.token_index;
+    if (declaration + 2 >= context.tokens.len) return null;
+    if (context.tokens[declaration + 1].tag == .colon) {
+        var root_index = declaration + 2;
+        if (context.tokens[root_index].tag == .asterisk) root_index += 1;
+        if (root_index < context.tokens.len and context.tokens[root_index].tag == .keyword_const) root_index += 1;
+        if (root_index >= context.tokens.len) return null;
+        const std_binding = scopes.findBinding(root_index) orelse return null;
+        if (!isModuleImport(context, std_binding.token_index, "\"std\"")) return null;
+        const paths = [_]struct { path: []const u8, kind: BuildReceiverKind }{
+            .{ .path = "Build.Step.Compile", .kind = .compile_step },
+            .{ .path = "Build.LazyPath", .kind = .lazy_path },
+            .{ .path = "Build.Module", .kind = .module },
+            .{ .path = "Build", .kind = .build },
+        };
+        for (paths) |entry| {
+            const path_end = matchedStdPathEnd(context, root_index, entry.path) orelse continue;
+            if (path_end + 1 >= context.tokens.len) continue;
+            switch (context.tokens[path_end + 1].tag) {
+                .comma, .r_paren, .equal, .semicolon => return entry.kind,
+                else => {},
+            }
+        }
+        return null;
+    }
+    if (declaration == 0 or context.tokens[declaration - 1].tag != .keyword_const or
+        context.tokens[declaration + 1].tag != .equal or context.tokens[declaration + 2].tag != .identifier) return null;
+    const initializer = declaration + 2;
+    const end = scopes.statementEnd(declaration) orelse return null;
+    if (end == initializer + 1) return buildReceiverKind(context, scopes, initializer, depth + 1);
+    if (initializer + 3 >= context.tokens.len or context.tokens[initializer + 1].tag != .period or
+        context.tokens[initializer + 3].tag != .l_paren) return null;
+    if (buildReceiverKind(context, scopes, initializer, depth + 1) != .build) return null;
+    const closing = scopes.matchingToken(initializer + 3) orelse return null;
+    if (closing + 1 != end) return null;
+    if (context.tokenIs(initializer + 2, "createModule") or context.tokenIs(initializer + 2, "addModule")) return .module;
+    const factories = [_][]const u8{ "addExecutable", "addLibrary", "addObject", "addTest", "addSharedLibrary", "addStaticLibrary" };
+    for (factories) |factory| if (context.tokenIs(initializer + 2, factory)) return .compile_step;
+    return null;
 }
 
 fn findBitcastChanges(context: RuleRun, scopes: *const syntax_scope.Index) !void {
@@ -853,6 +908,47 @@ test "modernize build API requires a scoped std Build receiver" {
     const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
     try std.testing.expectEqual(@as(usize, 2), findings.len);
     for (findings) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+}
+
+test "modernize build API proves module factory and compile root module receivers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const library = @import(\"std\");\n" ++
+        "fn build(b: *library.Build, module: *library.Build.Module, exe: *library.Build.Step.Compile, path: library.Build.LazyPath) void {\n" ++
+        "    module.addWin32ResourceFile(.{});\n" ++
+        "    exe.root_module.addWin32ResourceFile(.{});\n" ++
+        "    _ = path.basename();\n" ++
+        "    const created = b.createModule(.{});\n" ++
+        "    const alias = created;\n" ++
+        "    alias.addWin32ResourceFile(.{});\n" ++
+        "    const executable = b.addExecutable(.{});\n" ++
+        "    executable.root_module.addWin32ResourceFile(.{});\n" ++
+        "    { const created = Custom{}; created.addWin32ResourceFile(.{}); }\n" ++
+        "}\n" ++
+        "fn custom(module: *Custom, exe: *Custom, path: Custom) void {\n" ++
+        "    module.addWin32ResourceFile(.{}); exe.root_module.addWin32ResourceFile(.{}); _ = path.basename();\n" ++
+        "}\n";
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 5), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+}
+
+test "modernize build API leaves shadowed imports and unknown factory results alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "fn build(b: *std.Build) void {\n" ++
+        "    const unknown = b.customFactory(.{}); unknown.addWin32ResourceFile(.{});\n" ++
+        "    const list = b.createModule(.{}).items; list.addWin32ResourceFile(.{});\n" ++
+        "    var mutable = b.createModule(.{}); mutable.addWin32ResourceFile(.{});\n" ++
+        "}\n" ++
+        "fn other(std: Custom, module: *std.Build.Module) void { module.addWin32ResourceFile(.{}); }\n" ++
+        "comptime { var library = @import(\"std\"); library = Custom;\n" ++
+        "    const module: *library.Build.Module = undefined; module.addWin32ResourceFile(.{}); }\n";
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "modernize bitCast audits proven array and vector types" {

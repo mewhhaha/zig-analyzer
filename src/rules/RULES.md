@@ -410,6 +410,10 @@ Compiler-backed project rules are opt-in.
 - [`prefer-simd-iota`](prefer-simd-iota.md) — Reports vector literals initialized
   with sequential integers instead of `std.simd.iota`.
 
+- [`prefer-div-ceil`](prefer-div-ceil.md) — Reports manual ceiling division and
+  standard-library division calls that can be reviewed for Zig 0.17's
+  `@divCeil` builtin.
+
 ## Modernization profile
 
 - [`modernize-managed-container`](modernize-managed-container.md) — Reports
@@ -425,9 +429,17 @@ Compiler-backed project rules are opt-in.
 - [`modernize-removed-syntax`](modernize-removed-syntax.md) — Reports language
   constructs removed in Zig 0.17.0, including C imports and errdefer captures.
 - [`modernize-build-api`](modernize-build-api.md) — Reports removed build argument
-  access and the deprecated C translation build step.
+  and lazy-path access, deprecated C translation, and Windows resource APIs.
 - [`modernize-bitcast`](modernize-bitcast.md) — Reports array and vector bit casts
   to review for Zig 0.17.0's endian-independent logical bit representation.
+- [`modernize-extern-bitcast`](modernize-extern-bitcast.md) — Reports bit casts
+  involving proven extern structs or unions, which Zig 0.17 no longer permits.
+- [`modernize-global-linkage`](modernize-global-linkage.md) — Reports removed
+  `internal` and `link_once` linkage values in proven linkage contexts.
+- [`modernize-array-list-access`](modernize-array-list-access.md) — Reports
+  deprecated list last-element methods and migrates them to `last`.
+- [`modernize-container-init`](modernize-container-init.md) — Reports removed
+  fixed bitset and enum-set initialization methods.
 
 ## Disciplined profile
 

@@ -101,7 +101,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 194 rules with stable codes, organized into five named profiles,
+There are 199 rules with stable codes, organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings
@@ -109,8 +109,9 @@ can be suppressed with source directives;
 [docs/linting.md](docs/linting.md) documents all of it.
 
 The [Zig 0.17.0 audit](docs/zig-0.17.0-lint-audit.md) reviews every existing
-rule. Four new checks in the `modernize` profile cover removed syntax,
-deprecated builtins and build APIs, and changed array/vector bit casts.
+rule. Eight new checks in the `modernize` profile cover removed syntax,
+deprecated builtins and build APIs, changed bit casts, linkage values, and
+container APIs. The idiomatic profile also offers `@divCeil` guidance.
 
 The engine runs without crashes over TigerBeetle (244 files), the complete
 Zig standard library (550 files), and roughly 6,100 mangled fuzzing variants

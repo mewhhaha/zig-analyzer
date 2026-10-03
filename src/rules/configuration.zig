@@ -893,6 +893,10 @@ test "modernize and disciplined profiles enable only their rule families" {
         \\{"lints":{"profile":"modernize"}}
     );
     try std.testing.expectEqual(Level.information, modernize.level(.modernize_managed_container));
+    inline for (.{ Rule.modernize_extern_bitcast, .modernize_global_linkage, .modernize_array_list_access, .modernize_container_init }) |rule| {
+        try std.testing.expectEqual(Level.information, modernize.level(rule));
+    }
+    try std.testing.expectEqual(Level.off, modernize.level(.prefer_div_ceil));
     try std.testing.expectEqual(Level.off, modernize.level(.function_length));
     try std.testing.expectEqual(Level.off, modernize.level(.prefer_range_for));
 
@@ -908,6 +912,8 @@ test "modernize and disciplined profiles enable only their rule families" {
         \\{"lints":{"profile":"idiomatic"}}
     );
     try std.testing.expectEqual(Level.information, idiomatic.level(.prefer_range_for));
+    try std.testing.expectEqual(Level.information, idiomatic.level(.prefer_div_ceil));
+    try std.testing.expectEqual(Level.off, idiomatic.level(.modernize_extern_bitcast));
     try std.testing.expectEqual(Level.off, idiomatic.level(.exposed_private_type));
     try std.testing.expectEqual(Level.off, idiomatic.level(.allocator_first_parameter));
     try std.testing.expectEqual(Level.off, idiomatic.level(.minority_naming_style));

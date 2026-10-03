@@ -351,8 +351,9 @@ Acceptance:
   CI/download checksums are pinned to compatible inputs.
 - [x] All 190 original lint IDs have an evidence-backed relevance audit;
   updated API fixes and ownership models preserve current Zig behavior.
-- [x] Four opt-in modernization rules cover deprecated builtins, removed
-  syntax, build APIs, and changed array/vector bit casts.
+- [x] Eight opt-in modernization rules cover deprecated builtins, removed
+  syntax, build APIs, changed bit casts, linkage, and container APIs; idiomatic
+  ceiling-division guidance preserves the checked helper's error contract.
 - [x] Incremental sessions survive ordinary saves while imported edits and
   closed overlays refresh diagnostics; changed build configuration or an
   independent saved source root restarts the appropriate compilation.

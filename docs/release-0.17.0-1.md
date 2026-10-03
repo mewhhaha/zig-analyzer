@@ -17,7 +17,7 @@ optional `ArrayList.last()`, allocator printing and sentinel duplication,
 public-only `@hasDecl`, and overlapping copies through `@memmove`. Power
 simplifications preserve fallible integer-power behavior.
 
-Four new rules bring the catalog to 194. They are enabled by the opt-in
+Nine new rules bring the catalog to 199. Eight are enabled by the opt-in
 `modernize` profile:
 
 - [`modernize-deprecated-builtin`](../src/rules/modernize-deprecated-builtin.md)
@@ -29,6 +29,24 @@ Four new rules bring the catalog to 194. They are enabled by the opt-in
   covers removed build argument access and deprecated C translation APIs.
 - [`modernize-bitcast`](../src/rules/modernize-bitcast.md)
   requests review of array and vector bit casts whose semantics changed.
+- [`modernize-extern-bitcast`](../src/rules/modernize-extern-bitcast.md)
+  covers forbidden casts involving proven extern structs and unions.
+- [`modernize-global-linkage`](../src/rules/modernize-global-linkage.md)
+  covers removed `internal` and `link_once` values in linkage contexts.
+- [`modernize-array-list-access`](../src/rules/modernize-array-list-access.md)
+  migrates deprecated last-element accessors to `last()` or `last().?`.
+- [`modernize-container-init`](../src/rules/modernize-container-init.md)
+  migrates removed fixed-bitset and enum-set initializers to constant values.
+
+The idiomatic profile adds
+[`prefer-div-ceil`](../src/rules/prefer-div-ceil.md) for canonical unsigned
+rounding arithmetic and proved standard-library ceiling-division calls.
+Guidance carries no automatic edit because the builtin and the checked
+standard-library function have different error-handling contracts.
+
+Build migration guidance also covers removed `LazyPath.basename` and deprecated
+Windows resource compilation, including proven module factories and compile
+steps' `root_module` receivers.
 
 Existing modernization rules also recognize the 0.17 standard-library moves,
 reflection changes, allocator API replacements, and optimization mode names.
@@ -54,7 +72,7 @@ the [installation guide](installation.md).
 
 ## Validation
 
-- Host suite: all 30 build steps, including 1,059 analyzer unit tests, nine rule
+- Host suite: all 30 build steps, including analyzer unit tests, nine rule
   fuzz tests, examples, protocol invariants, and CLI checks.
 - Compiler-backed suite: ten integration cases, covering overlays, incremental
   updates, imported-file changes, and the backend protocol.

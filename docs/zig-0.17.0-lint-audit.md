@@ -1,9 +1,12 @@
 # Zig 0.17.0 audit of existing lints
 
 This audit covers all **190 rule IDs present on `origin/main` before the 0.17
-update**. Every ID appears exactly once in the table below. The four new opt-in migration
+update**. Every ID appears exactly once in the table below. The eight new opt-in migration
 IDs are `modernize-deprecated-builtin`, `modernize-removed-syntax`,
-`modernize-build-api` and `modernize-bitcast`; they are documented separately in
+`modernize-build-api`, `modernize-bitcast`, `modernize-extern-bitcast`,
+`modernize-global-linkage`, `modernize-array-list-access`, and
+`modernize-container-init`. The idiomatic profile also adds `prefer-div-ceil`.
+All nine are documented separately in
 the [rule reference](../src/rules/RULES.md).
 No existing rule is removed: the language, lifetime and policy checks remain
 useful, while release-dependent API advice and ownership recognition are updated.
