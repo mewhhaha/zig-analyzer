@@ -7,8 +7,8 @@ const Reading = struct {
 };
 
 fn Strategy(comptime Model: type) type {
-    const fields = @typeInfo(Model).@"struct".fields;
-    return if (fields.len >= 3 and fields[0].type == u32) struct {
+    const fields = @typeInfo(Model).@"struct".field_types;
+    return if (fields.len >= 3 and fields[0] == u32) struct {
         fn encode(model: Model) u32 {
             return model.sequence;
         }

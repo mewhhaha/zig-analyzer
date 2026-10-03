@@ -261,7 +261,7 @@ fn addPointerCastAction(context: ActionRun) !void {
 }
 
 fn constQualified(context: ActionRun, type_text: []const u8) !bool {
-    const buffer = try context.allocator.dupeZ(u8, type_text);
+    const buffer = try context.allocator.dupeSentinel(u8, type_text, 0);
     defer context.allocator.free(buffer);
     var tokenizer = std.zig.Tokenizer.init(buffer);
     while (true) {

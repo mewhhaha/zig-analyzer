@@ -102,7 +102,7 @@ test "idiomatic style actions preserve behavior" {
     closeResource(.{});
     runWhenEnabled(true);
     _ = manuallyTerminated;
-    try std.testing.expectEqual(@as(usize, 2), @typeInfo(json.JsonValue).@"union".fields.len);
+    try std.testing.expectEqual(@as(usize, 2), @typeInfo(json.JsonValue).@"union".field_names.len);
 }
 
 test "manual error expectation" {

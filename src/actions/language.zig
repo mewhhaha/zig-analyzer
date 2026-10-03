@@ -439,6 +439,8 @@ fn addInlineElseRefactor(context: ActionRun) !void {
         if (context.tokens[opening].tag != .l_paren) continue;
         const header_end = context.matchingToken(opening, .l_paren, .r_paren) orelse continue;
         const type_name = reflectedTypeName(context, opening + 1, header_end) orelse continue;
+        const names_only = header_end >= 2 and context.tokenIs(header_end - 1, "field_names");
+        if (!names_only and !context.tokenIs(header_end - 1, "fields")) continue;
         const shape = context.shapeNamed(type_name) orelse continue;
         if (shape.kind != .tagged_union) continue;
         if (uniformUnionPayloadType(context, type_name) == null) continue;
@@ -448,7 +450,7 @@ fn addInlineElseRefactor(context: ActionRun) !void {
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
         const value_name = reflectedDispatchValue(context, body_start + 1, body_end) orelse continue;
         const field_name = reflectedFieldCapture(context, header_end + 1, body_start) orelse continue;
-        if (!loopBodyIsGuardedReturn(context, value_name, field_name, body_start, body_end)) continue;
+        if (!loopBodyIsGuardedReturn(context, value_name, field_name, body_start, body_end, names_only)) continue;
         const trailing_unreachable = body_end + 2 < context.tokens.len and
             context.tokens[body_end + 1].tag == .keyword_unreachable and context.tokens[body_end + 2].tag == .semicolon;
         const at_function_end = body_end + 1 < context.tokens.len and context.tokens[body_end + 1].tag == .r_brace;
@@ -525,7 +527,7 @@ fn reflectedDispatchValue(context: ActionRun, start: usize, end: usize) ?[]const
     return null;
 }
 
-fn loopBodyIsGuardedReturn(context: ActionRun, value: []const u8, field: []const u8, body_start: usize, body_end: usize) bool {
+fn loopBodyIsGuardedReturn(context: ActionRun, value: []const u8, field: []const u8, body_start: usize, body_end: usize, names_only: bool) bool {
     const tokens = context.tokens;
     var index = body_start + 1;
     if (index + 2 >= body_end or tokens[index].tag != .keyword_if or tokens[index + 1].tag != .l_paren) return false;
@@ -546,20 +548,22 @@ fn loopBodyIsGuardedReturn(context: ActionRun, value: []const u8, field: []const
     index += 1;
     var compares_field = false;
     var compares_tag = false;
-    index = eqlOperandEnd(context, index, body_end, value, field, &compares_field, &compares_tag) orelse return false;
+    index = eqlOperandEnd(context, index, body_end, value, field, names_only, &compares_field, &compares_tag) orelse return false;
     if (index >= body_end or tokens[index].tag != .comma) return false;
     index += 1;
-    index = eqlOperandEnd(context, index, body_end, value, field, &compares_field, &compares_tag) orelse return false;
+    index = eqlOperandEnd(context, index, body_end, value, field, names_only, &compares_field, &compares_tag) orelse return false;
     if (!compares_field or !compares_tag) return false;
     if (index + 1 >= body_end or tokens[index].tag != .r_paren or tokens[index + 1].tag != .r_paren) return false;
     index += 2;
-    if (index + 10 != body_end) return false;
-    return tokens[index].tag == .keyword_return and
-        tokens[index + 1].tag == .builtin and context.tokenIs(index + 1, "@field") and
-        tokens[index + 2].tag == .l_paren and context.tokenIs(index + 3, value) and
-        tokens[index + 4].tag == .comma and context.tokenIs(index + 5, field) and
-        tokens[index + 6].tag == .period and context.tokenIs(index + 7, "name") and
-        tokens[index + 8].tag == .r_paren and tokens[index + 9].tag == .semicolon;
+    const return_length: usize = if (names_only) 8 else 10;
+    if (index + return_length != body_end) return false;
+    if (tokens[index].tag != .keyword_return or
+        tokens[index + 1].tag != .builtin or !context.tokenIs(index + 1, "@field") or
+        tokens[index + 2].tag != .l_paren or !context.tokenIs(index + 3, value) or
+        tokens[index + 4].tag != .comma or !context.tokenIs(index + 5, field)) return false;
+    const suffix = index + (if (names_only) @as(usize, 6) else 8);
+    if (!names_only and (tokens[index + 6].tag != .period or !context.tokenIs(index + 7, "name"))) return false;
+    return tokens[suffix].tag == .r_paren and tokens[suffix + 1].tag == .semicolon;
 }
 
 fn eqlOperandEnd(
@@ -568,15 +572,22 @@ fn eqlOperandEnd(
     end: usize,
     value: []const u8,
     field: []const u8,
+    names_only: bool,
     compares_field: *bool,
     compares_tag: *bool,
 ) ?usize {
     const tokens = context.tokens;
-    if (index + 2 < end and tokens[index].tag == .identifier and context.tokenIs(index, field) and
-        tokens[index + 1].tag == .period and tokens[index + 2].tag == .identifier and context.tokenIs(index + 2, "name"))
-    {
-        compares_field.* = true;
-        return index + 3;
+    if (index < end and tokens[index].tag == .identifier and context.tokenIs(index, field)) {
+        if (names_only) {
+            compares_field.* = true;
+            return index + 1;
+        }
+        if (index + 2 < end and tokens[index + 1].tag == .period and
+            tokens[index + 2].tag == .identifier and context.tokenIs(index + 2, "name"))
+        {
+            compares_field.* = true;
+            return index + 3;
+        }
     }
     if (index + 3 < end and tokens[index].tag == .builtin and context.tokenIs(index, "@tagName") and
         tokens[index + 1].tag == .l_paren and tokens[index + 2].tag == .identifier and
@@ -929,4 +940,23 @@ test "reflection dispatch loops that are not the exact guarded return stay put" 
     const trailing_start = std.mem.indexOf(u8, trailing_source, "inline") orelse unreachable;
     const trailing = try registry.actions(arena.allocator(), trailing_source, .{ .start = trailing_start, .end = trailing_start + 6 }, &shapes);
     try std.testing.expectEqual(@as(usize, 0), trailing.len);
+}
+
+test "Zig 0.17 field name reflection dispatch becomes an inline-else switch" {
+    const registry = @import("registry.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const shapes = [_]analysis.ResolvedShape{.{ .type_name = "Value", .kind = .tagged_union, .fields = &.{ "number", "code" } }};
+    const source: [:0]const u8 =
+        "const Value = union(enum) { number: u8, code: u8, }; " ++
+        "fn get(value: Value) u8 { inline for (@typeInfo(Value).@\"union\".field_names) |name| { " ++
+        "if (std.mem.eql(u8, name, @tagName(value))) return @field(value, name); } unreachable; }";
+    const start = std.mem.indexOf(u8, source, "inline") orelse unreachable;
+    const actions = try registry.actions(arena.allocator(), source, .{ .start = start, .end = start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expect(std.mem.indexOf(u8, actions[0].edits[0].replacement, "inline else") != null);
+    const wrong_source = try std.mem.replaceOwned(u8, arena.allocator(), source, "field_names", "field_types");
+    const wrong_z = try arena.allocator().dupeSentinel(u8, wrong_source, 0);
+    const wrong_actions = try registry.actions(arena.allocator(), wrong_z, .{ .start = start, .end = start + 6 }, &shapes);
+    try std.testing.expectEqual(@as(usize, 0), wrong_actions.len);
 }

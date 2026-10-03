@@ -665,7 +665,7 @@ fn checkFile(
 fn configurationForPath(configuration: analysis.Configuration, path: []const u8) analysis.Configuration {
     var file_configuration = configuration;
     if (isTestOnlyPath(path) or std.mem.eql(u8, std.fs.path.basename(path), "build.zig")) {
-        file_configuration.levels[@intFromEnum(analysis.Rule.prefer_log_over_print)] = .off;
+        file_configuration.levels[@backingInt(analysis.Rule.prefer_log_over_print)] = .off;
     }
     return file_configuration;
 }
@@ -683,7 +683,7 @@ fn isTestOnlyPath(path: []const u8) bool {
 
 test "test and build paths keep debug printing out of production logging guidance" {
     var configuration = analysis.Configuration.defaults();
-    configuration.levels[@intFromEnum(analysis.Rule.prefer_log_over_print)] = .information;
+    configuration.levels[@backingInt(analysis.Rule.prefer_log_over_print)] = .information;
     try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "build.zig").level(.prefer_log_over_print));
     try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "src/testing/snapshot.zig").level(.prefer_log_over_print));
     try std.testing.expectEqual(analysis.Level.off, configurationForPath(configuration, "src/parser_tests.zig").level(.prefer_log_over_print));
@@ -752,7 +752,7 @@ fn reportedFindings(
     std.mem.sort(ReportedFinding, reported.items, {}, struct {
         fn lessThan(_: void, left: ReportedFinding, right: ReportedFinding) bool {
             if (left.span.start != right.span.start) return left.span.start < right.span.start;
-            return @intFromEnum(left.rule) < @intFromEnum(right.rule);
+            return @backingInt(left.rule) < @backingInt(right.rule);
         }
     }.lessThan);
     const sorted = try reported.toOwnedSlice(allocator);

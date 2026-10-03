@@ -101,7 +101,7 @@ pub fn findingsWithCompilerFacts(
         fn lessThan(_: void, left: Finding, right: Finding) bool {
             if (left.file_index != right.file_index) return left.file_index < right.file_index;
             if (left.span.start != right.span.start) return left.span.start < right.span.start;
-            return @intFromEnum(left.rule) < @intFromEnum(right.rule);
+            return @backingInt(left.rule) < @backingInt(right.rule);
         }
     }.lessThan);
     return try found.toOwnedSlice(allocator);
@@ -182,7 +182,7 @@ fn findSummaryLifecycleDifferences(
         try findEscapingLocalStorage(allocator, file, file_index, configuration, summary_index, found);
         if (!allocation_lifecycle.enabled(configuration)) continue;
         if (!summary_index.hasImportedLifecycleFacts(file.source)) continue;
-        var tree = try std.zig.Ast.parse(allocator, file.source, .zig);
+        var tree = try std.zig.Ast.parse(allocator, file.source, .{ .mode = .zig });
         defer tree.deinit(allocator);
         var scope_index = try syntax_scope.Index.init(allocator, file.source, file.tokens);
         defer scope_index.deinit();
@@ -3229,7 +3229,7 @@ fn callReturnsOwned(
     if (summary_index.ownedReturnCall(source, receiver, name) != null) return true;
     if (owned_call.releaseForMethod(name) == null or std.mem.eql(u8, name, "realloc")) return false;
     const owner = receiver orelse return false;
-    return std.ascii.indexOfIgnoreCase(owner, "alloc") != null or std.mem.eql(u8, owner, "gpa");
+    return std.ascii.findIgnoreCase(owner, "alloc") != null or std.mem.eql(u8, owner, "gpa");
 }
 
 fn findItemsBefore(file: IndexedSourceFile, end: usize, start: usize) ?usize {
@@ -4115,21 +4115,21 @@ fn findMinorityNamingStyles(
             }
         }
     }
-    var totals: [std.meta.fields(NamingKind).len]usize = @splat(0);
-    var counts: [std.meta.fields(NamingKind).len][std.meta.fields(NamingStyle).len]usize = @splat(@splat(0));
+    var totals: [@typeInfo(NamingKind).@"enum".field_names.len]usize = @splat(0);
+    var counts: [@typeInfo(NamingKind).@"enum".field_names.len][@typeInfo(NamingStyle).@"enum".field_names.len]usize = @splat(@splat(0));
     for (samples.items) |sample| {
-        totals[@intFromEnum(sample.kind)] += 1;
-        counts[@intFromEnum(sample.kind)][@intFromEnum(sample.style)] += 1;
+        totals[@backingInt(sample.kind)] += 1;
+        counts[@backingInt(sample.kind)][@backingInt(sample.style)] += 1;
     }
     for (samples.items) |sample| {
-        const total = totals[@intFromEnum(sample.kind)];
-        const kind_counts = counts[@intFromEnum(sample.kind)];
+        const total = totals[@backingInt(sample.kind)];
+        const kind_counts = counts[@backingInt(sample.kind)];
         if (total < 20) continue;
         var dominant = NamingStyle.snake;
         for (std.enums.values(NamingStyle)) |style| {
-            if (kind_counts[@intFromEnum(style)] > kind_counts[@intFromEnum(dominant)]) dominant = style;
+            if (kind_counts[@backingInt(style)] > kind_counts[@backingInt(dominant)]) dominant = style;
         }
-        const dominant_count = kind_counts[@intFromEnum(dominant)];
+        const dominant_count = kind_counts[@backingInt(dominant)];
         if (dominant_count * 10 < total * 9 or sample.style == dominant) continue;
         try found.append(allocator, .{
             .file_index = sample.file_index,
@@ -4352,14 +4352,14 @@ fn findLiteralBooleanArguments(
 }
 
 fn functionDescribesBoolean(function_name: []const u8, parameter_name: []const u8) bool {
-    if (std.ascii.indexOfIgnoreCase(function_name, parameter_name) != null or
+    if (std.ascii.findIgnoreCase(function_name, parameter_name) != null or
         std.ascii.startsWithIgnoreCase(function_name, "test")) return true;
     if ((parameter_name.len <= 2 or std.ascii.eqlIgnoreCase(parameter_name, "value")) and
         (std.ascii.startsWithIgnoreCase(function_name, "set") or
             std.ascii.startsWithIgnoreCase(function_name, "enable") or
             std.ascii.startsWithIgnoreCase(function_name, "disable"))) return true;
     if (parameter_name.len > 2 and std.ascii.endsWithIgnoreCase(parameter_name, "ed") and
-        std.ascii.indexOfIgnoreCase(function_name, parameter_name[0 .. parameter_name.len - 2]) != null) return true;
+        std.ascii.findIgnoreCase(function_name, parameter_name[0 .. parameter_name.len - 2]) != null) return true;
     return false;
 }
 
@@ -4778,9 +4778,9 @@ test "project findings compose imports tests c imports and build options" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.duplicate_c_import)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.unreferenced_test_file)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.conflicting_build_options)] = .information;
+    configuration.levels[@backingInt(types.Rule.duplicate_c_import)] = .information;
+    configuration.levels[@backingInt(types.Rule.unreferenced_test_file)] = .information;
+    configuration.levels[@backingInt(types.Rule.conflicting_build_options)] = .information;
     const files = [_]SourceFile{
         .{ .path = "src/a.zig", .source = "const one = @import(\"../shared.zig\"); const two = @import(\"../src/../shared.zig\"); const c = @cImport({ @cInclude(\"x.h\"); });" },
         .{ .path = "src/b.zig", .source = "const c = @cImport({ @cInclude(\"x.h\"); });" },
@@ -4798,7 +4798,7 @@ test "test files imported from a test block are referenced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unreferenced_test_file)] = .information;
+    configuration.levels[@backingInt(types.Rule.unreferenced_test_file)] = .information;
     const files = [_]SourceFile{
         .{ .path = "src/parser.zig", .source = "test { _ = @import(\"parser_test.zig\"); }" },
         .{ .path = "src/parser_test.zig", .source = "test \"parser\" {}" },
@@ -4811,7 +4811,7 @@ test "build helpers may enumerate test directories" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unreferenced_test_file)] = .information;
+    configuration.levels[@backingInt(types.Rule.unreferenced_test_file)] = .information;
     const files = [_]SourceFile{
         .{ .path = "build.zig", .source = "pub fn build(b: *Build) void { @import(\"tests/add_cases.zig\").add(b); }" },
         .{ .path = "tests/add_cases.zig", .source = "pub fn add(b: *Build) void { var dir = b.path(\"tests/cases\").openDir(.{ .iterate = true }); var iterator = dir.iterate(); _ = iterator; }" },
@@ -4842,7 +4842,7 @@ test "project conventions require a strong corpus majority" {
         .inconsistent_parameter_vocabulary,
         .inconsistent_error_set_style,
     };
-    for (expected_rules) |rule| configuration.levels[@intFromEnum(rule)] = .information;
+    for (expected_rules) |rule| configuration.levels[@backingInt(rule)] = .information;
     const found = try findings(allocator, files, configuration);
     for (expected_rules) |rule| {
         var seen = false;
@@ -4859,7 +4859,7 @@ test "literal boolean arguments require a unique resolved project function" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.literal_boolean_argument)] = .information;
+    configuration.levels[@backingInt(types.Rule.literal_boolean_argument)] = .information;
     const files = [_]SourceFile{
         .{
             .path = "src/action.zig",
@@ -4880,7 +4880,7 @@ test "literal boolean arguments skip self-describing and ambiguous functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.literal_boolean_argument)] = .information;
+    configuration.levels[@backingInt(types.Rule.literal_boolean_argument)] = .information;
     const files = [_]SourceFile{
         .{
             .path = "src/a.zig",
@@ -4900,8 +4900,8 @@ test "disciplined project rules report direct allocation and recursion" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.allocation_after_init)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.recursive_call)] = .information;
+    configuration.levels[@backingInt(types.Rule.allocation_after_init)] = .information;
+    configuration.levels[@backingInt(types.Rule.recursive_call)] = .information;
     const files = [_]SourceFile{.{
         .path = "src/service.zig",
         .source = "fn work(allocator: std.mem.Allocator) !void { _ = try allocator.alloc(u8, 1); } fn walk() void { walk(); }",
@@ -4922,7 +4922,7 @@ test "allocation policy attributes nested function work only to the nested funct
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.allocation_after_init)] = .information;
+    configuration.levels[@backingInt(types.Rule.allocation_after_init)] = .information;
     const files = [_]SourceFile{.{
         .path = "src/factory.zig",
         .source = "fn Factory() type { return struct { fn work(allocator: std.mem.Allocator) !void { _ = try allocator.alloc(u8, 1); } }; }",
@@ -4940,7 +4940,7 @@ test "recursive calls use the runtime body and stay inside nested functions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.recursive_call)] = .information;
+    configuration.levels[@backingInt(types.Rule.recursive_call)] = .information;
     const files = [_]SourceFile{.{
         .path = "src/walk.zig",
         .source = "fn walk() error{Stop}!void { return walk(); } fn Factory() type { return struct { fn inner() void { inner(); } }; }",
@@ -4964,7 +4964,7 @@ test "declared import boundaries reject matching project imports" {
         .from = "src/rules",
         .denied = &.{"src/lsp_server.zig"},
     }};
-    configuration.levels[@intFromEnum(types.Rule.import_boundary)] = .warning;
+    configuration.levels[@backingInt(types.Rule.import_boundary)] = .warning;
     const files = [_]SourceFile{.{
         .path = "src/rules/example.zig",
         .source = "const lsp = @import(\"../lsp_server.zig\");",
@@ -5870,8 +5870,8 @@ test "compiler facts report divergent APIs and unreachable public declarations" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.configuration_divergent_api)] = .warning;
-    configuration.levels[@intFromEnum(types.Rule.unreachable_public_declaration)] = .warning;
+    configuration.levels[@backingInt(types.Rule.configuration_divergent_api)] = .warning;
+    configuration.levels[@backingInt(types.Rule.unreachable_public_declaration)] = .warning;
     const files = [_]SourceFile{.{
         .path = "src/api.zig",
         .source = "pub const Api = struct {}; pub fn detached() void {}",
@@ -5907,7 +5907,7 @@ test "unresolved named modules keep reachability findings opaque" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.unreachable_public_declaration)] = .warning;
+    configuration.levels[@backingInt(types.Rule.unreachable_public_declaration)] = .warning;
     const files = [_]SourceFile{
         .{ .path = "src/main.zig", .source = "const custom = @import(\"custom\"); pub fn run() void { _ = custom; }" },
         .{ .path = "src/detached.zig", .source = "pub fn detached() void {}" },

@@ -22,7 +22,7 @@ pub fn run(context: RuleRun) !void {
             .span = token.loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "@memcpy destination and source both derive from '{s}'; overlapping copies are undefined behavior, use std.mem.copyForwards or std.mem.copyBackwards",
+                "@memcpy destination and source both derive from '{s}'; overlapping copies are undefined behavior, use @memmove",
                 .{destination.base},
             ),
         });
@@ -158,7 +158,7 @@ test "memcpy between possibly overlapping slices of one base value reports the h
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "'buffer'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "copyForwards") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings[0].message, "@memmove") != null);
     try std.testing.expect(std.mem.indexOf(u8, findings[1].message, "'state.bytes'") != null);
 }
 

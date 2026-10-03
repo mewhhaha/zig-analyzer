@@ -35,7 +35,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
         const method = context.tokenText(acquisition.method_index);
         if (acquisition.kind == .allocation and std.mem.eql(u8, callable, "std.Build.create")) continue;
         if (acquisition.kind == .allocation and acquisitionUsesNamedArena(receiver, acquisition)) continue;
-        if (acquisition.kind == .allocation and std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
+        if (acquisition.kind == .allocation and std.mem.eql(u8, method, "create") and std.ascii.findIgnoreCase(receiver, "pool") != null) continue;
         if (acquisition.kind == .allocation and declarationLooksArenaBacked(
             context,
             context.tokenText(acquisition.release_owner_start),
@@ -467,7 +467,7 @@ fn findPartiallyInitializedOwnedFields(
             acquisitionUsesArenaContract(context, function_scope, acquisition) or
             scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end)) or
             scopeDeinitializesReceiver(context, scope_opening, scope_end, owner)) continue;
-        if (std.mem.eql(u8, method, "create") and std.ascii.indexOfIgnoreCase(receiver, "pool") != null) continue;
+        if (std.mem.eql(u8, method, "create") and std.ascii.findIgnoreCase(receiver, "pool") != null) continue;
         const fallible_index = fallibleBeforeBindingUse(context, statement_end + 1, scope_end, owner, false) orelse continue;
         const field = context.tokenText(equal_index - 1);
         const owned_path = context.source[context.tokens[owner_index].loc.start..context.tokens[equal_index - 1].loc.end];
@@ -787,9 +787,9 @@ const Acquisition = struct {
 };
 
 fn acquisitionUsesNamedArena(receiver: []const u8, acquisition: Acquisition) bool {
-    return std.ascii.indexOfIgnoreCase(receiver, "arena") != null or
+    return std.ascii.findIgnoreCase(receiver, "arena") != null or
         (acquisition.release_owner_member != null and
-            std.ascii.indexOfIgnoreCase(acquisition.release_owner_member.?, "arena") != null);
+            std.ascii.findIgnoreCase(acquisition.release_owner_member.?, "arena") != null);
 }
 
 fn owningAcquisition(
@@ -878,6 +878,8 @@ fn owningAcquisitionAfterEqual(
         };
     }
     const standard_allocator_argument = owned_call.standardAllocatorArgument(callable);
+    if ((context.tokenIs(path_end, "print") or context.tokenIs(path_end, "printSentinel")) and
+        !owned_call.printReceiverIsAllocator(context.source, context.tokens, path_end - 2)) return null;
     if (!isAllocatingMethod(context.tokenText(path_end)) and standard_allocator_argument == null) return null;
     if (argumentsReferenceArena(context, path_end + 2, call_close)) return null;
     if (standard_allocator_argument) |argument_index| {
@@ -907,7 +909,7 @@ fn receiverOwnsCreatedMemory(context: RuleRun, start: usize, end: usize) bool {
     if (start > end) return false;
     const receiver = context.source[context.tokens[start].loc.start..context.tokens[end].loc.end];
     const roles = [_][]const u8{ "alloc", "gpa", "pool" };
-    for (roles) |role| if (std.ascii.indexOfIgnoreCase(receiver, role) != null) return true;
+    for (roles) |role| if (std.ascii.findIgnoreCase(receiver, role) != null) return true;
     return false;
 }
 
@@ -951,15 +953,15 @@ fn callArgument(context: RuleRun, start: usize, end: usize, expected_index: usiz
 
 fn argumentsReferenceArena(context: RuleRun, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and std.ascii.indexOfIgnoreCase(context.tokenText(index), "arena") != null) return true;
+        if (token.tag == .identifier and std.ascii.findIgnoreCase(context.tokenText(index), "arena") != null) return true;
     }
     return false;
 }
 
 fn receiverLooksLikeAllocator(context: RuleRun, receiver_start: usize, receiver_end: usize) bool {
     const receiver_name = context.tokenText(receiver_end);
-    if (std.ascii.indexOfIgnoreCase(receiver_name, "alloc") != null or
-        std.ascii.indexOfIgnoreCase(receiver_name, "arena") != null or
+    if (std.ascii.findIgnoreCase(receiver_name, "alloc") != null or
+        std.ascii.findIgnoreCase(receiver_name, "arena") != null or
         std.mem.eql(u8, receiver_name, "gpa")) return true;
     if (receiver_start != receiver_end) return false;
     for (context.tokens, 0..) |token, identifier_index| {
@@ -1068,7 +1070,7 @@ fn functionDocumentsArenaAllocator(context: RuleRun, function: ScopeRange, alloc
     while (first_doc > 0 and context.tokens[first_doc - 1].tag == .doc_comment) first_doc -= 1;
     if (first_doc == modifier_start) return false;
     const documentation = context.source[context.tokens[first_doc].loc.start..context.tokens[modifier_start].loc.start];
-    return std.ascii.indexOfIgnoreCase(documentation, "allocator should be an arena") != null;
+    return std.ascii.findIgnoreCase(documentation, "allocator should be an arena") != null;
 }
 
 fn functionParameterIsAllocator(context: RuleRun, function: ScopeRange, parameter_name: []const u8) bool {
@@ -1141,7 +1143,7 @@ fn functionParameterIndex(context: RuleRun, function: ScopeRange, parameter_name
 fn callArgumentIsArenaBacked(context: RuleRun, argument: TokenRange, call_index: usize, depth: usize) bool {
     if (argument.start >= argument.end) return false;
     for (context.tokens[argument.start..argument.end], argument.start..) |token, index| {
-        if (token.tag == .identifier and std.ascii.indexOfIgnoreCase(context.tokenText(index), "arena") != null) return true;
+        if (token.tag == .identifier and std.ascii.findIgnoreCase(context.tokenText(index), "arena") != null) return true;
     }
     if (argument.start + 1 != argument.end or context.tokens[argument.start].tag != .identifier) return false;
     const argument_name = context.tokenText(argument.start);
@@ -1597,6 +1599,20 @@ test "standard allocation helpers require error-path cleanup" {
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqualStrings("    errdefer allocator.free(joined);\n", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "allocator print calls require error-path cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn build(a: std.mem.Allocator, writer: *std.Io.Writer) ![]u8 {\n" ++
+        "    const text = try a.print(\"{s}\", .{\"name\"});\n" ++
+        "    try writer.writeAll(text);\n" ++
+        "    return text;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("    errdefer a.free(text);\n", findings[0].fixes[0].edits[0].replacement);
 }
 
 test "standard allocation helpers preserve allocator field provenance" {

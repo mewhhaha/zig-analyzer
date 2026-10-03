@@ -182,7 +182,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             banned_entry.* = .{ .path = try allocator.dupe(u8, path), .hint = hint };
         }
         configuration.banned = banned;
-        if (banned.len != 0) configuration.levels[@intFromEnum(Rule.banned_identifier)] = .warning;
+        if (banned.len != 0) configuration.levels[@backingInt(Rule.banned_identifier)] = .warning;
     }
     if (lints.get("rules")) |rules_value| {
         const rules = switch (rules_value) {
@@ -216,7 +216,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
                         configuration.warning = try invalidLevelMessage(allocator, entry.key_ptr.*);
                         return configuration;
                     };
-                    configuration.levels[@intFromEnum(rule)] = level;
+                    configuration.levels[@backingInt(rule)] = level;
                 },
                 .object => if (try parseRuleSettings(allocator, rule, entry.value_ptr.*, &configuration)) |warning| {
                     configuration.warning = warning;
@@ -293,7 +293,7 @@ fn parseContracts(
             boundary.* = .{ .from = from, .denied = denied };
         }
         configuration.import_boundaries = boundaries;
-        if (boundaries.len != 0) configuration.levels[@intFromEnum(Rule.import_boundary)] = .warning;
+        if (boundaries.len != 0) configuration.levels[@backingInt(Rule.import_boundary)] = .warning;
     }
 
     if (contracts.get("resources")) |resources_value| {
@@ -366,7 +366,7 @@ fn parseContracts(
             };
         }
         configuration.must_use_contracts = callables;
-        if (callables.len != 0) configuration.levels[@intFromEnum(Rule.discarded_must_use)] = .warning;
+        if (callables.len != 0) configuration.levels[@backingInt(Rule.discarded_must_use)] = .warning;
     }
     return null;
 }
@@ -425,7 +425,7 @@ fn parseRuleSettings(
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "level")) {
             const level = parseLevel(entry.value_ptr.*) orelse return try invalidLevelMessage(allocator, rule.code());
-            configuration.levels[@intFromEnum(rule)] = level;
+            configuration.levels[@backingInt(rule)] = level;
             continue;
         }
         switch (rule) {
@@ -807,8 +807,8 @@ fn parseLevel(value: std.json.Value) ?Level {
         .string => |string| string,
         else => return null,
     };
-    inline for (std.meta.fields(Level)) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Level).@"enum".field_names, @typeInfo(Level).@"enum".field_values) |field_name, field_value| {
+        if (std.mem.eql(u8, name, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -824,7 +824,7 @@ fn invalidLevelMessage(allocator: std.mem.Allocator, path: []const u8) ![]const 
 fn setTier(configuration: *Configuration, tier: Tier, level: Level) void {
     for (std.enums.values(Rule)) |rule| {
         if (rule.tier() == tier and !requiresExplicitConfiguration(rule)) {
-            configuration.levels[@intFromEnum(rule)] = level;
+            configuration.levels[@backingInt(rule)] = level;
         }
     }
 }
@@ -844,7 +844,7 @@ fn applyLintProfile(configuration: *Configuration, profile: LintProfile) void {
     for (std.enums.values(Rule)) |rule| {
         const minimum_profile = rule.profile() orelse continue;
         if (profileIncludes(profile, minimum_profile)) {
-            configuration.levels[@intFromEnum(rule)] = .information;
+            configuration.levels[@backingInt(rule)] = .information;
         }
     }
 }

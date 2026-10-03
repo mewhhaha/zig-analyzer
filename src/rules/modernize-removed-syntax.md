@@ -1,0 +1,20 @@
+# `modernize-removed-syntax`
+
+Reports removed Zig 0.17 syntax: `@cImport`, obvious array multiplication
+expressions using `**`, `void{}`, `errdefer` error captures, and the `i0`
+primitive type.
+
+**Why it matters.** These constructs no longer compile. Migration requires
+the official translate-c package, typed `@splat` initialization for
+single-element repetition (or an initializer or loop for larger patterns), `{}`,
+caller-side `catch` handling, or review of whether `u0` expresses the intended
+zero-bit type.
+
+**When it matters.** Enabled by the `modernize` profile. Token scanning can
+provide migration guidance even when the current compiler cannot parse the
+source. Only removing `void` from `void{}` carries a fix. Array multiplication
+requires an obvious literal or a scoped binding with a known array or vector
+type, so pointer-to-pointer syntax is skipped. Unknown operand types receive
+no finding. Scoped declarations named `i0` are skipped.
+
+See [Zig 0.17 language changes](https://ziglang.org/download/0.17.0/release-notes.html#Language-Changes).

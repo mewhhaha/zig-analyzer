@@ -1,7 +1,14 @@
-# prefer-index-of-scalar
+# `prefer-index-of-scalar`
 
-Reports `std.mem.indexOf`, `std.mem.lastIndexOf`, `std.mem.indexOfAny`, `std.mem.lastIndexOfAny`, or `std.mem.count` called with a single-character string literal instead of using `indexOfScalar`, `lastIndexOfScalar`, or `countScalar` with a character literal.
+[Rule index](RULES.md)
 
-**Why it matters.** Searching for or counting a single byte using slice-search functions (`indexOf`, `lastIndexOf`, `count`) incurs slice overhead and multi-byte comparison logic. In Zig's standard library, `indexOfScalar`, `lastIndexOfScalar`, and `countScalar` are optimized with vector instructions (`@Vector`) to scan for individual scalar elements much faster and express intent directly.
+Reports `std.mem.find`, `findLast`, `findAny`, `findLastAny`, and `count` calls
+with a single-byte string literal. It also accepts their legacy `indexOf`
+spellings. The fix uses `findScalar`, `findScalarLast`, or `countScalar` with a
+character literal.
 
-**When it matters.** Whenever searching for or counting a single delimiter, separator, newline, or character within a slice.
+**Why it matters.** Scalar search states that only one element is needed and
+uses the standard library's scalar scanning implementation.
+
+**When it matters.** The needle must decode to one byte. Multi-byte strings and
+calls that already use scalar search stay unchanged.

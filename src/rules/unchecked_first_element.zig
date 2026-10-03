@@ -515,7 +515,8 @@ test "short circuit inline conditionals and switch guards prove a first element"
 test "entry guards remain valid in long functions and fields do not alias parameters" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const padding = "use();" ** 80;
+    const padding = std.mem.join(std.testing.allocator, "", &@as([80][]const u8, @splat("use();"))) catch unreachable;
+    defer std.testing.allocator.free(padding);
     const source = try std.fmt.allocPrintSentinel(
         arena.allocator(),
         "pub fn first(values: []const u8, result: Result) ?u8 {{ if (values.len == 0) return null; {s} return values[0] + result.values[0]; }}",

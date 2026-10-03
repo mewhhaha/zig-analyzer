@@ -111,7 +111,7 @@ zig build check
 zig build test
 zig build fixtures
 zig build examples
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zig-out/bin/zig-analyzer check --no-cache .
 ```
 

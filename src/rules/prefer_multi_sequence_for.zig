@@ -239,7 +239,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_multi_sequence_for)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_multi_sequence_for)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

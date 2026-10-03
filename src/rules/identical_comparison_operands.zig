@@ -52,11 +52,11 @@ pub fn run(context: RuleRun) !void {
         const op_text = context.tokenText(op_index);
 
         const message = if (token.tag == .equal_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} == {s}' always evaluates to true; operands are identical", .{ operand_text, operand_text })
+            try std.fmt.allocPrint(context.allocator, "comparison '{s} == {s}' compares identical operands; floating-point NaN is not equal to itself", .{ operand_text, operand_text })
         else if (token.tag == .bang_equal)
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} != {s}' always evaluates to false; if checking for NaN, use std.math.isNan or @isnan", .{ operand_text, operand_text })
+            try std.fmt.allocPrint(context.allocator, "comparison '{s} != {s}' compares identical operands; if checking for NaN, use std.math.isNan", .{ operand_text, operand_text })
         else
-            try std.fmt.allocPrint(context.allocator, "comparison '{s} {s} {s}' compares identical operands and always evaluates to a constant", .{ operand_text, op_text, operand_text });
+            try std.fmt.allocPrint(context.allocator, "comparison '{s} {s} {s}' compares identical operands; check whether a different value was intended", .{ operand_text, op_text, operand_text });
 
         try context.emit(.{
             .rule = .identical_comparison_operands,
@@ -168,7 +168,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.identical_comparison_operands)] = .warning;
+    configuration.levels[@backingInt(types.Rule.identical_comparison_operands)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

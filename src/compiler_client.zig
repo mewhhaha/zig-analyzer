@@ -7,7 +7,7 @@ const protocol = @import("compiler_protocol.zig");
 pub const default_response_deadline_ms: i64 = 60_000;
 
 /// A backend hello reply carries a Zig version string such as
-/// "0.16.0+zig-analyzer.1"; anything near the reader buffer size is garbage.
+/// "0.17.0+zig-analyzer.1"; anything near the reader buffer size is garbage.
 const max_zig_version_length = 256;
 
 pub const Client = struct {
@@ -560,7 +560,7 @@ fn readHelloResponse(reader: *std.Io.Reader, request_id: u32) !HelloResult {
 test "hello request carries the version and authentication token" {
     var allocating: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating.deinit();
-    try writeHello(&allocating.writer, 17, "0.16.0", protocol.current_version, "secret");
+    try writeHello(&allocating.writer, 17, "0.17.0", protocol.current_version, "secret");
 
     var reader: std.Io.Reader = .fixed(allocating.written());
     const header = try reader.takeStruct(protocol.Header, .little);
@@ -568,7 +568,7 @@ test "hello request carries the version and authentication token" {
     try std.testing.expectEqual(@as(u32, 17), header.request_id);
     try std.testing.expectEqual(protocol.Tag.hello, header.tag);
     try std.testing.expectEqual(protocol.current_version, hello.protocol_version);
-    try std.testing.expectEqualStrings("0.16.0", try reader.take(hello.zig_version_length));
+    try std.testing.expectEqualStrings("0.17.0", try reader.take(hello.zig_version_length));
     try std.testing.expectEqualStrings("secret", try reader.take(hello.authentication_token_length));
 }
 
@@ -626,7 +626,7 @@ test "hello response rejects an unexpected request id" {
         .status = .accepted,
         .zig_version_length = 6,
     }, .little);
-    try bytes.writer.writeAll("0.16.0");
+    try bytes.writer.writeAll("0.17.0");
 
     var reader: std.Io.Reader = .fixed(bytes.written());
     try std.testing.expectError(error.UnexpectedRequestId, readHelloResponse(&reader, 8));

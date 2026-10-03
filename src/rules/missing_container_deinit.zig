@@ -181,7 +181,7 @@ fn isAllocatingMethod(name: []const u8) bool {
 
 fn isArenaAllocator(allocator_name: ?[]const u8) bool {
     const name = allocator_name orelse return false;
-    return std.ascii.indexOfIgnoreCase(name, "arena") != null;
+    return std.ascii.findIgnoreCase(name, "arena") != null;
 }
 
 fn isContainerDeclaration(
@@ -361,7 +361,7 @@ fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool 
 
 fn testConfiguration() types.Configuration {
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.missing_container_deinit)] = .warning;
+    configuration.levels[@backingInt(types.Rule.missing_container_deinit)] = .warning;
     return configuration;
 }
 

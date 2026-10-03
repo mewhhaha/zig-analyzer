@@ -1,6 +1,7 @@
 const std = @import("std");
 const RuleRun = @import("context.zig").RuleRun;
 const types = @import("types.zig");
+const owned_call = @import("owned_call.zig");
 
 pub fn run(context: RuleRun) !void {
     const level = context.level(.prefer_allocator_dupe);
@@ -9,104 +10,76 @@ pub fn run(context: RuleRun) !void {
     for (context.tokens, 0..) |token, call_index| {
         if (token.tag != .identifier or call_index + 1 >= context.tokens.len or
             context.tokens[call_index + 1].tag != .l_paren) continue;
-
-        const is_alloc_print = context.tokenIs(call_index, "allocPrint");
-        const is_alloc_print_sentinel = context.tokenIs(call_index, "allocPrintSentinel");
-        if (!is_alloc_print and !is_alloc_print_sentinel) continue;
-
-        const is_std_fmt = (call_index >= 4 and context.tokenIs(call_index - 4, "std") and
-            context.tokens[call_index - 3].tag == .period and context.tokenIs(call_index - 2, "fmt") and
-            context.tokens[call_index - 1].tag == .period);
-        const is_fmt = (call_index >= 2 and context.tokenIs(call_index - 2, "fmt") and
-            context.tokens[call_index - 1].tag == .period);
-        if (!is_std_fmt and !is_fmt) continue;
-
-        const call_prefix_start = if (is_std_fmt) call_index - 4 else call_index - 2;
-
+        const legacy = context.tokenIs(call_index, "allocPrint") or context.tokenIs(call_index, "allocPrintSentinel");
+        const allocator_method = context.tokenIs(call_index, "print") or context.tokenIs(call_index, "printSentinel");
+        if (!legacy and !allocator_method) continue;
+        const sentinel = context.tokenIs(call_index, "allocPrintSentinel") or context.tokenIs(call_index, "printSentinel");
         const call_end = context.matchingToken(call_index + 1, .l_paren, .r_paren) orelse continue;
 
-        if (is_alloc_print) {
-            const args = threeArguments(context, call_index + 1, call_end) orelse continue;
-            try checkAllocPrint(context, level, call_prefix_start, call_end, args, false);
+        if (legacy) {
+            const is_std_fmt = call_index >= 4 and context.tokenIs(call_index - 4, "std") and
+                context.tokens[call_index - 3].tag == .period and context.tokenIs(call_index - 2, "fmt") and
+                context.tokens[call_index - 1].tag == .period;
+            const is_fmt = call_index >= 2 and context.tokenIs(call_index - 2, "fmt") and
+                context.tokens[call_index - 1].tag == .period;
+            if (!is_std_fmt and !is_fmt) continue;
+            const call_start = if (is_std_fmt) call_index - 4 else call_index - 2;
+            if (sentinel) {
+                const args = arguments(4, context, call_index + 1, call_end) orelse continue;
+                if (!isZero(context, args[3])) continue;
+                try checkAllocPrint(context, level, call_start, call_end, .{ args[0], args[1], args[2] }, true);
+            } else {
+                const args = arguments(3, context, call_index + 1, call_end) orelse continue;
+                try checkAllocPrint(context, level, call_start, call_end, args, false);
+            }
         } else {
-            const args = fourArguments(context, call_index + 1, call_end) orelse continue;
-            // Sentinel must be 0 for dupeZ
-            const sentinel_text = context.source[context.tokens[args[1].start].loc.start..context.tokens[args[1].end - 1].loc.end];
-            if (!std.mem.eql(u8, std.mem.trim(u8, sentinel_text, " \t\r\n"), "0")) continue;
-            const shifted_args = [3]ArgumentRange{ args[0], args[2], args[3] };
-            try checkAllocPrint(context, level, call_prefix_start, call_end, shifted_args, true);
+            if (call_index < 2 or context.tokens[call_index - 1].tag != .period or
+                context.tokens[call_index - 2].tag != .identifier) continue;
+            var receiver_start = call_index - 2;
+            while (receiver_start >= 2 and context.tokens[receiver_start - 1].tag == .period and
+                context.tokens[receiver_start - 2].tag == .identifier) receiver_start -= 2;
+            if (!owned_call.printReceiverIsAllocator(context.source, context.tokens, call_index - 2)) continue;
+            const receiver = ArgumentRange{ .start = receiver_start, .end = call_index - 1 };
+            if (sentinel) {
+                const args = arguments(3, context, call_index + 1, call_end) orelse continue;
+                if (!isZero(context, args[2])) continue;
+                try checkAllocPrint(context, level, receiver_start, call_end, .{ receiver, args[0], args[1] }, true);
+            } else {
+                const args = arguments(2, context, call_index + 1, call_end) orelse continue;
+                try checkAllocPrint(context, level, receiver_start, call_end, .{ receiver, args[0], args[1] }, false);
+            }
         }
     }
 }
 
 const ArgumentRange = struct { start: usize, end: usize };
 
-fn threeArguments(context: RuleRun, opening: usize, closing: usize) ?[3]ArgumentRange {
-    var commas: [3]usize = undefined;
-    var comma_count: usize = 0;
+fn arguments(comptime count: usize, context: RuleRun, opening: usize, closing: usize) ?[count]ArgumentRange {
+    var result: [count]ArgumentRange = undefined;
+    var argument_start = opening + 1;
+    var argument_count: usize = 0;
     var depth: usize = 0;
-    for (context.tokens[opening + 1 .. closing], opening + 1..) |token, index| {
-        switch (token.tag) {
-            .l_paren, .l_bracket, .l_brace => depth += 1,
-            .r_paren, .r_bracket, .r_brace => depth -|= 1,
-            .comma => if (depth == 0) {
-                if (comma_count < commas.len) commas[comma_count] = index;
-                comma_count += 1;
-            },
-            else => {},
-        }
+    for (context.tokens[opening + 1 .. closing], opening + 1..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .comma => if (depth == 0) {
+            if (argument_count == count or index == argument_start) return null;
+            result[argument_count] = .{ .start = argument_start, .end = index };
+            argument_count += 1;
+            argument_start = index + 1;
+        },
+        else => {},
+    };
+    if (argument_start < closing) {
+        if (argument_count == count) return null;
+        result[argument_count] = .{ .start = argument_start, .end = closing };
+        argument_count += 1;
     }
-    if (comma_count == 2) {
-        if (commas[0] == opening + 1 or commas[1] == commas[0] + 1 or closing == commas[1] + 1) return null;
-        return .{
-            .{ .start = opening + 1, .end = commas[0] },
-            .{ .start = commas[0] + 1, .end = commas[1] },
-            .{ .start = commas[1] + 1, .end = closing },
-        };
-    } else if (comma_count == 3 and commas[2] + 1 == closing) {
-        if (commas[0] == opening + 1 or commas[1] == commas[0] + 1 or commas[2] == commas[1] + 1) return null;
-        return .{
-            .{ .start = opening + 1, .end = commas[0] },
-            .{ .start = commas[0] + 1, .end = commas[1] },
-            .{ .start = commas[1] + 1, .end = commas[2] },
-        };
-    }
-    return null;
+    return if (argument_count == count) result else null;
 }
 
-fn fourArguments(context: RuleRun, opening: usize, closing: usize) ?[4]ArgumentRange {
-    var commas: [4]usize = undefined;
-    var comma_count: usize = 0;
-    var depth: usize = 0;
-    for (context.tokens[opening + 1 .. closing], opening + 1..) |token, index| {
-        switch (token.tag) {
-            .l_paren, .l_bracket, .l_brace => depth += 1,
-            .r_paren, .r_bracket, .r_brace => depth -|= 1,
-            .comma => if (depth == 0) {
-                if (comma_count < commas.len) commas[comma_count] = index;
-                comma_count += 1;
-            },
-            else => {},
-        }
-    }
-    if (comma_count == 3) {
-        if (commas[0] == opening + 1 or commas[1] == commas[0] + 1 or commas[2] == commas[1] + 1 or closing == commas[2] + 1) return null;
-        return .{
-            .{ .start = opening + 1, .end = commas[0] },
-            .{ .start = commas[0] + 1, .end = commas[1] },
-            .{ .start = commas[1] + 1, .end = commas[2] },
-            .{ .start = commas[2] + 1, .end = closing },
-        };
-    } else if (comma_count == 4 and commas[3] + 1 == closing) {
-        if (commas[0] == opening + 1 or commas[1] == commas[0] + 1 or commas[2] == commas[1] + 1 or commas[3] == commas[2] + 1) return null;
-        return .{
-            .{ .start = opening + 1, .end = commas[0] },
-            .{ .start = commas[0] + 1, .end = commas[1] },
-            .{ .start = commas[1] + 1, .end = commas[2] },
-            .{ .start = commas[2] + 1, .end = commas[3] },
-        };
-    }
-    return null;
+fn isZero(context: RuleRun, argument: ArgumentRange) bool {
+    return argument.end == argument.start + 1 and context.tokenIs(argument.start, "0");
 }
 
 fn checkAllocPrint(
@@ -122,7 +95,11 @@ fn checkAllocPrint(
 
     const fmt_text = context.tokenText(args[1].start);
     if (fmt_text.len < 2 or fmt_text[0] != '"' or fmt_text[fmt_text.len - 1] != '"') return;
-    const inner_fmt = fmt_text[1 .. fmt_text.len - 1];
+    const inner_fmt = std.zig.string_literal.parseAlloc(context.allocator, fmt_text) catch |err| switch (err) {
+        error.InvalidLiteral => return,
+        error.OutOfMemory => return err,
+    };
+    defer context.allocator.free(inner_fmt);
 
     const args_start = args[2].start;
     const args_end = args[2].end;
@@ -136,7 +113,8 @@ fn checkAllocPrint(
     const tuple_open = args_start + 1;
     const tuple_close = args_end - 1;
 
-    const dupe_fn = if (is_sentinel) "dupeZ" else "dupe";
+    const dupe_fn = if (is_sentinel) "dupeSentinel" else "dupe";
+    const sentinel_argument: []const u8 = if (is_sentinel) ", 0" else "";
 
     const allocator_text = std.mem.trim(
         u8,
@@ -156,8 +134,8 @@ fn checkAllocPrint(
 
         const replacement = try std.fmt.allocPrint(
             context.allocator,
-            "{s}.{s}(u8, {s})",
-            .{ allocator_text, dupe_fn, inner_arg },
+            "{s}.{s}(u8, {s}{s})",
+            .{ allocator_text, dupe_fn, inner_arg, sentinel_argument },
         );
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -181,12 +159,14 @@ fn checkAllocPrint(
             .span = context.tokens[call_start].loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "formatting '{s}' duplicates a slice; use '{s}.{s}(u8, {s})' directly for better performance",
-                .{ inner_fmt, allocator_text, dupe_fn, inner_arg },
+                "formatting '{s}' duplicates a slice; use '{s}.{s}(u8, {s}{s})' directly",
+                .{ inner_fmt, allocator_text, dupe_fn, inner_arg, sentinel_argument },
             ),
             .fixes = fixes,
         });
-    } else if (std.mem.indexOfScalar(u8, inner_fmt, '{') == null) {
+    } else if (std.mem.indexOfScalar(u8, inner_fmt, '{') == null and
+        std.mem.indexOfScalar(u8, inner_fmt, '}') == null)
+    {
         // Static string without format specifiers, tuple should be empty
         const tuple_contents = std.mem.trim(
             u8,
@@ -197,8 +177,8 @@ fn checkAllocPrint(
 
         const replacement = try std.fmt.allocPrint(
             context.allocator,
-            "{s}.{s}(u8, {s})",
-            .{ allocator_text, dupe_fn, fmt_text },
+            "{s}.{s}(u8, {s}{s})",
+            .{ allocator_text, dupe_fn, fmt_text, sentinel_argument },
         );
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -222,8 +202,8 @@ fn checkAllocPrint(
             .span = context.tokens[call_start].loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "formatting static string has no specifiers; use '{s}.{s}(u8, {s})' directly for better performance",
-                .{ allocator_text, dupe_fn, fmt_text },
+                "formatting static string has no specifiers; use '{s}.{s}(u8, {s}{s})' directly",
+                .{ allocator_text, dupe_fn, fmt_text, sentinel_argument },
             ),
             .fixes = fixes,
         });
@@ -265,12 +245,40 @@ test "prefer allocator dupe detects allocPrintSentinel with 0" {
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn cloneZ(allocator: std.mem.Allocator, path: []const u8) ![:0]u8 {\n" ++
-        "    return try std.fmt.allocPrintSentinel(allocator, 0, \"{s}\", .{path});\n" ++
+        "    return try std.fmt.allocPrintSentinel(allocator, \"{s}\", .{path}, 0);\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
-    try std.testing.expectEqualStrings("allocator.dupeZ(u8, path)", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("allocator.dupeSentinel(u8, path, 0)", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "allocator print methods preserve the receiver and sentinel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn clone(a: std.mem.Allocator, name: []const u8) ![]u8 { return try a.print(\"{s}\", .{name}); }\n" ++
+        "fn cloneZ(a: std.mem.Allocator, name: []const u8) ![:0]u8 { return try a.printSentinel(\"{s}\", .{name}, 0); }\n" ++
+        "fn make(self: *Owner) ![]u8 { return try self.allocator.print(\"literal\", .{}); }\n" ++
+        "fn keep(a: std.mem.Allocator) ![:1]u8 { return try a.printSentinel(\"literal\", .{}, 1); }\n" ++
+        "fn write(allocator: *std.Io.Writer, name: []const u8) !void { try allocator.print(\"{s}\", .{name}); }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    try std.testing.expectEqualStrings("a.dupe(u8, name)", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("a.dupeSentinel(u8, name, 0)", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("self.allocator.dupe(u8, \"literal\")", findings[2].fixes[0].edits[0].replacement);
+}
+
+test "allocator aliases qualify while custom allocator-shaped names do not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Memory = std.mem.Allocator; const Allocator = struct {};\n" ++
+        "fn clone(a: Memory) ![]u8 { return try a.print(\"literal\", .{}); }\n" ++
+        "fn custom(allocator: Allocator) ![]u8 { return try allocator.print(\"literal\", .{}); }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("a.dupe(u8, \"literal\")", findings[0].fixes[0].edits[0].replacement);
 }
 
 test "formatting with multiple specifiers is untouched" {
@@ -285,11 +293,25 @@ test "formatting with multiple specifiers is untouched" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
+test "allocator print escaped braces are not duplicated verbatim" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn escaped(a: std.mem.Allocator) !void {\n" ++
+        "    _ = try a.print(\"}}\", .{});\n" ++
+        "    _ = try a.print(\"\\x7d\\x7d\", .{});\n" ++
+        "    _ = try a.print(\"\\u{7d}\\u{7d}\", .{});\n" ++
+        "    _ = try std.fmt.allocPrint(a, \"{{\", .{});\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]types.Finding {
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_allocator_dupe)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_allocator_dupe)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

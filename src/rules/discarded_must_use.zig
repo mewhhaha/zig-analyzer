@@ -59,7 +59,7 @@ test "must-use contracts reject explicit result discards" {
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
     configuration.must_use_contracts = &.{"Builder.finish"};
-    configuration.levels[@intFromEnum(types.Rule.discarded_must_use)] = .warning;
+    configuration.levels[@backingInt(types.Rule.discarded_must_use)] = .warning;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,

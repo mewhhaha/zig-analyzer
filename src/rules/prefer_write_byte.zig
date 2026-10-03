@@ -358,6 +358,6 @@ fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token
 
 fn testConfiguration() types.Configuration {
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_write_byte)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_write_byte)] = .warning;
     return configuration;
 }

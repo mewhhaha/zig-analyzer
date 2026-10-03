@@ -2,14 +2,14 @@
 
 ## Release archive
 
-Release `0.16.0-6` supports x86_64 Linux and includes the patched compiler
+Release `0.17.0-1` supports x86_64 Linux and includes the patched compiler
 backend. Download both files from the GitHub release, then verify and extract
 the archive from the [releases page](https://github.com/mewhhaha/zig-analyzer/releases):
 
 ```sh
-sha256sum --check zig-analyzer-0.16.0-6-x86_64-linux.tar.xz.sha256
-tar -xf zig-analyzer-0.16.0-6-x86_64-linux.tar.xz
-./zig-analyzer-0.16.0-6-x86_64-linux/bin/zig-analyzer doctor
+sha256sum --check zig-analyzer-0.17.0-1-x86_64-linux.tar.xz.sha256
+tar -xf zig-analyzer-0.17.0-1-x86_64-linux.tar.xz
+./zig-analyzer-0.17.0-1-x86_64-linux/bin/zig-analyzer doctor
 ```
 
 Keep the extracted directory together: `bin/zig-analyzer` locates the bundled
@@ -18,11 +18,11 @@ move the directory to a stable location and symlink the executable:
 
 ```sh
 mkdir -p ~/.local/opt ~/.local/bin
-mv zig-analyzer-0.16.0-6-x86_64-linux ~/.local/opt/
-ln -s ~/.local/opt/zig-analyzer-0.16.0-6-x86_64-linux/bin/zig-analyzer ~/.local/bin/zig-analyzer
+mv zig-analyzer-0.17.0-1-x86_64-linux ~/.local/opt/
+ln -s ~/.local/opt/zig-analyzer-0.17.0-1-x86_64-linux/bin/zig-analyzer ~/.local/bin/zig-analyzer
 ```
 
-The machine still needs Zig 0.16.0 on `PATH`; `zig-analyzer doctor` verifies
+The machine still needs Zig 0.17.0 on `PATH`; `zig-analyzer doctor` verifies
 both it and the bundled backend.
 
 ## Build and install from source
@@ -30,10 +30,10 @@ both it and the bundled backend.
 ### Requirements
 
 - Git
-- Zig 0.16.0 exactly
+- Zig 0.17.0 exactly
 - A network connection for the Zig source and package downloads
 
-The patched compiler backend is also Zig 0.16.0. A project pinned to another
+The patched compiler backend is also Zig 0.17.0. A project pinned to another
 Zig release can still use syntax features and lint diagnostics, but its
 compiler-backed results would describe the wrong language version.
 
@@ -43,12 +43,12 @@ compiler-backed results would describe the wrong language version.
 git clone https://github.com/mewhhaha/zig-analyzer.git
 cd zig-analyzer
 zig version
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zig build backend
 zig-out/bin/zig-analyzer doctor
 ```
 
-`zig version` must print `0.16.0`. The backend step clones the pinned Zig
+`zig version` must print `0.17.0`. The backend step clones the pinned Zig
 source, applies the analyzer patch, and builds `zig-out/backend/bin/zig`. Keep
 `zig-out/bin/zig-analyzer` and `zig-out/backend/` together in this checkout;
 copying only the language-server executable loses compiler-backed analysis.
@@ -66,7 +66,7 @@ Rebuild after pulling changes:
 
 ```sh
 git pull --ff-only
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=fast
 zig build backend
 zig-out/bin/zig-analyzer doctor
 ```

@@ -73,11 +73,11 @@ fn findLastElementIndexing(context: RuleRun) !void {
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
             .span = .{ .start = token.loc.start, .end = context.tokens[receiver_index + 11].loc.end },
-            .replacement = try std.fmt.allocPrint(context.allocator, "{s}.getLast()", .{receiver}),
+            .replacement = try std.fmt.allocPrint(context.allocator, "{s}.last().?", .{receiver}),
         };
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
-            .title = "Use ArrayList.getLast",
+            .title = "Use ArrayList.last",
             .kind = .refactor_rewrite,
             .edits = edits,
             .preferred = true,
@@ -87,7 +87,7 @@ fn findLastElementIndexing(context: RuleRun) !void {
             .rule = .prefer_array_list_last,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "last-element indexing repeats '{s}'; use '{s}.getLast()'", .{ receiver, receiver }),
+            .message = try std.fmt.allocPrint(context.allocator, "last-element indexing repeats '{s}'; use '{s}.last().?'", .{ receiver, receiver }),
             .fixes = fixes,
         });
     }
@@ -232,7 +232,7 @@ test "standard container operations replace representation-level idioms" {
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expectEqualStrings("map.contains(key)", findings[0].fixes[0].edits[0].replacement);
-    try std.testing.expectEqualStrings("values.getLast()", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("values.last().?", findings[1].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("", findings[2].fixes[0].edits[0].replacement);
     const pop_edit = findings[2].fixes[0].edits[0];
     const fixed = try std.fmt.allocPrint(
@@ -291,9 +291,9 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_map_contains)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_array_list_last)] = .information;
-    configuration.levels[@intFromEnum(types.Rule.prefer_optional_pop)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_map_contains)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_array_list_last)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_optional_pop)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

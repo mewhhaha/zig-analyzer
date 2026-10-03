@@ -240,7 +240,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didClose"),
     ) !void {
-        if (server.compiler_worker) |worker| worker.cancel(params.textDocument.uri);
+        if (server.compiler_worker) |worker| try worker.cancel(params.textDocument.uri);
         if (server.compiler) |*compiler| {
             compiler.removeOverlay(params.textDocument.uri) catch |err| server.recordCompilerFailure(err, params.textDocument.uri);
         }
@@ -267,10 +267,24 @@ pub const Server = struct {
         params: lsp.ParamsType("textDocument/didSave"),
     ) !void {
         const document = server.analysisDocumentAfterSave(params.textDocument.uri) orelse return;
+        const build_configuration_changed = std.mem.endsWith(u8, params.textDocument.uri, "/build.zig") or
+            std.mem.endsWith(u8, params.textDocument.uri, "/build.zig.zon");
         if (server.compiler_worker) |worker| {
-            try worker.schedule(document, .restart);
+            try worker.schedule(document, if (build_configuration_changed) .restart else .save);
             return;
         }
+        if (build_configuration_changed or server.compiler == null) server.restartCompiler();
+        try server.ensureCompiler(arena, document.uri);
+        try server.syncCompilerOverlay(document.uri);
+        if (server.compiler != null and !server.compilerAnalysisCurrent(document)) {
+            server.restartCompiler();
+            try server.ensureCompiler(arena, document.uri);
+            try server.syncCompilerOverlay(document.uri);
+        }
+        try server.publishDiagnostics(arena, document.uri);
+    }
+
+    fn restartCompiler(server: *Server) void {
         if (server.compiler) |*compiler| compiler.deinit();
         server.compiler = null;
         server.clearCompilerTypeShapes();
@@ -278,9 +292,6 @@ pub const Server = struct {
         server.compiler_root_uri = null;
         server.compiler_start_attempted = false;
         server.compiler_restart_available = true;
-        try server.ensureCompiler(arena, document.uri);
-        try server.syncCompilerOverlay(document.uri);
-        try server.publishDiagnostics(arena, document.uri);
     }
 
     pub fn @"textDocument/completion"(
@@ -849,7 +860,7 @@ pub const Server = struct {
         const document = server.documents.getConst(params.textDocument.uri) orelse return null;
         var lint_configuration = try server.loadConfiguration(arena);
         if (action_lsp.isRequested(params.context.only, .@"source.organizeImports")) {
-            lint_configuration.levels[@intFromEnum(analysis.Rule.unsorted_imports)] = .warning;
+            lint_configuration.levels[@backingInt(analysis.Rule.unsorted_imports)] = .warning;
         }
         const document_findings = try server.documentFindings(arena, document, lint_configuration);
         const requested_span = std.zig.Token.Loc{
@@ -1081,7 +1092,7 @@ pub const Server = struct {
                 .severity = .Warning,
                 .code = .{ .string = "invalid-configuration" },
                 .source = "zig-analyzer configuration",
-                .message = warning,
+                .message = .{ .string = warning },
             });
         }
         if (try analysis.suppressionWarning(arena, document.source)) |warning| {
@@ -1090,7 +1101,7 @@ pub const Server = struct {
                 .severity = .Warning,
                 .code = .{ .string = "invalid-configuration" },
                 .source = "zig-analyzer configuration",
-                .message = warning,
+                .message = .{ .string = warning },
             });
         }
         const document_findings = try server.documentFindings(arena, document, lint_configuration);
@@ -1205,7 +1216,8 @@ pub const Server = struct {
     }
 
     fn analysisDocumentAfterSave(server: *const Server, saved_uri: []const u8) ?*const Document {
-        if (!std.mem.endsWith(u8, saved_uri, "/build.zig")) return server.documents.getConst(saved_uri);
+        if (!std.mem.endsWith(u8, saved_uri, "/build.zig") and
+            !std.mem.endsWith(u8, saved_uri, "/build.zig.zon")) return server.documents.getConst(saved_uri);
         const directory_end = (std.mem.lastIndexOfScalar(u8, saved_uri, '/') orelse return null) + 1;
         const directory_uri = saved_uri[0..directory_end];
         if (server.compiler_worker) |worker| {
@@ -1225,7 +1237,8 @@ pub const Server = struct {
         var documents = server.documents.documents.valueIterator();
         while (documents.next()) |document| {
             if (std.mem.startsWith(u8, document.uri, directory_uri) and
-                !std.mem.endsWith(u8, document.uri, "/build.zig")) return document;
+                !std.mem.endsWith(u8, document.uri, "/build.zig") and
+                !std.mem.endsWith(u8, document.uri, "/build.zig.zon")) return document;
         }
         return null;
     }
@@ -1861,7 +1874,7 @@ pub const Server = struct {
             else => return err,
         };
         defer allocator.free(bytes);
-        const source = try allocator.dupeZ(u8, bytes);
+        const source = try allocator.dupeSentinel(u8, bytes, 0);
         errdefer allocator.free(source);
         return .{ .path = path, .source = source, .tokens = try tokenize(allocator, source) };
     }
@@ -2341,6 +2354,10 @@ const CompilerWorker = struct {
     queue_condition: std.Io.Condition = .init,
     analysis_mutex: std.Io.Mutex = .init,
     pending: ?Job = null,
+    // The aggregate cleanup proof selects nested Job.deinit. Worker.deinit
+    // joins the worker, frees these owned URIs, and then releases this list.
+    // zig-analyzer: disable-next-line incomplete-owned-field-cleanup
+    closed_uris: std.ArrayList([]u8) = .empty,
     latest_generation: u64 = 0,
     stopping: bool = false,
     future: ?std.Io.Future(void) = null,
@@ -2351,6 +2368,7 @@ const CompilerWorker = struct {
         version: i32,
         generation: u64,
         restart: bool,
+        refresh_root: bool,
 
         fn deinit(job: *Job, allocator: std.mem.Allocator) void {
             allocator.free(job.uri);
@@ -2359,7 +2377,7 @@ const CompilerWorker = struct {
         }
     };
 
-    const ScheduleMode = enum { update, restart };
+    const ScheduleMode = enum { update, save, restart };
 
     fn create(
         io: std.Io,
@@ -2389,6 +2407,8 @@ const CompilerWorker = struct {
         if (worker.future) |*future| {
             future.cancel(worker.io);
         }
+        for (worker.closed_uris.items) |uri| worker.allocator.free(uri);
+        worker.closed_uris.deinit(worker.allocator);
         worker.server.deinit();
         const allocator = worker.allocator;
         worker.* = undefined;
@@ -2402,6 +2422,7 @@ const CompilerWorker = struct {
             .version = document.version,
             .generation = 0,
             .restart = mode == .restart,
+            .refresh_root = mode == .save,
         };
         errdefer worker.allocator.free(job.uri);
         job.source = try worker.allocator.dupe(u8, document.source);
@@ -2414,13 +2435,14 @@ const CompilerWorker = struct {
         job.generation = worker.latest_generation;
         if (worker.pending) |*previous| {
             job.restart = job.restart or previous.restart;
+            job.refresh_root = job.refresh_root or previous.refresh_root;
             previous.deinit(worker.allocator);
         }
         worker.pending = job;
         worker.queue_condition.signal(worker.io);
     }
 
-    fn cancel(worker: *CompilerWorker, uri: []const u8) void {
+    fn cancel(worker: *CompilerWorker, uri: []const u8) !void {
         worker.queue_mutex.lockUncancelable(worker.io);
         defer worker.queue_mutex.unlock(worker.io);
         worker.latest_generation +%= 1;
@@ -2429,8 +2451,16 @@ const CompilerWorker = struct {
             if (std.mem.eql(u8, job.uri, uri)) {
                 job.deinit(worker.allocator);
                 worker.pending = null;
+            } else {
+                job.generation = worker.latest_generation;
             }
         }
+        for (worker.closed_uris.items) |closed_uri| {
+            if (std.mem.eql(u8, closed_uri, uri)) return;
+        }
+        const owned_uri = try worker.allocator.dupe(u8, uri);
+        errdefer worker.allocator.free(owned_uri);
+        try worker.closed_uris.append(worker.allocator, owned_uri);
     }
 
     fn run(worker: *CompilerWorker) void {
@@ -2480,11 +2510,17 @@ const CompilerWorker = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        if (job.restart) worker.restartCompiler();
+        if (job.restart or (job.refresh_root and worker.server.compiler == null)) worker.restartCompiler();
+        try worker.removeClosedDocuments();
         try worker.server.documents.open(job.uri, job.version, job.source);
         try worker.server.ensureCompiler(arena, job.uri);
         try worker.server.syncCompilerOverlay(job.uri);
         const document = worker.server.documents.getConst(job.uri).?;
+        if (job.refresh_root and worker.server.compiler != null and !worker.server.compilerAnalysisCurrent(document)) {
+            worker.restartCompiler();
+            try worker.server.ensureCompiler(arena, job.uri);
+            try worker.server.syncCompilerOverlay(job.uri);
+        }
         if (!worker.server.compilerAnalysisCurrent(document)) return;
 
         worker.queue_mutex.lockUncancelable(worker.io);
@@ -2494,17 +2530,44 @@ const CompilerWorker = struct {
     }
 
     fn restartCompiler(worker: *CompilerWorker) void {
-        if (worker.server.compiler) |*compiler| compiler.deinit();
-        worker.server.compiler = null;
-        worker.server.clearCompilerTypeShapes();
-        if (worker.server.compiler_root_uri) |uri| worker.server.allocator.free(uri);
-        worker.server.compiler_root_uri = null;
-        worker.server.compiler_start_attempted = false;
-        worker.server.compiler_restart_available = true;
+        worker.server.restartCompiler();
+    }
+
+    /// Called with analysis_mutex held. Close notifications only enqueue URI
+    /// ownership so the foreground server never waits for compiler requests.
+    fn removeClosedDocuments(worker: *CompilerWorker) !void {
+        worker.queue_mutex.lockUncancelable(worker.io);
+        var closed_uris = worker.closed_uris;
+        worker.closed_uris = .empty;
+        worker.queue_mutex.unlock(worker.io);
+        defer {
+            for (closed_uris.items) |uri| worker.allocator.free(uri);
+            closed_uris.deinit(worker.allocator);
+        }
+        if (closed_uris.items.len != 0) worker.server.clearCompilerTypeShapes();
+        for (closed_uris.items) |uri| {
+            _ = worker.server.documents.close(uri);
+            if (worker.server.compiler_root_uri) |root_uri| {
+                if (std.mem.eql(u8, root_uri, uri)) {
+                    worker.allocator.free(root_uri);
+                    worker.server.compiler_root_uri = null;
+                }
+            }
+        }
+        for (closed_uris.items) |uri| {
+            if (worker.server.compiler) |*compiler| try compiler.removeOverlay(uri);
+        }
     }
 
     fn lockCurrent(worker: *CompilerWorker, document: *const Document) bool {
         if (!worker.analysis_mutex.tryLock()) return false;
+        worker.queue_mutex.lockUncancelable(worker.io);
+        const closed_documents_pending = worker.closed_uris.items.len != 0;
+        worker.queue_mutex.unlock(worker.io);
+        if (closed_documents_pending) {
+            worker.analysis_mutex.unlock(worker.io);
+            return false;
+        }
         const compiled_document = worker.server.documents.getConst(document.uri) orelse {
             worker.analysis_mutex.unlock(worker.io);
             return false;
@@ -3760,7 +3823,7 @@ fn findingDiagnostic(
         .code = .{ .string = finding.rule.code() },
         .codeDescription = if (ruleDocumentationUri(finding.rule)) |uri| .{ .href = uri } else null,
         .source = "zig-analyzer",
-        .message = finding.message,
+        .message = .{ .string = finding.message },
         .relatedInformation = related,
     };
 }
@@ -3842,7 +3905,7 @@ fn allocationCleanupEdit(
     const statement_end = binding_span.end + relative_end + 1;
     const statement = source[statement_start..statement_end];
     const equal = std.mem.indexOfScalar(u8, statement, '=') orelse return null;
-    const allocation_methods = [_][]const u8{ ".alloc(", ".allocSentinel(", ".alignedAlloc(", ".dupe(", ".dupeZ(", ".realloc(", ".create(" };
+    const allocation_methods = [_][]const u8{ ".alloc(", ".allocSentinel(", ".alignedAlloc(", ".dupe(", ".dupeSentinel(", ".realloc(", ".create(" };
     const method_offset, const release = for (allocation_methods) |method| {
         if (std.mem.indexOf(u8, statement[equal + 1 ..], method)) |offset| {
             break .{ equal + 1 + offset, if (std.mem.eql(u8, method, ".create(")) "destroy" else "free" };
@@ -4064,7 +4127,7 @@ fn extractExpressionEdits(
     if (selection.start == selection.end) return null;
     var exact_node = false;
     for (1..document.tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const first = document.tree.firstToken(node);
         const last = document.tree.lastToken(node);
         const start = document.tree.tokenStart(first);
@@ -4362,14 +4425,14 @@ fn deduplicateAndSortDiagnostics(diagnostics: []lsp.types.Diagnostic) usize {
         fn lessThan(_: void, left: lsp.types.Diagnostic, right: lsp.types.Diagnostic) bool {
             if (left.range.start.line != right.range.start.line) return left.range.start.line < right.range.start.line;
             if (left.range.start.character != right.range.start.character) return left.range.start.character < right.range.start.character;
-            return std.mem.lessThan(u8, left.message, right.message);
+            return std.mem.lessThan(u8, left.message.string, right.message.string);
         }
     }.lessThan);
     if (diagnostics.len < 2) return diagnostics.len;
     var write_index: usize = 1;
     for (diagnostics[1..]) |diagnostic| {
         const previous = diagnostics[write_index - 1];
-        if (std.meta.eql(previous.range, diagnostic.range) and std.mem.eql(u8, previous.message, diagnostic.message)) {
+        if (std.meta.eql(previous.range, diagnostic.range) and std.mem.eql(u8, previous.message.string, diagnostic.message.string)) {
             if (previous.relatedInformation == null and diagnostic.relatedInformation != null) {
                 diagnostics[write_index - 1] = diagnostic;
             }
@@ -4385,7 +4448,7 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
     const diagnostics = try allocator.alloc(lsp.types.Diagnostic, document.tree.errors.len);
     var initialized: usize = 0;
     errdefer {
-        for (diagnostics[0..initialized]) |diagnostic| allocator.free(diagnostic.message);
+        for (diagnostics[0..initialized]) |diagnostic| allocator.free(diagnostic.message.string);
         allocator.free(diagnostics);
     }
     for (document.tree.errors, diagnostics) |parse_error, *diagnostic| {
@@ -4400,7 +4463,7 @@ fn syntaxDiagnostics(document: *const Document, allocator: std.mem.Allocator) ![
             .severity = if (parse_error.is_note) .Information else .Error,
             .code = .{ .string = "syntax-error" },
             .source = "zig-analyzer parser",
-            .message = try message.toOwnedSlice(),
+            .message = .{ .string = try message.toOwnedSlice() },
         };
         initialized += 1;
     }
@@ -4420,7 +4483,7 @@ pub fn compilerDiagnostics(
     var diagnostics: std.ArrayList(lsp.types.Diagnostic) = .empty;
     errdefer {
         for (diagnostics.items) |diagnostic| {
-            allocator.free(diagnostic.message);
+            allocator.free(diagnostic.message.string);
             if (diagnostic.relatedInformation) |related_information| {
                 for (related_information) |information| {
                     allocator.free(information.location.uri);
@@ -4497,7 +4560,7 @@ pub fn compilerDiagnostics(
             .severity = .Error,
             .code = .{ .string = "compiler-error" },
             .source = "zig compiler",
-            .message = diagnostic_message,
+            .message = .{ .string = diagnostic_message },
             .relatedInformation = related_information,
         });
     }
@@ -4953,11 +5016,11 @@ test "syntax diagnostics describe malformed source" {
     defer document.deinit();
     const diagnostics = try syntaxDiagnostics(&document, std.testing.allocator);
     defer {
-        for (diagnostics) |diagnostic| std.testing.allocator.free(diagnostic.message);
+        for (diagnostics) |diagnostic| std.testing.allocator.free(diagnostic.message.string);
         std.testing.allocator.free(diagnostics);
     }
     try std.testing.expect(diagnostics.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, "expected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message.string, "expected") != null);
 }
 
 test "hover descriptions cover fields and loop captures" {
@@ -4966,7 +5029,7 @@ test "hover descriptions cover fields and loop captures" {
     try std.testing.expectEqualStrings("value: u32", field.declaration);
     try std.testing.expectEqualStrings("u32", field.type_summary.?);
 
-    const source_z = try std.testing.allocator.dupeZ(u8, source);
+    const source_z = try std.testing.allocator.dupeSentinel(u8, source, 0);
     defer std.testing.allocator.free(source_z);
     const tokens = try tokenize(std.testing.allocator, source_z);
     defer std.testing.allocator.free(tokens);
@@ -6233,6 +6296,129 @@ test "saving a build script reanalyzes the active source document" {
 
     try std.testing.expectEqualStrings("file:///workspace/src/main.zig", document.uri);
     try std.testing.expectEqual(@as(i32, 4), document.version);
+    const manifest_document = server.analysisDocumentAfterSave("file:///workspace/build.zig.zon").?;
+    try std.testing.expectEqualStrings("file:///workspace/src/main.zig", manifest_document.uri);
+}
+
+test "source saves retain the compiler worker and refresh imported diagnostics" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const source = "const dependency = @import(\"dependency.zig\");\nexport fn result() u32 { return dependency.value; }\n";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = source });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const value: u32 = 1;\n" });
+    const root_path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(root_path);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{root_path});
+    defer std.testing.allocator.free(uri);
+    const incoming = [_][]const u8{};
+    var transport = TestTransport.init(&incoming);
+    var server = Server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport);
+    defer server.deinit();
+    try server.documents.open(uri, 1, source);
+    try server.startCompilerWorker();
+    const worker = server.compiler_worker.?;
+    const original_process_id, var generation = setup: {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        worker.server.compiler = compiler_session.Session.start(std.testing.io, std.testing.allocator, .empty, root_path) catch |err| switch (err) {
+            error.CompilerBackendNotFound => return,
+            else => return err,
+        };
+        try worker.server.documents.open(uri, 1, source);
+        try worker.server.syncCompilerOverlay(uri);
+        break :setup .{ worker.server.compiler.?.child.id, (try worker.server.compiler.?.workspaceSummary()).last_generation };
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const changes = [_]struct { source: []const u8, error_count: u32 }{
+        .{ .source = "pub const value = true;\n", .error_count = 1 },
+        .{ .source = "pub const value: u32 = 42;\n", .error_count = 0 },
+    };
+    for (changes) |change| {
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = change.source });
+        try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = uri } });
+        var update_processed = false;
+        for (0..200) |_| {
+            try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+            worker.analysis_mutex.lockUncancelable(std.testing.io);
+            defer worker.analysis_mutex.unlock(std.testing.io);
+            const compiler = if (worker.server.compiler) |*active| active else continue;
+            const next_generation = (try compiler.workspaceSummary()).last_generation;
+            if (next_generation <= generation) continue;
+            try std.testing.expectEqual(original_process_id, compiler.child.id);
+            var diagnostics = try compiler.diagnostics(std.testing.allocator);
+            defer diagnostics.deinit(std.testing.allocator);
+            try std.testing.expectEqual(change.error_count, diagnostics.errorMessageCount());
+            generation = next_generation;
+            update_processed = true;
+            break;
+        }
+        try std.testing.expect(update_processed);
+    }
+
+    const dependency_path = try temporary.dir.realPathFileAlloc(std.testing.io, "dependency.zig", std.testing.allocator);
+    defer std.testing.allocator.free(dependency_path);
+    const dependency_uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{dependency_path});
+    defer std.testing.allocator.free(dependency_uri);
+    const unsaved_dependency = "pub const value = true;\n";
+    try server.documents.open(dependency_uri, 1, unsaved_dependency);
+    {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        try worker.server.documents.open(dependency_uri, 1, unsaved_dependency);
+        try worker.server.syncCompilerOverlay(dependency_uri);
+        try worker.server.syncCompilerOverlay(uri);
+        generation = (try worker.server.compiler.?.workspaceSummary()).last_generation;
+        var diagnostics = try worker.server.compiler.?.diagnostics(std.testing.allocator);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u32, 1), diagnostics.errorMessageCount());
+    }
+    {
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        try server.@"textDocument/didClose"(arena_state.allocator(), .{ .textDocument = .{ .uri = dependency_uri } });
+    }
+    try std.testing.expect(!worker.lockCurrent(server.documents.getConst(uri).?));
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const value: u32 = 77;\n" });
+    try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = uri } });
+    var closed_overlay_removed = false;
+    for (0..200) |_| {
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        const compiler = if (worker.server.compiler) |*active| active else continue;
+        if ((try compiler.workspaceSummary()).last_generation <= generation) continue;
+        try std.testing.expectEqual(original_process_id, compiler.child.id);
+        try std.testing.expect(worker.server.documents.getConst(dependency_uri) == null);
+        var diagnostics = try compiler.diagnostics(std.testing.allocator);
+        defer diagnostics.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u32, 0), diagnostics.errorMessageCount());
+        closed_overlay_removed = true;
+        break;
+    }
+    try std.testing.expect(closed_overlay_removed);
+
+    const other_source = "export fn independent() u32 { return 7; }\n";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "other.zig", .data = other_source });
+    const other_path = try temporary.dir.realPathFileAlloc(std.testing.io, "other.zig", std.testing.allocator);
+    defer std.testing.allocator.free(other_path);
+    const other_uri = try std.fmt.allocPrint(std.testing.allocator, "file://{s}", .{other_path});
+    defer std.testing.allocator.free(other_uri);
+    try server.documents.open(other_uri, 1, other_source);
+    try server.@"textDocument/didSave"(arena_state.allocator(), .{ .textDocument = .{ .uri = other_uri } });
+    var root_switched = false;
+    for (0..200) |_| {
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        worker.analysis_mutex.lockUncancelable(std.testing.io);
+        defer worker.analysis_mutex.unlock(std.testing.io);
+        const document = worker.server.documents.getConst(other_uri) orelse continue;
+        if (!worker.server.compilerAnalysisCurrent(document)) continue;
+        try std.testing.expect(original_process_id != worker.server.compiler.?.child.id);
+        root_switched = true;
+        break;
+    }
+    try std.testing.expect(root_switched);
 }
 
 test "compiler failures preserve syntax and allow one controlled restart" {

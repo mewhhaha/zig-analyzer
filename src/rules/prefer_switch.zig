@@ -483,7 +483,7 @@ test "prefer switch respects source suppression" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_switch)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_switch)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -523,7 +523,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const type
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_switch)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_switch)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

@@ -174,6 +174,6 @@ test "protocol structures have stable wire sizes" {
 }
 
 test "unknown protocol tags remain representable" {
-    const unknown: Tag = @enumFromInt(65535);
-    try std.testing.expectEqual(@as(u16, 65535), @intFromEnum(unknown));
+    const unknown: Tag = @fromBackingInt(@intCast(65535));
+    try std.testing.expectEqual(@as(u16, 65535), @backingInt(unknown));
 }

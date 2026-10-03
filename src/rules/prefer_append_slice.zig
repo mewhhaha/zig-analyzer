@@ -175,7 +175,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]types.Find
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_append_slice)] = .warning;
+    configuration.levels[@backingInt(types.Rule.prefer_append_slice)] = .warning;
     try run(.{
         .allocator = allocator,
         .source = source,

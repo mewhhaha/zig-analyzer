@@ -87,7 +87,7 @@ pub fn findingsWithShapesAndTokens(
     resolved_shapes: []const ResolvedShape,
 ) ![]Finding {
     if (generated_source_detection.isTranslateCOutput(source)) return &.{};
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     defer tree.deinit(allocator);
     var scope_index = try syntax_scope.Index.init(allocator, source, tokens);
     defer scope_index.deinit();
@@ -194,7 +194,7 @@ pub fn findingsWithShapesAndTokens(
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
             if (left.span.start != right.span.start) return left.span.start < right.span.start;
-            return @intFromEnum(left.rule) < @intFromEnum(right.rule);
+            return @backingInt(left.rule) < @backingInt(right.rule);
         }
     }.lessThan);
     return try found.toOwnedSlice(allocator);
@@ -227,7 +227,7 @@ pub fn fileNameFindingWithTokens(
     if (std.mem.eql(u8, basename, "build.zig")) return null;
     const name = basename[0 .. basename.len - ".zig".len];
     _ = tokens;
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     defer tree.deinit(allocator);
     var has_top_level_fields = false;
     for (tree.rootDecls()) |declaration| {
@@ -321,7 +321,7 @@ fn findUnresolvedIdentifiers(
     if (level == .off) return;
 
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         if (tree.nodeTag(node) != .identifier) continue;
         const token_index: usize = tree.nodeMainToken(node);
         if (token_index >= tokens.len) continue;
@@ -407,7 +407,7 @@ fn findUnresolvedMembers(
         if (container.has_usingnamespace or container.resolved) continue;
         const member_name = tokenText(source, member_token);
         if (containerHasField(container, member_name) or
-            containerHasDeclaration(source, tokens, container.name, member_name)) continue;
+            containerHasDeclaration(source, tokens, container.name, member_name, false)) continue;
         try addFinding(allocator, source, configuration, found, .{
             .rule = .unresolved_member,
             .level = level,
@@ -1541,7 +1541,7 @@ fn findErrorValueComparisons(
     const level = configuration.level(.error_value_comparison);
     if (level == .off) return;
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const tag = tree.nodeTag(node);
         if (tag != .equal_equal and tag != .bang_equal) continue;
         const left, const right = tree.nodeData(node).node_and_node;
@@ -1611,7 +1611,7 @@ fn findMixedBitwiseArithmetic(
     const level = configuration.level(.mixed_bitwise_arithmetic);
     if (level == .off) return;
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const parent_tag = tree.nodeTag(node);
         if (!isBitwiseOperator(parent_tag) and !isArithmeticOperator(parent_tag)) continue;
         const left, const right = tree.nodeData(node).node_and_node;
@@ -1701,7 +1701,7 @@ fn findUnusedPrivateDeclarations(
     var declarations: std.ArrayList(PrivateDeclaration) = .empty;
     defer declarations.deinit(allocator);
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         if (tree.fullVarDecl(node)) |declaration| {
             const keyword_index: usize = declaration.ast.mut_token;
             if (keyword_index >= tokens.len or tokens[keyword_index].tag != .keyword_const or
@@ -2025,15 +2025,21 @@ fn findComptimeReflectionIssues(
         if (has_field and container.kind == .enumeration or !has_field and container.resolved) continue;
         const exists = if (has_field)
             containerHasField(container, member_name) or
-                field_lookup and containerHasDeclaration(source, tokens, container.name, member_name)
+                field_lookup and containerHasDeclaration(source, tokens, container.name, member_name, false)
         else
-            containerHasDeclaration(source, tokens, container.name, member_name);
+            containerHasDeclaration(source, tokens, container.name, member_name, true);
         if (exists) continue;
         const message = if (field_lookup)
             try std.fmt.allocPrint(
                 allocator,
                 "{s} cannot resolve member '{s}' on type '{s}' in this analyzed shape",
                 .{ tokenText(source, token), member_name, container.name },
+            )
+        else if (!has_field)
+            try std.fmt.allocPrint(
+                allocator,
+                "{s} is always false: type '{s}' has no public declaration named '{s}' in this analyzed shape",
+                .{ tokenText(source, token), container.name, member_name },
             )
         else
             try std.fmt.allocPrint(
@@ -2060,6 +2066,7 @@ fn containerHasDeclaration(
     tokens: []const std.zig.Token,
     container_name: []const u8,
     declaration_name: []const u8,
+    require_public: bool,
 ) bool {
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_const or index + 4 >= tokens.len or
@@ -2076,7 +2083,19 @@ fn containerHasDeclaration(
                 .l_brace => depth += 1,
                 .r_brace => depth -= 1,
                 .keyword_fn, .keyword_const, .keyword_var => if (depth == 1 and member_index + 1 < closing and
-                    identifierNamesEqual(tokenText(source, tokens[member_index + 1]), declaration_name)) return true,
+                    identifierNamesEqual(tokenText(source, tokens[member_index + 1]), declaration_name))
+                {
+                    if (!require_public) return true;
+                    var modifier_index = member_index;
+                    while (modifier_index > opening + 1) {
+                        modifier_index -= 1;
+                        switch (tokens[modifier_index].tag) {
+                            .keyword_pub => return true,
+                            .keyword_inline, .keyword_noinline, .keyword_extern, .keyword_export, .keyword_threadlocal => {},
+                            else => break,
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -2540,7 +2559,7 @@ fn findStructInitializers(
     const level = configuration.level(.missing_struct_field);
     if (level == .off) return;
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         var buffer: [2]std.zig.Ast.Node.Index = undefined;
         const initializer = tree.fullStructInit(&buffer, node) orelse continue;
         const opening: usize = initializer.ast.lbrace;
@@ -2885,7 +2904,7 @@ fn findNonIdiomaticNames(
     var value_declarations: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer value_declarations.deinit(allocator);
     for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(raw_node);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         const declaration = tree.fullVarDecl(node) orelse continue;
         const initializer = declaration.ast.init_node.unwrap() orelse continue;
         const keyword_index: usize = declaration.ast.mut_token;
@@ -4424,7 +4443,7 @@ test "organize imports preserves directly attached comments" {
         "// standard library\n" ++
         "const std = @import(\"std\");\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unsorted_imports)] = .warning;
+    configuration.levels[@backingInt(Rule.unsorted_imports)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     const replacement = found[0].fixes[0].edits[0].replacement;
@@ -4459,7 +4478,7 @@ test "style findings require proven operands and expose safe fixes" {
         "}\n";
     var configuration = Configuration.defaults();
     for (std.enums.values(Rule)) |rule| if (rule.tier() == .style) {
-        configuration.levels[@intFromEnum(rule)] = .warning;
+        configuration.levels[@backingInt(rule)] = .warning;
     };
     const found = try findings(arena.allocator(), source, configuration);
     var saw_discarded_error = false;
@@ -4497,7 +4516,7 @@ test "error comparisons and mixed operators report precise findings" {
         "    return err == error.Other;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mixed_bitwise_arithmetic)] = .warning;
+    configuration.levels[@backingInt(Rule.mixed_bitwise_arithmetic)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var saw_error_comparison = false;
     var saw_mixed_operators = false;
@@ -4537,7 +4556,7 @@ test "unused private declarations omit public used and reflected names" {
         "fn private_unused() void {}\n" ++
         "pub fn run() void { _ = used; _ = @field(@This(), \"reflected\"); }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unused_private_declaration)] = .warning;
+    configuration.levels[@backingInt(Rule.unused_private_declaration)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var names: std.ArrayList([]const u8) = .empty;
     for (found) |finding| if (finding.rule == .unused_private_declaration) {
@@ -4555,8 +4574,8 @@ test "unused module aliases belong to unused import analysis" {
         "const module = @import(\"module.zig\");\n" ++
         "const Parser = @import(\"module.zig\").ParserType;\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unused_private_declaration)] = .warning;
-    configuration.levels[@intFromEnum(Rule.unused_import)] = .warning;
+    configuration.levels[@backingInt(Rule.unused_private_declaration)] = .warning;
+    configuration.levels[@backingInt(Rule.unused_import)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var unused_imports: usize = 0;
     var unused_private_declarations: usize = 0;
@@ -4604,7 +4623,7 @@ test "discarded error ignores an explanatory catch comment" {
         "fn run() void { failing() catch { // Best effort cleanup.\n" ++
         "}; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.discarded_error)] = .warning;
+    configuration.levels[@backingInt(Rule.discarded_error)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .discarded_error);
 }
@@ -4629,8 +4648,8 @@ test "line and scoped suppressions apply to semantic and modular rules" {
         "    defer { _ = ready; } // zig-analyzer: disable-line needless-defer-block\n" ++
         "}";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.redundant_boolean_if)] = .information;
-    configuration.levels[@intFromEnum(Rule.needless_defer_block)] = .information;
+    configuration.levels[@backingInt(Rule.redundant_boolean_if)] = .information;
+    configuration.levels[@backingInt(Rule.needless_defer_block)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
 
     for (found) |finding| switch (finding.rule) {
@@ -4775,7 +4794,7 @@ test "else after one terminating branch stays inside an else-if chain" {
         "}\n" ++
         "fn simple(first: bool) void { if (first) { return; } else { consume(); } }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .information;
+    configuration.levels[@backingInt(Rule.needless_else_after_terminator)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var warning_count: usize = 0;
     for (found) |finding| if (finding.rule == .needless_else_after_terminator) {
@@ -4796,7 +4815,7 @@ test "needless else after terminator preserves braces when bindings are declared
         "    }\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .information;
+    configuration.levels[@backingInt(Rule.needless_else_after_terminator)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var matched = false;
     for (found) |finding| {
@@ -4895,7 +4914,7 @@ test "naming resolves type functions aliases and namespace structs" {
         "const BadNamespace = struct { pub const value = 1; };\n" ++
         "fn generated_type() type { return struct { value: u32 }; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var naming_count: usize = 0;
     for (found) |finding| {
@@ -4921,7 +4940,7 @@ test "structural type aliases and bare type imports keep TitleCase names" {
         "fn Generic(comptime Source: type) type { const Alias = Source; return Alias; }\n" ++
         "const BadValue = 1;\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var naming_count: usize = 0;
     for (found) |finding| if (finding.rule == .non_idiomatic_name) {
@@ -4936,7 +4955,7 @@ test "compiler-resolved type aliases require TitleCase names" {
     defer arena.deinit();
     const source: [:0]const u8 = "const external_type = external_value;\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findingsWithShapes(arena.allocator(), source, configuration, &.{.{
         .type_name = "external_type",
         .kind = .structure,
@@ -5072,8 +5091,8 @@ test "error-set types foreign symbols and re-exports keep their names" {
         "const BadValue = error.Oops;\n" ++
         "pub fn use() void { _ = dispatch_get_context(0); _ = VerifyError; _ = BadValue; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
-    configuration.levels[@intFromEnum(Rule.underscore_private_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.underscore_private_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var naming_count: usize = 0;
     var underscore_count: usize = 0;
@@ -5100,7 +5119,7 @@ test "foreign-binding files preserve literal constants and extern builtin names"
         "const GENERIC_READ = 1; const FILE_SHARE_WRITE = 2;\n" ++
         "const CreateIoCompletionPort = @extern(*const fn () callconv(.c) void, .{ .name = \"CreateIoCompletionPort\" });\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| {
         if (finding.rule == .non_idiomatic_name) std.debug.print("unexpected foreign naming finding: {s}\n", .{finding.message});
@@ -5134,7 +5153,7 @@ test "a catch body that records the captured error keeps its context" {
         "    cache.file.lock() catch return error.CacheCheckFailed;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.lost_error_context)] = .warning;
+    configuration.levels[@backingInt(Rule.lost_error_context)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var context_loss_count: usize = 0;
     for (found) |finding| {
@@ -5147,7 +5166,7 @@ test "file naming follows the implicit file struct shape" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_file_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_file_name)] = .information;
     const namespace_source: [:0]const u8 = "pub fn run() void {}\n";
     const type_source: [:0]const u8 = "value: u32,\n";
     try std.testing.expect((try fileNameFinding(arena.allocator(), namespace_source, "BadName.zig", configuration)) != null);
@@ -5166,8 +5185,8 @@ test "catch diagnostics distinguish unreachable assertions from error remapping"
         "    fail() catch return error.Wrapped;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unsafe_catch_unreachable)] = .warning;
-    configuration.levels[@intFromEnum(Rule.lost_error_context)] = .warning;
+    configuration.levels[@backingInt(Rule.unsafe_catch_unreachable)] = .warning;
+    configuration.levels[@backingInt(Rule.lost_error_context)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var saw_unreachable = false;
     var saw_context_loss = false;
@@ -5312,7 +5331,7 @@ test "comptime hints use proven container members and explicit constant conditio
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
-        "const State = struct { value: u32, const enabled = true; };\n" ++
+        "const State = struct { value: u32, pub const enabled = true; };\n" ++
         "fn run() void {\n" ++
         "    _ = @hasField(State, \"value\");\n" ++
         "    _ = @hasField(State, \"missing\");\n" ++
@@ -5320,8 +5339,8 @@ test "comptime hints use proven container members and explicit constant conditio
         "    if (comptime true) {}\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .hint;
-    configuration.levels[@intFromEnum(Rule.constant_comptime_condition)] = .hint;
+    configuration.levels[@backingInt(Rule.unknown_comptime_member)] = .hint;
+    configuration.levels[@backingInt(Rule.constant_comptime_condition)] = .hint;
     const found = try findings(arena.allocator(), source, configuration);
     var member_count: usize = 0;
     var condition_count: usize = 0;
@@ -5347,6 +5366,31 @@ test "comptime hints use proven container members and explicit constant conditio
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 1), generated_member_count);
+}
+
+test "hasDecl only sees public declarations while field lookup sees local declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = struct { value: u32, const hidden = true; pub const visible = true; pub inline fn ready() bool { return true; } };\n" ++
+        "fn inspect() void {\n" ++
+        "    _ = @hasDecl(State, \"hidden\");\n" ++
+        "    _ = @hasDecl(State, \"visible\");\n" ++
+        "    _ = @hasDecl(State, \"ready\");\n" ++
+        "    _ = @hasDecl(State, \"value\");\n" ++
+        "    _ = @field(State, \"hidden\");\n" ++
+        "    _ = @hasField(State, \"value\");\n" ++
+        "}\n";
+    var configuration = Configuration.defaults();
+    configuration.levels[@backingInt(Rule.unknown_comptime_member)] = .warning;
+    const found = try findings(arena.allocator(), source, configuration);
+    var count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .unknown_comptime_member) continue;
+        count += 1;
+        try std.testing.expect(std.mem.indexOf(u8, finding.message, "no public declaration") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
 
 test "switch analysis reads multiline multi-value prongs as present cases" {
@@ -5416,7 +5460,7 @@ test "pointer parameters mutated through nested members or subscripts stay mutab
         "    return state.inner.count;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    configuration.levels[@backingInt(Rule.mutable_pointer_parameter)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var pointer_count: usize = 0;
     for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
@@ -5437,7 +5481,7 @@ test "pointer parameters mutated through captures or returned pointers stay muta
         "fn first(store: *Store) *u32 { return &store.values[0]; }\n" ++
         "fn observe(store: *Store) usize { return store.values.len; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    configuration.levels[@backingInt(Rule.mutable_pointer_parameter)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var pointer_count: usize = 0;
     for (found) |finding| {
@@ -5460,7 +5504,7 @@ test "pointer owner stays mutable when another parameter mutates its field type"
         "    fn count(self: *Highlighter) usize { return self.configurations.len; }\n" ++
         "};\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    configuration.levels[@backingInt(Rule.mutable_pointer_parameter)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var pointer_count: usize = 0;
     for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
@@ -5479,7 +5523,7 @@ test "ambiguous calls do not determine whether a declaration names a type" {
         "const bad_list = std.ArrayList(u8);\n" ++
         "fn run() void { const items = std.ArrayList(u8).init; _ = items; _ = MyList; _ = bad_list; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .non_idiomatic_name);
 }
@@ -5540,7 +5584,7 @@ test "vector values use value naming while vector type aliases use type naming" 
         "const VectorType = @Vector(4, u8);\n" ++
         "const BadVectorValue = @Vector(4, u8){ 1, 2, 3, 4 };\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_name)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var naming_count: usize = 0;
     for (found) |finding| if (finding.rule == .non_idiomatic_name) {
@@ -5555,7 +5599,7 @@ test "main entry points do not require API documentation" {
     defer arena.deinit();
     const source: [:0]const u8 = "pub fn main() !void {}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.public_declaration_docs)] = .information;
+    configuration.levels[@backingInt(Rule.public_declaration_docs)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .public_declaration_docs);
 }
@@ -5567,7 +5611,7 @@ test "build entry points do not require API documentation" {
         "pub fn build(builder: *std.Build) void { _ = builder; }\n" ++
         "pub fn buildCache() void {}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.public_declaration_docs)] = .information;
+    configuration.levels[@backingInt(Rule.public_declaration_docs)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var docs_count: usize = 0;
     for (found) |finding| {
@@ -5583,7 +5627,7 @@ test "needless cast proof stays within the enclosing function" {
         "fn widen(size: u32) u32 { return @as(u32, size); }\n" ++
         "fn narrow(size: u16) u32 { return @as(u32, size); }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_cast)] = .warning;
+    configuration.levels[@backingInt(Rule.needless_cast)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var cast_count: usize = 0;
     for (found) |finding| if (finding.rule == .needless_cast) {
@@ -5602,7 +5646,7 @@ test "organize imports leaves container doc comments in place" {
         "const apple = @import(\"apple.zig\");\n" ++
         "fn use() void { _ = zebra; _ = apple; }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unsorted_imports)] = .warning;
+    configuration.levels[@backingInt(Rule.unsorted_imports)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var import_count: usize = 0;
     for (found) |finding| if (finding.rule == .unsorted_imports) {
@@ -5626,7 +5670,7 @@ test "prefer try rewrites chained calls from the expression start" {
         "    _ = written;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.prefer_try)] = .warning;
+    configuration.levels[@backingInt(Rule.prefer_try)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var try_count: usize = 0;
     for (found) |finding| if (finding.rule == .prefer_try) {
@@ -5650,7 +5694,7 @@ test "optional capture skips foreign fields and assigned unwraps" {
         "    _ = y;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.prefer_optional_capture)] = .information;
+    configuration.levels[@backingInt(Rule.prefer_optional_capture)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var capture_count: usize = 0;
     for (found) |finding| if (finding.rule == .prefer_optional_capture) {
@@ -5670,7 +5714,7 @@ test "optional capture supports null != opt operand order" {
         "    return 0;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.prefer_optional_capture)] = .information;
+    configuration.levels[@backingInt(Rule.prefer_optional_capture)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var capture_count: usize = 0;
     for (found) |finding| if (finding.rule == .prefer_optional_capture) {
@@ -5691,7 +5735,7 @@ test "needless cast catches nested identical casts" {
         "    return a + b;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_cast)] = .warning;
+    configuration.levels[@backingInt(Rule.needless_cast)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var cast_count: usize = 0;
     for (found) |finding| if (finding.rule == .needless_cast) {
@@ -5710,7 +5754,7 @@ test "discarded error is reported even with an unused capture" {
         "    load() catch |err| { log(err); };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.discarded_error)] = .warning;
+    configuration.levels[@backingInt(Rule.discarded_error)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var discard_count: usize = 0;
     for (found) |finding| if (finding.rule == .discarded_error) {
@@ -5734,7 +5778,7 @@ test "lost error context ignores conditional remaps" {
         "    return load() catch { return error.LoadFailed; };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.lost_error_context)] = .warning;
+    configuration.levels[@backingInt(Rule.lost_error_context)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var context_count: usize = 0;
     for (found) |finding| if (finding.rule == .lost_error_context) {
@@ -5760,7 +5804,7 @@ test "usingnamespace uncertainty stays within its container" {
         "    borrowed();\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .hint;
+    configuration.levels[@backingInt(Rule.unknown_comptime_member)] = .hint;
     const found = try findings(arena.allocator(), source, configuration);
     var member_count: usize = 0;
     var call_count: usize = 0;
@@ -5794,7 +5838,7 @@ test "doc comment style checks the first line of a multi-line comment" {
         "/// Later lines may say anything.\n" ++
         "pub fn render() void {}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.doc_comment_style)] = .information;
+    configuration.levels[@backingInt(Rule.doc_comment_style)] = .information;
     const found = try findings(arena.allocator(), source, configuration);
     var docs_count: usize = 0;
     for (found) |finding| if (finding.rule == .doc_comment_style) {
@@ -5808,7 +5852,7 @@ test "top-level sentinel arrays do not make a file a type" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_file_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_file_name)] = .information;
     const source: [:0]const u8 = "pub const table = [_:0]u8{ 1, 2, 3 };\npub fn run() void {}\n";
     try std.testing.expect((try fileNameFinding(arena.allocator(), source, "tables.zig", configuration)) == null);
     try std.testing.expect((try fileNameFinding(arena.allocator(), source, "Tables.zig", configuration)) != null);
@@ -5818,7 +5862,7 @@ test "build entrypoint keeps its conventional file name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_idiomatic_file_name)] = .information;
+    configuration.levels[@backingInt(Rule.non_idiomatic_file_name)] = .information;
     const source: [:0]const u8 = "pub fn build(b: *Build) void { _ = b; }\n";
     try std.testing.expect((try fileNameFinding(arena.allocator(), source, "build.zig", configuration)) == null);
 }
@@ -5855,7 +5899,7 @@ test "catch unreachable offers try only inside fallible functions" {
         "    fail() catch unreachable;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unsafe_catch_unreachable)] = .warning;
+    configuration.levels[@backingInt(Rule.unsafe_catch_unreachable)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var unreachable_count: usize = 0;
     for (found) |finding| if (finding.rule == .unsafe_catch_unreachable) {
@@ -5880,7 +5924,7 @@ test "unused private declarations offer whole declaration removal" {
         "fn orphan() void {}\n" ++
         "pub fn run() void {}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unused_private_declaration)] = .warning;
+    configuration.levels[@backingInt(Rule.unused_private_declaration)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var declaration_count: usize = 0;
     for (found) |finding| if (finding.rule == .unused_private_declaration) {
@@ -6017,7 +6061,7 @@ test "else stays when the branch terminator is not the last statement" {
         "    }\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    configuration.levels[@backingInt(Rule.needless_else_after_terminator)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
 }
@@ -6035,7 +6079,7 @@ test "a loop else runs on normal exit and is never needless" {
         "    }\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    configuration.levels[@backingInt(Rule.needless_else_after_terminator)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
 }
@@ -6051,7 +6095,7 @@ test "else in a switch prong remains part of the if expression" {
         "    };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.needless_else_after_terminator)] = .warning;
+    configuration.levels[@backingInt(Rule.needless_else_after_terminator)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .needless_else_after_terminator);
 }
@@ -6068,7 +6112,7 @@ test "inline else is exhaustive by construction" {
         "    };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    configuration.levels[@backingInt(Rule.non_exhaustive_switch_else)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
 }
@@ -6082,7 +6126,7 @@ test "switch else reports eight remaining cases" {
         "    return switch (mode) { .a => 0, else => 1 };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    configuration.levels[@backingInt(Rule.non_exhaustive_switch_else)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var finding_count: usize = 0;
     for (found) |finding| {
@@ -6102,7 +6146,7 @@ test "switch else permits fallback over nine remaining cases" {
         "    return switch (mode) { .a => 0, else => 1 };\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.non_exhaustive_switch_else)] = .warning;
+    configuration.levels[@backingInt(Rule.non_exhaustive_switch_else)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
 }
@@ -6125,7 +6169,7 @@ test "pointer parameters that escape mutably stay mutable" {
         "    _ = ring.items[0];\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    configuration.levels[@backingInt(Rule.mutable_pointer_parameter)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .mutable_pointer_parameter);
 }
@@ -6144,7 +6188,7 @@ test "constrained signatures and field address escapes keep mutable pointers" {
         "    return &@field(forest, \"grooves\");\n" ++
         "}\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.mutable_pointer_parameter)] = .warning;
+    configuration.levels[@backingInt(Rule.mutable_pointer_parameter)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .mutable_pointer_parameter);
 }
@@ -6157,7 +6201,7 @@ test "compound Context and State names describe their role" {
         "const CheckpointState = struct { op: u64 };\n" ++
         "pub const Context = struct { key: u32 };\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.vague_type_name)] = .warning;
+    configuration.levels[@backingInt(Rule.vague_type_name)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var vague_count: usize = 0;
     for (found) |finding| if (finding.rule == .vague_type_name) {
@@ -6386,7 +6430,7 @@ test "field reflection reports missing members on typed values" {
     const source: [:0]const u8 =
         "const Message = struct { value: u8 }; fn use(message: Message) void { _ = @field(message, \"value\"); _ = @field(message, \"missing\"); }\n";
     var configuration = Configuration.defaults();
-    configuration.levels[@intFromEnum(Rule.unknown_comptime_member)] = .warning;
+    configuration.levels[@backingInt(Rule.unknown_comptime_member)] = .warning;
     const found = try findings(arena.allocator(), source, configuration);
     var reflection_count: usize = 0;
     for (found) |finding| {

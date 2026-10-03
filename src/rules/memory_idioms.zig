@@ -14,7 +14,7 @@ fn findIndexOfPrefixTests(context: RuleRun) !void {
     const level = context.level(.prefer_starts_with);
     if (level == .off) return;
     for (context.tokens, 0..) |token, call_index| {
-        if (token.tag != .identifier or !context.tokenIs(call_index, "indexOf") or call_index < 4 or
+        if (token.tag != .identifier or (!context.tokenIs(call_index, "indexOf") and !context.tokenIs(call_index, "find")) or call_index < 4 or
             call_index + 1 >= context.tokens.len or
             !context.tokenIs(call_index - 4, "std") or !context.tokenIs(call_index - 2, "mem") or
             context.tokens[call_index + 1].tag != .l_paren) continue;
@@ -30,7 +30,7 @@ fn findIndexOfPrefixTests(context: RuleRun) !void {
             .span = token.loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "indexOf checks whether '{s}' occurs at offset zero in '{s}'; use std.mem.startsWith",
+                "search checks whether '{s}' occurs at offset zero in '{s}'; use std.mem.startsWith",
                 .{ needle, haystack },
             ),
         });
@@ -252,7 +252,7 @@ fn findBooleanSearches(context: RuleRun) !void {
             .span = token.loc,
             .message = try std.fmt.allocPrint(
                 context.allocator,
-                "boolean linear search over '{s}' can use std.mem.indexOfScalar or std.mem.indexOf",
+                "boolean linear search over '{s}' can use std.mem.findScalar or std.mem.find",
                 .{loop.iterable},
             ),
         });
@@ -283,6 +283,13 @@ test "indexOf at zero prefers startsWith" {
         .prefer_starts_with,
     );
     try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "find at zero prefers startsWith" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const found = try findingsFor(arena.allocator(), "const prefixed = std.mem.find(u8, text, prefix) == 0;", .prefer_starts_with);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
 }
 
 test "guarded tail equality prefers endsWith" {
@@ -357,7 +364,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8, rule: types.R
     const tokens = try tokenize(allocator, source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(rule)] = .information;
+    configuration.levels[@backingInt(rule)] = .information;
     try run(.{
         .allocator = allocator,
         .source = source,

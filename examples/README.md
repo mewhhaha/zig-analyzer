@@ -1,6 +1,6 @@
 # Language-server examples
 
-The completion, hover, navigation, and rename sources compile with Zig 0.16.0.
+The completion, hover, navigation, and rename sources compile with Zig 0.17.0.
 Run those example tests with:
 
 ```sh
@@ -35,8 +35,9 @@ reflected-member generation, and test harnesses.
 Format calls with a simple missing or extra tuple argument also offer an explicit
 arity repair.
 Build-module repair appears on a package `@import` when its uniquely named Zig
-file and `build.zig` are both open. Repeated `@cImport` extraction additionally
-requires a client that supports workspace file creation.
+file and `build.zig` are both open. Repeated `@cImport` extraction is retained
+for legacy migration input and requires a client that supports workspace file
+creation. Zig 0.17 source uses the translate-c package instead of `@cImport`.
 
 Open `diagnostics/idiomatic_style.zig` for the style-guide actions. It covers a
 redundant fully-qualified type name, optional force-unwrapping after a null

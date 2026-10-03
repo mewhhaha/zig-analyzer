@@ -87,7 +87,7 @@ fn findManualSearches(context: RuleRun) !void {
             .rule = .prefer_index_of,
             .level = level,
             .span = token.loc,
-            .message = try std.fmt.allocPrint(context.allocator, "manual linear search over '{s}' can state its intent with std.mem.indexOfScalar or std.mem.indexOf", .{iterable}),
+            .message = try std.fmt.allocPrint(context.allocator, "manual linear search over '{s}' can state its intent with std.mem.findScalar or std.mem.find", .{iterable}),
         });
     }
 }
@@ -664,7 +664,7 @@ test "helping-hand rules recognize their exact manual idioms" {
         .prefer_buffered_writer,
         .prefer_arena,
     };
-    for (expected_rules) |rule| configuration.levels[@intFromEnum(rule)] = .information;
+    for (expected_rules) |rule| configuration.levels[@backingInt(rule)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     for (expected_rules) |rule| {
         var seen = false;
@@ -682,7 +682,7 @@ test "range loops preserve non-usize counter types" {
     defer arena.deinit();
     const source: [:0]const u8 = "fn run() void { var seed: u64 = 0; while (seed < 16) : (seed += 1) use(seed); }";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_range_for)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_range_for)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -697,7 +697,7 @@ test "string dispatch with branch bodies stays explicit" {
         "    } else if (std.mem.eql(u8, name, \"third\")) { try expectThird(); }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_string_switch)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_string_switch)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -709,7 +709,7 @@ test "command output from main is not replaced with logging" {
         "const std = @import(\"std\");\n" ++
         "pub fn main() void { std.debug.print(\"usage: tool\\n\", .{}); }\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_log_over_print)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_log_over_print)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -722,7 +722,7 @@ test "debug output reachable only from tests remains test output" {
         "fn verifyCase() void { printCase(); }\n" ++
         "test \"case\" { verifyCase(); }\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_log_over_print)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_log_over_print)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -732,7 +732,7 @@ test "memset rewrites do not collapse repeated side effects" {
     defer arena.deinit();
     const source: [:0]const u8 = "fn fill(buffer: []u8) void { for (buffer) |*element| { element.* = nextValue(); } }";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_memset)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_memset)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
@@ -746,7 +746,7 @@ test "prefer_memset handles unbraced and discarded index loops" {
         "    for (buffer, 0..) |*b, _| { b.* = 42; }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_memset)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_memset)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqualStrings("@memset(buffer, 0);", found[0].fixes[0].edits[0].replacement);
@@ -762,7 +762,7 @@ test "prefer_memcpy handles multi-sequence loops" {
         "    for (src, dest) |s, *d| { d.* = s; }\n" ++
         "}\n";
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.prefer_memcpy)] = .information;
+    configuration.levels[@backingInt(types.Rule.prefer_memcpy)] = .information;
     const found = try findingsFor(arena.allocator(), source, configuration);
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqualStrings("@memcpy(dest, src);", found[0].fixes[0].edits[0].replacement);

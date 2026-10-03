@@ -89,7 +89,7 @@ fn bindingUsedAfterReset(context: RuleRun, binding: []const u8, start: usize, en
 }
 
 fn allocationReceiver(context: RuleRun, start: usize, end: usize) ?[]const u8 {
-    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ" };
+    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "dupeSentinel", "print", "printSentinel" };
     for (context.tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or method_index < 2 or context.tokens[method_index - 1].tag != .period or
             context.tokens[method_index - 2].tag != .identifier or method_index + 1 >= end or
@@ -318,7 +318,7 @@ fn reallocationReplacesBorrowedField(context: RuleRun, view_name: []const u8, me
 }
 
 fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
-    if (std.ascii.indexOfIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
+    if (std.ascii.findIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
     var name_index = before;
     while (name_index > 0) {
         name_index -= 1;
@@ -506,6 +506,22 @@ test "arena allocations used after reset warn" {
     });
     try std.testing.expectEqual(@as(usize, 1), findings.items.len);
     try std.testing.expectEqual(types.Rule.invalidated_container_view, findings.items[0].rule);
+}
+
+test "arena printing and sentinel copies are invalidated by reset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(backing: std.mem.Allocator) !void { var scratch = std.heap.ArenaAllocator.init(backing);" ++
+        "defer scratch.deinit(); const allocator = scratch.allocator();" ++
+        "const printed = try allocator.print(\"literal\", .{});" ++
+        "const copied = try allocator.dupeSentinel(u8, \"before\", 0);" ++
+        "_ = scratch.reset(.free_all); consume(printed, copied); }";
+    const tokens = try tokenize(arena.allocator(), source);
+    var found: std.ArrayList(rule_types.Finding) = .empty;
+    try run(.{ .allocator = arena.allocator(), .source = source, .tokens = tokens, .configuration = rule_types.Configuration.defaults(), .findings = &found });
+    try std.testing.expectEqual(@as(usize, 2), found.items.len);
+    for (found.items) |finding| try std.testing.expectEqual(rule_types.Rule.invalidated_container_view, finding.rule);
 }
 
 test "arena allocations consumed before reset stay clean" {

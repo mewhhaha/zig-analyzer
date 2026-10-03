@@ -264,7 +264,7 @@ fn reportFindings(source: []const u8, label: []const u8, found: []const analysis
 
 fn sortedRules(allocator: std.mem.Allocator, found: []const analysis.Finding) ![]u16 {
     const rules = try allocator.alloc(u16, found.len);
-    for (found, rules) |finding, *rule| rule.* = @intFromEnum(finding.rule);
+    for (found, rules) |finding, *rule| rule.* = @backingInt(finding.rule);
     std.mem.sort(u16, rules, {}, std.sort.asc(u16));
     return rules;
 }
@@ -288,11 +288,11 @@ fn expectSameRules(
 }
 
 fn parseAndRender(allocator: std.mem.Allocator, source: [:0]const u8) ![:0]const u8 {
-    var tree = try std.zig.Ast.parse(allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     defer tree.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
     const rendered = try tree.renderAlloc(allocator);
-    return try allocator.dupeZ(u8, rendered);
+    return try allocator.dupeSentinel(u8, rendered, 0);
 }
 
 fn insertProbeComment(allocator: std.mem.Allocator, source: [:0]const u8, random: std.Random) ![:0]const u8 {

@@ -366,7 +366,7 @@ fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]types.Find
 const Configuration = struct {
     fn defaults() types.Configuration {
         var cfg = types.Configuration.defaults();
-        cfg.levels[@intFromEnum(types.Rule.nan_comparison)] = .warning;
+        cfg.levels[@backingInt(types.Rule.nan_comparison)] = .warning;
         return cfg;
     }
 };

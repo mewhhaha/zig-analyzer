@@ -106,7 +106,7 @@ test "optional captures replace repeated force unwraps" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -125,7 +125,7 @@ test "reassigned optionals do not produce capture rewrites" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -143,7 +143,7 @@ test "a field named like the optional binding is not the binding" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
@@ -161,7 +161,7 @@ test "assigning through the forced unwrap disqualifies the capture rewrite" {
     const tokens = try tokenize(arena.allocator(), source);
     var findings: std.ArrayList(types.Finding) = .empty;
     var configuration = types.Configuration.defaults();
-    configuration.levels[@intFromEnum(types.Rule.redundant_optional_unwrap)] = .information;
+    configuration.levels[@backingInt(types.Rule.redundant_optional_unwrap)] = .information;
     try run(.{
         .allocator = arena.allocator(),
         .source = source,
