@@ -1,7 +1,9 @@
 # Zig 0.17.0 audit of existing lints
 
-This audit covers all **190 rule IDs present on `origin/main` before the 0.17
-update**. Every ID appears exactly once in the table below. The eight new opt-in migration
+This audit originally reviewed **190 rule IDs present before the 0.17
+update**. The table below tracks the **188 retained IDs** after
+`defer-cleanup-in-loop` and `duplicate-c-import` were retired in
+[0.17.0-2](release-0.17.0-2.md). The eight new opt-in migration
 IDs are `modernize-deprecated-builtin`, `modernize-removed-syntax`,
 `modernize-build-api`, `modernize-bitcast`, `modernize-extern-bitcast`,
 `modernize-global-linkage`, `modernize-array-list-access`, and
@@ -9,8 +11,8 @@ IDs are `modernize-deprecated-builtin`, `modernize-removed-syntax`,
 The correctness rule `unreported-partial-send` is also new.
 All ten are documented separately in
 the [rule reference](rules/README.md).
-No existing rule is removed: the language, lifetime and policy checks remain
-useful, while release-dependent API advice and ownership recognition are updated.
+The initial 0.17.0-1 migration retained every existing rule, updating
+release-dependent API advice and ownership recognition.
 
 The review compares each rule's documented predicate, source matchers and emitted
 API names with the official release notes and the downloaded 0.17.0 standard
@@ -41,8 +43,8 @@ verify ownership and diagnostics freshness.
   calls from zero-exponent operands. Square-root actions for unknown or
   nonpositive operands require explicit selection because `pow` and `sqrt`
   differ on negative zero.
-- Legacy `@cImport` migration inputs still receive duplicate-import diagnostics;
-  the linter does not suggest the removed builtin for new 0.17 programs.
+- Legacy `@cImport` migration inputs receive `modernize-removed-syntax`
+  guidance; the separate `duplicate-c-import` rule was retired in 0.17.0-2.
 - Deprecation warnings follow resolved local and imported declarations, including
   standard-library documentation, immutable aliases and typed receivers. CLI
   cache reuse and editor dependency changes refresh imported warnings.
@@ -96,13 +98,12 @@ broader parser, rule, example and compiler integration coverage.
 
 | Disposition | Existing rules |
 | --- | ---: |
-| Retain: language | 76 |
+| Retain: language | 75 |
 | Updated shared model | 14 |
 | Retain: policy/project | 35 |
 | Retain: API verified | 50 |
 | Updated | 14 |
-| Retain for migration | 1 |
-| **Total** | **190** |
+| **Retained total** | **188** |
 
 ## Every existing rule
 

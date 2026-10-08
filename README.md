@@ -135,7 +135,7 @@ Worst-case single-file `check` time on that corpus is about 0.3 s
 
 ## Installation
 
-The `0.17.0-1` release provides a relocatable x86_64 Linux archive containing
+The `0.17.0-2` release provides a relocatable x86_64 Linux archive containing
 both zig-analyzer and its patched compiler backend. Verify the published
 SHA-256 checksum before installing it. Building from source requires Zig
 0.17.0 exactly:
@@ -148,7 +148,8 @@ zig-out/bin/zig-analyzer doctor      # verifies the setup
 
 [docs/installation.md](docs/installation.md) covers the complete setup,
 including how the patched backend is built and how to use it from other
-projects.
+projects. See the [release notes](docs/release-0.17.0-2.md) for changes and
+upgrade instructions.
 
 ## Versioning
 

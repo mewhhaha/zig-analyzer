@@ -2,7 +2,7 @@
 
 The first zig-analyzer release for Zig 0.17.0 updates the analyzer, its patched
 compiler backend, and the pinned build dependencies. Compiler-backed analysis
-requires the exact Zig 0.17.0 release. The compiler protocol is version 7.
+requires the exact Zig 0.17.0 release. The compiler protocol is version 5.
 
 ## Lint changes
 

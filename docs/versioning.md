@@ -42,6 +42,6 @@ deliberately falls back to syntax features and lint diagnostics; the
 
 ## Current status
 
-The next prepared release is `0.17.0-1`. The
+The current release is `0.17.0-2`. The
 [installation guide](installation.md) describes the release archive and source
 build.
