@@ -1,4 +1,4 @@
-const package = @import("package");
+const package = @import("package"); // expect: unsorted-imports, unused-import
 const std = @import("std");
 
 const Mode = enum { fast, safe, checked };
@@ -10,17 +10,23 @@ const Options = struct {
 };
 
 fn analyze(mode: Mode, enabled: bool, err: anyerror) void {
+    // expect: never-mutated-var
     var attempts = 3;
     _ = attempts;
 
+    // expect: missing-struct-field
     _ = Options{};
+    // expect: missing-switch-prong
     _ = switch (mode) {
         .fast => 1,
     };
 
+    // expect: redundant-bool-comparison
     _ = enabled == true;
+    // expect: mixed-bitwise-arithmetic
     _ = attempts + 1 << 2;
     _ = err == error.Failed;
+    // expect: unresolved-call
     _ = missingFunction(attempts);
 }
 
@@ -40,16 +46,19 @@ fn recoverValues() !void {
 fn returnOwnedStorage(allocator: std.mem.Allocator) ![]u8 {
     var values = std.ArrayList(u8).empty;
     defer values.deinit(allocator);
+    // expect: returning-deinitialized-view
     return values.items;
 }
 
 fn transferOwnership(allocator: std.mem.Allocator) ![]u8 {
     const value = try allocator.alloc(u8, 1);
     defer allocator.free(value);
+    // expect: returning-released-value
     return value;
 }
 
 fn readAfterInclusiveBound(values: []const u8, index: usize) u8 {
+    // expect: inclusive-index-bound
     std.debug.assert(index <= values.len);
     return values[index];
 }
@@ -57,6 +66,7 @@ fn readAfterInclusiveBound(values: []const u8, index: usize) u8 {
 fn reverseWithUnsignedIndex(values: []const u8) void {
     if (values.len == 0) return;
     var index: usize = values.len - 1;
+    // expect: unsigned-reverse-loop
     while (index >= 0) : (index -= 1) {
         _ = values[index];
     }
@@ -68,6 +78,7 @@ const Payload = union(enum) {
 };
 
 fn mutatePayload(value: ?u8) void {
+    // expect: never-mutated-var
     var current = value;
     if (current) |payload| payload += 1;
 }
@@ -79,7 +90,9 @@ fn inspectPayload(value: Payload) void {
 }
 
 fn formattingAndOverflow(allocator: std.mem.Allocator, count: usize) !void {
+    // expect: prefer-log-over-print
     std.debug.print("name {}", .{"zig"});
+    // expect: allocation-size-overflow
     _ = try allocator.alloc(u8, count * 4);
 }
 

@@ -51,10 +51,20 @@ for top-level constants rather than only their initializer text.
 
 ## Language server
 
-zig-analyzer implements diagnostics, completion, hover, references, rename
-(including declarations reached through reflection), call hierarchy, semantic
-tokens, inlay hints, code actions, and formatting that matches `zig fmt`
-byte for byte.
+zig-analyzer implements diagnostics, completion, hover, references, rename,
+call hierarchy, semantic tokens, inlay hints, code actions, and formatting that
+matches `zig fmt` byte for byte.
+
+Renaming a field, method, enum case, or top-level declaration asks the compiler
+which occurrences denote it: `x.name` through an alias, a pointer, a method
+result, a `for` capture, or `@field(x, "name")`, and not the same spelling on
+an unrelated type. If the file belongs to several compile units of your build
+(an executable and its tests, or one program built with different options),
+the rename is checked in each, and refused when the declaration differs between
+them. Occurrences the compiler cannot resolve are left unchanged and reported.
+Without a compiler, or for locals, rename uses syntax scoping; the editor log
+says which mode ran. Rename waits for a compile in progress (at most 5 s) and
+for each other compile unit it must start (at most 30 s, 16 units).
 
 Configure your editor to run the executable with the `lsp` argument;
 [docs/editors.md](docs/editors.md) has complete Helix and Neovim
@@ -62,9 +72,10 @@ configurations. This repository's own `.helix/languages.toml` is already set
 up, so opening `examples/compiler/comptime_pipeline.zig` in Helix reproduces
 the completion above.
 
-Compiler updates run on a debounced background worker. The server answers from
-the latest syntax immediately, then publishes compiler-enriched diagnostics
-only if that result still matches the current document version. If the backend
+Compiler updates run on a debounced background worker, one job per document.
+The server answers from the latest syntax immediately, then publishes
+compiler-enriched diagnostics only if that result still matches the current
+document version; a republish of the same version keeps them. If the backend
 hangs, a watchdog disconnects it without blocking foreground requests.
 Ordinary source saves reuse the running incremental compiler and its analysis
 state. Build configuration changes restart analysis to discover the current
@@ -101,7 +112,7 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 200 rules with stable codes, organized into five named profiles,
+There are 198 rules with stable codes (see the [rule index](docs/rules/README.md)), organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
 must-use functions. Configuration lives in `zig-analyzer.json`, and findings

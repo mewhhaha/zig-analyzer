@@ -1,20 +1,43 @@
 {
   "check": {
-    "exclude": [".claude", "examples/diagnostics", "tmp"]
+    "exclude": [".claude", "examples/diagnostics", "fixtures/projects", "tmp"]
   },
   "contracts": {
     "arena-allocators": [
       "RuleRun.allocator",
+      "ProjectRun.allocator",
       "ActionRun.allocator",
-      "findingsWithShapesAndTokens.allocator",
+      "findingsWith.allocator",
+      "findingsFromTokens.allocator",
       "parse.allocator",
-      "hoverDescription.allocator",
-      "cachedCompilerTypeShapes.allocator"
+      "describeIdentifier.allocator",
+      "standardLibraryMember.allocator",
+      "copyResolvedShapes.allocator",
+      "forFinding.allocator",
+      "extractExpression.allocator",
+      "moveCleanupAfterAcquisition.allocator",
+      "reflectionStringSpans.allocator"
     ],
     "imports": [
       {
+        "from": "src/syntax",
+        "deny": ["src/lsp", "src/compiler", "src/project", "src/rules", "src/actions"]
+      },
+      {
         "from": "src/rules",
-        "deny": ["src/lsp_server.zig"]
+        "deny": ["src/lsp", "src/compiler", "src/project"]
+      },
+      {
+        "from": "src/actions",
+        "deny": ["src/lsp", "src/compiler", "src/project"]
+      },
+      {
+        "from": "src/compiler",
+        "deny": ["src/lsp", "src/project", "src/actions"]
+      },
+      {
+        "from": "src/project",
+        "deny": ["src/lsp"]
       }
     ]
   },
@@ -23,7 +46,23 @@
     "correctness": "warning",
     "rules": {
       "discarded-error": "warning",
-      "literal-boolean-argument": "information"
+      "literal-boolean-argument": "information",
+      "modernize-managed-container": "warning",
+      "modernize-deprecated-io": "warning",
+      "modernize-deprecated-stdlib": "warning",
+      "modernize-deprecated-builtin": "warning",
+      "modernize-removed-syntax": "warning",
+      "modernize-build-api": "warning",
+      "modernize-bitcast": "warning",
+      "modernize-extern-bitcast": "warning",
+      "modernize-global-linkage": "warning",
+      "modernize-array-list-access": "warning",
+      "modernize-container-init": "warning",
+      "lost-error-context": "warning",
+      "unsafe-orelse-unreachable": "warning",
+      "unsafe-catch-unreachable": "warning",
+      "vague-type-name": "warning",
+      "error-collapsed-to-absence": "warning"
     }
   }
 }

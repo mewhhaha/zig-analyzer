@@ -43,7 +43,7 @@ fn addErrorAndOptionalActions(context: ActionRun) !void {
                 .{},
             );
         }
-        // A discarded |err| capture is a compile error in Zig 0.16, so the catch stays captureless.
+        // A discarded |err| capture is a compile error, so the catch stays captureless.
         try context.oneEdit(
             "Handle the error with catch",
             .refactor_rewrite,

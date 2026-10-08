@@ -19,16 +19,48 @@ zig build backend-test
 zig build fixtures
 zig build examples
 zig build fuzz-rules
+zig build rule-docs # regenerates docs/rules; `zig build test` fails when it is stale
 zig-out/bin/zig-analyzer check --no-cache .
 zig build run -- doctor
 zig build run -- version
 ```
 
+Tests are split by what they need. `zig build test` runs the unit tests next
+to each module, the contract tests (`compiler/protocol_invariant.zig`), the
+editor exchanges in `tests/lsp/` (one file per feature, sharing
+`tests/lsp/support.zig`), the build-graph tests (`tests/build_graph.zig`, which
+configure the small projects in `fixtures/projects/` with the host `zig`), the
+rule examples and docs checks, fix round trips, the fixtures, the examples and the fuzz cases;
+none of it needs the patched compiler.
+`zig build backend-test` builds the backend and runs exactly the tests that do:
+`tests/compiler_integration.zig` and `tests/lsp_compiler.zig`. Those fail when
+the backend is missing rather than skip.
+
 `zig build backend` clones the exact Zig source revision into `.zig-analyzer/`,
-checks the narrow compiler patch, builds without LLVM, and records the source
-commit, patch hash, and protocol version in
-`zig-out/backend/zig-analyzer-backend.json`. Repeating the command reuses the
-verified checkout and compiler caches.
+applies the narrow compiler patch, installs `src/compiler/protocol.zig` into
+the checkout as `src/AnalysisProtocol.zig` (the analyzer and the backend compile
+one definition of the wire format), builds without LLVM, and records the source
+commit, a digest of the patch and protocol source, and the protocol version in
+`zig-out/backend/zig-analyzer-backend.json`. Editing either input makes the
+backend stale: the next `zig build backend` resets the checkout to the pinned
+commit, reapplies the inputs, and rebuilds (about 15 minutes), and `doctor`
+reports the mismatch until then. Bump `version` in `src/compiler/protocol.zig`
+whenever the wire format changes (it is 7: `resolve_symbol` batches symbol
+queries, see the comment above `ResolveSymbolsRequest`). The patch adds
+`src/AnalysisSymbols.zig` beside `IncrementalDebugServer.zig`; to iterate on it
+without the 15 minute rebuild, edit the checkout in `.zig-analyzer/zig-0.17.0`
+and type-check with `zig build -Dno-lib -Denable-llvm=false
+-Ddebug-extensions=true -Dno-bin` (about 30 s), then regenerate the patch with
+`git add -N src/AnalysisSymbols.zig && git diff -- src/IncrementalDebugServer.zig
+src/AnalysisSymbols.zig src/Zcu.zig src/Zcu/PerThread.zig src/main.zig`. Repeating the command with unchanged inputs
+reuses the verified checkout and compiler caches.
+
+At run time the analyzer starts the backend with `ZIG_ANALYZER_PORT=0`; the
+backend binds a free loopback port and announces it on stderr, so concurrent
+analyzers never collide. Backend stderr is kept (bounded) and logged when the
+backend fails to start or exits uncleanly. Compiler caches live in
+`.zig-analyzer/` under the project root: the directory that holds
+`zig-analyzer.json`, else the workspace folder, else the file's directory.
 
 On x86_64 Linux, keep a compiler running while editing to reuse Zig 0.17.0's
 incremental analysis and receive build errors after each saved change:
@@ -57,11 +89,17 @@ analyzed.
 
 Editor diagnostics keep the patched compiler running with `-fincremental` and
 reuse its analysis state across unsaved edits and ordinary source saves. Each
-update also checks saved imports for changes. Saving `build.zig` or
-`build.zig.zon` restarts analysis so a changed build configuration can select
-the appropriate source root. Syntax diagnostics remain available while the
+update also checks saved imports for changes. The compile unit that analyzes a
+document comes from the build graph (`zig build --print-configuration-path`):
+compile steps under the `check` step, else `install`, with their module
+graphs passed to the compiler so `build_options` and dependencies resolve.
+Keep every test binary a dependency of `check` (see `Tests` in `build.zig`):
+that is how a file under test belongs to a unit. Saving `build.zig` or
+`build.zig.zon` discovers the graph again and restarts analysis so a changed
+build configuration can select the appropriate unit. Syntax diagnostics remain available while the
 debounced compiler worker updates; compiler diagnostics publish only for the
-current document generation.
+current document version, and edits to several documents inside the debounce
+all reach the compiler.
 
 The project separates thin transport/composition modules from thick proof and
 policy modules. Core rules and actions return byte-span domain values and do
@@ -105,6 +143,14 @@ every rule. The same tests run under `zig build test`; the continuous
 fuzz driver then panics with `start index 1 is larger than end index 0`. The
 same failure reproduces with a standalone no-op fuzz probe. The normal test
 suite still runs the deterministic fuzz cases.
+
+`tests/rule_fixes.zig` applies each catalog example's quick fixes and fix-all
+edits, then checks that the result still parses, preserves formatting when
+the input was formatted, and has no further fix-all edits for the same rule.
+It also applies all enabled rules' fix-all edits together and checks that
+their combined result parses. The example diagnostics and test-reachability
+checks ensure the documented examples report their marked findings and every
+source module with tests participates in the suite.
 
 See [examples/README.md](examples/README.md) for exact completion, hover,
 navigation, rename, diagnostic, and code-action cases.

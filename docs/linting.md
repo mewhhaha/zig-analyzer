@@ -13,17 +13,17 @@ Findings for unchanged files are cached between runs; `--no-cache` forces a
 full reanalysis. Imported deprecation warnings always use the current dependency
 source. In the editor, edits and closes also refresh warnings in open importers.
 
-The default [`deprecated-declaration`](../src/rules/deprecated-declaration.md)
+The default [`deprecated-declaration`](rules/deprecated-declaration.md)
 warning follows local declarations, literal file imports, and the standard
 library. It skips named build modules whose compilation bindings are unresolved.
 
 ## Rules, tiers, and profiles
 
-There are 200 rules. Each has a stable kebab-case code, such as
+There are 198 rules. Each has a stable kebab-case code, such as
 `missing-errdefer` or `discarded-error`, used consistently in configuration,
 diagnostics, and suppression directives. The full index, with one document
 per rule explaining why it exists and when it fires, is
-[`src/rules/RULES.md`](../src/rules/RULES.md).
+[`docs/rules/README.md`](rules/README.md).
 
 Every rule belongs to one of three tiers:
 
@@ -44,10 +44,12 @@ A profile enables a curated set of style rules:
 
 ## Configuration
 
-Configuration is read from `zig-analyzer.json` in the directory being checked
-(for the CLI) or the directory the editor starts the server in (for the
-language server). Configuration errors are reported with the offending key
-rather than silently ignored.
+Configuration is read from the nearest `zig-analyzer.json` at or above the
+directory being checked (for the CLI) or above each open file (for the language
+server); both apply the same per-path relaxations, such as allowing debug
+printing in tests and `build.zig`. The language server notices edits to the file
+on the next request. Configuration errors are reported with the offending key
+rather than silently ignored, once per change.
 
 ```json
 {
@@ -90,7 +92,7 @@ strongest proofs apply to your own APIs without heuristics:
 ```json
 {
   "contracts": {
-    "imports": [{ "from": "src/rules", "deny": ["src/lsp_server.zig"] }],
+    "imports": [{ "from": "src/rules", "deny": ["src/lsp", "src/compiler"] }],
     "resources": [{ "acquire": "Db.open", "release": "Db.close" }],
     "arena-allocators": ["RequestContext.allocator"],
     "must-use": ["Builder.finish"]
@@ -101,7 +103,11 @@ strongest proofs apply to your own APIs without heuristics:
 - `imports` declares module boundaries: files under `from` may not import the
   denied paths.
 - `resources` pairs an acquiring call with its releasing call, so the
-  resource-lifecycle analysis reports acquisitions that are never released.
+  resource-lifecycle analysis and the cleanup rules (`missing-resource-cleanup`,
+  `discarded-resource`, `resource-cleanup-on-error-only`,
+  `cleanup-after-fallible-operation`, `returning-released-value`) treat your own
+  APIs like `openFile`/`close`. A qualified entry such as `Db.open` only matches
+  calls on that receiver.
 - `arena-allocators` names allocator fields by their owner type, or allocator
   parameters by their function. For example, `RequestContext.allocator` and
   `render.allocator` declare that allocations made through those providers

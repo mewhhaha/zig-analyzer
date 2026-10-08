@@ -1,6 +1,10 @@
 const std = @import("std");
 const analysis = @import("../analysis.zig");
+const uri_module = @import("../uri.zig");
 const action_context = @import("context.zig");
+const tokenize = @import("../syntax/tokens.zig").tokenize;
+const tokenIs = @import("../syntax/tokens.zig").tokenIs;
+const matchingToken = @import("../syntax/tokens.zig").matchingToken;
 
 pub const OpenDocument = struct {
     uri: []const u8,
@@ -12,16 +16,10 @@ pub const FileEdit = struct {
     edit: analysis.Edit,
 };
 
-pub const CreatedFile = struct {
-    uri: []const u8,
-    source: []const u8,
-};
-
 pub const Candidate = struct {
     title: []const u8,
     kind: analysis.ActionKind = .refactor_rewrite,
     edits: []const FileEdit,
-    created_file: ?CreatedFile = null,
 };
 
 pub fn actions(
@@ -36,9 +34,6 @@ pub fn actions(
     if (try buildImportAction(allocator, current_uri, current_source, selection, documents)) |candidate| {
         try candidates.append(allocator, candidate);
     }
-    if (try cImportAction(allocator, current_uri, current_source, selection, documents)) |candidate| {
-        try candidates.append(allocator, candidate);
-    }
     return try candidates.toOwnedSlice(allocator);
 }
 
@@ -50,12 +45,12 @@ fn buildImportAction(
     documents: []const OpenDocument,
 ) !?Candidate {
     const import_name = try selectedPackageImport(allocator, current_source, selection) orelse return null;
-    const module_document = uniqueModuleDocument(import_name, current_uri, documents) orelse return null;
-    const build_document = uniqueBuildDocument(documents) orelse return null;
+    const module_document = try uniqueModuleDocument(allocator, import_name, current_uri, documents) orelse return null;
+    const build_document = try uniqueBuildDocument(allocator, documents) orelse return null;
     const existing_import = try allocator.print("addImport(\"{s}\"", .{import_name});
     defer allocator.free(existing_import);
     if (std.mem.find(u8, build_document.source, existing_import) != null) return null;
-    const build_tokens = try action_context.tokenize(allocator, build_document.source);
+    const build_tokens = try tokenize(allocator, build_document.source);
     defer allocator.free(build_tokens);
     const build_body = buildFunctionBody(build_tokens, build_document.source) orelse return null;
     const artifact_name = firstRootModuleReceiver(
@@ -64,8 +59,10 @@ fn buildImportAction(
         build_body.start,
         build_body.end,
     ) orelse return null;
-    const build_path = uriPath(build_document.uri) orelse return null;
-    const module_path = uriPath(module_document.uri) orelse return null;
+    const build_path = try uri_module.toPath(allocator, build_document.uri) orelse return null;
+    defer allocator.free(build_path);
+    const module_path = try uri_module.toPath(allocator, module_document.uri) orelse return null;
+    defer allocator.free(module_path);
     const build_directory = std.Io.Dir.path.dirname(build_path) orelse return null;
     const relative_path = try std.Io.Dir.path.relativeAlloc(allocator, "/", null, build_directory, module_path);
     defer allocator.free(relative_path);
@@ -97,7 +94,7 @@ fn selectedPackageImport(
     source: [:0]const u8,
     selection: std.zig.Token.Loc,
 ) !?[]const u8 {
-    const tokens = try action_context.tokenize(allocator, source);
+    const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or !tokenIs(source, token, "@import") or index + 2 >= tokens.len or
@@ -111,11 +108,17 @@ fn selectedPackageImport(
     return null;
 }
 
-fn uniqueModuleDocument(name: []const u8, current_uri: []const u8, documents: []const OpenDocument) ?OpenDocument {
+fn uniqueModuleDocument(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    current_uri: []const u8,
+    documents: []const OpenDocument,
+) !?OpenDocument {
     var selected: ?OpenDocument = null;
     for (documents) |document| {
         if (std.mem.eql(u8, document.uri, current_uri)) continue;
-        const path = uriPath(document.uri) orelse continue;
+        const path = try uri_module.toPath(allocator, document.uri) orelse continue;
+        defer allocator.free(path);
         const basename = std.Io.Dir.path.basename(path);
         if (!std.mem.endsWith(u8, basename, ".zig") or basename.len != name.len + 4 or
             !std.mem.eql(u8, basename[0..name.len], name)) continue;
@@ -125,10 +128,11 @@ fn uniqueModuleDocument(name: []const u8, current_uri: []const u8, documents: []
     return selected;
 }
 
-fn uniqueBuildDocument(documents: []const OpenDocument) ?OpenDocument {
+fn uniqueBuildDocument(allocator: std.mem.Allocator, documents: []const OpenDocument) !?OpenDocument {
     var selected: ?OpenDocument = null;
     for (documents) |document| {
-        const path = uriPath(document.uri) orelse continue;
+        const path = try uri_module.toPath(allocator, document.uri) orelse continue;
+        defer allocator.free(path);
         if (!std.mem.eql(u8, std.Io.Dir.path.basename(path), "build.zig")) continue;
         if (selected != null) return null;
         selected = document;
@@ -165,123 +169,11 @@ fn firstRootModuleReceiver(
     return null;
 }
 
-fn cImportAction(
-    allocator: std.mem.Allocator,
-    current_uri: []const u8,
-    current_source: [:0]const u8,
-    selection: std.zig.Token.Loc,
-    documents: []const OpenDocument,
-) !?Candidate {
-    const selected = try selectedCImport(allocator, current_source, selection) orelse return null;
-    const c_import_source = current_source[selected.start..selected.end];
-    var occurrences: std.ArrayList(FileEdit) = .empty;
-    defer occurrences.deinit(allocator);
-    for (documents) |document| {
-        const spans = try matchingCImports(allocator, document.source, c_import_source);
-        defer allocator.free(spans);
-        for (spans) |span| {
-            try occurrences.append(allocator, .{ .uri = document.uri, .edit = .{ .span = span, .replacement = "" } });
-        }
-    }
-    if (occurrences.items.len < 2) return null;
-
-    const current_path = uriPath(current_uri) orelse return null;
-    const wrapper_path = try std.Io.Dir.path.join(allocator, &.{ std.Io.Dir.path.dirname(current_path) orelse return null, "c_imports.zig" });
-    defer allocator.free(wrapper_path);
-    const wrapper_uri = try allocator.print("file://{s}", .{wrapper_path});
-    for (documents) |document| if (std.mem.eql(u8, document.uri, wrapper_uri)) return null;
-    for (occurrences.items) |*occurrence| {
-        const document_path = uriPath(occurrence.uri) orelse return null;
-        const document_directory = std.Io.Dir.path.dirname(document_path) orelse return null;
-        const relative_path = try std.Io.Dir.path.relativeAlloc(allocator, "/", null, document_directory, wrapper_path);
-        defer allocator.free(relative_path);
-        const import_path = if (relative_path.len > 0 and relative_path[0] == '.')
-            relative_path
-        else
-            try allocator.print("./{s}", .{relative_path});
-        defer if (import_path.ptr != relative_path.ptr) allocator.free(import_path);
-        occurrence.edit.replacement = try allocator.print("@import(\"{s}\").c", .{import_path});
-    }
-    const created_source = try allocator.print("pub const c = {s};\n", .{c_import_source});
-    errdefer allocator.free(created_source);
-    return .{
-        .title = "Extract repeated @cImport into c_imports.zig",
-        .edits = try occurrences.toOwnedSlice(allocator),
-        .created_file = .{
-            .uri = wrapper_uri,
-            .source = created_source,
-        },
-    };
-}
-
-fn selectedCImport(
-    allocator: std.mem.Allocator,
-    source: [:0]const u8,
-    selection: std.zig.Token.Loc,
-) !?std.zig.Token.Loc {
-    const tokens = try action_context.tokenize(allocator, source);
-    defer allocator.free(tokens);
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .builtin or !tokenIs(source, token, "@cImport") or index + 1 >= tokens.len or
-            tokens[index + 1].tag != .l_paren) continue;
-        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
-        const span = std.zig.Token.Loc{ .start = token.loc.start, .end = tokens[closing].loc.end };
-        if (action_context.spansOverlap(selection, span)) return span;
-    }
-    return null;
-}
-
-fn matchingCImports(
-    allocator: std.mem.Allocator,
-    source: [:0]const u8,
-    expected: []const u8,
-) ![]const std.zig.Token.Loc {
-    const tokens = try action_context.tokenize(allocator, source);
-    defer allocator.free(tokens);
-    var spans: std.ArrayList(std.zig.Token.Loc) = .empty;
-    errdefer spans.deinit(allocator);
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .builtin or !tokenIs(source, token, "@cImport") or index + 1 >= tokens.len or
-            tokens[index + 1].tag != .l_paren) continue;
-        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse continue;
-        const span = std.zig.Token.Loc{ .start = token.loc.start, .end = tokens[closing].loc.end };
-        if (std.mem.eql(u8, source[span.start..span.end], expected)) try spans.append(allocator, span);
-    }
-    return try spans.toOwnedSlice(allocator);
-}
-
-fn matchingToken(
-    tokens: []const std.zig.Token,
-    opening: usize,
-    opening_tag: std.zig.Token.Tag,
-    closing_tag: std.zig.Token.Tag,
-) ?usize {
-    var depth: usize = 0;
-    for (tokens[opening..], opening..) |token, index| {
-        if (token.tag == opening_tag) depth += 1;
-        if (token.tag != closing_tag) continue;
-        depth -= 1;
-        if (depth == 0) return index;
-    }
-    return null;
-}
-
-fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool {
-    return std.mem.eql(u8, source[token.loc.start..token.loc.end], expected);
-}
-
 fn stringValue(literal: []const u8) ?[]const u8 {
     if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
     const value = literal[1 .. literal.len - 1];
     if (std.mem.findScalar(u8, value, '\\') != null) return null;
     return value;
-}
-
-fn uriPath(uri: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, uri, "file://")) return null;
-    const path = uri["file://".len..];
-    if (std.mem.findScalar(u8, path, '%') != null) return null;
-    return path;
 }
 
 test "build import quick fixes release partial results on allocation failure" {
@@ -302,15 +194,30 @@ test "build import quick fixes release partial results on allocation failure" {
     }.run, .{});
 }
 
-test "project actions repair build imports and consolidate c imports" {
+test "build import paths are percent-decoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const main: [:0]const u8 = "const feature = @import(\"feature\");";
+    const documents = [_]OpenDocument{
+        .{ .uri = "file:///my%20project/build.zig", .source = "pub fn build(b: *std.Build) void { const exe = b.addExecutable(.{ .name = \"app\" }); _ = exe.root_module; }" },
+        .{ .uri = "file:///my%20project/src/main.zig", .source = main },
+        .{ .uri = "file:///my%20project/src/feature.zig", .source = "pub const value = 1;" },
+    };
+    const import_start = std.mem.find(u8, main, "\"feature\"").?;
+    const build_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = import_start, .end = import_start + 9 }, &documents);
+    try std.testing.expectEqual(@as(usize, 1), build_actions.len);
+    try std.testing.expect(std.mem.find(u8, build_actions[0].edits[0].edit.replacement, "b.path(\"src/feature.zig\")") != null);
+}
+
+test "project actions repair build imports" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const build: [:0]const u8 =
         "const std = @import(\"std\"); pub fn build(b: *std.Build) void { " ++
         "const exe = b.addExecutable(.{ .name = \"app\" }); _ = exe.root_module; } " ++
         "fn helper() void { const local = 1; _ = local; }";
-    const main: [:0]const u8 = "const feature = @import(\"feature\"); const c = @cImport({ @cInclude(\"x.h\"); });";
-    const feature: [:0]const u8 = "const c = @cImport({ @cInclude(\"x.h\"); });";
+    const main: [:0]const u8 = "const feature = @import(\"feature\");";
+    const feature: [:0]const u8 = "pub const value = 1;";
     const documents = [_]OpenDocument{
         .{ .uri = "file:///project/build.zig", .source = build },
         .{ .uri = "file:///project/src/main.zig", .source = main },
@@ -323,10 +230,4 @@ test "project actions repair build imports and consolidate c imports" {
     const build_close = (std.mem.find(u8, build, "} fn helper") orelse unreachable);
     try std.testing.expectEqual(build_close, build_actions[0].edits[0].edit.span.start);
     try std.testing.expectEqualStrings("exe", build_actions[0].edits[0].edit.replacement[4..7]);
-
-    const c_import = std.mem.find(u8, main, "@cImport") orelse unreachable;
-    const c_actions = try actions(arena.allocator(), documents[1].uri, main, .{ .start = c_import, .end = c_import + 8 }, &documents);
-    try std.testing.expectEqual(@as(usize, 1), c_actions.len);
-    try std.testing.expect(c_actions[0].created_file != null);
-    try std.testing.expectEqual(@as(usize, 2), c_actions[0].edits.len);
 }

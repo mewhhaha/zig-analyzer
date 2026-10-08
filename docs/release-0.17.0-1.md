@@ -2,7 +2,7 @@
 
 The first zig-analyzer release for Zig 0.17.0 updates the analyzer, its patched
 compiler backend, and the pinned build dependencies. Compiler-backed analysis
-requires the exact Zig 0.17.0 release. The compiler protocol remains version 5.
+requires the exact Zig 0.17.0 release. The compiler protocol is version 7.
 
 ## Lint changes
 
@@ -20,28 +20,28 @@ simplifications preserve fallible integer-power behavior.
 Ten new rules bring the catalog to 200. Eight are enabled by the opt-in
 `modernize` profile:
 
-- [`modernize-deprecated-builtin`](../src/rules/modernize-deprecated-builtin.md)
+- [`modernize-deprecated-builtin`](rules/modernize-deprecated-builtin.md)
   covers enum conversions and deprecated builtin target constants.
-- [`modernize-removed-syntax`](../src/rules/modernize-removed-syntax.md)
+- [`modernize-removed-syntax`](rules/modernize-removed-syntax.md)
   covers removed C imports, array repetition, `void{}`, captured `errdefer`
   errors, and `i0`.
-- [`modernize-build-api`](../src/rules/modernize-build-api.md)
+- [`modernize-build-api`](rules/modernize-build-api.md)
   covers removed build argument access, deprecated Run helpers, lazy dependencies,
   and deprecated C translation APIs.
-- [`modernize-bitcast`](../src/rules/modernize-bitcast.md)
+- [`modernize-bitcast`](rules/modernize-bitcast.md)
   requests review of array and vector bit casts whose semantics changed.
-- [`modernize-extern-bitcast`](../src/rules/modernize-extern-bitcast.md)
+- [`modernize-extern-bitcast`](rules/modernize-extern-bitcast.md)
   covers forbidden casts involving proven extern structs and unions.
-- [`modernize-global-linkage`](../src/rules/modernize-global-linkage.md)
+- [`modernize-global-linkage`](rules/modernize-global-linkage.md)
   covers removed `internal` and `link_once` values in linkage contexts.
-- [`modernize-array-list-access`](../src/rules/modernize-array-list-access.md)
+- [`modernize-array-list-access`](rules/modernize-array-list-access.md)
   migrates deprecated last-element accessors to `last()` or `last().?`.
-- [`modernize-container-init`](../src/rules/modernize-container-init.md)
+- [`modernize-container-init`](rules/modernize-container-init.md)
   migrates removed fixed-bitset and enum-set initializers and deprecated default
   initialization to constant values.
 
 The idiomatic profile adds
-[`prefer-div-ceil`](../src/rules/prefer-div-ceil.md) for canonical unsigned
+[`prefer-div-ceil`](rules/prefer-div-ceil.md) for canonical unsigned
 rounding arithmetic and proved standard-library ceiling-division calls.
 Guidance carries no automatic edit because the builtin and the checked
 standard-library function have different error-handling contracts.
@@ -60,7 +60,7 @@ to `.empty`, and `ArenaAllocator.State` to `.init`. Reader and target deprecatio
 receive direct renames where signatures agree. Runtime-safety advice checks the
 caller's optimization mode rather than the standard library's mode.
 
-The new default warning [`unreported-partial-send`](../src/rules/unreported-partial-send.md)
+The new default warning [`unreported-partial-send`](rules/unreported-partial-send.md)
 flags `Socket.sendMany`, whose error result hides partial-send progress. It asks
 callers to use `sendManyTimeout` and handle both the error and progress count.
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const catalog = @import("catalog.zig");
 const rule_types = @import("types.zig");
 
 const Configuration = rule_types.Configuration;
@@ -22,7 +23,6 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             return configuration;
         },
     };
-    const removed_format = root.contains("format");
 
     if (root.get("check")) |check_value| {
         const check = switch (check_value) {
@@ -77,10 +77,7 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
         }
     }
 
-    const lints_value = root.get("lints") orelse {
-        if (removed_format) configuration.warning = try removedFormatWarning(allocator);
-        return configuration;
-    };
+    const lints_value = root.get("lints") orelse return configuration;
     const lints = switch (lints_value) {
         .object => |object| object,
         else => {
@@ -223,7 +220,6 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Configuration {
             }
         }
     }
-    if (removed_format) configuration.warning = try removedFormatWarning(allocator);
     return configuration;
 }
 
@@ -403,7 +399,8 @@ fn parseRuleSettings(
     value: std.json.Value,
     configuration: *Configuration,
 ) !?[]const u8 {
-    if (rule != .function_length and rule != .line_length and rule != .todo_comment) {
+    const options = catalog.entry(rule).settings.options();
+    if (options.len == 0) {
         return try allocator.print(
             "zig-analyzer.json rule '{s}' accepts a severity string, not an options object",
             .{rule.code()},
@@ -411,7 +408,7 @@ fn parseRuleSettings(
     }
     const settings = switch (value) {
         .object => |object| object,
-        else => unreachable,
+        else => return try invalidLevelMessage(allocator, rule.code()),
     };
     var iterator = settings.iterator();
     while (iterator.next()) |entry| {
@@ -421,54 +418,56 @@ fn parseRuleSettings(
             configuration.levels[@backingInt(rule)] = level;
             continue;
         }
-        switch (rule) {
-            .function_length => if (std.mem.eql(u8, key, "max-lines")) {
-                configuration.function_length_limit = positiveInteger(entry.value_ptr.*) orelse return try settingTypeWarning(
-                    allocator,
-                    rule,
-                    key,
-                    "a positive integer",
-                );
-                continue;
-            },
-            .line_length => {
-                if (std.mem.eql(u8, key, "max-columns")) {
-                    configuration.line_length_limit = positiveInteger(entry.value_ptr.*) orelse return try settingTypeWarning(
-                        allocator,
-                        rule,
-                        key,
-                        "a positive integer",
-                    );
-                    continue;
-                }
-                if (std.mem.eql(u8, key, "allow-unsplittable")) {
-                    configuration.line_length_allow_unsplittable = switch (entry.value_ptr.*) {
-                        .bool => |enabled| enabled,
-                        else => return try settingTypeWarning(allocator, rule, key, "a boolean"),
-                    };
-                    continue;
-                }
-            },
-            .todo_comment => if (std.mem.eql(u8, key, "markers")) {
-                const values = switch (entry.value_ptr.*) {
-                    .array => |array| array.items,
-                    else => return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
-                };
-                if (values.len == 0) return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings");
-                const markers = try allocator.alloc([]const u8, values.len);
-                for (values, markers) |marker_value, *marker| marker.* = switch (marker_value) {
-                    .string => |text| if (text.len != 0) try allocator.dupe(u8, text) else return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
-                    else => return try settingTypeWarning(allocator, rule, key, "a non-empty array of non-empty strings"),
-                };
-                configuration.todo_markers = markers;
-                continue;
-            },
-            else => unreachable,
-        }
-        return try allocator.print(
+        const setting = for (options) |option| {
+            if (settingKeyMatches(option, key)) break option;
+        } else return try allocator.print(
             "zig-analyzer.json rule '{s}' contains unknown setting '{s}'",
             .{ rule.code(), key },
         );
+        if (try applySetting(allocator, rule, setting, entry.value_ptr.*, configuration)) |warning| return warning;
+    }
+    return null;
+}
+
+fn settingKeyMatches(setting: catalog.Setting, key: []const u8) bool {
+    return switch (setting) {
+        inline else => |known| std.mem.eql(u8, key, comptime catalog.Setting.key(known)),
+    };
+}
+
+fn applySetting(
+    allocator: std.mem.Allocator,
+    rule: Rule,
+    setting: catalog.Setting,
+    value: std.json.Value,
+    configuration: *Configuration,
+) !?[]const u8 {
+    const key = switch (setting) {
+        inline else => |known| comptime catalog.Setting.key(known),
+    };
+    switch (setting) {
+        .max_lines, .max_columns => {
+            const limit = positiveInteger(value) orelse return try settingTypeWarning(allocator, rule, key, "a positive integer");
+            if (setting == .max_lines) configuration.function_length_limit = limit else configuration.line_length_limit = limit;
+        },
+        .allow_unsplittable => configuration.line_length_allow_unsplittable = switch (value) {
+            .bool => |enabled| enabled,
+            else => return try settingTypeWarning(allocator, rule, key, "a boolean"),
+        },
+        .markers => {
+            const expected = "a non-empty array of non-empty strings";
+            const values = switch (value) {
+                .array => |array| array.items,
+                else => return try settingTypeWarning(allocator, rule, key, expected),
+            };
+            if (values.len == 0) return try settingTypeWarning(allocator, rule, key, expected);
+            const markers = try allocator.alloc([]const u8, values.len);
+            for (values, markers) |marker_value, *marker| marker.* = switch (marker_value) {
+                .string => |text| if (text.len != 0) try allocator.dupe(u8, text) else return try settingTypeWarning(allocator, rule, key, expected),
+                else => return try settingTypeWarning(allocator, rule, key, expected),
+            };
+            configuration.todo_markers = markers;
+        },
     }
     return null;
 }
@@ -497,13 +496,6 @@ fn containsParentPathComponent(path: []const u8) bool {
     return false;
 }
 
-fn removedFormatWarning(allocator: std.mem.Allocator) ![]const u8 {
-    return try allocator.dupe(
-        u8,
-        "zig-analyzer.json key 'format' is no longer supported; formatting always delegates to zig fmt",
-    );
-}
-
 pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]const u8 {
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
@@ -527,30 +519,66 @@ pub fn suppressionWarning(allocator: std.mem.Allocator, source: []const u8) !?[]
     return null;
 }
 
-/// Cheap pre-check so per-finding suppression lookups can be skipped for the
-/// common case of a file with no directives at all.
-pub fn hasSuppressionDirectives(source: []const u8) bool {
-    return std.mem.find(u8, source, "// zig-analyzer:") != null;
-}
+/// The suppression directives of one file, parsed once so that every finding
+/// can be checked without rescanning the source.
+pub const Suppressions = struct {
+    source: []const u8,
+    directives: []const Placed,
 
-pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
-    if (!hasSuppressionDirectives(source)) return false;
-    const target_offset = @min(offset, source.len);
-    const target_line_start = lineStart(source, target_offset);
-    var cursor: usize = 0;
-    var disabled = false;
-    var disable_next_line = false;
-    var file_header = true;
+    const Placed = struct {
+        directive: Directive,
+        /// Start of the line holding the directive.
+        line_start: usize,
+        /// End of that line, excluding the newline.
+        line_end: usize,
+        /// A disable-file directive that sits in the file header, before any code.
+        in_header: bool,
+    };
 
-    while (cursor <= target_line_start and cursor < source.len) {
-        const end = lineEnd(source, cursor);
-        const line = source[cursor..end];
-        if (directiveOnLine(line)) |directive| {
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !Suppressions {
+        if (std.mem.find(u8, source, "// zig-analyzer:") == null) return .{ .source = source, .directives = &.{} };
+        var placed: std.ArrayList(Placed) = .empty;
+        errdefer placed.deinit(allocator);
+        var cursor: usize = 0;
+        var file_header = true;
+        while (cursor < source.len) {
+            const end = lineEnd(source, cursor);
+            const line = source[cursor..end];
+            if (directiveOnLine(line)) |directive| {
+                try placed.append(allocator, .{
+                    .directive = directive,
+                    .line_start = cursor,
+                    .line_end = end,
+                    .in_header = directive.kind == .disable_file and file_header and
+                        !lineHasCodeBeforeDirective(line, directive.comment_start),
+                });
+            }
+            if (lineHasCode(line)) file_header = false;
+            if (end == source.len) break;
+            cursor = end + 1;
+        }
+        return .{ .source = source, .directives = try placed.toOwnedSlice(allocator) };
+    }
+
+    pub fn deinit(suppressions: Suppressions, allocator: std.mem.Allocator) void {
+        allocator.free(suppressions.directives);
+    }
+
+    pub fn isEmpty(suppressions: Suppressions) bool {
+        return suppressions.directives.len == 0;
+    }
+
+    pub fn isSuppressed(suppressions: Suppressions, rule: Rule, offset: usize) bool {
+        const source = suppressions.source;
+        const target_offset = @min(offset, source.len);
+        const target_line_start = lineStart(source, target_offset);
+        var disabled = false;
+        for (suppressions.directives) |placed| {
+            if (placed.line_start > target_line_start) break;
+            const directive = placed.directive;
             const targets_rule = directiveTargetsRule(directive.targets, rule);
-            if (directive.kind == .disable_file and file_header and
-                !lineHasCodeBeforeDirective(line, directive.comment_start) and targets_rule) return true;
-
-            if (cursor < target_line_start) {
+            if (placed.in_header and targets_rule) return true;
+            if (placed.line_start < target_line_start) {
                 switch (directive.kind) {
                     .disable => if (targets_rule) {
                         disabled = true;
@@ -558,13 +586,12 @@ pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
                     .enable => if (targets_rule) {
                         disabled = false;
                     },
-                    .disable_next_line => disable_next_line = targets_rule,
+                    .disable_next_line => if (targets_rule and placed.line_end + 1 == target_line_start) return true,
                     else => {},
                 }
             } else {
                 if (directive.kind == .disable_line and targets_rule) return true;
-                const absolute_comment_start = cursor + directive.comment_start;
-                if (absolute_comment_start <= target_offset) switch (directive.kind) {
+                if (placed.line_start + directive.comment_start <= target_offset) switch (directive.kind) {
                     .disable => if (targets_rule) {
                         disabled = true;
                     },
@@ -575,18 +602,21 @@ pub fn isSuppressed(source: []const u8, rule: Rule, offset: usize) bool {
                 };
             }
         }
-
-        if (cursor < target_line_start) {
-            const next_start = if (end < source.len) end + 1 else source.len;
-            if (next_start == target_line_start and disable_next_line) return true;
-            if (next_start != target_line_start) disable_next_line = false;
-        }
-        if (lineHasCode(line)) file_header = false;
-        if (end == source.len) break;
-        cursor = end + 1;
+        return disabled;
     }
-    return disabled;
-}
+
+    /// Drops every finding that a directive suppresses.
+    pub fn filter(suppressions: Suppressions, found: *std.ArrayList(rule_types.Finding)) void {
+        if (suppressions.isEmpty()) return;
+        var kept: usize = 0;
+        for (found.items) |finding| {
+            if (suppressions.isSuppressed(finding.rule, finding.span.start)) continue;
+            found.items[kept] = finding;
+            kept += 1;
+        }
+        found.shrinkRetainingCapacity(kept);
+    }
+};
 
 pub const SuppressionEdits = struct {
     line: Edit,
@@ -809,21 +839,10 @@ fn invalidLevelMessage(allocator: std.mem.Allocator, path: []const u8) ![]const 
 
 fn setTier(configuration: *Configuration, tier: Tier, level: Level) void {
     for (std.enums.values(Rule)) |rule| {
-        if (rule.tier() == tier and !requiresExplicitConfiguration(rule)) {
+        if (rule.tier() == tier and catalog.entry(rule).needs == .nothing) {
             configuration.levels[@backingInt(rule)] = level;
         }
     }
-}
-
-fn requiresExplicitConfiguration(rule: Rule) bool {
-    return switch (rule) {
-        .import_boundary,
-        .discarded_must_use,
-        .configuration_divergent_api,
-        .unreachable_public_declaration,
-        => true,
-        else => false,
-    };
 }
 
 fn applyLintProfile(configuration: *Configuration, profile: LintProfile) void {
@@ -1088,6 +1107,12 @@ test "malformed banned configuration reports the offending key or value" {
     }
 }
 
+fn suppressedAt(source: []const u8, rule: Rule, offset: usize) bool {
+    const suppressions = Suppressions.init(std.testing.allocator, source) catch @panic("out of memory");
+    defer suppressions.deinit(std.testing.allocator);
+    return suppressions.isSuppressed(rule, offset);
+}
+
 test "suppression reports its source line" {
     const warning = (try suppressionWarning(
         std.testing.allocator,
@@ -1120,13 +1145,13 @@ test "line next-line and scoped suppressions target several rules" {
     const first_defer = std.mem.find(u8, source, "defer { close(); }").?;
     const second_defer = std.mem.find(u8, source, "defer { closeAgain(); }").?;
 
-    try std.testing.expect(isSuppressed(source, .never_mutated_var, line_value));
-    try std.testing.expect(!isSuppressed(source, .needless_defer_block, line_value));
-    try std.testing.expect(isSuppressed(source, .never_mutated_var, next_value));
-    try std.testing.expect(isSuppressed(source, .never_mutated_var, scoped_value));
-    try std.testing.expect(!isSuppressed(source, .never_mutated_var, enabled_value));
-    try std.testing.expect(isSuppressed(source, .needless_defer_block, first_defer));
-    try std.testing.expect(!isSuppressed(source, .needless_defer_block, second_defer));
+    try std.testing.expect(suppressedAt(source, .never_mutated_var, line_value));
+    try std.testing.expect(!suppressedAt(source, .needless_defer_block, line_value));
+    try std.testing.expect(suppressedAt(source, .never_mutated_var, next_value));
+    try std.testing.expect(suppressedAt(source, .never_mutated_var, scoped_value));
+    try std.testing.expect(!suppressedAt(source, .never_mutated_var, enabled_value));
+    try std.testing.expect(suppressedAt(source, .needless_defer_block, first_defer));
+    try std.testing.expect(!suppressedAt(source, .needless_defer_block, second_defer));
 }
 
 test "file and unnamed suppressions target all rules" {
@@ -1134,9 +1159,9 @@ test "file and unnamed suppressions target all rules" {
         "// zig-analyzer: disable-file never-mutated-var, needless-defer-block\n" ++
         "var value = 1;\n";
     const value = std.mem.find(u8, file_source, "value").?;
-    try std.testing.expect(isSuppressed(file_source, .never_mutated_var, value));
-    try std.testing.expect(isSuppressed(file_source, .needless_defer_block, value));
-    try std.testing.expect(!isSuppressed(file_source, .redundant_boolean_if, value));
+    try std.testing.expect(suppressedAt(file_source, .never_mutated_var, value));
+    try std.testing.expect(suppressedAt(file_source, .needless_defer_block, value));
+    try std.testing.expect(!suppressedAt(file_source, .redundant_boolean_if, value));
 
     const scoped_source =
         "// zig-analyzer: disable\n" ++
@@ -1145,8 +1170,8 @@ test "file and unnamed suppressions target all rules" {
         "var enabled = 2;\n";
     const disabled = std.mem.find(u8, scoped_source, "disabled").?;
     const enabled = std.mem.find(u8, scoped_source, "enabled =").?;
-    try std.testing.expect(isSuppressed(scoped_source, .never_mutated_var, disabled));
-    try std.testing.expect(!isSuppressed(scoped_source, .never_mutated_var, enabled));
+    try std.testing.expect(suppressedAt(scoped_source, .never_mutated_var, disabled));
+    try std.testing.expect(!suppressedAt(scoped_source, .never_mutated_var, enabled));
 }
 
 test "suppression validation accepts eslint-style forms and rejects ambiguous targets" {
@@ -1180,7 +1205,7 @@ test "directive markers inside strings are ignored" {
         "const multiline = \\\\// zig-analyzer: disable-file all;\n";
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(std.testing.allocator, source));
     const marker = std.mem.find(u8, source, "marker").?;
-    try std.testing.expect(!isSuppressed(source, .never_mutated_var, marker));
+    try std.testing.expect(!suppressedAt(source, .never_mutated_var, marker));
 }
 
 test "suppression edits insert an indented next-line directive that suppresses the finding" {
@@ -1201,7 +1226,7 @@ test "suppression edits insert an indented next-line directive that suppresses t
             "}\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(suppressedAt(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
 }
 
@@ -1220,8 +1245,8 @@ test "suppression edits extend a next-line directive already above the finding" 
             "var value = 1;\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
-    try std.testing.expect(isSuppressed(suppressed, .needless_defer_block, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(suppressedAt(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(suppressedAt(suppressed, .needless_defer_block, std.mem.find(u8, suppressed, "value").?));
 }
 
 test "suppression file edit lands after module doc comments and suppresses the whole file" {
@@ -1244,11 +1269,93 @@ test "suppression file edit lands after module doc comments and suppresses the w
             "var again = 2;\n",
         suppressed,
     );
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
-    try std.testing.expect(isSuppressed(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "again").?));
+    try std.testing.expect(suppressedAt(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "value").?));
+    try std.testing.expect(suppressedAt(suppressed, .never_mutated_var, std.mem.find(u8, suppressed, "again").?));
     try std.testing.expectEqual(@as(?[]const u8, null), try suppressionWarning(arena.allocator(), suppressed));
 }
 
 fn applyEdit(allocator: std.mem.Allocator, source: []const u8, edit: Edit) ![]u8 {
     return std.mem.concat(allocator, u8, &.{ source[0..edit.span.start], edit.replacement, source[edit.span.end..] });
+}
+
+test "suppression table is empty without directives and drops nothing" {
+    const source = "const x = 1; // not a directive\n";
+    const suppressions = try Suppressions.init(std.testing.allocator, source);
+    defer suppressions.deinit(std.testing.allocator);
+    try std.testing.expect(suppressions.isEmpty());
+    try std.testing.expect(!suppressions.isSuppressed(.never_mutated_var, 0));
+}
+
+test "suppression table filters findings by directive scope" {
+    const source =
+        "// zig-analyzer: disable never-mutated-var\n" ++
+        "a;\n" ++
+        "// zig-analyzer: enable never-mutated-var\n" ++
+        "b;\n" ++
+        "c; // zig-analyzer: disable-line needless-defer-block\n" ++
+        "// zig-analyzer: disable-next-line all\n" ++
+        "d;\n" ++
+        "e;\n";
+    const suppressions = try Suppressions.init(std.testing.allocator, source);
+    defer suppressions.deinit(std.testing.allocator);
+    try std.testing.expect(!suppressions.isEmpty());
+    var found: std.ArrayList(rule_types.Finding) = .empty;
+    defer found.deinit(std.testing.allocator);
+    for ([_][]const u8{ "a;", "b;", "c;", "d;", "e;" }) |marker| {
+        const start = std.mem.find(u8, source, marker).?;
+        for ([_]Rule{ .never_mutated_var, .needless_defer_block }) |rule| {
+            try found.append(std.testing.allocator, .{ .rule = rule, .level = .warning, .span = .{ .start = start, .end = start + 1 }, .message = "" });
+        }
+    }
+    suppressions.filter(&found);
+    // a: never-mutated-var disabled; b: nothing; c: needless-defer-block; d: both; e: nothing.
+    const expected = [_]struct { Rule, u8 }{
+        .{ .needless_defer_block, 'a' },
+        .{ .never_mutated_var, 'b' },
+        .{ .needless_defer_block, 'b' },
+        .{ .never_mutated_var, 'c' },
+        .{ .never_mutated_var, 'e' },
+        .{ .needless_defer_block, 'e' },
+    };
+    try std.testing.expectEqual(expected.len, found.items.len);
+    for (expected, found.items) |want, got| {
+        try std.testing.expectEqual(want[0], got.rule);
+        try std.testing.expectEqual(want[1], source[got.span.start]);
+    }
+}
+
+test "disable-file only counts in the file header" {
+    const late = "const x = 1;\n// zig-analyzer: disable-file never-mutated-var\nconst y = 2;\n";
+    try std.testing.expect(!suppressedAt(late, .never_mutated_var, std.mem.find(u8, late, "y =").?));
+    const early = "//! docs\n// zig-analyzer: disable-file never-mutated-var\nconst y = 2;\n";
+    try std.testing.expect(suppressedAt(early, .never_mutated_var, std.mem.find(u8, early, "y =").?));
+    try std.testing.expect(suppressedAt(early, .never_mutated_var, 0) == false);
+}
+
+test "configuration applies tiers and per-rule overrides" {
+    const configuration = try parse(std.testing.allocator,
+        \\{"lints":{"correctness":"error","style":"hint","rules":{"discarded-error":"warning","mixed-bitwise-arithmetic":"information"}}}
+    );
+    try std.testing.expectEqual(Level.@"error", configuration.level(.unreleased_allocation));
+    try std.testing.expectEqual(Level.hint, configuration.level(.unsorted_imports));
+    try std.testing.expectEqual(Level.warning, configuration.level(.discarded_error));
+    try std.testing.expectEqual(Level.information, configuration.level(.mixed_bitwise_arithmetic));
+}
+
+test "configuration reports unknown rules" {
+    const configuration = try parse(std.testing.allocator,
+        \\{"lints":{"rules":{"mystery-rule":"warning"}}}
+    );
+    defer std.testing.allocator.free(configuration.warning.?);
+    try std.testing.expect(std.mem.find(u8, configuration.warning.?, "mystery-rule") != null);
+}
+
+test "suppression parser reports malformed and unknown rules" {
+    const malformed = try suppressionWarning(std.testing.allocator, "// zig-analyzer: ignore-next-line never-mutated-var\nconst x = 1;");
+    defer std.testing.allocator.free(malformed.?);
+    try std.testing.expect(std.mem.find(u8, malformed.?, "malformed") != null);
+
+    const unknown = try suppressionWarning(std.testing.allocator, "// zig-analyzer: disable-file unknown-rule\n");
+    defer std.testing.allocator.free(unknown.?);
+    try std.testing.expect(std.mem.find(u8, unknown.?, "unknown-rule") != null);
 }

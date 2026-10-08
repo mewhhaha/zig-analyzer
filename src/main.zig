@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             }
             path = argument;
         }
-        return try zig_analyzer.project_check.run(io, allocator, .{
+        return try zig_analyzer.project.check.run(io, allocator, .{
             .path = path orelse ".",
             .fix = fix,
             .cache = cache,
@@ -96,14 +96,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             try std.Io.File.stderr().writeStreamingAll(io, "unknown backend command; expected 'bootstrap'\n");
             return 2;
         }
-        zig_analyzer.backend_bootstrap.bootstrap(io, allocator, init.environ) catch |err| switch (err) {
+        zig_analyzer.compiler.bootstrap.bootstrap(io, allocator, init.environ) catch |err| switch (err) {
             error.BootstrapFailed => return 1,
             else => return err,
         };
         return 0;
     }
     if (std.mem.eql(u8, command, "lsp")) {
-        try zig_analyzer.lsp_server.run(io, allocator, init.environ);
+        try zig_analyzer.lsp.server.run(io, allocator, init.environ);
         return 0;
     }
 
@@ -119,7 +119,7 @@ fn writeVersion(io: std.Io) !void {
     try writer.print("zig-analyzer {s}\nZig {s}\ncompiler protocol {d}\n", .{
         zig_analyzer.build_options.version_string,
         zig_analyzer.build_options.zig_version,
-        zig_analyzer.compiler_protocol.current_version,
+        zig_analyzer.compiler.protocol.version,
     });
     try writer.flush();
 }
@@ -152,23 +152,22 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
         try file_writer.interface.flush();
         return 1;
     }
-    const zig_lib_directory = zig_analyzer.zig_environment.libDirectory(io, allocator) catch |err| {
+    _ = zig_analyzer.compiler.zig_environment.libDirectory(io) catch |err| {
         var buffer: [256]u8 = undefined;
         var file_writer = std.Io.File.stderr().writer(io, &buffer);
         try file_writer.interface.print("zig-analyzer doctor: could not locate the Zig standard library ({t})\n", .{err});
         try file_writer.interface.flush();
         return 1;
     };
-    defer allocator.free(zig_lib_directory);
 
     try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: Zig 0.17.0 is available\n");
 
-    var backend = (try zig_analyzer.backend_bootstrap.findBackend(io, allocator)) orelse {
+    var backend = (try zig_analyzer.compiler.bootstrap.findBackend(io, allocator)) orelse {
         try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend is missing; install a release archive or run 'zig build backend'\n");
         return 1;
     };
     defer backend.deinit(allocator);
-    var manifest = zig_analyzer.backend_bootstrap.readManifestAt(io, allocator, backend.manifest_path) catch |err| {
+    var manifest = zig_analyzer.compiler.bootstrap.readManifestAt(io, allocator, backend.manifest_path) catch |err| {
         var buffer: [512]u8 = undefined;
         var file_writer = std.Io.File.stderr().writer(io, &buffer);
         try file_writer.interface.print("zig-analyzer doctor: backend manifest {s} is unreadable ({t})\n", .{ backend.manifest_path, err });
@@ -177,14 +176,12 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
     };
     defer manifest.deinit();
 
-    const expected_patch_sha256 = try zig_analyzer.backend_bootstrap.expectedPatchSha256(io, allocator);
-    defer allocator.free(expected_patch_sha256);
     const expected = zig_analyzer.build_options;
     if (!std.mem.eql(u8, manifest.value.analyzer_version, expected.version_string) or
         !std.mem.eql(u8, manifest.value.zig_version, expected.zig_version) or
         !std.mem.eql(u8, manifest.value.zig_commit, expected.zig_commit) or
-        !std.mem.eql(u8, manifest.value.patch_sha256, expected_patch_sha256) or
-        manifest.value.compiler_protocol_version != expected.compiler_protocol_version)
+        !std.mem.eql(u8, manifest.value.backend_sha256, zig_analyzer.compiler.bootstrap.expected_inputs_sha256) or
+        manifest.value.compiler_protocol_version != zig_analyzer.compiler.protocol.version)
     {
         try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend manifest is incompatible with this executable\n");
         return 1;

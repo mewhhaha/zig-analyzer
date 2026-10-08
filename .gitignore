@@ -1,7 +1,6 @@
-/.zig-cache/
+.zig-cache/
 .agents
 skills-lock.json
-.zig-global-cache
 .claude
 tmp
 /zig-pkg/

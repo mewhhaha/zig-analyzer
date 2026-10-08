@@ -72,8 +72,8 @@ configuration API.
 
 ## Project configuration
 
-Place `zig-analyzer.json` in the directory from which the editor starts the
-server. A small configuration that enables idiomatic guidance is:
+Place `zig-analyzer.json` in the project root; the server uses the nearest one
+above each file. A small configuration that enables idiomatic guidance is:
 
 ```json
 {

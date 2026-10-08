@@ -11,6 +11,7 @@ pub fn recycled(allocator: std.mem.Allocator) !void {
 }
 
 pub fn forgotten(allocator: std.mem.Allocator) !void {
+    // expect: unreleased-allocation
     const line = try allocator.alloc(u8, 80);
     line[0] = '>';
 }

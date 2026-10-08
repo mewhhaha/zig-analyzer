@@ -26,6 +26,7 @@ fn handleEveryError() u8 {
 }
 
 fn unwrapOptional(value: ?u8) u8 {
+    // expect: unsafe-orelse-unreachable
     return value orelse unreachable;
 }
 
@@ -51,6 +52,7 @@ fn inspectPayload(value: Payload) void {
         .number => |payload| {
             _ = payload;
         },
+        // expect: non-exhaustive-switch-else
         else => {},
     }
 }
@@ -72,6 +74,7 @@ fn pointerCasts(source: *const u8) *align(8) u16 {
 }
 
 fn repairedFormat() void {
+    // expect: prefer-log-over-print
     std.debug.print("name {s}", .{"zig"});
 }
 

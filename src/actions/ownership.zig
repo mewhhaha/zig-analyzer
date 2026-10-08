@@ -1,5 +1,7 @@
 const std = @import("std");
+const analysis = @import("../analysis.zig");
 const action_context = @import("context.zig");
+const resources = analysis.resources;
 
 const ActionRun = action_context.ActionRun;
 
@@ -85,14 +87,8 @@ fn addReturnedOwnershipTransfer(context: ActionRun) !void {
 }
 
 fn cleanupBinding(context: ActionRun, start: usize, end: usize) ?[]const u8 {
-    const cleanup_methods = [_][]const u8{ "free", "destroy", "close", "deinit", "join", "detach" };
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier) continue;
-        var cleanup = false;
-        for (cleanup_methods) |method| if (context.tokenIs(index, method)) {
-            cleanup = true;
-        };
-        if (!cleanup) continue;
+        if (token.tag != .identifier or !resources.isReleaseMethod(context.tokenText(index))) continue;
         if (index >= 2 and context.tokens[index - 1].tag == .period and context.tokens[index - 2].tag == .identifier and
             (context.tokenIs(index, "close") or context.tokenIs(index, "deinit") or context.tokenIs(index, "join") or
                 context.tokenIs(index, "detach"))) return context.tokenText(index - 2);
@@ -123,7 +119,6 @@ fn everyReturnTransfersOwnership(context: ActionRun, name: []const u8, start: us
 }
 
 fn addCheckedAllocationSize(context: ActionRun) !void {
-    const allocation_methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "realloc" };
     for (context.tokens, 0..) |token, multiplication_index| {
         if (token.tag != .asterisk or multiplication_index == 0 or multiplication_index + 1 >= context.tokens.len) continue;
         const left = context.tokens[multiplication_index - 1];
@@ -135,7 +130,7 @@ fn addCheckedAllocationSize(context: ActionRun) !void {
             else => false,
         }) continue;
         const product_span = std.zig.Token.Loc{ .start = left.loc.start, .end = right.loc.end };
-        if (!context.selected(product_span) or !insideAllocationCall(context, multiplication_index, &allocation_methods)) continue;
+        if (!context.selected(product_span) or !insideAllocationCall(context, multiplication_index)) continue;
         try context.oneEdit(
             "Check allocation size overflow",
             .refactor_rewrite,
@@ -153,7 +148,7 @@ fn simpleOperand(tag: std.zig.Token.Tag) bool {
     return tag == .identifier or tag == .number_literal;
 }
 
-fn insideAllocationCall(context: ActionRun, index: usize, methods: []const []const u8) bool {
+fn insideAllocationCall(context: ActionRun, index: usize) bool {
     var cursor = index;
     var depth: usize = 0;
     while (cursor > 0) {
@@ -166,7 +161,7 @@ fn insideAllocationCall(context: ActionRun, index: usize, methods: []const []con
                     continue;
                 }
                 if (cursor == 0 or context.tokens[cursor - 1].tag != .identifier) return false;
-                for (methods) |method| if (context.tokenIs(cursor - 1, method)) return true;
+                for (resources.sized_allocations) |allocation| if (context.tokenIs(cursor - 1, allocation.method)) return true;
                 return false;
             },
             .semicolon => if (depth == 0) return false,

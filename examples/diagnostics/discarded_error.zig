@@ -3,5 +3,6 @@ fn refresh() !void {
 }
 
 pub fn continueAfterFailure() void {
+    // expect: discarded-error
     refresh() catch {};
 }

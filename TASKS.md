@@ -47,7 +47,8 @@ Acceptance:
 
 ## ZA-004 — Workspace build driver
 
-Status: in progress  
+Status: complete
+
 Depends on: ZA-003
 
 Outcome: build graphs, generated modules, targets, options, and compile units
@@ -57,8 +58,8 @@ Acceptance:
 
 - [x] A source file starts from the nearest build-declared root source when one
   unambiguously contains it, rather than becoming an isolated compile unit.
-- [ ] `check` compile units are preferred, with `install` as the fallback.
-- [ ] Required generation steps run without executing produced applications.
+- [x] `check` compile units are preferred, with `install` as the fallback.
+- [x] Required generation steps run without executing produced applications.
 - [x] Saved build-script changes restart analysis from an affected open source
   document and rediscover its build-declared root.
 
@@ -92,7 +93,8 @@ Acceptance:
 
 ## ZA-007 — Core semantic features
 
-Status: in progress  
+Status: complete
+
 Depends on: ZA-006
 
 Outcome: completion, hover, signature help, navigation, references, and rename
@@ -103,7 +105,7 @@ Acceptance:
 - [x] Comptime-generated members appear in completion and navigation.
 - [x] Hover reports signature, documentation, type, and bounded comptime value.
 - [x] Rename refuses invalid spellings and ambiguous same-name declarations.
-- [ ] Rename uses compiler identities and refuses declarations that differ across
+- [x] Rename uses compiler identities and refuses declarations that differ across
   configured compile units.
 
 ## ZA-008 — Broad editor features

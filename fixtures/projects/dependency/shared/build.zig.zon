@@ -1,0 +1,6 @@
+.{
+    .name = .shared,
+    .version = "0.0.0",
+    .fingerprint = 0x138cf4bb87f0637f,
+    .paths = .{ "build.zig", "build.zig.zon", "shared.zig" },
+}

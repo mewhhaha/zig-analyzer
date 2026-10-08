@@ -11,17 +11,30 @@ For an independent file-local rule:
 1. Add a `snake_case` member to `Rule` in `src/rules/types.zig`. Its public
    kebab-case code is derived automatically, so `missing_switch_prong` becomes
    `missing-switch-prong` everywhere configuration and diagnostics use it.
-2. Add the rule to the appropriate tier in `Rule.tier`. New rules default to
-   the opt-in style tier. Add it to `Rule.profile` only when a named profile
-   should enable it.
-3. Add a focused module under `src/rules/` with
-   `pub fn run(context: RuleRun) !void`.
+2. Add one entry to the table in `src/rules/catalog.zig`: tier, minimum
+   profile (only when a named profile should enable it), settings, fix
+   availability, a one-sentence summary, and a minimal `example` that triggers
+   the rule (or the reason it has none). Tier, profile, defaults, settings
+   parsing, editor links, and the rule documents all derive from that entry.
+3. Add a focused module under the family directory of `src/rules/` that
+   matches what the rule proves (`lifecycle/`, `hazards/`, `idioms/`, `style/`,
+   `modernize/`, or `semantic/`; the criteria are in `src/rules/README.md`) with
+   `pub const rules = [_]Rule{...}`, listing exactly the rules it emits, and
+   `pub fn run(context: RuleRun) !void`. Every rule is owned by exactly one
+   module; a test enforces it.
 4. Add the module once to the ordered `rule_modules` tuple in
-   `src/rules/registry.zig`.
-5. Keep positive, negative, suppression, and fix tests in the rule module.
-6. Add `<rule-code>.md` beside the rule modules and link it from
-   `src/rules/RULES.md`; the test suite rejects missing documents, missing
-   why/when sections, and duplicate or absent index links.
+   `src/rules/registry.zig`. The registry skips a module whose rules are all
+   off.
+5. Keep positive, negative, and fix tests in the rule module, using
+   `src/rules/test_support.zig` (`findings`, `only`, `expectRules`).
+   `tests/rule_examples.zig` already checks every catalog example for firing,
+   fix availability, and both suppression directives, so rules do not need a
+   suppression test of their own.
+6. Run `zig build rule-docs`. It creates `docs/rules/<rule-code>.md` with a
+   generated header and footer and the index; replace the placeholder body with
+   the `## Why it matters` and `## When it fires` sections. The test suite
+   rejects documents that differ from the generated parts, lack those sections,
+   or document no rule.
 
 Use `RuleRun.emit` rather than appending a finding directly. It applies the
 configured severity and all suppression forms consistently. A rule emits byte
@@ -30,12 +43,16 @@ or mutate source files.
 
 Do not create an independent traversal when the rule needs a fact already
 owned by a thick proof engine. Allocation ownership belongs in
-`allocation_lifecycle.zig`, cleanup ordering in `cleanup_lifecycle.zig`, and
-container/scope facts in `semantic.zig`. Keeping one proof authoritative
+`lifecycle/allocation_lifecycle.zig`, cleanup ordering in
+`lifecycle/cleanup_lifecycle.zig`, and container facts in
+`semantic/containers.zig`. Which calls acquire a resource and
+which release it is answered only by `rules/resources.zig`. Keeping one proof authoritative
 prevents related diagnostics from disagreeing about the same binding.
 
-Rules that need workspace reachability belong in `src/rules/project.zig` and
-receive normalized paths and source text from the project scanner. They must
+Rules that need workspace reachability belong in `src/rules/project/` (driven
+by `src/rules/project.zig`; a new lint takes a `ProjectRun` and calls
+`run.report`) and receive normalized paths and source text from the project
+scanner. They must
 not infer project membership from one open document.
 
 ## Add a code action
@@ -60,30 +77,38 @@ policy remain explicit actions.
 
 Hover has three separate owners:
 
-- `src/language_hover.zig` is the catalog for Zig keywords, builtins,
+- `src/syntax/language_reference.zig` is the catalog for Zig keywords, builtins,
   primitives, literals, operators, and punctuation. Change summaries,
   signatures, categories, or language-reference targets there.
-- `src/hover.zig` defines transport-neutral hover content and the Markdown
-  renderer. Change code fences, section ordering, or Markdown layout there.
+- `src/lsp/hover_markdown.zig` defines transport-neutral hover content and the
+  Markdown renderer. Change code fences, section ordering, or Markdown layout there.
   `MarkdownRenderer` is public, so an embedding application can supply its own
   renderer without changing analysis.
-- `src/lsp_server.zig` resolves identifiers and adapts the rendered Markdown
-  to the LSP response. It should select facts, not own presentation policy.
+- `src/lsp/hover.zig` orders the compiler's facts and the syntax-side
+  descriptions (`src/syntax/declaration_summary.zig`,
+  `src/project/describe.zig`) and adapts the rendered Markdown to the LSP
+  response. It should select facts, not own presentation policy.
 
-Both `hover` and `language_hover` are exported from `src/zig_analyzer.zig` for
-embedders. Renderer tests assert Markdown directly; LSP tests should only cover
+`zig_analyzer.lsp.hover_markdown` and `zig_analyzer.syntax.language_reference`
+are exported from `src/zig_analyzer.zig` for embedders. Renderer tests assert Markdown directly; LSP tests should only cover
 the protocol boundary and the selection of the right content.
 
 ## Extend compiler-backed analysis
 
 Compiler changes cross a versioned boundary:
 
-1. Define the request and response in `src/compiler_protocol.zig`.
-2. Implement serialization in `src/compiler_client.zig` and lifecycle or
-   stale-generation behavior in `src/compiler_session.zig`.
+1. Define the request and response in `src/compiler/protocol.zig`. The backend
+   compiles the same file, so keep it free of analyzer imports and bump
+   `version` when the wire format changes.
+2. Add a typed method to `src/compiler/client.zig` built on `roundTrip`, and a
+   domain query (with any lookup or caching) in `src/compiler/session.zig`.
 3. Convert the response to a small domain value before rules, actions, hover,
    or completion consume it.
-4. Update the patched compiler sources and protocol compatibility tests.
+4. Update the patch in `compiler/` to handle the new tag;
+   `compiler/protocol_invariant.zig` checks that it only names declarations the
+   protocol file defines. Regenerate the patch from the checkout in
+   `.zig-analyzer/` (`git diff HEAD` of the files it touches, without
+   `src/AnalysisProtocol.zig`) and run `zig build backend`.
 
 Core analysis must not depend on raw JSON responses or compiler process state.
 If the query cannot prove a fact, return unavailable and let the language
@@ -96,10 +121,15 @@ suppression comments. Add project policy there, convert it to types in
 `src/rules/types.zig`, and report malformed or unknown input at that boundary.
 Rule modules consume the parsed policy and never inspect JSON themselves.
 
-New LSP capabilities belong in `src/lsp_server.zig` only when they are thin
-adapters. Put reusable semantics behind a transport-neutral module first, then
-convert byte spans to protocol positions at the edge. CLI filesystem behavior
-similarly belongs in `src/project_check.zig`, outside file-local analysis.
+New LSP capabilities are a module in `src/lsp/` that takes `Services`
+(`src/lsp/services.zig`) plus one forwarding handler in `src/lsp/server.zig`.
+Put reusable semantics behind a transport-neutral module first (`src/syntax/`
+for source text, `src/project/` for other files), then convert byte spans to
+protocol positions at the edge. Exchange tests go in `tests/lsp/`, grouped by
+feature, and drive the public server API through `tests/lsp/support.zig`; tests
+that need the patched compiler go in `tests/lsp_compiler.zig`. CLI filesystem
+behavior similarly belongs in `src/project/check.zig`, outside file-local
+analysis.
 
 ## Verification
 

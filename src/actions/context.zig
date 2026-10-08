@@ -1,5 +1,7 @@
 const std = @import("std");
 const analysis = @import("../analysis.zig");
+const tokens_util = @import("../syntax/tokens.zig");
+const tokenize = tokens_util.tokenize;
 
 pub const Candidate = struct {
     title: []const u8,
@@ -67,31 +69,11 @@ pub const ActionRun = struct {
         opening_tag: std.zig.Token.Tag,
         closing_tag: std.zig.Token.Tag,
     ) ?usize {
-        var depth: usize = 0;
-        for (context.tokens[opening..], opening..) |token, index| {
-            if (token.tag == opening_tag) depth += 1;
-            if (token.tag != closing_tag) continue;
-            depth -= 1;
-            if (depth == 0) return index;
-        }
-        return null;
+        return tokens_util.matchingToken(context.tokens, opening, opening_tag, closing_tag);
     }
 
     pub fn statementEnd(context: ActionRun, start: usize) ?usize {
-        var parenthesis_depth: usize = 0;
-        var bracket_depth: usize = 0;
-        var brace_depth: usize = 0;
-        for (context.tokens[start..], start..) |token, index| switch (token.tag) {
-            .l_paren => parenthesis_depth += 1,
-            .r_paren => parenthesis_depth -|= 1,
-            .l_bracket => bracket_depth += 1,
-            .r_bracket => bracket_depth -|= 1,
-            .l_brace => brace_depth += 1,
-            .r_brace => brace_depth -|= 1,
-            .semicolon => if (parenthesis_depth == 0 and bracket_depth == 0 and brace_depth == 0) return index,
-            else => {},
-        };
-        return null;
+        return tokens_util.statementEnd(context.tokens, start);
     }
 
     pub fn shapeNamed(context: ActionRun, name: []const u8) ?analysis.ResolvedShape {
@@ -112,16 +94,6 @@ pub const ActionRun = struct {
 pub fn spansOverlap(left: std.zig.Token.Loc, right: std.zig.Token.Loc) bool {
     if (left.start == left.end) return right.start <= left.start and left.start <= right.end;
     return left.start < right.end and right.start < left.end;
-}
-
-pub fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.Token {
-    var tokens: std.ArrayList(std.zig.Token) = .empty;
-    var tokenizer = std.zig.Tokenizer.init(source);
-    while (true) {
-        const token = tokenizer.next();
-        if (token.tag == .eof) return try tokens.toOwnedSlice(allocator);
-        try tokens.append(allocator, token);
-    }
 }
 
 pub fn selectedTokenIndex(context: ActionRun) ?usize {

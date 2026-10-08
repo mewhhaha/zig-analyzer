@@ -1,8 +1,13 @@
 const std = @import("std");
 const analysis = @import("../analysis.zig");
 const action_context = @import("context.zig");
+const tokenize = @import("../syntax/tokens.zig").tokenize;
 
 pub const Candidate = action_context.Candidate;
+/// Rewrites driven by one finding or one selection (see `rewrites.zig`).
+pub const rewrites = @import("rewrites.zig");
+/// Name suggestions for style renames (see `naming.zig`).
+pub const naming = @import("naming.zig");
 
 const action_modules = .{
     @import("expression.zig"),
@@ -17,7 +22,7 @@ pub fn actions(
     selection: std.zig.Token.Loc,
     shapes: []const analysis.ResolvedShape,
 ) ![]const Candidate {
-    const tokens = try action_context.tokenize(allocator, source);
+    const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
     var candidates: std.ArrayList(Candidate) = .empty;
     const context: action_context.ActionRun = .{
@@ -34,4 +39,6 @@ pub fn actions(
 
 test {
     _ = action_modules;
+    _ = rewrites;
+    _ = naming;
 }

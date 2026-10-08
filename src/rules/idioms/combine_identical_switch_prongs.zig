@@ -1,0 +1,172 @@
+const std = @import("std");
+const RuleRun = @import("../context.zig").RuleRun;
+const types = @import("../types.zig");
+const support = @import("../test_support.zig");
+const containsComment = @import("../../syntax/tokens.zig").containsComment;
+
+const Prong = struct {
+    body: []const u8,
+    body_span: std.zig.Token.Loc,
+    has_capture: bool,
+    has_comment: bool,
+    is_else: bool,
+};
+
+pub const rules = [_]types.Rule{
+    .combine_identical_switch_prongs,
+};
+
+pub fn run(context: RuleRun) !void {
+    const level = context.level(.combine_identical_switch_prongs);
+    if (level == .off) return;
+
+    for (context.tokens, 0..) |token, switch_index| {
+        if (token.tag != .keyword_switch or switch_index + 2 >= context.tokens.len or
+            context.tokens[switch_index + 1].tag != .l_paren) continue;
+        const operand_end = context.matchingToken(switch_index + 1, .l_paren, .r_paren) orelse continue;
+        const opening = operand_end + 1;
+        if (opening >= context.tokens.len or context.tokens[opening].tag != .l_brace) continue;
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+
+        var previous: ?Prong = null;
+        var cursor = opening + 1;
+        while (cursor < closing) {
+            const arrow = topLevelArrow(context.tokens, cursor, closing) orelse break;
+            const body_start = arrow + 1;
+            const body_end = prongBodyEnd(context, body_start, closing) orelse break;
+            const body = std.mem.trim(
+                u8,
+                context.source[context.tokens[body_start].loc.start..context.tokens[body_end].loc.end],
+                " \t\r\n",
+            );
+            const current: Prong = .{
+                .body = body,
+                .body_span = .{ .start = context.tokens[body_start].loc.start, .end = context.tokens[body_end].loc.end },
+                .has_capture = body_start < closing and context.tokens[body_start].tag == .pipe,
+                .has_comment = containsComment(
+                    context.source[context.tokens[cursor].loc.start..context.tokens[body_end].loc.end],
+                ),
+                .is_else = isElseCase(context.tokens, cursor, arrow),
+            };
+            if (previous) |prior| {
+                if (!prior.has_capture and !current.has_capture and !prior.is_else and !current.is_else and
+                    std.mem.eql(u8, prior.body, current.body) and
+                    !prior.has_comment and !current.has_comment)
+                {
+                    try context.emit(.{
+                        .rule = .combine_identical_switch_prongs,
+                        .level = level,
+                        .span = current.body_span,
+                        .message = "adjacent switch prongs have identical uncaptured bodies; combine their case values",
+                    });
+                    previous = null;
+                } else {
+                    previous = current;
+                }
+            } else {
+                previous = current;
+            }
+            cursor = body_end + 1;
+            if (cursor < closing and context.tokens[cursor].tag == .comma) cursor += 1;
+        }
+    }
+}
+
+fn isElseCase(tokens: []const std.zig.Token, start: usize, arrow: usize) bool {
+    for (tokens[start..arrow]) |token| {
+        if (token.tag == .keyword_else) return true;
+    }
+    return false;
+}
+
+fn topLevelArrow(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
+    var depth: usize = 0;
+    for (tokens[start..end], start..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .equal_angle_bracket_right => if (depth == 0) return index,
+        else => {},
+    };
+    return null;
+}
+
+fn prongBodyEnd(context: RuleRun, start: usize, switch_end: usize) ?usize {
+    if (start >= switch_end) return null;
+    var body_expr = start;
+    if (context.tokens[body_expr].tag == .pipe) {
+        body_expr += 1;
+        while (body_expr < switch_end and context.tokens[body_expr].tag != .pipe) : (body_expr += 1) {}
+        if (body_expr >= switch_end) return null;
+        body_expr += 1;
+    }
+    if (body_expr >= switch_end) return null;
+    if (context.tokens[body_expr].tag == .l_brace) return context.matchingToken(body_expr, .l_brace, .r_brace);
+    var depth: usize = 0;
+    for (context.tokens[body_expr..switch_end], body_expr..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .comma => if (depth == 0) return if (index == body_expr) null else index - 1,
+        else => {},
+    };
+    return switch_end - 1;
+}
+
+test "adjacent identical switch bodies prefer one combined prong" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (mode) {\n" ++
+        "    .fast => run(),\n" ++
+        "    .turbo => run(),\n" ++
+        "    .safe => recover(),\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "captured and different switch bodies stay separate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (value) { .left => |payload| use(payload), .right => |payload| use(payload) }\n" ++
+        "switch (mode) { .fast => run(), else => run() }\n" ++
+        "switch (mode) { .fast => run(), .safe => recover() }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "captured prong does not abort scanning subsequent identical prongs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (value) {\n" ++
+        "    .left => |payload| use(payload),\n" ++
+        "    .fast => run(),\n" ++
+        "    .turbo => run(),\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "nested switches report their identical prongs once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (outer) {\n" ++
+        "    .active => switch (inner) {\n" ++
+        "        .first => run(),\n" ++
+        "        .second => run(),\n" ++
+        "    },\n" ++
+        "    .inactive => stop(),\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
+    return support.findings(allocator, run, source, support.only(&.{.combine_identical_switch_prongs}, .information));
+}

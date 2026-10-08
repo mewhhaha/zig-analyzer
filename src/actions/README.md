@@ -18,13 +18,17 @@ preservation, ownership, or an insertion target cannot be proven, omit the
 action rather than generating a plausible-looking edit.
 
 `project.zig` owns actions spanning open files. Build repair requires one package
-import, one matching module source, and one `build.zig`. C-import extraction
-requires identical blocks and an LSP client advertising document changes plus
-file creation. Local action modules must not inspect the filesystem or construct
-protocol objects.
+import, one matching module source, and one `build.zig`. Local action modules
+must not inspect the filesystem or construct protocol objects.
+
+`rewrites.zig` holds the rewrites that repair one finding or one selection and
+need more than the finding's own span (moving a cleanup, deferring a release,
+generating a missing function, extracting an expression); `naming.zig` suggests
+the identifier a style finding should be renamed to. Both return byte edits or
+names only; the server wires them to requests.
 
 `lsp_adapter.zig` is the transport exception: it maps action kinds, byte spans,
-URI edits, and created files into LSP values. It contains no rewrite policy.
+and URI edits into LSP values. It contains no rewrite policy.
 Action engines must not import it or `lsp`; the server calls it only after a
 candidate has been proven.
 

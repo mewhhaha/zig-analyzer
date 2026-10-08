@@ -1,24 +1,6 @@
 const std = @import("std");
-const syntax_scope = @import("../syntax_scope.zig");
-
-pub fn releaseForMethod(method: []const u8) ?[]const u8 {
-    const free_methods = [_][]const u8{
-        "alloc",
-        "allocSentinel",
-        "alignedAlloc",
-        "dupe",
-        "dupeZ",
-        "dupeSentinel",
-        "print",
-        "printSentinel",
-        "realloc",
-    };
-    for (free_methods) |candidate| {
-        if (std.mem.eql(u8, method, candidate)) return "free";
-    }
-    if (std.mem.eql(u8, method, "create")) return "destroy";
-    return null;
-}
+const syntax_scope = @import("../syntax/scope.zig");
+const resources = @import("resources.zig");
 
 pub fn printReceiverIsAllocator(source: []const u8, tokens: []const std.zig.Token, receiver_end: usize) bool {
     if (receiver_end >= tokens.len or tokens[receiver_end].tag != .identifier) return false;
@@ -88,7 +70,7 @@ pub fn releaseForCallable(callable: []const u8) ?[]const u8 {
     if (standardAllocatorArgument(callable) != null) return "free";
     const separator = std.mem.findScalarLast(u8, callable, '.');
     const method = if (separator) |position| callable[position + 1 ..] else callable;
-    const release = releaseForMethod(method) orelse return null;
+    const release = resources.allocationRelease(method) orelse return null;
     if (!std.mem.eql(u8, method, "create")) return release;
     const position = separator orelse return null;
     const receiver = callable[0..position];
@@ -107,9 +89,9 @@ test "standard allocator functions return memory released with free" {
     try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("items.toOwnedSlice"));
     try std.testing.expectEqualStrings("free", releaseForCallable("std.fs.path.resolve").?);
     try std.testing.expect(standardAllocatorArgument("project.mem.concat") == null);
-    try std.testing.expectEqualStrings("free", releaseForMethod("dupeSentinel").?);
-    try std.testing.expectEqualStrings("free", releaseForMethod("print").?);
-    try std.testing.expectEqualStrings("free", releaseForMethod("printSentinel").?);
+    try std.testing.expectEqualStrings("free", resources.allocationRelease("dupeSentinel").?);
+    try std.testing.expectEqualStrings("free", resources.allocationRelease("print").?);
+    try std.testing.expectEqualStrings("free", resources.allocationRelease("printSentinel").?);
     try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("std.Io.Dir.path.resolveAlloc"));
     try std.testing.expectEqual(@as(?usize, 0), standardAllocatorArgument("std.Io.Dir.path.relativeAllocPosix"));
     try std.testing.expect(standardAllocatorArgument("std.Io.Dir.path.resolveAppend") == null);

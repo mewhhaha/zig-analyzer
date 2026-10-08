@@ -1,0 +1,9 @@
+.{
+    .name = .dependency_fixture,
+    .version = "0.0.0",
+    .fingerprint = 0xebec5ba8a7e5978e,
+    .dependencies = .{
+        .shared = .{ .path = "shared" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "shared" },
+}

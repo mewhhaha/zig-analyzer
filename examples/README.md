@@ -35,54 +35,60 @@ reflected-member generation, and test harnesses.
 Format calls with a simple missing or extra tuple argument also offer an explicit
 arity repair.
 Build-module repair appears on a package `@import` when its uniquely named Zig
-file and `build.zig` are both open. Repeated `@cImport` extraction is retained
-for legacy migration input and requires a client that supports workspace file
-creation. Zig 0.17 source uses the translate-c package instead of `@cImport`.
+file and `build.zig` are both open.
 
-Open `diagnostics/idiomatic_style.zig` for the style-guide actions. It covers a
-redundant fully-qualified type name, optional force-unwrapping after a null
-check, direct error propagation, a generic testing expectation, a mutable
-pointer used only for reads, and type names repeated despite a known result
-location. It also demonstrates a returned slice backed by an expired local
-array, cleanup registered after a fallible operation, a force-unwrap that
-ignores an existing optional capture, and byte equality that should use
-`expectEqualStrings`. These remain valid Zig so every diagnostic can be
-inspected and applied independently. The same fixture covers exact
-`expectEqualSlices` and `expectError` rewrites, an advisory approximate-float
-expectation, errors collapsed to absence, an optional capture used only as a
-presence test, and a manually appended zero terminator. It also shows quick
-fixes for boolean-valued `if` expressions, one-statement `defer` blocks, and
-empty `else` branches; all three are safe fix-all rewrites. Formatting itself
-remains the exact output of `zig fmt`.
+## Diagnostic fixtures
 
-Open `diagnostics/memory_management.zig` to exercise memory ownership warnings.
-`forgottenRelease` warns because its allocation has no cleanup. `errorPathOnly`
-also warns because `errdefer` cleans up only when the function returns an error.
-`releasedCorrectly` stays clean because its normal `defer` covers every exit.
-`cleanupRegisteredTooLate` warns because the second allocation can fail before
-cleanup for the first allocation is registered; its quick fix moves the first
-`defer` directly after the first allocation.
+Every file under `diagnostics/` marks the findings it must produce with a
+`// expect: <rule-code>[, <rule-code>...]` comment. A marker on its own line
+applies to the next line; a marker after code applies to that line (used where
+a finding anchors at the first byte of the file). `tests/example_diagnostics.zig`
+runs the file and project engines over each fixture with this repository's
+`zig-analyzer.json` and requires exactly the marked (line, rule) set, so a
+missing or an unexpected finding fails `zig build test`. Add a marker whenever
+you add an offending line, and the table below with it: the test also fails
+when the generated block between the two comments differs from the markers.
 
-Open `diagnostics/lifetime_mistakes.zig` for compiler-missed borrowed-storage
-mistakes. It returns views from destroyed containers and arenas, keeps an
-element pointer across an `ArrayList` growth, reassigns a deferred cleanup
-binding, relies on error-only file cleanup, multiplies an allocation length,
-and mutates a map during iteration. The functions are referenced but not run,
-so the file remains a safe compilation fixture while every diagnostic is
-visible in the editor.
-
-Seven smaller diagnostic fixtures each isolate one valid Zig program that the
-compiler accepts but zig-analyzer warns about:
-
-| File | Diagnostic |
+<!-- diagnostics:begin -->
+| File | Rules reported |
 | --- | --- |
-| `diagnostics/overlapping_copy.zig` | `aliased-memcpy` |
-| `diagnostics/unsigned_reverse_loop.zig` | `unsigned-reverse-loop` |
-| `diagnostics/padded_equality.zig` | `padded-byte-compare` |
+| `diagnostics/action_results.zig` | `unsafe-orelse-unreachable`, `non-exhaustive-switch-else`, `prefer-log-over-print` |
+| `diagnostics/code_actions.zig` | `unsorted-imports`, `unused-import`, `never-mutated-var`, `missing-struct-field`, `missing-switch-prong`, `redundant-bool-comparison`, `mixed-bitwise-arithmetic`, `unresolved-call`, `returning-deinitialized-view`, `returning-released-value`, `inclusive-index-bound`, `unsigned-reverse-loop`, `prefer-log-over-print`, `allocation-size-overflow` |
+| `diagnostics/compiler_error.zig` | none |
+| `diagnostics/dangling_slice.zig` | `never-mutated-var`, `returning-local-slice` |
 | `diagnostics/discarded_error.zig` | `discarded-error` |
-| `diagnostics/use_after_release.zig` | `use-after-release`, `double-release` |
-| `diagnostics/dangling_slice.zig` | `returning-local-slice` |
 | `diagnostics/helper_release.zig` | `unreleased-allocation` |
+| `diagnostics/idiomatic_style.zig` | `redundant-qualified-name`, `mutable-pointer-parameter`, `prefer-optional-capture`, `prefer-try`, `prefer-testing-expect-equal`, `redundant-type-qualification`, `prefer-anonymous-initializer`, `never-mutated-var`, `returning-local-slice`, `unsafe-orelse-unreachable`, `redundant-optional-unwrap`, `cleanup-after-fallible-operation`, `error-collapsed-to-absence`, `redundant-boolean-if`, `needless-defer-block`, `needless-empty-else`, `prefer-optional-presence-test`, `prefer-sentinel-termination`, `prefer-testing-expect-equal-strings`, `prefer-testing-expect-equal-slices`, `prefer-testing-expect-approx`, `prefer-testing-expect-error` |
+| `diagnostics/lifetime_mistakes.zig` | `returning-deinitialized-view`, `returning-arena-allocation`, `invalidated-element-pointer`, `defer-uses-reassigned-binding`, `resource-cleanup-on-error-only`, `allocation-size-overflow`, `iterator-invalidated-during-loop` |
+| `diagnostics/memory_management.zig` | `unreleased-allocation`, `cleanup-after-fallible-operation`, `missing-errdefer` |
+| `diagnostics/overlapping_copy.zig` | `aliased-memcpy` |
+| `diagnostics/padded_equality.zig` | `padded-byte-compare` |
+| `diagnostics/unsigned_reverse_loop.zig` | `unsigned-reverse-loop` |
+| `diagnostics/use_after_release.zig` | `use-after-release`, `double-release` |
+<!-- diagnostics:end -->
+
+All fixtures except `compiler_error.zig` (a semantic error only the compiler
+reports) and `code_actions.zig` (intentionally incomplete) are valid Zig that
+the compiler accepts. Use them as follows:
+
+- `idiomatic_style.zig` is the style-guide tour: each marked line has an
+  independent quick fix, and the semantics-preserving ones are fix-all
+  rewrites. Formatting itself remains the exact output of `zig fmt`.
+- `memory_management.zig` pairs warnings with clean functions: `releasedCorrectly`
+  stays clean because its normal `defer` covers every exit, and the quick fix
+  for `cleanup-after-fallible-operation` moves the first `defer` directly after
+  the first allocation.
+- `lifetime_mistakes.zig` is compiler-missed borrowed-storage mistakes. Its
+  functions are referenced but not run, so the file stays a safe compilation
+  fixture.
+- The single-purpose fixtures (`overlapping_copy.zig`, `padded_equality.zig`,
+  `discarded_error.zig`, `use_after_release.zig`, `dangling_slice.zig`,
+  `helper_release.zig`, `unsigned_reverse_loop.zig`) each isolate one program
+  the compiler accepts but zig-analyzer warns about.
+
+The `lsp/` and `compiler/` examples are editor interaction fixtures (cursor
+positions for completion, hover and rename, below) rather than lint cases, so
+they carry no markers; the same test requires them to be finding-free.
 
 For compiler-derived completion cases, leave the source unchanged and place the
 cursor directly after the listed dot, before the existing member name:

@@ -6,5 +6,6 @@ pub const Header = struct {
 };
 
 pub fn headersEqual(left: Header, right: Header) bool {
+    // expect: padded-byte-compare
     return std.mem.eql(u8, std.mem.asBytes(&left), std.mem.asBytes(&right));
 }

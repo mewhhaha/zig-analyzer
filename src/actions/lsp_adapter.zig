@@ -1,7 +1,7 @@
 const std = @import("std");
 const lsp = @import("lsp");
 const analysis = @import("../analysis.zig");
-const document_module = @import("../document.zig");
+const document_module = @import("../syntax/document.zig");
 const project_actions = @import("project.zig");
 
 pub fn kind(action_kind: analysis.ActionKind) lsp.types.CodeAction.Kind {
@@ -55,9 +55,6 @@ pub fn projectEdit(
     documents: *const document_module.Store,
     candidate: project_actions.Candidate,
 ) !lsp.types.WorkspaceEdit {
-    if (candidate.created_file) |created_file| {
-        return try projectEditWithCreatedFile(allocator, documents, candidate.edits, created_file);
-    }
     var changes: std.json.ArrayHashMap([]const lsp.types.TextEdit) = .{};
     for (candidate.edits) |file_edit| {
         const document = documents.getConst(file_edit.uri) orelse continue;
@@ -71,56 +68,6 @@ pub fn projectEdit(
         try changes.map.put(allocator, file_edit.uri, edits);
     }
     return .{ .changes = changes };
-}
-
-fn projectEditWithCreatedFile(
-    allocator: std.mem.Allocator,
-    documents: *const document_module.Store,
-    file_edits: []const project_actions.FileEdit,
-    created_file: project_actions.CreatedFile,
-) !lsp.types.WorkspaceEdit {
-    const DocumentChanges = @typeInfo(@FieldType(lsp.types.WorkspaceEdit, "documentChanges")).optional.child;
-    const DocumentChange = @typeInfo(DocumentChanges).pointer.child;
-    const EditChanges = @typeInfo(@FieldType(lsp.types.TextDocument.Edit, "edits")).pointer.child;
-    const operations = try allocator.alloc(DocumentChange, file_edits.len + 2);
-    var initialized_edits: usize = 0;
-    errdefer {
-        for (operations[1 .. initialized_edits + 1]) |operation| switch (operation) {
-            .text_document_edit => |edit| allocator.free(edit.edits),
-            else => {},
-        };
-        allocator.free(operations);
-    }
-    operations[0] = .{ .create_file = .{ .uri = created_file.uri } };
-
-    const created_edits = try allocator.alloc(EditChanges, 1);
-    created_edits[0] = .{ .text_edit = .{
-        .range = .{
-            .start = .{ .line = 0, .character = 0 },
-            .end = .{ .line = 0, .character = 0 },
-        },
-        .newText = created_file.source,
-    } };
-    operations[1] = .{ .text_document_edit = .{
-        .textDocument = .{ .uri = created_file.uri, .version = null },
-        .edits = created_edits,
-    } };
-    initialized_edits += 1;
-
-    for (file_edits, 2..) |file_edit, operation_index| {
-        const document = documents.getConst(file_edit.uri) orelse return error.DocumentNotOpen;
-        const edits = try allocator.alloc(EditChanges, 1);
-        edits[0] = .{ .text_edit = .{
-            .range = document.range(file_edit.edit.span),
-            .newText = file_edit.edit.replacement,
-        } };
-        operations[operation_index] = .{ .text_document_edit = .{
-            .textDocument = .{ .uri = file_edit.uri, .version = document.version },
-            .edits = edits,
-        } };
-        initialized_edits += 1;
-    }
-    return .{ .documentChanges = operations };
 }
 
 test "parent action kinds include their children" {
@@ -151,21 +98,4 @@ test "document edits convert byte spans to UTF-16 ranges" {
     }
     const edits = edit.changes.?.map.get(document.uri).?;
     try std.testing.expectEqual(@as(u32, 17), edits[0].range.start.character);
-}
-
-test "created-file edits release partial operations when a document is missing" {
-    var documents = document_module.Store.init(std.testing.allocator);
-    defer documents.deinit();
-    try documents.open("file:///workspace/open.zig", 1, "const value = 1;\n");
-    const edits = [_]project_actions.FileEdit{
-        .{ .uri = "file:///workspace/open.zig", .edit = .{ .span = .{ .start = 0, .end = 0 }, .replacement = "// open\n" } },
-        .{ .uri = "file:///workspace/missing.zig", .edit = .{ .span = .{ .start = 0, .end = 0 }, .replacement = "// missing\n" } },
-    };
-
-    try std.testing.expectError(error.DocumentNotOpen, projectEditWithCreatedFile(
-        std.testing.allocator,
-        &documents,
-        &edits,
-        .{ .uri = "file:///workspace/new.zig", .source = "const created = true;\n" },
-    ));
 }

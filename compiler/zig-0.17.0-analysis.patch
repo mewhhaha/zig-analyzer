@@ -1,174 +1,407 @@
-diff --git a/src/AnalysisProtocol.zig b/src/AnalysisProtocol.zig
+diff --git a/src/AnalysisSymbols.zig b/src/AnalysisSymbols.zig
 new file mode 100644
-index 00000000..04416896
+index 00000000..f7bad1db
 --- /dev/null
-+++ b/src/AnalysisProtocol.zig
-@@ -0,0 +1,160 @@
++++ b/src/AnalysisSymbols.zig
+@@ -0,0 +1,393 @@
++//! Answers the analyzer's `resolve_symbol` queries: evaluates a member-access
++//! path against the declarations the compiler resolved (type declarations,
++//! aliases, imports, method return types, field types) and reports the source
++//! name token of the declaration or field a name denotes. Evaluation is lazy
++//! and syntax-driven: it needs no analysis of function bodies, so code the
++//! compile never reached resolves too. Anything it cannot evaluate yields a
++//! status instead of an identity.
 +const std = @import("std");
++const Ast = std.zig.Ast;
 +
-+pub const version: u16 = 5;
++const AnalysisProtocol = @import("AnalysisProtocol.zig");
++const InternPool = @import("InternPool.zig");
++const Type = @import("Type.zig");
++const Zcu = @import("Zcu.zig");
 +
-+pub const Header = extern struct {
-+    body_length: u32,
-+    request_id: u32,
-+    generation: u32,
-+    tag: Tag,
-+    reserved: u16 = 0,
++const Resolver = @This();
++
++zcu: *Zcu,
++pt: Zcu.PerThread,
++scope: [max_scope_depth]InternPool.Index = undefined,
++scope_len: usize = 0,
++
++const max_scope_depth = 32;
++const max_steps = 64;
++
++pub const Symbol = struct {
++    status: AnalysisProtocol.SymbolStatus,
++    kind: AnalysisProtocol.SymbolKind = .none,
++    file: ?*Zcu.File = null,
++    start: u32 = 0,
++    end: u32 = 0,
 +};
 +
-+pub const Hello = extern struct {
-+    protocol_version: u16,
-+    zig_version_length: u16,
-+    authentication_token_length: u16,
-+    reserved: u16 = 0,
++const Fail = error{ Unresolved, Absent, Generic, OutOfMemory, Canceled };
++
++/// What the steps evaluated so far produced.
++const Value = union(enum) {
++    /// Nothing yet: the next name is looked up lexically.
++    none,
++    /// A type, used as a namespace.
++    type: InternPool.Index,
++    /// An expression of this type.
++    instance: InternPool.Index,
++    /// A declared function.
++    function: InternPool.Nav.Index,
 +};
 +
-+pub const HelloResponse = extern struct {
-+    protocol_version: u16,
-+    status: HandshakeStatus,
-+    zig_version_length: u16,
-+    reserved: u16 = 0,
++const Step = struct {
++    kind: AnalysisProtocol.StepKind,
++    name: []const u8,
 +};
 +
-+pub const HandshakeStatus = enum(u16) {
-+    accepted,
-+    incompatible_protocol,
-+    incompatible_zig,
-+    authentication_failed,
-+    _,
-+};
++/// Reads the query at `offset.*` of `bytes`, advances past it, and resolves it
++/// in the file `file_index`.
++pub fn resolve(
++    resolver: *Resolver,
++    file_index: Zcu.File.Index,
++    bytes: []const u8,
++    offset: *usize,
++) error{ MalformedQuery, OutOfMemory, Canceled }!Symbol {
++    if (bytes.len - offset.* < @sizeOf(AnalysisProtocol.QueryHeader)) return error.MalformedQuery;
++    const flags = std.mem.readInt(u16, bytes[offset.*..][0..2], .little);
++    const step_count = std.mem.readInt(u16, bytes[offset.* + 2 ..][0..2], .little);
++    offset.* += @sizeOf(AnalysisProtocol.QueryHeader);
 +
-+pub const WorkspaceSummary = extern struct {
-+    type_count: u32,
-+    declaration_count: u32,
-+    analysis_unit_count: u32,
-+    last_generation: u32,
-+};
++    var steps: [max_steps]Step = undefined;
++    var kept: usize = 0;
++    for (0..step_count) |_| {
++        if (bytes.len - offset.* < @sizeOf(AnalysisProtocol.Step)) return error.MalformedQuery;
++        const kind: AnalysisProtocol.StepKind = @fromBackingInt(bytes[offset.*]);
++        const name_length = std.mem.readInt(u16, bytes[offset.* + 2 ..][0..2], .little);
++        offset.* += @sizeOf(AnalysisProtocol.Step);
++        if (bytes.len - offset.* < name_length) return error.MalformedQuery;
++        if (kept < max_steps) {
++            steps[kept] = .{ .kind = kind, .name = bytes[offset.*..][0..name_length] };
++            kept += 1;
++        }
++        offset.* += name_length;
++    }
++    if (step_count > max_steps) return .{ .status = .unresolved };
++    return resolver.evaluate(file_index, flags, steps[0..kept]) catch |err| switch (err) {
++        error.Unresolved => .{ .status = .unresolved },
++        error.Absent => .{ .status = .absent },
++        error.Generic => .{ .status = .generic },
++        error.OutOfMemory => error.OutOfMemory,
++        error.Canceled => error.Canceled,
++    };
++}
 +
-+pub const ReplaceOverlayRequest = extern struct {
-+    uri_length: u32,
-+    source_length: u32,
-+    document_version: i32,
-+    reserved: u32 = 0,
-+};
++fn evaluate(resolver: *Resolver, file_index: Zcu.File.Index, flags: u16, steps: []const Step) Fail!Symbol {
++    var root = resolver.zcu.fileRootType(file_index);
++    if (root == .none) {
++        // Nothing the compile reached imported the file yet, but it is part of
++        // the compile: populate its root container so its declarations exist.
++        const file = resolver.zcu.fileByIndex(file_index);
++        if (file.zir == null or file.getMode() != .zig) return error.Unresolved;
++        resolver.pt.ensureFilePopulated(file_index) catch |err| switch (err) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Canceled => return error.Canceled,
++        };
++        root = resolver.zcu.fileRootType(file_index);
++        if (root == .none) return error.Unresolved;
++    }
++    resolver.scope[0] = root;
++    resolver.scope_len = 1;
 +
-+pub const AnalyzeRequest = extern struct {
-+    uri_length: u32,
-+    expected_document_version: i32,
-+};
++    var current: Value = .none;
++    for (steps, 0..) |step, index| {
++        switch (step.kind) {
++            .scope => {
++                if (current != .none) return error.Unresolved;
++                const nav = resolver.findDeclaration(resolver.scope[resolver.scope_len - 1], step.name) orelse return error.Unresolved;
++                switch (try resolver.navValue(nav)) {
++                    .type => |container| {
++                        if (resolver.scope_len == max_scope_depth) return error.Unresolved;
++                        resolver.scope[resolver.scope_len] = container;
++                        resolver.scope_len += 1;
++                    },
++                    else => return error.Unresolved,
++                }
++            },
++            .name => current = try resolver.stepName(current, step.name),
++            .call => current = try resolver.stepCall(current),
++            .index => current = try resolver.stepIndex(current),
++            .target => {
++                if (index + 1 != steps.len) return error.Unresolved;
++                return resolver.target(current, flags & AnalysisProtocol.query_declaration_site != 0, step.name);
++            },
++            _ => return error.Unresolved,
++        }
++    }
++    return error.Unresolved;
++}
 +
-+pub const RemoveOverlayRequest = extern struct {
-+    uri_length: u32,
-+};
++fn target(resolver: *Resolver, current: Value, declaration_site: bool, name: []const u8) Fail!Symbol {
++    if (declaration_site) {
++        if (current != .none) return error.Unresolved;
++        return resolver.member(resolver.scope[resolver.scope_len - 1], name);
++    }
++    switch (current) {
++        .none => {
++            var depth = resolver.scope_len;
++            while (depth > 0) {
++                depth -= 1;
++                if (resolver.findDeclaration(resolver.scope[depth], name)) |nav| return resolver.navSymbol(nav);
++            }
++            return error.Unresolved;
++        },
++        .type => |container| return resolver.member(resolver.peel(container), name),
++        .instance => |container| return resolver.member(resolver.peel(container), name),
++        .function => return error.Unresolved,
++    }
++}
 +
-+pub const TypeMembersRequest = extern struct {
-+    name_length: u32,
-+};
++/// The declaration or field `name` of the container type `container`.
++fn member(resolver: *Resolver, container: InternPool.Index, name: []const u8) Fail!Symbol {
++    if (!resolver.isContainer(container)) return error.Unresolved;
++    if (resolver.findDeclaration(container, name)) |nav| return resolver.navSymbol(nav);
++    return (try resolver.fieldSymbol(container, name)) orelse error.Absent;
++}
 +
-+pub const TypeShape = extern struct {
-+    kind: TypeShapeKind,
-+    reserved: u16 = 0,
-+    field_count: u32,
-+    names_length: u32,
-+};
++fn isContainer(resolver: *Resolver, ty: InternPool.Index) bool {
++    return switch (resolver.zcu.intern_pool.indexToKey(ty)) {
++        .struct_type, .union_type, .enum_type, .opaque_type => true,
++        else => false,
++    };
++}
 +
-+pub const ResolvedValue = extern struct {
-+    type_length: u32,
-+    value_length: u32,
-+};
++fn stepName(resolver: *Resolver, current: Value, name: []const u8) Fail!Value {
++    switch (current) {
++        .none => {
++            var depth = resolver.scope_len;
++            while (depth > 0) {
++                depth -= 1;
++                if (resolver.findDeclaration(resolver.scope[depth], name)) |nav| return resolver.navValue(nav);
++            }
++            return error.Unresolved;
++        },
++        .type => |container| return resolver.memberValue(resolver.peel(container), name),
++        .instance => |container| return resolver.memberValue(resolver.peel(container), name),
++        .function => return error.Unresolved,
++    }
++}
 +
-+pub const TypeShapeKind = enum(u16) {
-+    enumeration,
-+    tagged_union,
-+    structure,
-+    _,
-+};
++fn memberValue(resolver: *Resolver, container: InternPool.Index, name: []const u8) Fail!Value {
++    if (!resolver.isContainer(container)) return error.Unresolved;
++    if (resolver.findDeclaration(container, name)) |nav| return resolver.navValue(nav);
++    return .{ .instance = try resolver.fieldType(container, name) };
++}
 +
-+pub const DocumentFacts = extern struct {
-+    document_version: i32,
-+    declaration_count: u32,
-+    syntax_error_count: u32,
-+    reserved: u32 = 0,
-+    source_hash: u64,
-+};
++fn stepCall(resolver: *Resolver, current: Value) Fail!Value {
++    const nav_index = switch (current) {
++        .function => |nav| nav,
++        else => return error.Unresolved,
++    };
++    const ip = &resolver.zcu.intern_pool;
++    const resolved = ip.getNav(nav_index).resolved orelse return error.Unresolved;
++    const func_type = switch (ip.indexToKey(resolved.type)) {
++        .func_type => |func_type| func_type,
++        else => return error.Unresolved,
++    };
++    if (func_type.return_type == .generic_poison_type or func_type.return_type == .type_type) return error.Generic;
++    return .{ .instance = func_type.return_type };
++}
 +
-+pub const ErrorResponse = extern struct {
-+    code: ErrorCode,
-+    reserved: u16 = 0,
-+    observed_generation: u32,
-+    message_length: u32,
-+};
++fn stepIndex(resolver: *Resolver, current: Value) Fail!Value {
++    const ip = &resolver.zcu.intern_pool;
++    var ty = switch (current) {
++        .instance => |ty| ty,
++        else => return error.Unresolved,
++    };
++    while (true) switch (ip.indexToKey(ty)) {
++        .ptr_type => |pointer| {
++            if (pointer.flags.size != .one) return .{ .instance = pointer.child };
++            ty = pointer.child;
++        },
++        .opt_type => |child| ty = child,
++        .array_type => |array| return .{ .instance = array.child },
++        .vector_type => |vector| return .{ .instance = vector.child },
++        else => return error.Unresolved,
++    };
++}
 +
-+pub const DeclarationList = extern struct {
-+    declaration_count: u32,
-+    names_length: u32,
-+};
++/// Strips single-item pointers, optionals, and error unions: the type member
++/// access looks into.
++fn peel(resolver: *Resolver, start: InternPool.Index) InternPool.Index {
++    const ip = &resolver.zcu.intern_pool;
++    var ty = start;
++    while (true) switch (ip.indexToKey(ty)) {
++        .ptr_type => |pointer| {
++            if (pointer.flags.size != .one) return ty;
++            ty = pointer.child;
++        },
++        .opt_type => |child| ty = child,
++        .error_union_type => |error_union| ty = error_union.payload_type,
++        else => return ty,
++    };
++}
 +
-+pub const DiagnosticBundle = extern struct {
-+    extra_length: u32,
-+    string_bytes_length: u32,
-+};
++/// The declaration of `container` named `name`, if the container has one.
++fn findDeclaration(resolver: *Resolver, container: InternPool.Index, name: []const u8) ?InternPool.Nav.Index {
++    const zcu = resolver.zcu;
++    const ip = &zcu.intern_pool;
++    if (!resolver.isContainer(container)) return null;
++    // A union's generated tag enum has no namespace.
++    const namespace_index = Type.fromInterned(container).getNamespace(zcu).unwrap() orelse return null;
++    const namespace = zcu.namespacePtr(namespace_index);
++    for (namespace.pub_decls.keys()) |nav_index| {
++        if (std.mem.eql(u8, ip.getNav(nav_index).name.toSlice(ip), name)) return nav_index;
++    }
++    for (namespace.priv_decls.keys()) |nav_index| {
++        if (std.mem.eql(u8, ip.getNav(nav_index).name.toSlice(ip), name)) return nav_index;
++    }
++    return null;
++}
 +
-+pub const ErrorCode = enum(u16) {
-+    incompatible_protocol,
-+    incompatible_zig,
-+    authentication_failed,
-+    stale_generation,
-+    unknown_compile_unit,
-+    unavailable,
-+    malformed_request,
-+    internal_failure,
-+    _,
-+};
++/// What a declaration is: resolves its value if that has not happened yet.
++fn navValue(resolver: *Resolver, nav_index: InternPool.Nav.Index) Fail!Value {
++    const zcu = resolver.zcu;
++    const ip = &zcu.intern_pool;
++    var nav = ip.getNav(nav_index);
++    if (nav.resolved == null or nav.resolved.?.value == .none) {
++        resolver.pt.ensureNavValUpToDate(nav_index, null) catch |err| switch (err) {
++            error.AnalysisFail => return error.Unresolved,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Canceled => return error.Canceled,
++        };
++        nav = ip.getNav(nav_index);
++    }
++    const resolved = nav.resolved orelse return error.Unresolved;
++    return switch (Type.fromInterned(resolved.type).zigTypeTag(zcu)) {
++        .type => if (resolved.value == .none) error.Unresolved else .{ .type = resolved.value },
++        .@"fn" => .{ .function = nav_index },
++        else => .{ .instance = resolved.type },
++    };
++}
 +
-+pub const Tag = enum(u16) {
-+    hello,
-+    hello_response,
-+    register_compile_unit,
-+    replace_overlay,
-+    remove_overlay,
-+    analyze,
-+    diagnostics,
-+    document_facts,
-+    resolve_symbol,
-+    type_members,
-+    workspace_declarations,
-+    cancel,
-+    shutdown,
-+    response_error,
-+    workspace_declaration_names,
-+    type_shape,
-+    resolved_value,
-+    _,
-+};
++/// The type of the field `name` of `container`.
++fn fieldType(resolver: *Resolver, container: InternPool.Index, name: []const u8) Fail!InternPool.Index {
++    const ip = &resolver.zcu.intern_pool;
++    switch (ip.indexToKey(container)) {
++        .enum_type => {
++            const loaded = ip.loadEnumType(container);
++            for (loaded.field_names.get(ip)) |field_name| {
++                if (std.mem.eql(u8, field_name.toSlice(ip), name)) return container;
++            }
++            return error.Absent;
++        },
++        .struct_type => {
++            try resolver.ensureLayout(container);
++            const loaded = ip.loadStructType(container);
++            for (loaded.field_names.get(ip), loaded.field_types.get(ip)) |field_name, field_type| {
++                if (std.mem.eql(u8, field_name.toSlice(ip), name)) return usable(field_type);
++            }
++            return error.Absent;
++        },
++        .union_type => {
++            try resolver.ensureLayout(container);
++            const loaded = ip.loadUnionType(container);
++            if (loaded.tag_usage != .tagged or loaded.enum_tag_type == .none) return error.Unresolved;
++            const tag_names = ip.loadEnumType(loaded.enum_tag_type).field_names.get(ip);
++            for (tag_names, loaded.field_types.get(ip)) |field_name, field_type| {
++                if (std.mem.eql(u8, field_name.toSlice(ip), name)) return usable(field_type);
++            }
++            return error.Absent;
++        },
++        else => return error.Unresolved,
++    }
++}
 +
-+pub const SourceSpan = extern struct {
-+    start: u32,
-+    end: u32,
-+};
++fn usable(field_type: InternPool.Index) Fail!InternPool.Index {
++    if (field_type == .none or field_type == .generic_poison_type) return error.Generic;
++    return field_type;
++}
 +
-+comptime {
-+    std.debug.assert(@sizeOf(Header) == 16);
-+    std.debug.assert(@sizeOf(Hello) == 8);
-+    std.debug.assert(@sizeOf(HelloResponse) == 8);
-+    std.debug.assert(@sizeOf(SourceSpan) == 8);
-+    std.debug.assert(@sizeOf(WorkspaceSummary) == 16);
-+    std.debug.assert(@sizeOf(ReplaceOverlayRequest) == 16);
-+    std.debug.assert(@sizeOf(AnalyzeRequest) == 8);
-+    std.debug.assert(@sizeOf(RemoveOverlayRequest) == 4);
-+    std.debug.assert(@sizeOf(TypeMembersRequest) == 4);
-+    std.debug.assert(@sizeOf(TypeShape) == 12);
-+    std.debug.assert(@sizeOf(ResolvedValue) == 8);
-+    std.debug.assert(@sizeOf(DocumentFacts) == 24);
-+    std.debug.assert(@sizeOf(ErrorResponse) == 12);
-+    std.debug.assert(@sizeOf(DeclarationList) == 8);
-+    std.debug.assert(@sizeOf(DiagnosticBundle) == 8);
++fn ensureLayout(resolver: *Resolver, container: InternPool.Index) Fail!void {
++    resolver.pt.ensureTypeLayoutUpToDate(Type.fromInterned(container), null) catch |err| switch (err) {
++        error.AnalysisFail => return error.Unresolved,
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Canceled => return error.Canceled,
++    };
++}
++
++/// The name token of the declaration `nav_index`.
++fn navSymbol(resolver: *Resolver, nav_index: InternPool.Nav.Index) Fail!Symbol {
++    const zcu = resolver.zcu;
++    const source = zcu.navSrcLoc(nav_index).upgradeOrLost(zcu) orelse return error.Unresolved;
++    const tree = source.file_scope.getTree(zcu) catch return error.Unresolved;
++    var buffer: [1]Ast.Node.Index = undefined;
++    const name_token: Ast.TokenIndex = if (tree.fullFnProto(&buffer, source.base_node)) |prototype|
++        prototype.name_token orelse return error.Unresolved
++    else if (tree.fullVarDecl(source.base_node)) |declaration|
++        declaration.ast.mut_token + 1
++    else
++        return error.Unresolved;
++    return tokenSymbol(source.file_scope, tree, name_token, .declaration);
++}
++
++/// The name token of the field `name` of `container`, from the container's
++/// source, or null when it declares no such field.
++fn fieldSymbol(resolver: *Resolver, container: InternPool.Index, name: []const u8) Fail!?Symbol {
++    const zcu = resolver.zcu;
++    const ip = &zcu.intern_pool;
++    const tracked = switch (ip.indexToKey(container)) {
++        .struct_type => ip.loadStructType(container).zir_index,
++        .union_type => ip.loadUnionType(container).zir_index,
++        .enum_type => ip.loadEnumType(container).zir_index.unwrap() orelse return error.Unresolved,
++        .opaque_type => ip.loadOpaqueType(container).zir_index,
++        else => return error.Unresolved,
++    };
++    const resolved = tracked.resolveFull(ip) orelse return error.Unresolved;
++    const file = zcu.fileByIndex(resolved.file);
++    const zir = if (file.zir) |*zir| zir else return error.Unresolved;
++    const instruction = zir.instructions.get(@backingInt(resolved.inst));
++    if (instruction.tag != .extended) return error.Unresolved;
++    const node: Ast.Node.Index = switch (instruction.data.extended.opcode) {
++        .struct_decl => zir.getStructDecl(resolved.inst).src_node,
++        .union_decl => zir.getUnionDecl(resolved.inst).src_node,
++        .enum_decl => zir.getEnumDecl(resolved.inst).src_node,
++        .opaque_decl => zir.getOpaqueDecl(resolved.inst).src_node,
++        else => return error.Unresolved,
++    };
++    const tree = file.getTree(zcu) catch return error.Unresolved;
++    var buffer: [2]Ast.Node.Index = undefined;
++    const members: []const Ast.Node.Index = if (node == .root)
++        tree.rootDecls()
++    else
++        (tree.fullContainerDecl(&buffer, node) orelse return error.Unresolved).ast.members;
++    for (members) |member_node| {
++        const field = tree.fullContainerField(member_node) orelse continue;
++        const name_token = field.ast.main_token;
++        if (tree.tokenTag(name_token) != .identifier) continue;
++        if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
++        return tokenSymbol(file, tree, name_token, .field);
++    }
++    return null;
++}
++
++fn tokenSymbol(
++    file: *Zcu.File,
++    tree: *const Ast,
++    token: Ast.TokenIndex,
++    kind: AnalysisProtocol.SymbolKind,
++) Symbol {
++    const start: u32 = tree.tokenStart(token);
++    return .{
++        .status = .resolved,
++        .kind = kind,
++        .file = file,
++        .start = start,
++        .end = start + @as(u32, @intCast(tree.tokenSlice(token).len)),
++    };
 +}
 diff --git a/src/IncrementalDebugServer.zig b/src/IncrementalDebugServer.zig
-index d8869137..bed8d1f4 100644
+index d8869137..f0aefcc5 100644
 --- a/src/IncrementalDebugServer.zig
 +++ b/src/IncrementalDebugServer.zig
-@@ -18,31 +18,47 @@ future: ?Io.Future(void),
+@@ -18,31 +18,46 @@ future: ?Io.Future(void),
  /// Held by our owner when an update is in-progress, and held by us when responding to a command.
  /// So, essentially guards all access to `Compilation`, including `Zcu`.
  mutex: std.Io.Mutex,
@@ -206,7 +439,6 @@ index d8869137..bed8d1f4 100644
  pub fn spawn(ids: *IncrementalDebugServer) void {
      const io = ids.zcu.comp.io;
 -    std.debug.print("spawning incremental debug server on port {d}\n", .{port});
-+    std.debug.print("spawning incremental debug server on port {d}\n", .{ids.protocol_port});
      ids.future = io.concurrent(runServer, .{ids}) catch |err|
          std.process.fatal("failed to start incremental debug server: {s}", .{@errorName(err)});
  }
@@ -218,7 +450,17 @@ index d8869137..bed8d1f4 100644
      var server = addr.listen(io, .{}) catch |err| switch (err) {
          error.Canceled => return,
          else => |e| {
-@@ -69,7 +85,11 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -51,6 +66,9 @@ fn runServer(ids: *IncrementalDebugServer) void {
+         },
+     };
+     defer server.deinit(io);
++    // Requesting port 0 lets the OS pick a free port; the analyzer reads the
++    // bound port from this announcement on stderr.
++    std.debug.print("{s}{d}\n", .{ AnalysisProtocol.port_announcement, server.socket.address.getPort() });
+ 
+     while (true) {
+         var stream = server.accept(io) catch |err| switch (err) {
+@@ -69,7 +87,11 @@ fn runServer(ids: *IncrementalDebugServer) void {
          var cmd_buf: [1024]u8 = undefined;
          var reader = stream.reader(io, &cmd_buf);
          var writer = stream.writer(io, &.{});
@@ -231,7 +473,7 @@ index d8869137..bed8d1f4 100644
              const actual_err = switch (orig_err) {
                  error.Canceled,
                  error.OutOfMemory,
-@@ -109,6 +129,686 @@ fn runServer(ids: *IncrementalDebugServer) void {
+@@ -109,6 +131,796 @@ fn runServer(ids: *IncrementalDebugServer) void {
      }
  }
  
@@ -440,6 +682,39 @@ index d8869137..bed8d1f4 100644
 +                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "resolved comptime value is unavailable");
 +                }
 +            },
++            .resolve_symbol => {
++                if (!authenticated) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .authentication_failed, "authentication required");
++                    continue;
++                }
++                if (header.generation != ids.analysis_generation) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .stale_generation, "analysis generation is stale");
++                    continue;
++                }
++                if (header.body_length < @sizeOf(AnalysisProtocol.ResolveSymbolsRequest)) {
++                    try discardBody(stream_reader, header.body_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "symbol request is truncated");
++                    continue;
++                }
++                const request = try stream_reader.takeStruct(AnalysisProtocol.ResolveSymbolsRequest, .little);
++                const rest_length = header.body_length - @sizeOf(AnalysisProtocol.ResolveSymbolsRequest);
++                if (request.uri_length > rest_length) {
++                    try discardBody(stream_reader, rest_length);
++                    try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "symbol request length is invalid");
++                    continue;
++                }
++                const uri = try stream_reader.readAlloc(ids.zcu.gpa, request.uri_length);
++                defer ids.zcu.gpa.free(uri);
++                const queries = try stream_reader.readAlloc(ids.zcu.gpa, rest_length - request.uri_length);
++                defer ids.zcu.gpa.free(queries);
++                switch (try ids.writeSymbols(stream_writer, header.request_id, uri, request.query_count, queries)) {
++                    .written => {},
++                    .unavailable => try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .unavailable, "document is outside the active compile unit"),
++                    .malformed => try writeErrorResponse(stream_writer, header.request_id, ids.analysis_generation, .malformed_request, "symbol queries are malformed"),
++                }
++            },
 +            .remove_overlay => {
 +                if (!authenticated) {
 +                    try discardBody(stream_reader, header.body_length);
@@ -557,7 +832,8 @@ index d8869137..bed8d1f4 100644
 +fn overlayFileIndex(ids: *IncrementalDebugServer, uri: []const u8) ?Zcu.File.Index {
 +    const prefix = "file://";
 +    if (!std.mem.startsWith(u8, uri, prefix)) return null;
-+    const uri_path = uri[prefix.len..];
++    var decoded_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
++    const uri_path = percentDecode(&decoded_buffer, uri[prefix.len..]) orelse return null;
 +    for (ids.zcu.module_roots.values()) |optional_file_index| {
 +        const file_index = optional_file_index.unwrap() orelse continue;
 +        const file = ids.zcu.fileByIndex(file_index);
@@ -577,6 +853,27 @@ index d8869137..bed8d1f4 100644
 +        .astgen_failure, .success => file.stat.size +%= 1,
 +        .never_loaded, .retryable_failure => {},
 +    }
++}
++
++/// Decodes the `%XX` escapes of a URI path. Null when an escape is malformed or
++/// the result does not fit `buffer`.
++fn percentDecode(buffer: []u8, encoded: []const u8) ?[]const u8 {
++    var length: usize = 0;
++    var index: usize = 0;
++    while (index < encoded.len) : (length += 1) {
++        if (length == buffer.len) return null;
++        if (encoded[index] != '%') {
++            buffer[length] = encoded[index];
++            index += 1;
++            continue;
++        }
++        if (index + 2 >= encoded.len) return null;
++        const high = std.fmt.charToDigit(encoded[index + 1], 16) catch return null;
++        const low = std.fmt.charToDigit(encoded[index + 2], 16) catch return null;
++        buffer[length] = @as(u8, high) << 4 | low;
++        index += 3;
++    }
++    return buffer[0..length];
 +}
 +
 +fn overlayPathMatches(uri_path: []const u8, file_path: []const u8) bool {
@@ -830,6 +1127,61 @@ index d8869137..bed8d1f4 100644
 +    return true;
 +}
 +
++const SymbolsOutcome = enum { written, unavailable, malformed };
++
++fn writeSymbols(
++    ids: *IncrementalDebugServer,
++    writer: *Io.Writer,
++    request_id: u32,
++    uri: []const u8,
++    query_count: u32,
++    queries: []const u8,
++) !SymbolsOutcome {
++    const io = ids.zcu.comp.io;
++    if (!ids.mutex.tryLock()) try ids.mutex.lock(io);
++    defer ids.mutex.unlock(io);
++
++    const zcu = ids.zcu;
++    const file_index = overlayFileIndex(ids, uri) orelse return .unavailable;
++    const active = zcu.activate(.main);
++    defer active.deactivate();
++    var resolver: AnalysisSymbols = .{ .zcu = zcu, .pt = active.pt };
++    var body: Io.Writer.Allocating = .init(zcu.gpa);
++    defer body.deinit();
++    try body.writer.writeStruct(AnalysisProtocol.SymbolsResponse{ .result_count = query_count }, .little);
++    var offset: usize = 0;
++    for (0..query_count) |_| {
++        const symbol = resolver.resolve(file_index, queries, &offset) catch |err| switch (err) {
++            error.MalformedQuery => return .malformed,
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Canceled => return error.Canceled,
++        };
++        var path: Io.Writer.Allocating = .init(zcu.gpa);
++        defer path.deinit();
++        if (symbol.file) |file| try path.writer.print("{f}", .{file.path.fmt(zcu.comp)});
++        try body.writer.writeStruct(AnalysisProtocol.SymbolResult{
++            .status = symbol.status,
++            .kind = symbol.kind,
++            .start = symbol.start,
++            .end = symbol.end,
++            .file_length = @intCast(path.written().len),
++        }, .little);
++        try body.writer.writeAll(path.written());
++    }
++    if (offset != queries.len) return .malformed;
++    const bytes = body.written();
++    if (bytes.len > 16 * 1024 * 1024) return error.StreamTooLong;
++    try writer.writeStruct(AnalysisProtocol.Header{
++        .body_length = @intCast(bytes.len),
++        .request_id = request_id,
++        .generation = ids.analysis_generation,
++        .tag = .resolve_symbol,
++    }, .little);
++    try writer.writeAll(bytes);
++    try writer.flush();
++    return .written;
++}
++
 +fn writeName(writer: *Io.Writer, name: []const u8) !void {
 +    try writer.writeInt(u32, @intCast(name.len), .little);
 +    try writer.writeAll(name);
@@ -918,13 +1270,14 @@ index d8869137..bed8d1f4 100644
  fn serveStream(
      ids: *IncrementalDebugServer,
      stream_reader: *Io.Reader,
-@@ -466,6 +1166,8 @@ const Compilation = @import("Compilation.zig");
+@@ -466,6 +1278,9 @@ const Compilation = @import("Compilation.zig");
  const Zcu = @import("Zcu.zig");
  const InternPool = @import("InternPool.zig");
  const Type = @import("Type.zig");
 +const Value = @import("Value.zig");
  const AnalUnit = InternPool.AnalUnit;
 +const AnalysisProtocol = @import("AnalysisProtocol.zig");
++const AnalysisSymbols = @import("AnalysisSymbols.zig");
  
  const IncrementalDebugServer = @This();
 diff --git a/src/Zcu.zig b/src/Zcu.zig

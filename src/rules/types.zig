@@ -1,4 +1,5 @@
 const std = @import("std");
+const catalog = @import("catalog.zig");
 
 pub const Level = enum {
     off,
@@ -17,7 +18,6 @@ pub const Rule = enum {
     missing_struct_field,
     never_mutated_var,
     unreleased_allocation,
-    defer_cleanup_in_loop,
     error_value_comparison,
     discarded_error,
     redundant_bool_comparison,
@@ -80,7 +80,6 @@ pub const Rule = enum {
     redundant_error_capture,
     needless_switch_else_capture,
     prefer_sentinel_termination,
-    duplicate_c_import,
     unreferenced_test_file,
     conflicting_build_options,
     duplicate_module_import,
@@ -217,196 +216,11 @@ pub const Rule = enum {
     }
 
     pub fn tier(rule: Rule) Tier {
-        return switch (rule) {
-            .unresolved_call,
-            .unresolved_identifier,
-            .unresolved_member,
-            .unresolved_label,
-            .missing_switch_prong,
-            .missing_struct_field,
-            .never_mutated_var,
-            => .semantic,
-            .unreleased_allocation,
-            .defer_cleanup_in_loop,
-            .error_value_comparison,
-            .cleanup_after_fallible_operation,
-            .mismatched_allocation_release,
-            .double_release,
-            .use_after_release,
-            .overwritten_owning_value,
-            .missing_resource_cleanup,
-            .undefined_value_escape,
-            .returning_local_slice,
-            .invalidated_container_view,
-            .returning_deinitialized_view,
-            .returning_arena_allocation,
-            .invalidated_element_pointer,
-            .defer_uses_reassigned_binding,
-            .allocation_size_overflow,
-            .resource_cleanup_on_error_only,
-            .iterator_invalidated_during_loop,
-            .duplicate_module_import,
-            .returning_released_value,
-            .unsigned_reverse_loop,
-            .missing_errdefer,
-            .aliased_memcpy,
-            .usize_in_packed_struct,
-            .unconditional_busy_loop,
-            .padded_byte_compare,
-            .useless_error_return,
-            .deprecated_declaration,
-            .mutated_container_copy,
-            .import_boundary,
-            .discarded_must_use,
-            .copied_io_interface,
-            .directory_iteration_not_enabled,
-            .discarded_read_count,
-            .discarded_realloc_result,
-            .discarded_write_count,
-            .unreported_partial_send,
-            .unchecked_first_element,
-            .unsequenced_state_access,
-            .unchecked_slice_reinterpretation,
-            .undefined_readvec_destination,
-            .local_storage_escape,
-            .incomplete_owned_field_cleanup,
-            .partial_ownership_transfer,
-            .stale_index_map,
-            .lock_order_cycle,
-            .wait_while_holding_lock,
-            .silent_buffer_truncation,
-            .pointer_only_free,
-            .nullable_pointer_length,
-            .discarded_resource,
-            .child_pipe_double_close,
-            .unwaited_child_process,
-            .overflow_before_clamp,
-            .unchecked_range_end,
-            .self_assignment,
-            .identical_comparison_operands,
-            .identical_logical_operands,
-            .identical_conditional_branches,
-            .nan_comparison,
-            .identical_bitwise_operands,
-            .missing_container_deinit,
-            => .correctness,
-            else => .style,
-        };
+        return catalog.entry(rule).tier;
     }
 
     pub fn profile(rule: Rule) ?LintProfile {
-        return switch (rule) {
-            .non_idiomatic_name,
-            .redundant_qualified_name,
-            .underscore_private_name,
-            .non_idiomatic_file_name,
-            .doc_comment_style,
-            => .official,
-            .discarded_error,
-            .redundant_bool_comparison,
-            .redundant_boolean_if,
-            .non_exhaustive_switch_else,
-            .unsorted_imports,
-            .needless_cast,
-            .needless_else_after_terminator,
-            .needless_empty_else,
-            .mixed_bitwise_arithmetic,
-            .unknown_comptime_member,
-            .constant_comptime_condition,
-            .prefer_optional_capture,
-            .prefer_try,
-            .prefer_testing_expect_equal,
-            .mutable_pointer_parameter,
-            .redundant_comptime,
-            .redundant_inline,
-            .needless_defer_block,
-            .non_exhaustive_error_switch,
-            .duplicate_import,
-            .unused_import,
-            .redundant_import_path,
-            .redundant_type_qualification,
-            .prefer_anonymous_initializer,
-            .redundant_optional_unwrap,
-            .prefer_testing_expect_equal_strings,
-            .prefer_testing_expect_equal_slices,
-            .prefer_testing_expect_error,
-            .prefer_testing_expect_approx,
-            .prefer_optional_presence_test,
-            .redundant_error_capture,
-            .needless_switch_else_capture,
-            .prefer_sentinel_termination,
-            .duplicate_c_import,
-            .unreferenced_test_file,
-            .conflicting_build_options,
-            .inclusive_index_bound,
-            .negated_comptime_expression,
-            .unbraced_multiline_if,
-            .prefer_range_for,
-            .prefer_index_of,
-            .prefer_memset,
-            .prefer_memcpy,
-            .prefer_map_contains,
-            .prefer_array_list_last,
-            .prefer_optional_pop,
-            .prefer_string_switch,
-            .prefer_log_over_print,
-            .prefer_buffered_writer,
-            .prefer_arena,
-            .invariant_loop_condition,
-            .redundant_slice_end,
-            .redundant_boolean_negation,
-            .prefer_min_max,
-            .prefer_empty_slice_len,
-            .prefer_index_of_scalar,
-            .prefer_split_scalar,
-            .pointer_to_allocator,
-            .expect_equal_argument_order,
-            .prefer_allocator_dupe,
-            .prefer_append_slice,
-            .prefer_eql_over_order,
-            .prefer_math_pow,
-            .prefer_div_ceil,
-            .prefer_vector_splat,
-            .prefer_vector_load,
-            .prefer_vector_op,
-            .prefer_vector_reduce,
-            .prefer_map_get_or_put,
-            .prefer_starts_with_scalar,
-            .prefer_ends_with_scalar,
-            .prefer_write_byte,
-            .prefer_simd_iota,
-            => .idiomatic,
-            .modernize_managed_container,
-            .modernize_deprecated_io,
-            .modernize_deprecated_stdlib,
-            .modernize_deprecated_builtin,
-            .modernize_removed_syntax,
-            .modernize_build_api,
-            .modernize_bitcast,
-            .modernize_extern_bitcast,
-            .modernize_global_linkage,
-            .modernize_array_list_access,
-            .modernize_container_init,
-            => .modernize,
-            .function_length,
-            .assertion_free_branching,
-            .unbounded_loop,
-            .allocation_after_init,
-            .recursive_call,
-            .quadratic_front_removal,
-            => .disciplined,
-            .vague_type_name,
-            .unsafe_catch_unreachable,
-            .lost_error_context,
-            .unsafe_orelse_unreachable,
-            .error_collapsed_to_absence,
-            .public_declaration_docs,
-            .exposed_private_type,
-            .exposed_private_error_set,
-            .literal_boolean_argument,
-            => .strict,
-            else => null,
-        };
+        return catalog.entry(rule).profile;
     }
 };
 
@@ -444,21 +258,18 @@ pub const Configuration = struct {
 
     pub fn defaults() Configuration {
         var levels: [@typeInfo(Rule).@"enum".field_names.len]Level = undefined;
-        for (std.enums.values(Rule)) |rule| {
-            levels[@backingInt(rule)] = if (rule == .import_boundary or rule == .discarded_must_use or
-                rule == .configuration_divergent_api or rule == .unreachable_public_declaration)
-                .off
-            else switch (rule.tier()) {
-                .semantic => .@"error",
-                .correctness => .warning,
-                .style => .off,
-            };
-        }
+        for (std.enums.values(Rule)) |rule| levels[@backingInt(rule)] = catalog.entry(rule).defaultLevel();
         return .{ .levels = levels };
     }
 
     pub fn level(configuration: Configuration, rule: Rule) Level {
         return configuration.levels[@backingInt(rule)];
+    }
+
+    /// Whether any of `rules` is on; engines use this to skip all their work.
+    pub fn anyEnabled(configuration: Configuration, rules: []const Rule) bool {
+        for (rules) |rule| if (configuration.level(rule) != .off) return true;
+        return false;
     }
 };
 
@@ -483,7 +294,55 @@ pub const Fix = struct {
     edits: []const Edit,
     preferred: bool = false,
     fix_all: bool = false,
+
+    pub const Single = struct {
+        title: []const u8,
+        kind: ActionKind = .quickfix,
+        span: std.zig.Token.Loc,
+        replacement: []const u8,
+        preferred: bool = false,
+        fix_all: bool = false,
+    };
+
+    /// The one-fix, one-edit slice most rules attach to a finding.
+    pub fn single(allocator: std.mem.Allocator, spec: Single) ![]const Fix {
+        const edits = try allocator.alloc(Edit, 1);
+        errdefer allocator.free(edits);
+        edits[0] = .{ .span = spec.span, .replacement = spec.replacement };
+        const fixes = try allocator.alloc(Fix, 1);
+        fixes[0] = .{
+            .title = spec.title,
+            .kind = spec.kind,
+            .edits = edits,
+            .preferred = spec.preferred,
+            .fix_all = spec.fix_all,
+        };
+        return fixes;
+    }
 };
+
+/// Type shape the compiler resolved for a name the source does not declare.
+pub const ResolvedShape = struct {
+    type_name: []const u8,
+    kind: Kind,
+    fields: []const []const u8,
+
+    pub const Kind = enum { enumeration, tagged_union, structure };
+};
+
+/// The names a top-level import alias (or container constant) exposes to the
+/// file that declares it, as resolved from the files it refers to.
+pub const ModuleMembers = struct {
+    receiver: []const u8,
+    members: []const []const u8,
+};
+
+/// The last segment of a compiler-qualified declaration name
+/// (`root.shapes.Point` -> `Point`).
+pub fn declarationBaseName(qualified_name: []const u8) []const u8 {
+    const separator = std.mem.findScalarLast(u8, qualified_name, '.') orelse return qualified_name;
+    return qualified_name[separator + 1 ..];
+}
 
 pub const Finding = struct {
     rule: Rule,
@@ -535,45 +394,4 @@ test "subjective preference rules require explicit opt in" {
         try std.testing.expectEqual(@as(?LintProfile, null), rule.profile());
         try std.testing.expectEqual(Level.off, configuration.level(rule));
     }
-}
-
-test "rule reference documents every rule" {
-    @setEvalBranchQuota(10_000);
-    const reference = @embedFile("RULES.md");
-    try std.testing.expectEqual(
-        @typeInfo(Rule).@"enum".field_names.len,
-        std.mem.count(u8, reference, "\n- [`"),
-    );
-
-    for (std.enums.values(Rule)) |rule| {
-        var heading_bytes: [128]u8 = undefined;
-        const link = try std.mem.print(&heading_bytes, "]({s}.md)", .{rule.code()});
-        if (std.mem.count(u8, reference, link) != 1) {
-            std.debug.print("rule reference needs exactly one '{s}' link\n", .{link});
-            return error.IncompleteRuleReference;
-        }
-    }
-
-    inline for (@typeInfo(Rule).@"enum".field_names) |enum_name| {
-        const document = @embedFile(comptime derivedRuleDocumentPath(enum_name));
-        if (std.mem.find(u8, document, "**Why it matters.**") == null or
-            std.mem.find(u8, document, "**When it matters.**") == null)
-        {
-            std.debug.print("rule document '{s}' needs why and when explanations\n", .{enum_name});
-            return error.IncompleteRuleReference;
-        }
-    }
-}
-
-fn derivedRuleDocumentPath(comptime enum_name: []const u8) []const u8 {
-    const extension = ".md";
-    const path = comptime path: {
-        var path_bytes: [enum_name.len + extension.len]u8 = undefined;
-        for (enum_name, 0..) |byte, index| {
-            path_bytes[index] = if (byte == '_') '-' else byte;
-        }
-        for (extension, 0..) |byte, index| path_bytes[enum_name.len + index] = byte;
-        break :path path_bytes;
-    };
-    return &path;
 }

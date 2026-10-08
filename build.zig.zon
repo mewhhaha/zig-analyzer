@@ -19,6 +19,7 @@
         ".helix",
         "src",
         "tests",
+        "tools",
         "ARCHITECTURE.md",
         "DEVELOPING.md",
         "EXTENDING.md",

@@ -1,6 +1,17 @@
 const std = @import("std");
 
-const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable;
+const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch |err| @panic(@errorName(err));
+
+/// Digest of the files the patched backend is built from besides upstream Zig:
+/// the compiler patch, then the shared protocol source. Backend bootstrap
+/// computes the same value at run time, so editing either file without
+/// rebuilding the backend is detected rather than trusted.
+fn backendSha256(b: *std.Build) []const u8 {
+    var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hasher.update(@embedFile("compiler/zig-0.17.0-analysis.patch"));
+    hasher.update(@embedFile("src/compiler/protocol.zig"));
+    return b.graph.dupeString(&std.fmt.bytesToHex(hasher.finalResult(), .lower));
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,8 +23,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version_string", @import("build.zig.zon").version);
     build_options.addOption([]const u8, "zig_version", "0.17.0");
     build_options.addOption([]const u8, "zig_commit", "7647adab80dd088f4de3610fd245915a912eb6ad");
-    build_options.addOption([]const u8, "compiler_patch_sha256", "8a049ce36246a0854097d1bb4a230922b8ab9ff47a260d62d91c2cf60e2a02ab");
-    build_options.addOption(u16, "compiler_protocol_version", 5);
+    build_options.addOption([]const u8, "backend_sha256", backendSha256(b));
 
     const lsp_module = b.dependency("lsp_kit", .{
         .target = target,
@@ -60,29 +70,50 @@ pub fn build(b: *std.Build) void {
     const backend_step = b.step("backend", "Bootstrap the patched Zig compiler backend");
     backend_step.dependOn(&backend_command.step);
 
-    const module_tests = b.addTest(.{ .root_module = analyzer_module });
-    const run_module_tests = b.addRunArtifact(module_tests);
-    const comptime_fixture_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("fixtures/comptime/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_comptime_fixture_tests = b.addRunArtifact(comptime_fixture_tests);
-    const compiler_patch_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("compiler/protocol_invariant.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
-        }),
-    });
-    const run_compiler_patch_tests = b.addRunArtifact(compiler_patch_tests);
+    const tests = Tests{
+        .b = b,
+        .check = check_step,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zig_analyzer", .module = analyzer_module },
+            .{ .name = "lsp", .module = lsp_module },
+        },
+    };
+
     const test_step = b.step("test", "Run zig-analyzer tests");
-    test_step.dependOn(&run_module_tests.step);
-    test_step.dependOn(&run_comptime_fixture_tests.step);
-    test_step.dependOn(&run_compiler_patch_tests.step);
+    const fixtures_step = b.step("fixtures", "Run the comptime regression fixtures");
+    const examples_step = b.step("examples", "Compile and test the language-server examples");
+    const fuzz_rules_step = b.step("fuzz-rules", "Generate clean programs and mutations to hunt rule false positives and crashes");
+    const backend_test_step = b.step("backend-test", "Run tests against the patched compiler backend");
+
+    // The analyzer's own unit tests, the contract tests and the language-server
+    // exchanges: everything here runs without a patched compiler.
+    const analyzer_tests = b.addTest(.{ .root_module = analyzer_module });
+    check_step.dependOn(&analyzer_tests.step);
+    const analyzer_run = b.addRunArtifact(analyzer_tests);
+    analyzer_run.setCwd(b.path("."));
+    test_step.dependOn(&analyzer_run.step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("compiler/protocol_invariant.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/lsp.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/build_graph.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_examples.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_docs.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_fixes.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/example_diagnostics.zig"), .imports = tests.imports }).step);
+
+    const fixtures = tests.run(.{ .root_source_file = b.path("fixtures/comptime/main.zig") });
+    fixtures_step.dependOn(&fixtures.step);
+    test_step.dependOn(&fixtures.step);
+
+    // examples/examples.zig imports every example, compiler ones included.
+    const examples = tests.run(.{ .root_source_file = b.path("examples/examples.zig") });
+    examples_step.dependOn(&examples.step);
+    test_step.dependOn(&examples.step);
+
+    const fuzz = tests.run(.{ .root_source_file = b.path("tests/rule_fuzz.zig"), .imports = tests.imports });
+    fuzz_rules_step.dependOn(&fuzz.step);
+    test_step.dependOn(&fuzz.step);
 
     const no_argument_command = b.addRunArtifact(executable);
     no_argument_command.expectStdOutEqual(
@@ -98,111 +129,50 @@ pub fn build(b: *std.Build) void {
     );
     test_step.dependOn(&no_argument_command.step);
 
-    const fixtures_step = b.step("fixtures", "Run the comptime regression fixtures");
-    fixtures_step.dependOn(&run_comptime_fixture_tests.step);
+    const rule_docs_module = b.createModule(.{
+        .root_source_file = b.path("tools/rule_docs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zig_analyzer", .module = analyzer_module }},
+    });
+    const rule_docs_executable = b.addExecutable(.{ .name = "rule-docs", .root_module = rule_docs_module });
+    check_step.dependOn(&rule_docs_executable.step);
+    const rule_docs_command = b.addRunArtifact(rule_docs_executable);
+    rule_docs_command.setCwd(b.path("."));
+    b.step("rule-docs", "Regenerate docs/rules from the rule catalog").dependOn(&rule_docs_command.step);
 
-    const language_server_examples_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/examples.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_language_server_examples_tests = b.addRunArtifact(language_server_examples_tests);
-    const examples_step = b.step("examples", "Compile and test the language-server examples");
-    examples_step.dependOn(&run_language_server_examples_tests.step);
-    test_step.dependOn(&run_language_server_examples_tests.step);
-    const pipeline_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/comptime_pipeline.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const conditional_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/conditional_api.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const indirect_lookup_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/indirect_type_lookup.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const parsed_configuration_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/parsed_configuration.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const recursive_wrapper_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/recursive_wrapper.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const reflected_strategy_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/reflected_strategy.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const reified_flags_example_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/compiler/reified_flags.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const compiler_example_tests = [_]*std.Build.Step.Compile{
-        pipeline_example_tests,
-        conditional_example_tests,
-        indirect_lookup_example_tests,
-        parsed_configuration_example_tests,
-        recursive_wrapper_example_tests,
-        reflected_strategy_example_tests,
-        reified_flags_example_tests,
-    };
-    for (compiler_example_tests) |compiler_example_test| {
-        const run_compiler_example_test = b.addRunArtifact(compiler_example_test);
-        examples_step.dependOn(&run_compiler_example_test.step);
-        test_step.dependOn(&run_compiler_example_test.step);
+    // Backend-dependent tests live in their own roots so that `test` never
+    // needs a patched compiler and these never skip: a missing backend is
+    // built by the dependency below or fails the run.
+    const compiler_integration = tests.run(.{ .root_source_file = b.path("tests/compiler_integration.zig"), .imports = tests.imports });
+    const lsp_compiler = tests.run(.{ .root_source_file = b.path("tests/lsp_compiler.zig"), .imports = tests.imports });
+    for ([_]*std.Build.Step.Run{ compiler_integration, lsp_compiler }) |backend_tests| {
+        backend_tests.step.dependOn(&backend_command.step);
+        backend_test_step.dependOn(&backend_tests.step);
     }
-
-    const rule_fuzz_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/rule_fuzz.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zig_analyzer", .module = analyzer_module }},
-        }),
-    });
-    const run_rule_fuzz_tests = b.addRunArtifact(rule_fuzz_tests);
-    test_step.dependOn(&run_rule_fuzz_tests.step);
-    const fuzz_rules_step = b.step("fuzz-rules", "Generate clean programs and mutations to hunt rule false positives and crashes");
-    fuzz_rules_step.dependOn(&run_rule_fuzz_tests.step);
-
-    const compiler_integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/compiler_integration.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "zig_analyzer", .module = analyzer_module }},
-        }),
-    });
-    const run_compiler_integration_tests = b.addRunArtifact(compiler_integration_tests);
-    run_compiler_integration_tests.step.dependOn(&backend_command.step);
-    const backend_module_tests = b.addTest(.{ .root_module = analyzer_module });
-    const run_backend_module_tests = b.addRunArtifact(backend_module_tests);
-    run_backend_module_tests.step.dependOn(&backend_command.step);
-    const backend_test_step = b.step("backend-test", "Run tests against the patched compiler backend");
-    backend_test_step.dependOn(&run_compiler_integration_tests.step);
-    backend_test_step.dependOn(&run_backend_module_tests.step);
 }
+
+/// Test roots share one recipe: each is a module with the shared target and
+/// optimize mode, run from the project root. Every test binary is also a
+/// dependency of the `check` step, which is what the analyzer reads to learn
+/// which compile units exist: a file under test is analyzed through the test
+/// that contains it.
+const Tests = struct {
+    b: *std.Build,
+    check: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    /// The analyzer module as `zig_analyzer` (and its `lsp` dependency), for tests that drive its API.
+    imports: []const std.Build.Module.Import,
+
+    fn run(tests: Tests, options: std.Build.Module.CreateOptions) *std.Build.Step.Run {
+        var module_options = options;
+        module_options.target = tests.target;
+        module_options.optimize = tests.optimize;
+        const compile = tests.b.addTest(.{ .root_module = tests.b.createModule(module_options) });
+        tests.check.dependOn(&compile.step);
+        const command = tests.b.addRunArtifact(compile);
+        command.setCwd(tests.b.path("."));
+        return command;
+    }
+};

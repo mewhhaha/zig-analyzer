@@ -15,3 +15,15 @@ test "translate-c preambles are recognized without treating ordinary bindings as
     ));
     try std.testing.expect(!isTranslateCOutput("pub const __builtin_value = 1;\n"));
 }
+
+test "translate-c output skips file-local diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub const __builtin_bswap16 = @import(\"std\").zig.c_builtins.__builtin_bswap16;\n" ++
+        "pub const __builtin_bswap32 = @import(\"std\").zig.c_builtins.__builtin_bswap32;\n" ++
+        "pub const __builtin_bswap64 = @import(\"std\").zig.c_builtins.__builtin_bswap64;\n" ++
+        "fn generated() void { var value = 1; missing(value); }\n";
+    const found = try @import("pipeline.zig").findings(arena.allocator(), source, @import("types.zig").Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}

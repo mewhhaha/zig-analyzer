@@ -1,8 +1,14 @@
 const std = @import("std");
 
-const syntax_scope = @import("../syntax_scope.zig");
+const syntax_scope = @import("../syntax/scope.zig");
 const owned_call = @import("owned_call.zig");
+const resources = @import("resources.zig");
 const types = @import("types.zig");
+const tokenize = @import("../syntax/tokens.zig").tokenize;
+const tokenText = @import("../syntax/tokens.zig").tokenText;
+const matchingDelimiter = @import("../syntax/tokens.zig").matchingDelimiter;
+const enclosingScopeEnd = @import("../syntax/tokens.zig").enclosingScopeEnd;
+const TokenRange = @import("../syntax/tokens.zig").Range;
 
 pub const Source = struct {
     file_index: usize,
@@ -28,8 +34,6 @@ pub const ContainerMutation = struct {
     field: []const u8,
     method: []const u8,
 };
-
-const TokenRange = struct { start: usize, end: usize };
 
 pub const FunctionSummary = struct {
     file_index: usize,
@@ -197,6 +201,15 @@ pub const Index = struct {
         if (index.acquireContract(callable)) |contract| return .{ .release = callableBaseName(contract.release) };
         const function = index.uniqueFunction(callable) orelse return null;
         return ownedReturnFromFunction(function);
+    }
+
+    /// Whether the call returns memory its caller owns: a summarized owned
+    /// return, or a standard allocation through an allocator-like receiver.
+    pub fn callReturnsOwned(index: Index, source: []const u8, receiver: ?[]const u8, name: []const u8) bool {
+        if (index.ownedReturnCall(source, receiver, name) != null) return true;
+        if (resources.allocationRelease(name) == null or std.mem.eql(u8, name, "realloc")) return false;
+        const owner = receiver orelse return false;
+        return std.ascii.findIgnoreCase(owner, "alloc") != null or std.mem.eql(u8, owner, "gpa");
     }
 
     pub fn ownedReturnCall(
@@ -595,9 +608,9 @@ fn collectFunctions(
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= tokens.len or
             tokens[fn_index + 1].tag != .identifier or tokens[fn_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(tokens, fn_index + 2) orelse continue;
+        const parameters_end = matchingDelimiter(tokens, fn_index + 2) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(tokens, body_start) orelse continue;
+        const body_end = matchingDelimiter(tokens, body_start) orelse continue;
         const parameters = try collectParameterNames(
             allocator,
             source_file.source,
@@ -612,11 +625,11 @@ fn collectFunctions(
         const escapes = try allocator.alloc(bool, parameters.len);
         errdefer allocator.free(escapes);
         @memset(escapes, false);
-        while (function_stack.getLastOrNull()) |candidate| {
+        while (function_stack.last()) |candidate| {
             if (functions.items[candidate].body_end > fn_index) break;
             _ = function_stack.pop();
         }
-        const parent_function = function_stack.getLastOrNull();
+        const parent_function = function_stack.last();
         const function_index = functions.items.len;
         try function_stack.append(allocator, function_index);
         try functions.append(allocator, .{
@@ -660,7 +673,7 @@ fn containerNameContaining(
         if (token.tag != .keyword_const or declaration_index + 4 >= target or
             tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal or
             tokens[declaration_index + 3].tag != .keyword_struct or tokens[declaration_index + 4].tag != .l_brace) continue;
-        const closing = matchingToken(tokens, declaration_index + 4) orelse continue;
+        const closing = matchingDelimiter(tokens, declaration_index + 4) orelse continue;
         if (closing <= target or declaration_index + 4 < selected_opening) continue;
         selected = tokenText(source, tokens[declaration_index + 1]);
         selected_opening = declaration_index + 4;
@@ -792,7 +805,7 @@ fn parameterUseIsCopied(function: FunctionSummary, use_index: usize) bool {
         call_open -= 1;
         switch (function.tokens[call_open].tag) {
             .l_paren => {
-                const call_end = matchingToken(function.tokens, call_open) orelse continue;
+                const call_end = matchingDelimiter(function.tokens, call_open) orelse continue;
                 if (call_end <= use_index) continue;
                 const callable = callableBefore(function.source, function.tokens, call_open) orelse return false;
                 const method = callableBaseName(callable);
@@ -890,7 +903,7 @@ fn parameterUseDefinitelyEscapes(function: FunctionSummary, use_index: usize) bo
     if (use_index + 2 < function.body_end and function.tokens[use_index + 1].tag == .period and
         std.mem.eql(u8, tokenText(function.source, function.tokens[use_index + 2]), "len")) return false;
     if (use_index + 1 < function.body_end and function.tokens[use_index + 1].tag == .l_bracket) {
-        const bracket_end = matchingToken(function.tokens, use_index + 1) orelse return false;
+        const bracket_end = matchingDelimiter(function.tokens, use_index + 1) orelse return false;
         var is_slice = false;
         for (function.tokens[use_index + 2 .. bracket_end]) |token| {
             if (token.tag == .ellipsis2 or token.tag == .ellipsis3) {
@@ -939,7 +952,7 @@ fn directBorrowedReturn(function: FunctionSummary) ?BorrowedReturn {
             const sliced_parameter = return_index + 2 < return_end and
                 function.tokens[return_index + 1].tag == .identifier and
                 function.tokens[return_index + 2].tag == .l_bracket and
-                (matchingToken(function.tokens, return_index + 2) orelse return_end) + 1 == return_end;
+                (matchingDelimiter(function.tokens, return_index + 2) orelse return_end) + 1 == return_end;
             if (direct_parameter or sliced_parameter) {
                 const returned_name = tokenText(function.source, function.tokens[return_index + 1]);
                 for (function.parameter_names, 0..) |parameter_name, parameter| {
@@ -991,7 +1004,7 @@ fn directPartialIoReturn(function: FunctionSummary) PartialIo {
         for (function.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, method_index| {
             if (candidate.tag != .identifier or method_index == 0 or method_index + 1 >= return_end or
                 function.tokens[method_index - 1].tag != .period or function.tokens[method_index + 1].tag != .l_paren) continue;
-            const call_end = matchingToken(function.tokens, method_index + 1) orelse continue;
+            const call_end = matchingDelimiter(function.tokens, method_index + 1) orelse continue;
             if (call_end + 1 != return_end) continue;
             const method = tokenText(function.source, candidate);
             if (partialReadMethod(method)) returned = .read;
@@ -1028,7 +1041,7 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
             const returns_binding = token_index + 2 == statement_end and function.tokens[token_index + 1].tag == .identifier;
             const returns_binding_slice = token_index + 2 < statement_end and
                 function.tokens[token_index + 1].tag == .identifier and function.tokens[token_index + 2].tag == .l_bracket and
-                (matchingToken(function.tokens, token_index + 2) orelse statement_end) + 1 == statement_end;
+                (matchingDelimiter(function.tokens, token_index + 2) orelse statement_end) + 1 == statement_end;
             if (returns_binding or returns_binding_slice) {
                 const binding_name = tokenText(function.source, function.tokens[token_index + 1]);
                 if (directOwnedBinding(function, token_index, binding_name, contracts)) |binding_owned| break :owned binding_owned;
@@ -1037,7 +1050,7 @@ fn directOwnedReturn(function: FunctionSummary, contracts: []const types.Resourc
             while (call_open < statement_end) : (call_open += 1) {
                 if (function.tokens[call_open].tag != .l_paren) continue;
                 const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
-                const call_end = matchingToken(function.tokens, call_open) orelse continue;
+                const call_end = matchingDelimiter(function.tokens, call_open) orelse continue;
                 if (call_end > statement_end) continue;
                 for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
                     break :owned .{ .release = callableBaseName(contract.release) };
@@ -1080,7 +1093,7 @@ fn directOwnedBinding(
         };
         for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, call_open| {
             if (tokenBelongsToNestedFunction(function, call_open) or token.tag != .l_paren) continue;
-            const call_end = matchingToken(function.tokens, call_open) orelse continue;
+            const call_end = matchingDelimiter(function.tokens, call_open) orelse continue;
             if (call_end >= return_index or exactArgumentIndex(
                 function.source,
                 function.tokens,
@@ -1125,7 +1138,7 @@ fn directOwnedBinding(
         while (call_open < declaration_end and function.tokens[call_open].tag != .l_paren) : (call_open += 1) {}
         if (call_open == declaration_end) continue;
         const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
-        const call_end = matchingToken(function.tokens, call_open) orelse continue;
+        const call_end = matchingDelimiter(function.tokens, call_open) orelse continue;
         if (call_end > declaration_end) continue;
         for (contracts) |contract| if (callableMatches(callable, contract.acquire)) {
             return .{ .release = callableBaseName(contract.release) };
@@ -1166,7 +1179,7 @@ fn errdeferReleaseForBinding(
             if (method_index >= 2 and function.tokens[method_index - 1].tag == .period and
                 std.mem.eql(u8, tokenText(function.source, function.tokens[method_index - 2]), binding_name)) return method;
             if (method_index + 1 >= statement_end or function.tokens[method_index + 1].tag != .l_paren) continue;
-            const call_end = matchingToken(function.tokens, method_index + 1) orelse continue;
+            const call_end = matchingDelimiter(function.tokens, method_index + 1) orelse continue;
             for (function.tokens[method_index + 2 .. @min(call_end, statement_end)]) |argument| {
                 if (argument.tag == .identifier and std.mem.eql(u8, tokenText(function.source, argument), binding_name)) return method;
             }
@@ -1235,7 +1248,7 @@ fn localAllocatorProvenance(
             if (function.tokens[init_open].tag != .identifier or
                 !std.mem.eql(u8, tokenText(function.source, function.tokens[init_open]), "init") or
                 init_open + 1 >= declaration_end or function.tokens[init_open + 1].tag != .l_paren) continue;
-            const init_end = matchingToken(function.tokens, init_open + 1) orelse continue;
+            const init_end = matchingDelimiter(function.tokens, init_open + 1) orelse continue;
             if (init_end > declaration_end) continue;
             return parameterProvenanceAtArgument(function, init_open + 2, init_end, 0);
         }
@@ -1251,7 +1264,7 @@ fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
             if (tokenBelongsToNestedFunction(caller.*, call_open)) continue;
             if (token.tag != .l_paren) continue;
             const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
-            const call_end = matchingToken(caller.tokens, call_open) orelse continue;
+            const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
             const method = callableBaseName(callable);
             const method_call = std.mem.findScalar(u8, callable, '.') != null;
             const imported_call = if (std.mem.findScalar(u8, callable, '.')) |separator|
@@ -1287,7 +1300,7 @@ fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
             const possible_returned: ?DirectOwnedReturn = returned: {
                 for (caller.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, call_open| {
                     if (candidate.tag != .l_paren) continue;
-                    const call_end = matchingToken(caller.tokens, call_open) orelse continue;
+                    const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
                     if (call_end + 1 != return_end) continue;
                     const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
                     const owned = index.ownedReturnForCall(caller.source, callable) orelse continue;
@@ -1671,67 +1684,12 @@ fn callableBaseName(callable: []const u8) []const u8 {
     return callable[separator + 1 ..];
 }
 
-fn allocationRelease(method: []const u8) ?[]const u8 {
-    return owned_call.releaseForMethod(method);
-}
-
 fn allocationReleaseForCallable(function: FunctionSummary, callable: []const u8, call_open: usize) ?[]const u8 {
     const method = callableBaseName(callable);
     if (std.mem.eql(u8, method, "print") or std.mem.eql(u8, method, "printSentinel")) {
         if (call_open < 3 or !owned_call.printReceiverIsAllocator(function.source, function.tokens, call_open - 3)) return null;
     }
     return owned_call.releaseForCallable(callable);
-}
-
-fn matchingToken(tokens: []const std.zig.Token, opening: usize) ?usize {
-    const closing_tag: std.zig.Token.Tag = switch (tokens[opening].tag) {
-        .l_paren => .r_paren,
-        .l_brace => .r_brace,
-        .l_bracket => .r_bracket,
-        else => return null,
-    };
-    const opening_tag = tokens[opening].tag;
-    var depth: usize = 0;
-    for (tokens[opening..], opening..) |token, index| {
-        if (token.tag == opening_tag) depth += 1;
-        if (token.tag != closing_tag) continue;
-        depth -= 1;
-        if (depth == 0) return index;
-    }
-    return null;
-}
-
-fn enclosingScopeEnd(tokens: []const std.zig.Token, index: usize) ?usize {
-    var depth: usize = 0;
-    var cursor = index;
-    const opening = while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => depth += 1,
-            .l_brace => {
-                if (depth == 0) break cursor;
-                depth -= 1;
-            },
-            else => {},
-        }
-    } else return null;
-    return matchingToken(tokens, opening);
-}
-
-fn tokenText(source: []const u8, token: std.zig.Token) []const u8 {
-    return source[token.loc.start..token.loc.end];
-}
-
-fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]const std.zig.Token {
-    var tokens: std.ArrayList(std.zig.Token) = .empty;
-    errdefer tokens.deinit(allocator);
-    var tokenizer = std.zig.Tokenizer.init(source);
-    while (true) {
-        const token = tokenizer.next();
-        try tokens.append(allocator, token);
-        if (token.tag == .eof) break;
-    }
-    return try tokens.toOwnedSlice(allocator);
 }
 
 test "summary build releases partial state after allocation failure" {
