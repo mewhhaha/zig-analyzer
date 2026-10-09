@@ -40,13 +40,15 @@ pub fn run(context: RuleRun) !void {
             context.source[context.tokens[argument_comma + 1].loc.start..context.tokens[eql_end - 1].loc.end],
             " \t\r\n",
         );
+        // expectEqualStrings takes (expected, actual): a literal is the expectation.
+        const swap = isStringLiteral(actual) and !isStringLiteral(expected);
         const fixes = try context.singleFix(.{
             .title = "Use expectEqualStrings",
             .kind = .refactor_rewrite,
             .span = .{ .start = context.tokens[expression_start].loc.start, .end = context.tokens[expect_end].loc.end },
             .replacement = try context.allocator.print(
                 "{s}expectEqualStrings({s}, {s})",
-                .{ qualification, expected, actual },
+                .{ qualification, if (swap) actual else expected, if (swap) expected else actual },
             ),
             .preferred = true,
             .fix_all = true,
@@ -62,6 +64,10 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+fn isStringLiteral(text: []const u8) bool {
+    return text.len >= 2 and text[0] == '"' and text[text.len - 1] == '"' and std.mem.findScalar(u8, text[1 .. text.len - 1], '"') == null;
 }
 
 fn calleeIsTestingQualified(context: RuleRun, expect_index: usize) bool {
@@ -106,4 +112,16 @@ test "non-byte equality assertions do not use string expectations" {
     const configuration = support.only(&.{.prefer_testing_expect_equal_strings}, .information);
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "a literal on the right becomes the expectation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "try std.testing.expect(std.mem.eql(u8, actual, \"ready\"));";
+    const configuration = support.only(&.{.prefer_testing_expect_equal_strings}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqualStrings(
+        "std.testing.expectEqualStrings(\"ready\", actual)",
+        findings[0].fixes[0].edits[0].replacement,
+    );
 }

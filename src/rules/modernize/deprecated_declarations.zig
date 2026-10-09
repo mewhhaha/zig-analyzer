@@ -9,6 +9,8 @@ pub const Source = struct {
     path: []const u8,
     source: [:0]const u8,
     tokens: ?[]const std.zig.Token = null,
+    /// Scope index of `source` and `tokens` when the caller already has one.
+    scopes: ?*const syntax_scope.Index = null,
     owned_source: bool = false,
 };
 
@@ -23,7 +25,9 @@ pub const Loader = struct {
 const File = struct {
     source: Source,
     tokens: []const std.zig.Token,
-    scopes: syntax_scope.Index,
+    scopes: *const syntax_scope.Index,
+    /// Set when this file built its own scope index.
+    owned_scopes: ?syntax_scope.Index,
     owned_tokens: bool,
 };
 
@@ -42,6 +46,7 @@ pub const Target = struct {
     allocator: std.mem.Allocator,
     source: [:0]const u8,
     tokens: []const std.zig.Token,
+    scopes: ?*const syntax_scope.Index = null,
     configuration: types.Configuration,
     findings: *std.ArrayList(types.Finding),
 
@@ -71,7 +76,7 @@ pub const Index = struct {
         var files = index.files.iterator();
         while (files.next()) |entry| {
             const file = entry.value_ptr.*;
-            file.scopes.deinit();
+            if (file.owned_scopes) |*owned| owned.deinit();
             if (file.owned_tokens) index.allocator.free(file.tokens);
             if (file.source.owned_source) index.allocator.free(file.source.source);
             index.allocator.destroy(file);
@@ -101,7 +106,7 @@ pub const Index = struct {
 
     pub fn run(index: *Index, context: Target, path: []const u8, imported_only: bool) !void {
         if (context.level(.deprecated_declaration) == .off) return;
-        const file = try index.addFile(.{ .path = path, .source = context.source, .tokens = context.tokens });
+        const file = try index.addFile(.{ .path = path, .source = context.source, .tokens = context.tokens, .scopes = context.scopes });
         index.root = file;
         index.used_files.clearRetainingCapacity();
         for (file.tokens, 0..) |token, start| {
@@ -135,11 +140,21 @@ pub const Index = struct {
         errdefer index.allocator.free(key);
         const tokens = source.tokens orelse try tokenize(index.allocator, source.source);
         errdefer if (source.tokens == null) index.allocator.free(tokens);
-        var scopes = try syntax_scope.Index.init(index.allocator, source.source, tokens);
-        errdefer scopes.deinit();
+        var owned_scopes: ?syntax_scope.Index = if (source.scopes == null)
+            try syntax_scope.Index.init(index.allocator, source.source, tokens)
+        else
+            null;
+        errdefer if (owned_scopes) |*owned| owned.deinit();
         const file = try index.allocator.create(File);
         errdefer index.allocator.destroy(file);
-        file.* = .{ .source = source, .tokens = tokens, .scopes = scopes, .owned_tokens = source.tokens == null };
+        file.* = .{
+            .source = source,
+            .tokens = tokens,
+            .scopes = undefined,
+            .owned_scopes = owned_scopes,
+            .owned_tokens = source.tokens == null,
+        };
+        file.scopes = source.scopes orelse &file.owned_scopes.?;
         file.source.path = key;
         try index.files.put(index.allocator, key, file);
         return file;
@@ -323,6 +338,7 @@ pub fn runLocal(context: RuleRun) !void {
         .allocator = context.allocator,
         .source = context.source,
         .tokens = context.tokens,
+        .scopes = context.scopes,
         .configuration = context.configuration,
         .findings = context.findings,
     }, "", false);

@@ -38,7 +38,7 @@ shared domain types          rules/types.zig, rules/context.zig,
 | --- | --- |
 | `syntax/` | Reads source text only: no files, processes or protocol. Open documents, tokens, scopes, type sites, summaries, cursor queries, annotations and byte edits. |
 | `compiler/` | Everything about the patched Zig compiler as a process: wire protocol, client, session, bootstrap, compile-unit discovery, `zig fmt`. |
-| `project/` | Workspace-level facts shared by the CLI and the server: configuration, other files' declarations (`module_sites`, `describe`), imported deprecations, `check`. |
+| `project/` | Workspace-level facts shared by the CLI and the server: configuration, other files' declarations (`module_sites`, `describe`), imported deprecations, `check` (whose cross-file passes in `cross_file` cache per-file results with the hashes of the files they read), `source_store` (parsed dependencies shared by the server's lint runs). |
 | `lsp/` | Speaks LSP: the `Server`, the compiler worker, diagnostics publishing, and one module per feature family. Nothing outside `lsp/` and `actions/lsp_adapter.zig` imports `lsp`. |
 | `rules/`, `actions/` | Lint engines and rewrites; they emit findings and byte edits. |
 | top level | Entry points (`main.zig`, `zig_analyzer.zig`), the `analysis.zig` facade, and leaf utilities (`uri.zig`, `filesystem.zig`). |
@@ -99,6 +99,12 @@ help, code lens, call hierarchy, formatting). Those modules order strategies and
 convert answers to LSP positions and shapes; what a name resolves to, what a
 declaration looks like and which tokens carry hints are decided inward, in
 `project/module_sites.zig`, `project/describe.zig` and `syntax/`.
+
+Formatting has two profiles. `zig` passes the document to the pinned
+`zig fmt --stdin`. `analyzer` gathers the edits safe fix-all proves, adds
+mixed-operator parentheses and optional import organization, applies the
+non-overlapping byte-span edits in memory, and then invokes `zig fmt`. The LSP
+returns one whole-document edit either way, so clients need no special support.
 
 Rename resolves member names by compiler identity. `syntax/symbol_query.zig`
 reads one document and states each occurrence as a `Query` (enclosing named
@@ -234,9 +240,8 @@ Before merging a structural change:
 - keep the facade and registry APIs stable unless the domain model genuinely
   changed;
 - add a boundary test when data changes representation;
-- run `zig fmt --check`, `zig build check`, and `zig build test`; and
-- run fixtures, examples, backend tests, and an editor exchange when the
-  affected boundary reaches them.
+- run the verification list in [DEVELOPING.md](DEVELOPING.md#verify) (`zig build ci`); and
+- exercise an editor exchange when the affected boundary reaches one.
 
 See [EXTENDING.md](EXTENDING.md) for fork-oriented recipes and
 `src/rules/README.md` and `src/actions/README.md` for the contracts within each

@@ -64,6 +64,8 @@ pub const ProjectRun = struct {
     findings: *std.ArrayList(Finding),
     /// Syntax per file, built on first use by `syntax`.
     syntaxes: []?context.Syntax,
+    /// Lets per-file passes run on several threads; null runs them in order.
+    io: ?std.Io = null,
 
     pub fn level(run: ProjectRun, rule: types.Rule) types.Level {
         return run.configuration.level(rule);
@@ -158,6 +160,51 @@ fn cloneEdits(allocator: std.mem.Allocator, edits: []const types.Edit) ![]const 
         .replacement = try allocator.dupe(u8, source.replacement),
     };
     return copies;
+}
+
+/// Workers a parallel pass uses at most.
+const max_workers = 8;
+
+/// Runs `body(context, index)` for every index below `count`. With `run.io`
+/// the indices are shared by a few threads, so `body` may only touch state of
+/// its own index (and read-only state); the first error stops the pass.
+pub fn forEachIndex(
+    run: ProjectRun,
+    count: usize,
+    payload: anytype,
+    comptime body: fn (@TypeOf(payload), usize) anyerror!void,
+) !void {
+    const io = run.io orelse {
+        for (0..count) |index| try body(payload, index);
+        return;
+    };
+    const Pass = struct {
+        payload: @TypeOf(payload),
+        next: std.atomic.Value(usize) = .init(0),
+        failure: ?anyerror = null,
+        mutex: std.Io.Mutex = .init,
+
+        fn work(pass: *@This(), pass_io: std.Io, total: usize) void {
+            while (true) {
+                const index = pass.next.fetchAdd(1, .monotonic);
+                if (index >= total) return;
+                body(pass.payload, index) catch |err| {
+                    pass.mutex.lockUncancelable(pass_io);
+                    defer pass.mutex.unlock(pass_io);
+                    if (pass.failure == null) pass.failure = err;
+                    pass.next.store(total, .monotonic);
+                    return;
+                };
+            }
+        }
+    };
+    var pass: Pass = .{ .payload = payload };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (1..@max(1, @min(max_workers, count / 4))) |_| group.concurrent(io, Pass.work, .{ &pass, io, count }) catch break;
+    pass.work(io, count);
+    try group.await(io);
+    if (pass.failure) |failure| return failure;
 }
 
 /// Releases findings `ProjectRun` copied to `allocator`.

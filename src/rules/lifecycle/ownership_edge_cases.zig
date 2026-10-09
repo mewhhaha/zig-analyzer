@@ -1,6 +1,7 @@
 const std = @import("std");
 const statementStart = @import("../../syntax/tokens.zig").statementStart;
 const RuleRun = @import("../context.zig").RuleRun;
+const container_types = @import("../container_types.zig");
 const resources = @import("../resources.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -63,7 +64,7 @@ fn loopContaining(context: RuleRun, target: usize) ?LoopRange {
     return selected;
 }
 
-fn typeHasCleanupMethod(context: RuleRun, type_name: []const u8) bool {
+pub fn typeHasCleanupMethod(context: RuleRun, type_name: []const u8) bool {
     const container = typeContainer(context, type_name) orelse return false;
     for (context.tokens[container.start + 1 .. container.end], container.start + 1..) |token, function_index| {
         if (token.tag == .keyword_fn and function_index + 1 < container.end and
@@ -285,7 +286,7 @@ fn localArrayListStoresSlices(context: RuleRun, binding: []const u8, start: usiz
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declaration_end > end) continue;
         for (context.tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |_, array_list_index| {
-            if (!context.tokenIs(array_list_index, "ArrayList") or array_list_index + 5 >= declaration_end or
+            if (container_types.kindOfToken(context.source, context.tokens, array_list_index) != .list or array_list_index + 5 >= declaration_end or
                 context.tokens[array_list_index + 1].tag != .l_paren or
                 context.tokens[array_list_index + 2].tag != .l_bracket or
                 context.tokens[array_list_index + 3].tag != .r_bracket or
@@ -519,8 +520,8 @@ fn arrayListElementType(context: RuleRun, removal_index: usize, field_name: []co
         if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or field_index + 6 >= container_end or
             context.enclosingOpeningBrace(field_index) != container_start or
             context.tokens[field_index + 1].tag != .colon) continue;
-        for (context.tokens[field_index + 2 .. @min(field_index + 12, container_end)], field_index + 2..) |candidate, index| {
-            if (candidate.tag == .identifier and context.tokenIs(index, "ArrayList") and index + 2 < container_end and
+        for (context.tokens[field_index + 2 .. @min(field_index + 12, container_end)], field_index + 2..) |_, index| {
+            if (container_types.kindOfToken(context.source, context.tokens, index) == .list and index + 2 < container_end and
                 context.tokens[index + 1].tag == .l_paren and context.tokens[index + 2].tag == .identifier)
             {
                 return context.tokenText(index + 2);

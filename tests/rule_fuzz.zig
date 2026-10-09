@@ -1,7 +1,12 @@
 const std = @import("std");
 const analysis = @import("zig_analyzer").analysis;
+const project_rules = @import("zig_analyzer").project_rules;
+const compile_batch = @import("fuzz/compile_batch.zig");
+const round_trip = @import("fuzz/round_trip.zig");
 
 const generated_program_count = 600;
+const profile_program_count = 150;
+const fix_program_count = 100;
 const metamorphic_stride = 5;
 const mutation_seed_count = 48;
 const mutations_per_seed = 16;
@@ -147,9 +152,8 @@ fn emitBoundedSum(builder: *ProgramBuilder) !void {
     try builder.append(
         \\fn {s}(values: []const u32) u64 {{
         \\    var total: u64 = 0;
-        \\    var index: usize = 0;
-        \\    while (index < values.len) : (index += 1) {{
-        \\        total += values[index];
+        \\    for (values) |value| {{
+        \\        total += value;
         \\    }}
         \\    return total;
         \\}}
@@ -193,8 +197,7 @@ fn emitListAppend(builder: *ProgramBuilder) !void {
         \\fn {s}(allocator: std.mem.Allocator, count: usize) !usize {{
         \\    var entries: std.ArrayList(u32) = .empty;
         \\    defer entries.deinit(allocator);
-        \\    var round: usize = 0;
-        \\    while (round < count) : (round += 1) {{
+        \\    for (0..count) |round| {{
         \\        try entries.append(allocator, @intCast(round));
         \\    }}
         \\    return entries.items.len;
@@ -228,6 +231,102 @@ fn emitEarlyReturn(builder: *ProgramBuilder) !void {
     , .{function});
 }
 
+/// The shapes `zig fmt` produces for long headers: a trailing comma puts every
+/// parameter, capture source and argument on its own line.
+fn emitMultilineHeaders(builder: *ProgramBuilder) !void {
+    const sum = try builder.functionName();
+    defer builder.allocator.free(sum);
+    const call = try builder.functionName();
+    defer builder.allocator.free(call);
+    const keys = try builder.localName();
+    defer builder.allocator.free(keys);
+    try builder.append(
+        \\fn {s}(
+        \\    {s}: []const u32,
+        \\    weights: []const u32,
+        \\) u64 {{
+        \\    var total: u64 = 0;
+        \\    for (
+        \\        {s},
+        \\        weights,
+        \\    ) |key, weight| {{
+        \\        total += key * weight;
+        \\    }}
+        \\    return total;
+        \\}}
+        \\fn {s}(first: []const u32) u64 {{
+        \\    return {s}(
+        \\        first,
+        \\        first,
+        \\    );
+        \\}}
+        \\
+    , .{ sum, keys, keys, call, sum });
+}
+
+fn emitLabeledBlock(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(count: u8) u8 {{
+        \\    return clamp: {{
+        \\        if (count > {d}) break :clamp {d};
+        \\        break :clamp count;
+        \\    }};
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 3, 9), builder.random.intRangeAtMost(u8, 1, 3) });
+}
+
+fn emitLabeledSwitch(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(start: u8) u8 {{
+        \\    return state: switch (start) {{
+        \\        0 => {d},
+        \\        1 => continue :state 0,
+        \\        else => continue :state 1,
+        \\    }};
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 200) });
+}
+
+fn emitInlineElse(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const Shape{d} = union(enum) {{ circle: u32, square: u32 }};
+        \\fn {s}(shape: Shape{d}) u32 {{
+        \\    return switch (shape) {{
+        \\        inline else => |side| side * side,
+        \\    }};
+        \\}}
+        \\
+    , .{ builder.sequence, function, builder.sequence });
+}
+
+fn emitDeclLiterals(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const Settings{d} = struct {{
+        \\    level: u8 = {d},
+        \\    /// The settings used when a caller names none.
+        \\    pub const standard: Settings{d} = .{{}};
+        \\}};
+        \\fn {s}(allocator: std.mem.Allocator) !usize {{
+        \\    const settings: Settings{d} = .standard;
+        \\    var entries: std.ArrayList(u8) = .empty;
+        \\    defer entries.deinit(allocator);
+        \\    try entries.append(allocator, settings.level);
+        \\    return entries.items.len;
+        \\}}
+        \\
+    , .{ builder.sequence, builder.random.intRangeAtMost(u8, 1, 9), builder.sequence, function, builder.sequence });
+}
+
 const templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitReleasedBuffer,
     emitOwnershipReturn,
@@ -239,18 +338,155 @@ const templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitListAppend,
     emitPureCompute,
     emitEarlyReturn,
+    emitMultilineHeaders,
+    emitLabeledBlock,
+    emitLabeledSwitch,
+    emitInlineElse,
+    emitDeclLiterals,
+};
+
+/// Programs that break idioms, so the fix gates see more than clean code
+/// produces under the stricter rules. Each one compiles as written.
+fn emitDirtyCounter(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(count: usize) usize {{
+        \\    var total: usize = 0;
+        \\    var index: usize = 0;
+        \\    while (index < count) : (index += 1) {{
+        \\        total += {d};
+        \\    }}
+        \\    return total;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+fn emitDirtyLastElement(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(list: *std.ArrayList(u8)) u8 {{
+        \\    const before = list.items[list.items.len - 1];
+        \\    list.items[list.items.len - 1] = '/';
+        \\    list.items[list.items.len - 1] += {d};
+        \\    return before;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+fn emitDirtyBitMix(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(value: u32, mask: u32) u32 {{
+        \\    const mixed = value ^ value >> {d};
+        \\    const folded = value & mask == mask;
+        \\    return if (folded) mixed else value | value << {d};
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 31), builder.random.intRangeAtMost(u8, 1, 31) });
+}
+
+fn emitDirtyAppendLoops(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(gpa: std.mem.Allocator, items: []const u32) !std.ArrayList(u32) {{
+        \\    var list: std.ArrayList(u32) = .empty;
+        \\    errdefer list.deinit(gpa);
+        \\    for (items) |item| {{
+        \\        try list.append(gpa, item);
+        \\    }}
+        \\    for (0..{d}) |number| {{
+        \\        try list.append(gpa, @intCast(number));
+        \\    }}
+        \\    return list;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 2, 20) });
+}
+
+fn emitDirtyCopies(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(dst: []u8, src: []const u8) void {{
+        \\    for (dst, src) |*d, s| d.* = s;
+        \\    var local: [4]u8 = undefined;
+        \\    const fixed = [_]u8{{ 1, 2, 3, {d} }};
+        \\    for (0..local.len) |j| {{
+        \\        local[j] = fixed[j];
+        \\    }}
+        \\    dst[0] = local[0];
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+fn emitDirtySliceMutation(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(src: []const u8) u8 {{
+        \\    var padded: [{d}]u8 = undefined;
+        \\    @memset(padded[0..], 0);
+        \\    @memcpy(padded[0..src.len], src);
+        \\    return padded[0];
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 64, 128) });
+}
+
+fn emitDirtyTesting(builder: *ProgramBuilder) !void {
+    try builder.append(
+        \\test "generated {d}" {{
+        \\    const actual: []const u8 = "ready";
+        \\    try std.testing.expect(std.mem.eql(u8, actual, "ready"));
+        \\    try std.testing.expect(std.mem.eql(u8, "ready", actual));
+        \\}}
+        \\
+    , .{builder.sequence});
+    builder.sequence += 1;
+}
+
+const dirty_templates = [_]*const fn (*ProgramBuilder) anyerror!void{
+    emitDirtyCounter,
+    emitDirtyLastElement,
+    emitDirtyBitMix,
+    emitDirtyAppendLoops,
+    emitDirtyCopies,
+    emitDirtySliceMutation,
+    emitDirtyTesting,
 };
 
 fn generateCleanProgram(allocator: std.mem.Allocator, seed: u64) ![:0]const u8 {
+    return generateProgram(allocator, seed, &templates);
+}
+
+/// Clean templates plus the idiom-breaking ones, for the fix gates.
+fn generateDirtyProgram(allocator: std.mem.Allocator, seed: u64) ![:0]const u8 {
+    return generateProgram(allocator, seed, &(templates ++ dirty_templates));
+}
+
+fn generateProgram(
+    allocator: std.mem.Allocator,
+    seed: u64,
+    available: []const *const fn (*ProgramBuilder) anyerror!void,
+) ![:0]const u8 {
     var prng = std.Random.DefaultPrng.init(seed);
     var builder = ProgramBuilder.init(allocator, prng.random());
-    try builder.append("const std = @import(\"std\");\n", .{});
     const function_count = builder.random.intRangeAtMost(usize, 3, 8);
     for (0..function_count) |_| {
-        const template = templates[builder.random.uintLessThan(usize, templates.len)];
+        const template = available[builder.random.uintLessThan(usize, available.len)];
         try template(&builder);
     }
-    return builder.text.toOwnedSliceSentinel(allocator, 0);
+    // The import is only clean when something uses it.
+    const body = builder.text.items;
+    const header = if (std.mem.find(u8, body, "std.") != null) "const std = @import(\"std\");\n" else "";
+    return allocator.printSentinel("{s}{s}", .{ header, body }, 0);
 }
 
 fn reportFindings(source: []const u8, label: []const u8, found: []const analysis.Finding) void {
@@ -348,6 +584,207 @@ test "generated clean programs raise no default findings" {
             reportFindings(source, "generated", found);
             return error.FalsePositiveOnCleanProgram;
         }
+    }
+}
+
+const profile_names = [_][]const u8{ "official", "idiomatic", "strict", "modernize", "disciplined" };
+
+fn profileConfiguration(allocator: std.mem.Allocator, profile: []const u8) !analysis.Configuration {
+    const text = try allocator.print("{{\"lints\":{{\"profile\":\"{s}\"}}}}", .{profile});
+    const configuration = try analysis.parseConfiguration(allocator, text);
+    if (configuration.warning) |warning| {
+        std.debug.print("profile {s}: {s}\n", .{ profile, warning });
+        return error.InvalidProfile;
+    }
+    return configuration;
+}
+
+test "generated clean programs raise no findings under any lint profile" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var configuration_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer configuration_arena.deinit();
+    var configurations: [profile_names.len]analysis.Configuration = undefined;
+    const defaults = analysis.Configuration.defaults();
+    for (profile_names, &configurations) |name, *configuration| {
+        configuration.* = try profileConfiguration(configuration_arena.allocator(), name);
+        // A profile that enabled nothing would make the check vacuous.
+        try std.testing.expect(!std.mem.eql(analysis.Level, &configuration.levels, &defaults.levels));
+    }
+    var reported: std.EnumSet(analysis.Rule) = .empty;
+    var seed: u64 = 0;
+    while (seed < profile_program_count) : (seed += 1) {
+        defer _ = arena.reset(.retain_capacity);
+        const source = try generateCleanProgram(allocator, seed);
+        try std.testing.expect(try round_trip.isFormatted(allocator, source));
+        for (profile_names, configurations) |name, configuration| {
+            const found = try analysis.findings(allocator, source, configuration);
+            for (found) |finding| {
+                if (reported.contains(finding.rule)) continue;
+                reported.insert(finding.rule);
+                std.debug.print("false positive on clean-by-construction code: seed {d} under the {s} profile\n", .{ seed, name });
+                reportFindings(source, "generated", &.{finding});
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), reported.count());
+}
+
+test "fixes of every rule on generated programs parse, lower and compile" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var corpus: compile_batch.Corpus = .init(std.testing.allocator);
+    defer corpus.deinit();
+    var verdict: round_trip.Verdict = .{ .corpus = &corpus };
+    const everything = everythingOnConfiguration();
+    var seed: u64 = 0;
+    while (seed < fix_program_count) : (seed += 1) {
+        defer _ = arena_state.reset(.retain_capacity);
+        const source = try generateDirtyProgram(arena, seed);
+        const label = try arena.print("seed {d}", .{seed});
+        try round_trip.checkEveryReportingRule(arena, &verdict, label, source, everything);
+        try round_trip.checkCombined(arena, &verdict, label, source, everything);
+    }
+    try std.testing.expectEqual(@as(usize, 0), verdict.failures);
+    try std.testing.expectEqual(@as(usize, 0), verdict.unformatted);
+    // The idiom-breaking templates must reach the rules they are written for.
+    for ([_]analysis.Rule{
+        .prefer_range_for,
+        .prefer_array_list_last,
+        .prefer_append_slice,
+        .prefer_memcpy,
+        .prefer_testing_expect_equal_strings,
+        .unused_private_declaration,
+    }) |rule| {
+        if (verdict.fixed_rules.contains(rule)) continue;
+        std.debug.print("no generated program had a fix for {s}\n", .{rule.code()});
+        return error.RuleNeverReached;
+    }
+    const outcome = try compile_batch.check(std.testing.allocator, std.testing.io, &corpus);
+    std.debug.print("fuzz fix gate: {d} programs ({d} already erroneous, {d} skipped), {d} fix results, {d} rules fixed\n", .{
+        outcome.programs, outcome.erroneous, outcome.skipped, outcome.variants, verdict.fixed_rules.count(),
+    });
+    try std.testing.expectEqual(@as(usize, 0), outcome.failures);
+}
+
+const project_count = 40;
+
+/// A small clean project: `main.zig` and two to four modules whose public
+/// functions are documented and referenced from `main.zig`, each module built
+/// from the clean templates.
+fn generateProject(allocator: std.mem.Allocator, seed: u64) ![]const project_rules.SourceFile {
+    var prng = std.Random.DefaultPrng.init(seed ^ 0x70726f6a);
+    const random = prng.random();
+    const module_count = random.intRangeAtMost(usize, 2, 4);
+    const files = try allocator.alloc(project_rules.SourceFile, module_count + 1);
+    var main_imports: std.ArrayList(u8) = .empty;
+    var main_uses: std.ArrayList(u8) = .empty;
+    for (files[1..], 0..) |*file, module_index| {
+        const module = try allocator.print("part{d}", .{module_index});
+        const body = try generateProgram(allocator, seed * 8 + module_index, &templates);
+        // Public, documented functions the main file references.
+        var publicized: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "fn ")) {
+                const name_end = std.mem.findScalar(u8, line, '(').?;
+                const name = line["fn ".len..name_end];
+                try publicized.print(allocator, "/// Generated function {s}.\npub {s}\n", .{ name, line });
+                try main_uses.print(allocator, "    _ = {s}.{s};\n", .{ module, name });
+            } else if (std.mem.startsWith(u8, line, "const ") and !std.mem.startsWith(u8, line, "const std ")) {
+                // Types the public functions mention must be nameable too.
+                try publicized.print(allocator, "/// Generated type.\npub {s}\n", .{line});
+            } else {
+                try publicized.print(allocator, "{s}\n", .{line});
+            }
+        }
+        const path = try allocator.print("{s}.zig", .{module});
+        const source = try allocator.dupeSentinel(u8, std.mem.trimEnd(u8, publicized.items, "\n"), 0);
+        file.* = .{ .path = path, .source = source };
+        try main_imports.print(allocator, "const {s} = @import(\"{s}.zig\");\n", .{ module, module });
+    }
+    files[0] = .{
+        .path = "main.zig",
+        .source = try allocator.printSentinel(
+            "{s}\n/// Touches every module.\npub fn main() void {{\n{s}}}\n",
+            .{ main_imports.items, main_uses.items },
+            0,
+        ),
+    };
+    return files;
+}
+
+test "generated clean projects raise no findings through the project pipeline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var configuration_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer configuration_arena.deinit();
+    var configurations: [profile_names.len + 1]analysis.Configuration = undefined;
+    configurations[0] = analysis.Configuration.defaults();
+    for (profile_names, configurations[1..]) |name, *configuration| {
+        configuration.* = try profileConfiguration(configuration_arena.allocator(), name);
+    }
+    var reported: std.EnumSet(analysis.Rule) = .empty;
+    var seed: u64 = 0;
+    while (seed < project_count) : (seed += 1) {
+        defer _ = arena.reset(.retain_capacity);
+        const files = try generateProject(allocator, seed);
+        for (configurations) |configuration| {
+            for (files) |file| {
+                try std.testing.expect(try round_trip.isFormatted(allocator, file.source));
+                for (try analysis.findings(allocator, file.source, configuration)) |finding| {
+                    try reportProjectFalsePositive(&reported, seed, file.path, file.source, finding);
+                }
+            }
+            for (try project_rules.findings(allocator, files, configuration)) |entry| {
+                const file = files[entry.file_index];
+                try reportProjectFalsePositive(&reported, seed, file.path, file.source, entry.finding);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), reported.count());
+}
+
+fn reportProjectFalsePositive(
+    reported: *std.EnumSet(analysis.Rule),
+    seed: u64,
+    path: []const u8,
+    source: []const u8,
+    finding: analysis.Finding,
+) !void {
+    // The templates allocate in ordinary functions, which the disciplined
+    // profile exists to forbid; every other rule must stay quiet.
+    if (finding.rule == .allocation_after_init) return;
+    if (reported.contains(finding.rule)) return;
+    reported.insert(finding.rule);
+    std.debug.print("false positive on a clean project: seed {d}, {s}\n", .{ seed, path });
+    reportFindings(source, path, &.{finding});
+}
+
+test "a seeded project defect is still reported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var files = try allocator.dupe(project_rules.SourceFile, try generateProject(allocator, 0));
+    files[0].source = "const part0 = @import(\"part0.zig\");\n";
+    const found = try project_rules.findings(allocator, files, everythingOnConfiguration());
+    try std.testing.expect(found.len != 0);
+}
+
+test "every rule survives generated projects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const configuration = everythingOnConfiguration();
+    var seed: u64 = 0;
+    while (seed < project_count) : (seed += 1) {
+        defer _ = arena.reset(.retain_capacity);
+        const files = try generateProject(allocator, seed);
+        for (files) |file| _ = try analysis.findings(allocator, file.source, configuration);
+        _ = try project_rules.findings(allocator, files, configuration);
     }
 }
 
@@ -474,7 +911,8 @@ fn mutateBytes(allocator: std.mem.Allocator, source: [:0]const u8, random: std.R
             3 => {
                 const from = random.uintLessThan(usize, bytes.items.len);
                 const length = random.uintLessThan(usize, @min(64, bytes.items.len - from) + 1);
-                try bytes.appendSlice(allocator, bytes.items[from .. from + length]);
+                try bytes.ensureUnusedCapacity(allocator, length);
+                bytes.appendSliceAssumeCapacity(bytes.items[from .. from + length]);
             },
             else => unreachable,
         }

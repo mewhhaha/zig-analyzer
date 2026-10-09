@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const language_reference = "https://ziglang.org/documentation/0.17.0/";
+const language_reference = "https://ziglang.org/documentation/" ++ @import("build_options").zig_version ++ "/";
 
 pub const Description = struct {
     syntax: []const u8,

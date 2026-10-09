@@ -13,10 +13,12 @@ const std = @import("std");
 
 const build_configuration = @import("build_configuration.zig");
 const build_graph = @import("build_graph.zig");
+const zig_environment = @import("zig_environment.zig");
 
 pub const BuildGraph = build_graph.BuildGraph;
 pub const Launch = build_graph.Launch;
 pub const Unit = build_graph.Unit;
+pub const NamedModules = build_graph.NamedModules;
 pub const lower = build_graph.lower;
 
 /// Whether looking a build graph up may run the build script.
@@ -24,6 +26,9 @@ pub const Mode = enum {
     /// Only graphs already discovered; never spawns a process. For request
     /// handlers that must not wait.
     cached,
+    /// Like `.discover`, but a graph restored from `NamedModules` is enough:
+    /// for lookups of named modules only.
+    modules,
     /// Discovers the graph when it is missing or stale.
     discover,
 };
@@ -90,7 +95,8 @@ pub fn buildGraph(io: std.Io, build_root: []const u8, mode: Mode) !?*BuildGraph 
         store.mutex.lockUncancelable(io);
         defer store.mutex.unlock(io);
         if (store.entries.get(build_root)) |entry| {
-            if (mode == .cached or entry.stamp.eql(stamp)) return entry.graph.retain();
+            if (mode == .cached) return entry.graph.retain();
+            if (entry.stamp.eql(stamp) and (mode == .modules or !entry.graph.modules_only)) return entry.graph.retain();
         } else if (mode == .cached) return null;
     }
     // Configuring can take seconds; do it without holding the store.
@@ -106,6 +112,73 @@ pub fn buildGraph(io: std.Io, build_root: []const u8, mode: Mode) !?*BuildGraph 
     }
     entry.value_ptr.* = .{ .graph = discovered, .stamp = stamp };
     return discovered.retain();
+}
+
+/// The named-module table of the graph discovered for `build_root`, for the
+/// check cache to keep. Null when no complete graph is known.
+pub fn exportNamedModules(io: std.Io, arena: std.mem.Allocator, build_root: []const u8) !?NamedModules {
+    const graph = (try buildGraph(io, build_root, .cached)) orelse return null;
+    defer graph.release();
+    return try graph.namedModules(arena);
+}
+
+/// Makes `table` (read back from the check cache) stand for the build in
+/// `build_root` until the build script changes, unless a graph is known.
+pub fn restoreNamedModules(io: std.Io, build_root: []const u8, table: NamedModules) !bool {
+    const stamp = try Stamp.of(io, build_root);
+    const restored = (try build_graph.BuildGraph.restore(std.heap.page_allocator, build_root, table)) orelse return false;
+    errdefer restored.release();
+    store.mutex.lockUncancelable(io);
+    defer store.mutex.unlock(io);
+    const entry = try store.entries.getOrPut(std.heap.page_allocator, build_root);
+    if (entry.found_existing) {
+        restored.release();
+        return true;
+    }
+    entry.key_ptr.* = try std.heap.page_allocator.dupe(u8, build_root);
+    entry.value_ptr.* = .{ .graph = restored, .stamp = stamp };
+    return true;
+}
+
+/// A digest of everything that decides what configuring the build in
+/// `build_root` yields: the build script and the files it imports, the
+/// package manifest, and the host compiler. Equal digests mean the stored
+/// named-module table is still valid.
+pub fn buildDigest(io: std.Io, allocator: std.mem.Allocator, build_root: []const u8) ![std.crypto.hash.Blake3.digest_length]u8 {
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    const zig_exe = zig_environment.executable(io) catch "";
+    hasher.update(zig_exe);
+    if (std.Io.Dir.cwd().statFile(io, zig_exe, .{})) |stat| {
+        hasher.update(std.mem.asBytes(&stat.size));
+        hasher.update(std.mem.asBytes(&stat.mtime.nanoseconds));
+    } else |_| {}
+    var reached: std.StringHashMapUnmanaged(void) = .empty;
+    try build_graph.reachableFiles(io, arena, try std.Io.Dir.path.join(arena, &.{ build_root, "build.zig" }), &reached);
+    try reached.put(arena, try std.Io.Dir.path.join(arena, &.{ build_root, "build.zig.zon" }), {});
+    var path_list: std.ArrayList([]const u8) = .empty;
+    var reached_paths = reached.keyIterator();
+    while (reached_paths.next()) |path| try path_list.append(arena, path.*);
+    const paths = path_list.items;
+    std.mem.sort([]const u8, paths, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    for (paths) |path| {
+        hasher.update(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch {
+            hasher.update("\x00missing");
+            continue;
+        };
+        hasher.update(std.mem.asBytes(&bytes.len));
+        hasher.update(bytes);
+    }
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
 }
 
 /// Drops the cached graph of the build that contains `document_path`, so the

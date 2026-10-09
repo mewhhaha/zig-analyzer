@@ -23,7 +23,13 @@ coordinate offsets starting from zero.
 ## Example
 
 ```zig
+const std = @import("std");
+
 const lanes: @Vector(4, u32) = .{ 0, 1, 2, 3 };
+
+test "lanes" {
+    try std.testing.expectEqual(@as(u32, 3), lanes[3]);
+}
 ```
 
 [Rule index](README.md)

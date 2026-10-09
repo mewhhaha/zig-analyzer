@@ -5,7 +5,6 @@ const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
-const insideFunctionOrTestBody = @import("../../syntax/tokens.zig").insideFunctionOrTestBody;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
@@ -125,7 +124,7 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
             (declarationIsNamespace(tokens, index) or declarationIsBareImport(source, tokens, index));
         const is_type = declaration_tag == .keyword_const and
             (structural_type_declarations.contains(index) or
-                (!insideFunctionOrTestBody(tokens, index) and resolvedShapeNamesType(name, context.resolved_shapes)) or
+                (!context.scopes.insideFunctionOrTestBody(index) and resolvedShapeNamesType(name, context.resolved_shapes)) or
                 declarationNamesType(source, tokens, index, &type_declaring_names));
         const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index);
         if (declaration_tag == .keyword_const and !is_namespace and !is_type and

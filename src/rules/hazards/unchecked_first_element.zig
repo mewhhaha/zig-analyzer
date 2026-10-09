@@ -13,13 +13,15 @@ pub fn run(context: RuleRun) !void {
     const level = context.level(.unchecked_first_element);
     if (level == .off) return;
 
+    var bodies: FunctionBodies = .{};
+    defer bodies.deinit(context.allocator);
     for (context.tokens, 0..) |token, use_index| {
         if (token.tag != .identifier or use_index + 3 >= context.tokens.len or
             (use_index > 0 and context.tokens[use_index - 1].tag == .period) or
             context.tokens[use_index + 1].tag != .l_bracket or
             context.tokens[use_index + 2].tag != .number_literal or !context.tokenIs(use_index + 2, "0") or
             context.tokens[use_index + 3].tag != .r_bracket) continue;
-        const declaration_index = plainSliceDeclaration(context, context.tokenText(use_index), use_index) orelse continue;
+        const declaration_index = try plainSliceDeclaration(context, &bodies, context.tokenText(use_index), use_index) orelse continue;
         if (!isPublicFunctionParameter(context, declaration_index)) continue;
         if (bindingShadowed(context, context.tokenText(use_index), declaration_index + 1, use_index)) continue;
         if (hasNonEmptyProof(context, context.tokenText(use_index), declaration_index, use_index)) continue;
@@ -55,30 +57,60 @@ fn isPublicFunctionParameter(context: RuleRun, declaration_index: usize) bool {
     return false;
 }
 
-fn plainSliceDeclaration(context: RuleRun, name: []const u8, use_index: usize) ?usize {
-    var selected: ?usize = null;
-    var selected_body_start: usize = 0;
-    for (context.tokens[0..use_index], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= use_index or
-            context.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
-        var body_start = parameters_end + 1;
-        while (body_start < use_index and context.tokens[body_start].tag != .l_brace and
-            context.tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start >= use_index or context.tokens[body_start].tag != .l_brace or body_start < selected_body_start) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (body_end < use_index) continue;
-        for (context.tokens[function_index + 3 .. parameters_end], function_index + 3..) |parameter, index| {
-            if (parameter.tag != .identifier or !context.tokenIs(index, name) or
-                index + 3 >= parameters_end or context.tokens[index + 1].tag != .colon or
-                context.tokens[index + 2].tag != .l_bracket) continue;
-            if (context.tokens[index + 3].tag != .r_bracket) continue;
-            selected = index;
-            selected_body_start = body_start;
+/// The functions of the file by the brace opening their body, built the first
+/// time a lookup needs them.
+const FunctionBodies = struct {
+    by_opening: std.AutoHashMapUnmanaged(usize, std.ArrayList(Function)) = .empty,
+    built: bool = false,
+
+    const Function = struct { declaration: usize, parameters_end: usize };
+
+    fn deinit(bodies: *FunctionBodies, allocator: std.mem.Allocator) void {
+        var lists = bodies.by_opening.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        bodies.by_opening.deinit(allocator);
+    }
+
+    fn build(bodies: *FunctionBodies, context: RuleRun) !void {
+        bodies.built = true;
+        for (context.tokens, 0..) |token, function_index| {
+            if (token.tag != .keyword_fn or function_index + 2 >= context.tokens.len or
+                context.tokens[function_index + 2].tag != .l_paren) continue;
+            const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
+            var body_start = parameters_end + 1;
+            while (body_start < context.tokens.len and context.tokens[body_start].tag != .l_brace and
+                context.tokens[body_start].tag != .semicolon) : (body_start += 1)
+            {}
+            if (body_start >= context.tokens.len or context.tokens[body_start].tag != .l_brace) continue;
+            const entry = try bodies.by_opening.getOrPut(context.allocator, body_start);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(context.allocator, .{ .declaration = function_index, .parameters_end = parameters_end });
         }
     }
-    return selected;
+};
+
+/// The parameter `name: []T` of the innermost function whose body holds `use_index`.
+fn plainSliceDeclaration(context: RuleRun, bodies: *FunctionBodies, name: []const u8, use_index: usize) !?usize {
+    if (!bodies.built) try bodies.build(context);
+    var opening = context.enclosingOpeningBrace(use_index);
+    while (opening) |brace| : (opening = context.enclosingOpeningBrace(brace)) {
+        const functions = bodies.by_opening.get(brace) orelse continue;
+        var position = functions.items.len;
+        while (position > 0) {
+            position -= 1;
+            const function = functions.items[position];
+            var selected: ?usize = null;
+            for (context.tokens[function.declaration + 3 .. function.parameters_end], function.declaration + 3..) |parameter, index| {
+                if (parameter.tag != .identifier or !context.tokenIs(index, name) or
+                    index + 3 >= function.parameters_end or context.tokens[index + 1].tag != .colon or
+                    context.tokens[index + 2].tag != .l_bracket) continue;
+                if (context.tokens[index + 3].tag != .r_bracket) continue;
+                selected = index;
+            }
+            if (selected != null) return selected;
+        }
+    }
+    return null;
 }
 
 fn bindingShadowed(context: RuleRun, name: []const u8, start: usize, end: usize) bool {

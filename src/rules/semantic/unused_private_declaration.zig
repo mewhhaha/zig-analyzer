@@ -8,7 +8,6 @@ const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
 const attachedCommentStart = @import("../../syntax/tokens.zig").attachedCommentStart;
-const insideFunctionOrTestBody = @import("../../syntax/tokens.zig").insideFunctionOrTestBody;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
@@ -42,7 +41,7 @@ fn findUnusedPrivateDeclarations(context: RuleRun) !void {
             const keyword_index: usize = declaration.ast.mut_token;
             if (keyword_index >= tokens.len or tokens[keyword_index].tag != .keyword_const or
                 keyword_index + 1 >= tokens.len or tokens[keyword_index + 1].tag != .identifier or
-                !declarationIsPrivate(tokens, keyword_index) or insideFunctionOrTestBody(tokens, keyword_index)) continue;
+                !declarationIsPrivate(tokens, keyword_index) or context.scopes.insideFunctionOrTestBody(keyword_index)) continue;
             const statement_end = statementEnd(tokens, keyword_index) orelse continue;
             var equal_index = keyword_index + 2;
             while (equal_index < statement_end and tokens[equal_index].tag != .equal) : (equal_index += 1) {}
@@ -76,7 +75,7 @@ fn findUnusedPrivateDeclarations(context: RuleRun) !void {
         if (std.mem.eql(u8, name, "_") or std.mem.startsWith(u8, name, "@\"") or
             isImplicitDeclarationName(name) or (occurrence_counts.get(name) orelse 0) != 1 or
             reflected_names.names.contains(name)) continue;
-        const fixes = try unusedDeclarationFixes(context.allocator, source, tokens, declaration);
+        const fixes = try unusedDeclarationFixes(context.allocator, source, tokens, context.tree, declaration);
         const message = try context.allocator.print(
             "private {s} '{s}' is never referenced",
             .{ @tagName(declaration.kind), name },
@@ -96,6 +95,7 @@ fn unusedDeclarationFixes(
     allocator: std.mem.Allocator,
     source: []const u8,
     tokens: []const std.zig.Token,
+    tree: *const std.zig.Ast,
     declaration: PrivateDeclaration,
 ) ![]const Fix {
     const keyword_index = declaration.name_index - 1;
@@ -108,14 +108,7 @@ fn unusedDeclarationFixes(
     }
     const last_index: ?usize = switch (declaration.kind) {
         .constant => statementEnd(tokens, keyword_index),
-        .function => end: {
-            if (declaration.name_index + 1 >= tokens.len or tokens[declaration.name_index + 1].tag != .l_paren) break :end null;
-            const parameters_end = matchingToken(tokens, declaration.name_index + 1, .l_paren, .r_paren) orelse break :end null;
-            var body_open = parameters_end + 1;
-            while (body_open < tokens.len and tokens[body_open].tag != .l_brace and tokens[body_open].tag != .semicolon) : (body_open += 1) {}
-            if (body_open >= tokens.len or tokens[body_open].tag != .l_brace) break :end null;
-            break :end matchingToken(tokens, body_open, .l_brace, .r_brace);
-        },
+        .function => functionEnd(tree, declaration.name_index),
     };
     const end_index = last_index orelse return &.{};
     const line_start = lineStart(source, tokens[declaration_start].loc.start);
@@ -127,6 +120,19 @@ fn unusedDeclarationFixes(
         .replacement = "",
     });
     return fixes;
+}
+
+/// The last token of the function whose name token is `name_index`; a body
+/// cannot be found by scanning for `{`, since the return type may hold one
+/// (`error{Empty}!usize`).
+fn functionEnd(tree: *const std.zig.Ast, name_index: usize) ?usize {
+    for (0..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        const prototype, const body = tree.nodeData(node).node_and_node;
+        if (tree.nodeMainToken(prototype) + 1 == name_index) return tree.lastToken(body);
+    }
+    return null;
 }
 
 fn declarationIsPrivate(tokens: []const std.zig.Token, keyword_index: usize) bool {
@@ -254,4 +260,19 @@ test "unused private declarations offer whole declaration removal" {
         } else return error.TestUnexpectedResult;
     };
     try std.testing.expectEqual(@as(usize, 3), declaration_count);
+}
+
+test "removing an unused function keeps a braced return type with it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn orphan(message: []const u8) error{Empty}!usize {\n" ++
+        "    if (message.len == 0) return error.Empty;\n" ++
+        "    return message.len;\n" ++
+        "}\n" ++
+        "pub fn run() void {}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unused_private_declaration}, .warning));
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    const span = found[0].fixes[0].edits[0].span;
+    try std.testing.expectEqualStrings(source[0 .. source.len - "pub fn run() void {}\n".len], source[span.start..span.end]);
 }

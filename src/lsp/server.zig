@@ -21,6 +21,7 @@ const presentation = @import("presentation.zig");
 const project_config = @import("../project/config.zig");
 const rename = @import("rename.zig");
 const services_module = @import("services.zig");
+const source_store = @import("../project/source_store.zig");
 const uri_module = @import("../uri.zig");
 
 const Document = document_module.Document;
@@ -62,6 +63,8 @@ pub const Server = struct {
     publisher: diagnostics.Publisher,
     /// Deprecation findings' file dependencies per open document.
     dependencies: diagnostics.Dependencies,
+    /// Dependencies of open documents, parsed once for every lint run.
+    sources: source_store.Store,
     /// The compiler worker: queued, never waited on by requests.
     backend: compiler_backend.CompilerBackend,
     shutdown_requested: bool = false,
@@ -91,6 +94,7 @@ pub const Server = struct {
             .project_config = .init(io, allocator),
             .publisher = .init(io, allocator, transport),
             .dependencies = .init(allocator),
+            .sources = .init(allocator),
             .backend = undefined,
         };
         errdefer server.deinit();
@@ -101,13 +105,14 @@ pub const Server = struct {
         server.backend.deinit();
         server.publisher.deinit();
         server.dependencies.deinit();
+        server.sources.deinit();
         server.project_config.deinit();
         server.documents.deinit();
         server.* = undefined;
     }
 
     pub fn linter(server: *Server) diagnostics.Linter {
-        return .{ .io = server.io, .transport = server.transport, .configurations = &server.project_config };
+        return .{ .io = server.io, .transport = server.transport, .configurations = &server.project_config, .sources = &server.sources };
     }
     /// What feature requests read; see `services.zig`.
     pub fn services(server: *Server) Services {

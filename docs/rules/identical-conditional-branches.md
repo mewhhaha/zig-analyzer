@@ -23,11 +23,11 @@ comment explaining the purpose.
 ## Example
 
 ```zig
-fn pick(flag: bool) u32 {
-    if (flag) {
-        return 1;
+fn pick(values: []const u32) u32 {
+    if (values.len > 4) {
+        return values[0];
     } else {
-        return 1;
+        return values[0];
     }
 }
 ```

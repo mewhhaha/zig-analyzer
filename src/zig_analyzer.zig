@@ -46,6 +46,7 @@ pub const project = struct {
     pub const describe = @import("project/describe.zig");
     pub const imported_deprecations = @import("project/imported_deprecations.zig");
     pub const module_sites = @import("project/module_sites.zig");
+    pub const source_store = @import("project/source_store.zig");
 };
 
 /// The language server transport; the only layer that speaks LSP.
@@ -100,6 +101,7 @@ test {
     _ = project.describe;
     _ = project.imported_deprecations;
     _ = project.module_sites;
+    _ = project.source_store;
     _ = lsp.code_actions;
     _ = lsp.compiler_backend;
     _ = lsp.completion;

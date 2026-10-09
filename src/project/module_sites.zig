@@ -12,6 +12,7 @@ const document_module = @import("../syntax/document.zig");
 const tokens_util = @import("../syntax/tokens.zig");
 const syntax_types = @import("../syntax/types.zig");
 const uri_module = @import("../uri.zig");
+const source_store = @import("source_store.zig");
 
 const Document = document_module.Document;
 const TokenRange = syntax_types.TokenRange;
@@ -66,14 +67,57 @@ const max_source_bytes = 16 * 1024 * 1024;
 pub const Cache = struct {
     arena: std.heap.ArenaAllocator,
     files: std.StringHashMapUnmanaged(?File) = .empty,
+    /// Files whose contents the caller already holds, by path; they are used
+    /// instead of reading the disk.
+    known: ?*const std.StringHashMapUnmanaged(File) = null,
+    /// Parsed files shared between lookups; used instead of reading the disk
+    /// when set. The cache holds what it took until `deinit`.
+    store: ?*source_store.Store = null,
+    held: std.ArrayList(*source_store.Parsed) = .empty,
+    /// Records the paths looked up and the build roots consulted, so a caller
+    /// can tell what a result depends on (see `forgetTouched`).
+    tracing: bool = false,
+    touched_files: std.StringHashMapUnmanaged(void) = .empty,
+    touched_roots: std.StringHashMapUnmanaged(void) = .empty,
+    directory_roots: std.StringHashMapUnmanaged(?[]const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Cache {
         return .{ .arena = .init(allocator) };
     }
 
     pub fn deinit(cache: *Cache) void {
+        for (cache.held.items) |file| file.release();
+        cache.held.deinit(cache.arena.child_allocator);
         cache.arena.deinit();
         cache.* = undefined;
+    }
+
+    /// Starts a new tracing window: what was touched so far is forgotten.
+    pub fn forgetTouched(cache: *Cache) void {
+        cache.touched_files.clearRetainingCapacity();
+        cache.touched_roots.clearRetainingCapacity();
+    }
+
+    fn touchFile(cache: *Cache, path: []const u8) !void {
+        if (!cache.tracing or cache.touched_files.contains(path)) return;
+        const stable = try cache.arena.allocator().dupe(u8, path);
+        try cache.touched_files.put(cache.arena.allocator(), stable, {});
+    }
+
+    /// Notes the build root that decides what named modules `file_path` sees.
+    fn touchBuildRoot(cache: *Cache, io: std.Io, file_path: []const u8) !void {
+        if (!cache.tracing) return;
+        const arena = cache.arena.allocator();
+        const directory = std.Io.Dir.path.dirname(file_path) orelse return;
+        const known = try cache.directory_roots.getOrPut(arena, directory);
+        if (!known.found_existing) {
+            known.key_ptr.* = try arena.dupe(u8, directory);
+            known.value_ptr.* = null;
+            const absolute = try compile_units.absolutePath(io, arena, file_path);
+            known.value_ptr.* = try compile_units.nearestBuildRoot(io, arena, absolute);
+        }
+        const root = known.value_ptr.* orelse return;
+        try cache.touched_roots.put(arena, root, {});
     }
 };
 
@@ -81,7 +125,7 @@ pub const Resolver = struct {
     io: std.Io,
     cache: ?*Cache = null,
     /// Whether resolving a named module may configure the project's build
-    /// (run its build script) when no build graph was discovered yet. The CLI
+    /// (run its build script) when no build graph or stored module table was discovered yet. The CLI
     /// does; the language server leaves discovery to its compiler worker so a
     /// request never waits for it.
     discover_build: bool = false,
@@ -90,9 +134,17 @@ pub const Resolver = struct {
     /// cached resolver live as long as the cache; others belong to `allocator`.
     pub fn readFile(resolver: Resolver, allocator: std.mem.Allocator, path: []const u8) !?File {
         const cache = resolver.cache orelse return try resolver.load(allocator, path);
+        try cache.touchFile(path);
         if (cache.files.get(path)) |known| return known;
         const stable_path = try cache.arena.allocator().dupe(u8, path);
-        const loaded = try resolver.load(cache.arena.allocator(), stable_path);
+        const loaded = if (cache.known) |preloaded|
+            preloaded.get(path) orelse try resolver.load(cache.arena.allocator(), stable_path)
+        else if (cache.store) |store| shared: {
+            const file = try store.acquire(resolver.io, path) orelse break :shared null;
+            errdefer file.release();
+            try cache.held.append(cache.arena.child_allocator, file);
+            break :shared File{ .path = stable_path, .source = file.source, .tokens = file.tokens };
+        } else try resolver.load(cache.arena.allocator(), stable_path);
         try cache.files.put(cache.arena.allocator(), stable_path, loaded);
         return loaded;
     }
@@ -126,12 +178,15 @@ pub const Resolver = struct {
             return try allocator.print("{s}/std/std.zig", .{try zig_environment.libDirectory(resolver.io)});
         }
         if (!std.mem.endsWith(u8, import_string, ".zig")) {
+            // The compiler provides these itself; a build never names them.
+            if (std.mem.eql(u8, import_string, "builtin") or std.mem.eql(u8, import_string, "root")) return null;
+            if (resolver.cache) |cache| try cache.touchBuildRoot(resolver.io, current_path);
             return try compile_units.namedModuleSource(
                 resolver.io,
                 allocator,
                 current_path,
                 import_string,
-                if (resolver.discover_build) .discover else .cached,
+                if (resolver.discover_build) .modules else .cached,
             );
         }
         const directory = std.Io.Dir.path.dirname(current_path) orelse return null;

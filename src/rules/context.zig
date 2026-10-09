@@ -60,19 +60,22 @@ pub const RuleRun = struct {
         opening_tag: std.zig.Token.Tag,
         closing_tag: std.zig.Token.Tag,
     ) ?usize {
-        return tokens_util.matchingToken(context.tokens, opening_index, opening_tag, closing_tag);
+        std.debug.assert(context.tokens[opening_index].tag == opening_tag);
+        const closing = context.scopes.matchingToken(opening_index) orelse return null;
+        std.debug.assert(context.tokens[closing].tag == closing_tag);
+        return closing;
     }
 
     pub fn statementEnd(context: RuleRun, start: usize) ?usize {
-        return tokens_util.statementEnd(context.tokens, start);
+        return context.scopes.statementEnd(start);
     }
 
     pub fn enclosingOpeningBrace(context: RuleRun, index: usize) ?usize {
-        return tokens_util.enclosingOpeningBrace(context.tokens, index);
+        return context.scopes.enclosingOpeningBrace(index);
     }
 
     pub fn enclosingScopeEnd(context: RuleRun, index: usize) ?usize {
-        return tokens_util.enclosingScopeEnd(context.tokens, index);
+        return context.scopes.enclosingScopeEnd(index);
     }
 
     pub fn topLevelComma(context: RuleRun, start: usize, end: usize) ?usize {

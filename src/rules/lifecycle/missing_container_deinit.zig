@@ -2,6 +2,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const container_types = @import("../container_types.zig");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 
@@ -46,7 +47,7 @@ pub fn run(context: RuleRun) !void {
         }
 
         if (!has_mutating_call) continue;
-        if (isArenaAllocator(allocator_name)) continue;
+        if (isArenaAllocator(allocator_name) or allocatorAliasesArena(context, allocator_name, declaration_index)) continue;
 
         // Check if container is deinitialized or transferred
         if (hasDeinitOrTransfer(context, container_name, declaration_end + 1, scope_end)) continue;
@@ -95,33 +96,6 @@ pub fn run(context: RuleRun) !void {
                 ),
         });
     }
-}
-
-fn isContainerTypeName(name: []const u8) bool {
-    const container_types = [_][]const u8{
-        "ArrayList",
-        "ArrayListUnmanaged",
-        "AutoHashMap",
-        "AutoHashMapUnmanaged",
-        "StringHashMap",
-        "StringHashMapUnmanaged",
-        "ArrayHashMap",
-        "ArrayHashMapUnmanaged",
-        "AutoArrayHashMap",
-        "AutoArrayHashMapUnmanaged",
-        "StringArrayHashMap",
-        "StringArrayHashMapUnmanaged",
-        "HashMap",
-        "HashMapUnmanaged",
-        "MultiArrayList",
-        "SegmentedList",
-        "PriorityQueue",
-        "PriorityDequeue",
-    };
-    for (container_types) |candidate| {
-        if (std.mem.eql(u8, name, candidate)) return true;
-    }
-    return false;
 }
 
 fn isMutatingMethod(name: []const u8) bool {
@@ -177,7 +151,25 @@ fn isAllocatingMethod(name: []const u8) bool {
 
 fn isArenaAllocator(allocator_name: ?[]const u8) bool {
     const name = allocator_name orelse return false;
-    return std.ascii.findIgnoreCase(name, "arena") != null;
+    // The build graph's allocator is an arena owned by `std.Build`.
+    return std.ascii.findIgnoreCase(name, "arena") != null or std.mem.eql(u8, name, "b.allocator");
+}
+
+/// `const temporary = arena_state.allocator();` before the container.
+fn allocatorAliasesArena(context: RuleRun, allocator_name: ?[]const u8, before: usize) bool {
+    const name = allocator_name orelse return false;
+    var index = before;
+    while (index > 1) {
+        index -= 1;
+        if (!context.tokenIs(index, name) or context.tokens[index - 1].tag != .keyword_const or
+            index + 5 >= before or context.tokens[index + 1].tag != .equal) continue;
+        const end = context.statementEnd(index) orelse continue;
+        for (context.tokens[index + 2 .. end]) |token| {
+            if (token.tag == .identifier and std.ascii.findIgnoreCase(tokenText(context.source, token), "arena") != null) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn isContainerDeclaration(
@@ -200,10 +192,16 @@ fn isContainerDeclaration(
     // `.empty`, `.{}` and methods such as `insert` also belong to fixed-storage
     // sets and user types. Require a known allocating container before proposing
     // a deinit that might not exist.
+    // A fixed buffer never allocates, so there is nothing to deinit.
     for (tokens[declaration_index + 2 .. declaration_end]) |token| {
-        if (token.tag == .identifier and isContainerTypeName(tokenText(source, token))) return true;
+        if (token.tag == .identifier and tokenIs(source, token, "initBuffer")) return false;
     }
-    return false;
+    // A managed container carries its allocator from `init` and releases with `deinit()`.
+    for (tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |token, index| {
+        if (token.tag == .identifier and (tokenIs(source, token, "Managed") or tokenIs(source, token, "AlignedManaged")) and
+            index > 0 and tokens[index - 1].tag == .period) return false;
+    }
+    return container_types.firstKindIn(source, tokens, declaration_index + 2, declaration_end) != null;
 }
 
 fn hasDeinitOrTransfer(
@@ -465,4 +463,51 @@ test "missing container deinit does not invent ownership for fixed-storage sets"
     ;
     const findings = try support.findings(arena.allocator(), run, source, testConfiguration());
     try std.testing.expectEqual(0, findings.len);
+}
+
+test "annotated unmanaged containers are tracked and managed ones are not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const config = types.Configuration.defaults();
+    const unmanaged = try support.findings(
+        arena.allocator(),
+        run,
+        "fn f(gpa: A) !void { var l: std.ArrayList(u8) = .empty; try l.append(gpa, 1); }",
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 1), unmanaged.len);
+    const managed = try support.findings(
+        arena.allocator(),
+        run,
+        "fn f(gpa: A) !void { var l = try std.array_list.Managed(u8).initCapacity(gpa, 2); l.appendAssumeCapacity(1); try l.appendSlice(&.{ 1, 2 }); }",
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 0), managed.len);
+    const build = try support.findings(
+        arena.allocator(),
+        run,
+        "fn f(b: *std.Build) !void { var m: std.array_hash_map.String(u8) = .empty; try m.put(b.allocator, \"k\", 1); }",
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 0), build.len);
+}
+
+test "fixed buffers and arena aliases need no deinit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const config = types.Configuration.defaults();
+    const buffer = try support.findings(
+        arena.allocator(),
+        run,
+        "fn f() void { var values = [_]u8{1}; var l: std.array_list.Aligned(u8, null) = .initBuffer(&values); l.appendAssumeCapacity(1); }",
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 0), buffer.len);
+    const alias = try support.findings(
+        arena.allocator(),
+        run,
+        "fn f(arena_state: *std.heap.ArenaAllocator) !void { const temporary = arena_state.allocator(); var l: std.ArrayList(u8) = .empty; try l.append(temporary, 1); }",
+        config,
+    );
+    try std.testing.expectEqual(@as(usize, 0), alias.len);
 }

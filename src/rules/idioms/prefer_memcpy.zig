@@ -85,7 +85,7 @@ pub fn run(context: RuleRun) !void {
                                 .title = "Replace the element loop with @memcpy",
                                 .kind = .refactor_rewrite,
                                 .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
-                                .replacement = try context.allocator.print("@memcpy({s}, {s});", .{ dest_arg.?, src_arg.? }),
+                                .replacement = try context.allocator.print("@memcpy({s}{s}, {s}{s});", .{ addressOf(distinct), dest_arg.?, addressOf(distinct), src_arg.? }),
                                 .preferred = distinct,
                                 .fix_all = distinct,
                             });
@@ -137,12 +137,18 @@ pub fn run(context: RuleRun) !void {
             .title = "Replace the element loop with @memcpy",
             .kind = .refactor_rewrite,
             .span = .{ .start = token.loc.start, .end = context.tokens[body_end].loc.end },
-            .replacement = try context.allocator.print("@memcpy({s}, {s});", .{ destination, source }),
+            .replacement = try context.allocator.print("@memcpy(&{s}, &{s});", .{ destination, source }),
             .preferred = true,
             .fix_all = true,
         });
         try context.emit(.{ .rule = .prefer_memcpy, .level = level, .span = token.loc, .message = "this loop only copies corresponding elements from distinct bindings; use @memcpy", .fixes = fixes });
     }
+}
+
+/// `@memcpy` takes slices and pointers, not arrays: the distinct-array case
+/// rewrites loops over local arrays, which need their address.
+fn addressOf(arrays: bool) []const u8 {
+    return if (arrays) "&" else "";
 }
 
 fn bindingsAreDistinctLocalArrays(context: RuleRun, before: usize, left: []const u8, right: []const u8) bool {
@@ -209,6 +215,7 @@ test "distinct local arrays copy with a fix-all rewrite" {
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_memcpy}, .information));
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expect(found[0].fixes[0].fix_all);
+    try std.testing.expectEqualStrings("@memcpy(&dst, &src);", found[0].fixes[0].edits[0].replacement);
 }
 
 test "element copy loops report" {

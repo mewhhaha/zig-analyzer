@@ -23,7 +23,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_var and token.tag != .keyword_const) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
-            !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+            !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         // A 'comptime var' array is interned into the binary; slices of it are
         // valid after the function returns.
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
@@ -32,7 +32,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
         if (enclosingFunctionHasOnlyComptimeParameters(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
-        const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        const function_scope = context.scopes.enclosingFunctionBody(declaration_index) orelse continue;
         if (token.tag == .keyword_const and !constArrayIsStackStorage(context, declaration_index, declaration_end, function_scope)) continue;
         const scope_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const binding_index = declaration_index + 1;
@@ -41,7 +41,7 @@ fn findReturnedLocalSlices(context: RuleRun) !void {
         var return_index = declaration_end + 1;
         while (return_index + 2 < scope_end) : (return_index += 1) {
             if (context.tokens[return_index].tag != .keyword_return or
-                enclosingFunctionScope(context, return_index) != function_scope) continue;
+                context.scopes.enclosingFunctionBody(return_index) != function_scope) continue;
             const return_end = context.statementEnd(return_index) orelse continue;
             const direct_slice = context.tokenIs(return_index + 1, binding_name) and
                 context.tokens[return_index + 2].tag == .l_bracket and
@@ -77,15 +77,15 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 1 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
-            !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+            !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declarationStoresPointer(context, declaration_index, declaration_end)) continue;
-        const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        const function_scope = context.scopes.enclosingFunctionBody(declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
         for (context.tokens[declaration_end + 1 .. function_end], declaration_end + 1..) |candidate, return_index| {
-            if (candidate.tag != .keyword_return or enclosingFunctionScope(context, return_index) != function_scope) continue;
+            if (candidate.tag != .keyword_return or context.scopes.enclosingFunctionBody(return_index) != function_scope) continue;
             const return_end = context.statementEnd(return_index) orelse continue;
             const address_index = returnedAddressOfBinding(context, binding_name, return_index + 1, return_end) orelse continue;
             try context.emit(.{
@@ -107,10 +107,10 @@ fn findGloballyStoredLocalSlices(context: RuleRun) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 1 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
-            !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+            !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
-        const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        const function_scope = context.scopes.enclosingFunctionBody(declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const local_name = context.tokenText(declaration_index + 1);
         var index = declaration_end + 1;
@@ -145,10 +145,10 @@ fn findOutputParameterStoredLocalSlices(context: RuleRun) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 1 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
-            !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+            !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declarationStoresArray(context, declaration_index, declaration_end)) continue;
-        const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        const function_scope = context.scopes.enclosingFunctionBody(declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const local_name = context.tokenText(declaration_index + 1);
         var index = declaration_end + 1;
@@ -186,11 +186,11 @@ fn findRetainedLocalPointers(context: RuleRun) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 1 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
-            !insideFunctionOrTestBody(context.tokens, declaration_index)) continue;
+            !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         if (declaration_index > 0 and context.tokens[declaration_index - 1].tag == .keyword_comptime) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declarationStoresPointer(context, declaration_index, declaration_end)) continue;
-        const function_scope = enclosingFunctionScope(context, declaration_index) orelse continue;
+        const function_scope = context.scopes.enclosingFunctionBody(declaration_index) orelse continue;
         const function_end = context.matchingToken(function_scope, .l_brace, .r_brace) orelse continue;
         const local_name = context.tokenText(declaration_index + 1);
         for (context.tokens[declaration_end + 1 .. function_end], declaration_end + 1..) |candidate, method_index| {
@@ -308,7 +308,7 @@ fn moduleBindingExists(context: RuleRun, name: []const u8) bool {
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 1 >= context.tokens.len or
             !context.tokenIs(declaration_index + 1, name)) continue;
-        if (!insideFunctionOrTestBody(context.tokens, declaration_index)) return true;
+        if (!context.scopes.insideFunctionOrTestBody(declaration_index)) return true;
     }
     return false;
 }
@@ -361,34 +361,6 @@ fn returnedAddressOfBinding(context: RuleRun, binding: []const u8, start: usize,
         if (token.tag == .r_paren) parenthesis_depth -|= 1;
         if (saw_initializer and parenthesis_depth == 0 and token.tag == .ampersand and
             index + 1 < end and context.tokenIs(index + 1, binding)) return index;
-    }
-    return null;
-}
-
-fn enclosingFunctionScope(context: RuleRun, index: usize) ?usize {
-    var cursor = index;
-    var nested: usize = 0;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (context.tokens[cursor].tag) {
-            .r_brace => nested += 1,
-            .l_brace => {
-                if (nested != 0) {
-                    nested -= 1;
-                    continue;
-                }
-                var signature = cursor;
-                while (signature > 0) {
-                    signature -= 1;
-                    switch (context.tokens[signature].tag) {
-                        .keyword_fn, .keyword_test => return cursor,
-                        .semicolon, .l_brace, .r_brace => break,
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
     }
     return null;
 }
@@ -511,35 +483,6 @@ fn arrayLengthToken(tag: std.zig.Token.Tag) bool {
 
 fn containsRange(tokens: []const std.zig.Token, start: usize, end: usize) bool {
     for (tokens[start..end]) |token| if (token.tag == .ellipsis2) return true;
-    return false;
-}
-
-fn insideFunctionOrTestBody(tokens: []const std.zig.Token, declaration_index: usize) bool {
-    var nested_closing_braces: usize = 0;
-    var cursor = declaration_index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => nested_closing_braces += 1,
-            .l_brace => {
-                if (nested_closing_braces != 0) {
-                    nested_closing_braces -= 1;
-                    continue;
-                }
-                var signature_cursor = cursor;
-                while (signature_cursor > 0) {
-                    signature_cursor -= 1;
-                    switch (tokens[signature_cursor].tag) {
-                        .keyword_fn, .keyword_test => return true,
-                        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return false,
-                        .semicolon, .l_brace, .r_brace => break,
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-    }
     return false;
 }
 

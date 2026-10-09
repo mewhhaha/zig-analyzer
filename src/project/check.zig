@@ -7,8 +7,7 @@ const project_rules = @import("../rules/project.zig");
 const text_edits = @import("../syntax/text_edits.zig");
 const check_cache = @import("check_cache.zig");
 const project_config = @import("config.zig");
-const imported_deprecations = @import("imported_deprecations.zig");
-const module_sites = @import("module_sites.zig");
+const cross_file = @import("cross_file.zig");
 const tokenize = @import("../syntax/tokens.zig").tokenize;
 
 const max_source_size = 64 * 1024 * 1024;
@@ -32,6 +31,28 @@ test "CLI imported deprecations refresh when an unscanned dependency changes des
     const second = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &refreshed.writer);
     try std.testing.expectEqual(@as(u8, 0), second);
     try std.testing.expect(std.mem.find(u8, refreshed.written(), "deprecated-declaration") == null);
+}
+
+test "CLI module member findings refresh when an imported file changes despite cache" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "const dependency = @import(\"dependency.zig\");\npub fn run() u8 { return dependency.missing; }\n" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const present: u8 = 1;\n" });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first.deinit();
+    _ = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &first.writer);
+    try std.testing.expect(std.mem.find(u8, first.written(), "unresolved-member") != null);
+    var cached: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer cached.deinit();
+    _ = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &cached.writer);
+    try std.testing.expectEqualStrings(first.written(), cached.written());
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "dependency.zig", .data = "pub const present: u8 = 1;\npub const missing: u8 = 2;\n" });
+    var refreshed: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer refreshed.deinit();
+    _ = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &refreshed.writer);
+    try std.testing.expect(std.mem.find(u8, refreshed.written(), "unresolved-member") == null);
 }
 
 pub const Options = struct {
@@ -304,18 +325,78 @@ fn reportProjectFindings(
             .tokens = loaded_file.tokens,
         });
     }
-    try reportImportedDeprecations(io, allocator, root, files.items, configuration, writer, summary);
-    try reportMissingModuleMembers(io, allocator, root, files.items, configuration, writer, summary);
-    const cache_sources = try allocator.alloc(check_cache.ProjectSource, files.items.len);
-    for (files.items, cache_sources) |file, *cache_source| cache_source.* = .{
+    // The cross-file pass and the project rules read the same files and share
+    // nothing, so they run side by side; their output is joined in that order.
+    var cross: CrossFileTask = .{};
+    defer if (cross.output) |output| allocator.free(output);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    group.concurrent(io, crossFileTask, .{ io, allocator, root, files.items, configuration, cache, &cross }) catch
+        crossFileTask(io, allocator, root, files.items, configuration, cache, &cross);
+    var rules_output: std.Io.Writer.Allocating = .init(allocator);
+    defer rules_output.deinit();
+    var rules_summary: Summary = .{};
+    const rules_failure = reportProjectRules(io, allocator, root, loaded_files, files.items, configuration, cache, &rules_output.writer, &rules_summary);
+    try group.await(io);
+    if (cross.failure) |failure| return failure;
+    try writer.writeAll(cross.output.?);
+    summary.findings += cross.findings;
+    try rules_failure;
+    try writer.writeAll(rules_output.written());
+    summary.findings += rules_summary.findings;
+}
+
+const CrossFileTask = struct {
+    output: ?[]u8 = null,
+    findings: usize = 0,
+    failure: ?anyerror = null,
+};
+
+fn crossFileTask(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    files: []const project_rules.SourceFile,
+    configuration: analysis.Configuration,
+    cache: check_cache.Cache,
+    task: *CrossFileTask,
+) void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    var summary: Summary = .{};
+    reportCrossFileFindings(io, allocator, root, files, configuration, cache, &output.writer, &summary) catch |err| {
+        output.deinit();
+        task.failure = err;
+        return;
+    };
+    task.output = output.toOwnedSlice() catch |err| {
+        output.deinit();
+        task.failure = err;
+        return;
+    };
+    task.findings = summary.findings;
+}
+
+fn reportProjectRules(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    loaded_files: []const LoadedFile,
+    files: []const project_rules.SourceFile,
+    configuration: analysis.Configuration,
+    cache: check_cache.Cache,
+    writer: *std.Io.Writer,
+    summary: *Summary,
+) !void {
+    const cache_sources = try allocator.alloc(check_cache.ProjectSource, files.len);
+    for (files, cache_sources) |file, *cache_source| cache_source.* = .{
         .path = file.path,
         .source = file.source,
     };
-    const source_locators = try allocator.alloc(?SourceLocator, files.items.len);
+    const source_locators = try allocator.alloc(?SourceLocator, files.len);
     @memset(source_locators, null);
     if (!project_rules.needsCompilerFacts(configuration)) if (try cache.loadProject(io, allocator, cache_sources)) |cached| {
         for (cached) |finding| {
-            const file = files.items[finding.file_index];
+            const file = files[finding.file_index];
             if (source_locators[finding.file_index] == null) {
                 source_locators[finding.file_index] = try SourceLocator.init(allocator, file.source);
             }
@@ -335,11 +416,11 @@ fn reportProjectFindings(
         return;
     };
     const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration, writer);
-    const findings = try project_rules.findingsWithCompilerFacts(allocator, files.items, configuration, compiler_facts);
+    const findings = try project_rules.findingsConcurrently(io, allocator, files, configuration, compiler_facts);
     defer project_rules.freeFindings(allocator, findings);
     var records: std.ArrayList(check_cache.ProjectRecord) = .empty;
     defer records.deinit(allocator);
-    const suppressions = try allocator.alloc(?analysis.Suppressions, files.items.len);
+    const suppressions = try allocator.alloc(?analysis.Suppressions, files.len);
     defer {
         for (suppressions) |table| if (table) |present| present.deinit(allocator);
         allocator.free(suppressions);
@@ -347,7 +428,7 @@ fn reportProjectFindings(
     @memset(suppressions, null);
     for (findings) |entry| {
         const finding = entry.finding;
-        const file = files.items[entry.file_index];
+        const file = files[entry.file_index];
         if (suppressions[entry.file_index] == null) {
             suppressions[entry.file_index] = try analysis.Suppressions.init(allocator, file.source);
         }
@@ -379,89 +460,44 @@ fn reportProjectFindings(
     if (!project_rules.needsCompilerFacts(configuration)) try cache.storeProject(io, allocator, cache_sources, records.items);
 }
 
-/// `unresolved_member` findings for names a file reads from its imports. The
-/// members come from the imported files, so this runs beside the other
-/// cross-file checks instead of in the per-file (cached) pass; the language
-/// server reports the same findings through the same rule.
-fn reportMissingModuleMembers(
+/// Reports the cross-file findings (deprecations reached through imports,
+/// then members missing from imported modules), each in file order.
+fn reportCrossFileFindings(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: ScanRoot,
     files: []const project_rules.SourceFile,
     configuration: analysis.Configuration,
+    cache: check_cache.Cache,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
-    if (configuration.level(.unresolved_member) == .off) return;
-    var cache: module_sites.Cache = .init(allocator);
-    defer cache.deinit();
-    const resolver: module_sites.Resolver = .{ .io = io, .cache = &cache, .discover_build = true };
-    for (files) |file| {
-        if (analysis.isTranslateCOutput(file.source)) continue;
-        var scratch: std.heap.ArenaAllocator = .init(allocator);
-        defer scratch.deinit();
-        const arena = scratch.allocator();
-        const absolute_path = try std.Io.Dir.path.resolveAlloc(arena, &.{ root.absolute_path, file.path });
-        const modules = try resolver.fileModules(arena, .{ .path = absolute_path, .source = file.source, .tokens = file.tokens.? });
-        const found = try analysis.moduleMemberFindings(
-            arena,
-            file.source,
-            file.tokens.?,
-            project_config.configurationForPath(configuration, file.path),
-            modules,
-        );
-        if (found.len == 0) continue;
-        const locator = try SourceLocator.init(arena, file.source);
-        const display = try displayPath(arena, root, file.path);
-        for (found) |finding| {
-            const location = locator.location(finding.span.start);
-            try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
-                display, location.line, location.column, @tagName(finding.level), finding.rule.code(), finding.message,
-            });
-            summary.findings += 1;
-        }
-    }
-}
-
-fn reportImportedDeprecations(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    root: ScanRoot,
-    files: []const project_rules.SourceFile,
-    configuration: analysis.Configuration,
-    writer: *std.Io.Writer,
-    summary: *Summary,
-) !void {
-    if (configuration.level(.deprecated_declaration) == .off) return;
-    var imported: imported_deprecations.ImportedDeprecations = undefined;
-    imported.init(io, allocator);
-    defer imported.deinit();
-    const paths = try allocator.alloc([]const u8, files.len);
-    var initialized: usize = 0;
-    defer {
-        for (paths[0..initialized]) |path| allocator.free(path);
-        allocator.free(paths);
-    }
-    for (files, paths) |file, *path| {
-        path.* = try std.Io.Dir.path.resolveAlloc(allocator, &.{ root.absolute_path, file.path });
-        initialized += 1;
-        try imported.addSource(.{ .path = path.*, .source = file.source, .tokens = file.tokens });
-    }
-    for (files, paths) |file, path| {
-        var found: std.ArrayList(analysis.Finding) = .empty;
-        defer found.deinit(allocator);
-        try imported.check(.{ .path = path, .source = file.source, .tokens = file.tokens.? }, configuration, &found);
-        if (found.items.len == 0) continue;
-        const locator = try SourceLocator.init(allocator, file.source);
-        defer allocator.free(locator.line_starts);
-        const display = try displayPath(allocator, root, file.path);
-        defer if (!std.mem.eql(u8, root.display_path, ".")) allocator.free(display);
-        for (found.items) |finding| {
-            const location = locator.location(finding.span.start);
-            try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
-                display, location.line, location.column, @tagName(finding.level), finding.rule.code(), finding.message,
-            });
-            summary.findings += 1;
+    var results = try cross_file.run(.{
+        .io = io,
+        .allocator = std.heap.smp_allocator,
+        .root_path = root.absolute_path,
+        .files = files,
+        .configuration = configuration,
+        .cache = cache,
+    });
+    defer results.deinit();
+    if (results.failure) |failure| return failure;
+    for ([_]enum { imports, members }{ .imports, .members }) |pass| {
+        for (files, results.files) |file, result| {
+            const records = switch (pass) {
+                .imports => result.imports,
+                .members => result.members,
+            };
+            if (records.len == 0) continue;
+            const locator = try SourceLocator.init(allocator, file.source);
+            const display = try displayPath(allocator, root, file.path);
+            for (records) |record| {
+                const location = locator.location(record.start);
+                try writer.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
+                    display, location.line, location.column, @tagName(record.level), record.rule.code(), record.message,
+                });
+                summary.findings += 1;
+            }
         }
     }
 }
@@ -626,6 +662,8 @@ fn collectZigPaths(
     return try paths.toOwnedSlice(allocator);
 }
 
+/// Reads and tokenizes every file, a few at a time. `allocator` must be safe
+/// to use from threads.
 fn loadFiles(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -633,32 +671,68 @@ fn loadFiles(
     relative_paths: []const []const u8,
 ) ![]const LoadedFile {
     const loaded_files = try allocator.alloc(LoadedFile, relative_paths.len);
-    for (relative_paths, loaded_files) |relative_path, *loaded_file| {
-        const source = root.dir.readFileAllocOptions(
-            io,
+    var load: FileLoad = .{ .io = io, .allocator = allocator, .root = root, .relative_paths = relative_paths, .loaded_files = loaded_files };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (1..@max(1, @min(max_load_workers, relative_paths.len / 16))) |_| group.concurrent(io, FileLoad.work, .{&load}) catch break;
+    load.work();
+    try group.await(io);
+    if (load.failure) |failure| return failure;
+    return loaded_files;
+}
+
+const max_load_workers = 8;
+
+const FileLoad = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    relative_paths: []const []const u8,
+    loaded_files: []LoadedFile,
+    next: std.atomic.Value(usize) = .init(0),
+    failure: ?anyerror = null,
+    mutex: std.Io.Mutex = .init,
+
+    fn work(load: *FileLoad) void {
+        while (true) {
+            const index = load.next.fetchAdd(1, .monotonic);
+            if (index >= load.relative_paths.len) return;
+            load.one(index) catch |err| {
+                load.mutex.lockUncancelable(load.io);
+                defer load.mutex.unlock(load.io);
+                if (load.failure == null) load.failure = err;
+                load.next.store(load.relative_paths.len, .monotonic);
+                return;
+            };
+        }
+    }
+
+    fn one(load: *FileLoad, index: usize) !void {
+        const relative_path = load.relative_paths[index];
+        const source = load.root.dir.readFileAllocOptions(
+            load.io,
             relative_path,
-            allocator,
+            load.allocator,
             .limited(max_source_size),
             .of(u8),
             0,
         ) catch |err| {
-            loaded_file.* = .{
+            load.loaded_files[index] = .{
                 .relative_path = relative_path,
                 .source = null,
                 .tokens = &.{},
                 .read_error = err,
             };
-            continue;
+            return;
         };
-        loaded_file.* = .{
+        load.loaded_files[index] = .{
             .relative_path = relative_path,
             .source = source,
-            .tokens = try tokenize(allocator, source),
+            .tokens = try tokenize(load.allocator, source),
             .read_error = null,
         };
     }
-    return loaded_files;
-}
+};
 
 fn pathIsExcluded(path: []const u8, exclusions: []const []const u8) bool {
     for (exclusions) |exclusion| {

@@ -97,12 +97,27 @@ const ImportAlias = struct {
     target_file_index: usize,
 };
 
+const no_function = std.math.maxInt(u32);
+
 const FileSummary = struct {
     file_index: usize,
     source: [:0]const u8,
     function_start: usize,
     function_end: usize,
+    alias_start: usize,
+    alias_end: usize,
     local_bindings: std.StringHashMapUnmanaged(void),
+    /// First function of this file per name; `Index.next_same_name` chains the rest.
+    functions_by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Type named by every `receiver: Type` parameter or field of the file, per
+    /// receiver name; null when the file spells two different types.
+    receiver_types: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+
+    fn deinit(file: *FileSummary, allocator: std.mem.Allocator) void {
+        file.local_bindings.deinit(allocator);
+        file.functions_by_name.deinit(allocator);
+        file.receiver_types.deinit(allocator);
+    }
 };
 
 pub const Index = struct {
@@ -113,6 +128,13 @@ pub const Index = struct {
     import_aliases: []const ImportAlias,
     owned_tokens: []const []const std.zig.Token,
     owned_member_paths: std.ArrayList([]u8) = .empty,
+    /// Next function of the same file with the same name, or `no_function`.
+    next_same_name: []const u32 = &.{},
+    /// The only function of each name across all files, or `no_function`.
+    unique_by_name: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Position in `files` of the file with each source pointer and file index.
+    file_by_source: std.AutoHashMapUnmanaged(usize, u32) = .empty,
+    file_by_index: std.AutoHashMapUnmanaged(usize, u32) = .empty,
 
     pub fn deinit(index: *Index, allocator: std.mem.Allocator) void {
         for (index.functions) |function| {
@@ -122,8 +144,12 @@ pub const Index = struct {
             allocator.free(function.nested_function_ranges);
         }
         allocator.free(index.functions);
-        for (index.files) |*file| file.local_bindings.deinit(allocator);
+        for (index.files) |*file| file.deinit(allocator);
         allocator.free(index.files);
+        allocator.free(index.next_same_name);
+        index.unique_by_name.deinit(allocator);
+        index.file_by_source.deinit(allocator);
+        index.file_by_index.deinit(allocator);
         allocator.free(index.import_aliases);
         for (index.owned_tokens) |tokens| allocator.free(tokens);
         allocator.free(index.owned_tokens);
@@ -344,14 +370,8 @@ pub const Index = struct {
     }
 
     fn uniqueFunction(index: Index, callable: []const u8) ?FunctionSummary {
-        const name = callableBaseName(callable);
-        var selected: ?FunctionSummary = null;
-        for (index.functions) |function| {
-            if (!std.mem.eql(u8, function.name, name)) continue;
-            if (selected != null) return null;
-            selected = function;
-        }
-        return selected;
+        const position = index.unique_by_name.get(callableBaseName(callable)) orelse return null;
+        return if (position == no_function) null else index.functions[position];
     }
 
     fn functionHasReceiver(function: FunctionSummary) bool {
@@ -382,13 +402,8 @@ pub const Index = struct {
 
     fn uniqueFunctionInFile(index: Index, file_index: usize, name: []const u8) ?FunctionSummary {
         const file = index.fileForIndex(file_index) orelse return null;
-        var selected: ?FunctionSummary = null;
-        for (index.functions[file.function_start..file.function_end]) |function| {
-            if (!std.mem.eql(u8, function.name, name)) continue;
-            if (selected != null) return null;
-            selected = function;
-        }
-        return selected;
+        const first = file.functions_by_name.get(name) orelse return null;
+        return if (index.next_same_name[first] == no_function) index.functions[first] else null;
     }
 
     fn functionInContainer(
@@ -399,9 +414,10 @@ pub const Index = struct {
     ) ?FunctionSummary {
         const file = index.fileForIndex(file_index) orelse return null;
         var selected: ?FunctionSummary = null;
-        for (index.functions[file.function_start..file.function_end]) |function| {
-            if (!std.mem.eql(u8, function.name, function_name) or function.container_name == null or
-                !std.mem.eql(u8, function.container_name.?, container_name)) continue;
+        var position = file.functions_by_name.get(function_name) orelse return null;
+        while (position != no_function) : (position = index.next_same_name[position]) {
+            const function = index.functions[position];
+            if (function.container_name == null or !std.mem.eql(u8, function.container_name.?, container_name)) continue;
             if (selected != null) return null;
             selected = function;
         }
@@ -415,27 +431,7 @@ pub const Index = struct {
     ) ?[]const u8 {
         if (receiver.len != 0 and std.ascii.isUpper(receiver[0])) return receiver;
         const file = index.fileForSource(source) orelse return null;
-        if (file.function_start == file.function_end) return null;
-        const tokens = index.functions[file.function_start].tokens;
-        var selected: ?[]const u8 = null;
-        for (tokens, 0..) |token, receiver_index| {
-            if (token.tag != .identifier or !std.mem.eql(u8, tokenText(source, token), receiver) or
-                receiver_index + 2 >= tokens.len or tokens[receiver_index + 1].tag != .colon) continue;
-            var type_name: ?[]const u8 = null;
-            var type_index = receiver_index + 2;
-            while (type_index < tokens.len and tokens[type_index].tag != .comma and
-                tokens[type_index].tag != .r_paren) : (type_index += 1)
-            {
-                if (tokens[type_index].tag == .identifier) type_name = tokenText(source, tokens[type_index]);
-            }
-            const candidate = type_name orelse continue;
-            if (selected) |known| {
-                if (!std.mem.eql(u8, known, candidate)) return null;
-            } else {
-                selected = candidate;
-            }
-        }
-        return selected;
+        return file.receiver_types.get(receiver) orelse null;
     }
 
     fn acquireContract(index: Index, callable: []const u8) ?types.ResourceContract {
@@ -453,10 +449,10 @@ pub const Index = struct {
     }
 
     fn importedFile(index: Index, source: []const u8, alias: []const u8) ?usize {
+        const file = index.fileForSource(source) orelse return null;
         var selected: ?usize = null;
-        for (index.import_aliases) |import_alias| {
-            if (import_alias.source.ptr != source.ptr or import_alias.source.len != source.len or
-                !std.mem.eql(u8, import_alias.name, alias)) continue;
+        for (index.import_aliases[file.alias_start..file.alias_end]) |import_alias| {
+            if (!std.mem.eql(u8, import_alias.name, alias)) continue;
             if (selected != null and selected.? != import_alias.target_file_index) return null;
             selected = import_alias.target_file_index;
         }
@@ -473,15 +469,13 @@ pub const Index = struct {
     }
 
     fn fileForSource(index: Index, source: []const u8) ?FileSummary {
-        for (index.files) |file| {
-            if (file.source.ptr == source.ptr and file.source.len == source.len) return file;
-        }
-        return null;
+        const position = index.file_by_source.get(@intFromPtr(source.ptr)) orelse return null;
+        const file = index.files[position];
+        return if (file.source.len == source.len) file else null;
     }
 
     fn fileForIndex(index: Index, file_index: usize) ?FileSummary {
-        for (index.files) |file| if (file.file_index == file_index) return file;
-        return null;
+        return index.files[index.file_by_index.get(file_index) orelse return null];
     }
 };
 
@@ -502,7 +496,7 @@ pub fn build(
             allocator.free(function.nested_function_ranges);
         }
         functions.deinit(allocator);
-        for (files.items) |*file| file.local_bindings.deinit(allocator);
+        for (files.items) |*file| file.deinit(allocator);
         files.deinit(allocator);
         import_aliases.deinit(allocator);
         for (owned_tokens.items) |tokens| allocator.free(tokens);
@@ -532,12 +526,15 @@ pub fn build(
                 std.mem.eql(u8, tokenText(source_file.source, tokens[token_index + 3]), "@import")) continue;
             try local_bindings.put(allocator, tokenText(source_file.source, tokens[token_index + 1]), {});
         }
+        const alias_start = import_aliases.items.len;
         try collectImportAliases(allocator, source_file, tokens, sources, &import_aliases);
         try files.append(allocator, .{
             .file_index = source_file.file_index,
             .source = source_file.source,
             .function_start = function_start,
             .function_end = functions.items.len,
+            .alias_start = alias_start,
+            .alias_end = import_aliases.items.len,
             .local_bindings = local_bindings,
         });
     }
@@ -555,7 +552,7 @@ pub fn build(
         }
         const owned_files = try files.toOwnedSlice(allocator);
         errdefer {
-            for (owned_files) |*file| file.local_bindings.deinit(allocator);
+            for (owned_files) |*file| file.deinit(allocator);
             allocator.free(owned_files);
         }
         const owned_import_aliases = try import_aliases.toOwnedSlice(allocator);
@@ -575,12 +572,59 @@ pub fn build(
         };
     };
     errdefer index.deinit(allocator);
+    try buildLookups(allocator, &index);
     try markRecursiveFunctions(allocator, index);
     inferDirectEffects(index, configuration);
     for (0..index.functions.len) |_| {
         if (!try propagateCallEffects(allocator, &index)) break;
     }
     return index;
+}
+
+fn buildLookups(allocator: std.mem.Allocator, index: *Index) !void {
+    const next_same_name = try allocator.alloc(u32, index.functions.len);
+    index.next_same_name = next_same_name;
+    @memset(next_same_name, no_function);
+    for (index.functions, 0..) |function, position| {
+        const entry = try index.unique_by_name.getOrPut(allocator, function.name);
+        entry.value_ptr.* = if (entry.found_existing) no_function else @intCast(position);
+    }
+    for (index.files, 0..) |*file, position| {
+        const by_source = try index.file_by_source.getOrPut(allocator, @intFromPtr(file.source.ptr));
+        if (!by_source.found_existing) by_source.value_ptr.* = @intCast(position);
+        const by_index = try index.file_by_index.getOrPut(allocator, file.file_index);
+        if (!by_index.found_existing) by_index.value_ptr.* = @intCast(position);
+        var function_position = file.function_end;
+        while (function_position > file.function_start) {
+            function_position -= 1;
+            const entry = try file.functions_by_name.getOrPut(allocator, index.functions[function_position].name);
+            next_same_name[function_position] = if (entry.found_existing) entry.value_ptr.* else no_function;
+            entry.value_ptr.* = @intCast(function_position);
+        }
+        if (file.function_start != file.function_end) {
+            try collectReceiverTypes(allocator, file, index.functions[file.function_start].tokens);
+        }
+    }
+}
+
+fn collectReceiverTypes(allocator: std.mem.Allocator, file: *FileSummary, tokens: []const std.zig.Token) !void {
+    for (tokens, 0..) |token, receiver_index| {
+        if (token.tag != .identifier or receiver_index + 2 >= tokens.len or tokens[receiver_index + 1].tag != .colon) continue;
+        var type_name: ?[]const u8 = null;
+        var type_index = receiver_index + 2;
+        while (type_index < tokens.len and tokens[type_index].tag != .comma and
+            tokens[type_index].tag != .r_paren) : (type_index += 1)
+        {
+            if (tokens[type_index].tag == .identifier) type_name = tokenText(file.source, tokens[type_index]);
+        }
+        const candidate = type_name orelse continue;
+        const entry = try file.receiver_types.getOrPut(allocator, tokenText(file.source, token));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = candidate;
+        } else if (entry.value_ptr.*) |known| {
+            if (!std.mem.eql(u8, known, candidate)) entry.value_ptr.* = null;
+        }
+    }
 }
 
 fn collectNestedFunctionRanges(allocator: std.mem.Allocator, functions: []FunctionSummary) !void {
@@ -605,6 +649,8 @@ fn collectFunctions(
 ) !void {
     var function_stack: std.ArrayList(usize) = .empty;
     defer function_stack.deinit(allocator);
+    var enclosing_structs: EnclosingStructs = .{};
+    defer enclosing_structs.deinit(allocator);
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= tokens.len or
             tokens[fn_index + 1].tag != .identifier or tokens[fn_index + 2].tag != .l_paren) continue;
@@ -636,7 +682,7 @@ fn collectFunctions(
             .file_index = source_file.file_index,
             .declaration_start = fn_index,
             .name = tokenText(source_file.source, tokens[fn_index + 1]),
-            .container_name = containerNameContaining(source_file.source, tokens, fn_index),
+            .container_name = try enclosing_structs.nameAt(allocator, source_file.source, tokens, fn_index),
             .parameter_names = parameters,
             .parameter_effects = effects,
             .parameter_escapes = escapes,
@@ -662,24 +708,39 @@ fn collectFunctions(
     }
 }
 
-fn containerNameContaining(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    target: usize,
-) ?[]const u8 {
-    var selected: ?[]const u8 = null;
-    var selected_opening: usize = 0;
-    for (tokens[0..target], 0..) |token, declaration_index| {
-        if (token.tag != .keyword_const or declaration_index + 4 >= target or
-            tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal or
-            tokens[declaration_index + 3].tag != .keyword_struct or tokens[declaration_index + 4].tag != .l_brace) continue;
-        const closing = matchingDelimiter(tokens, declaration_index + 4) orelse continue;
-        if (closing <= target or declaration_index + 4 < selected_opening) continue;
-        selected = tokenText(source, tokens[declaration_index + 1]);
-        selected_opening = declaration_index + 4;
+/// The innermost `const Name = struct {` declaration enclosing each function,
+/// found while functions are visited in token order.
+const EnclosingStructs = struct {
+    open: std.ArrayList(Open) = .empty,
+    scanned: usize = 0,
+
+    const Open = struct { name: []const u8, closing: usize };
+
+    fn deinit(enclosing: *EnclosingStructs, allocator: std.mem.Allocator) void {
+        enclosing.open.deinit(allocator);
     }
-    return selected;
-}
+
+    fn nameAt(
+        enclosing: *EnclosingStructs,
+        allocator: std.mem.Allocator,
+        source: []const u8,
+        tokens: []const std.zig.Token,
+        target: usize,
+    ) !?[]const u8 {
+        while (enclosing.scanned + 4 < target) : (enclosing.scanned += 1) {
+            const declaration_index = enclosing.scanned;
+            if (tokens[declaration_index].tag != .keyword_const or
+                tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal or
+                tokens[declaration_index + 3].tag != .keyword_struct or tokens[declaration_index + 4].tag != .l_brace) continue;
+            const closing = matchingDelimiter(tokens, declaration_index + 4) orelse continue;
+            try enclosing.open.append(allocator, .{ .name = tokenText(source, tokens[declaration_index + 1]), .closing = closing });
+        }
+        while (enclosing.open.items.len != 0 and enclosing.open.items[enclosing.open.items.len - 1].closing <= target) {
+            _ = enclosing.open.pop();
+        }
+        return if (enclosing.open.getLastOrNull()) |innermost| innermost.name else null;
+    }
+};
 
 fn collectImportAliases(
     allocator: std.mem.Allocator,
@@ -1989,6 +2050,45 @@ test "local receivers shadow import aliases in ownership summaries" {
     const owned = index.ownedReturnCall(caller, "server", "make").?;
     try std.testing.expectEqualStrings("free", owned.release);
     try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
+test "a receiver spelled with two different types resolves to neither" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const First = struct { fn make(self: *First, allocator: std.mem.Allocator) ![]u8 { _ = self; return allocator.alloc(u8, 4); } };" ++
+        "const Second = struct { fn make(self: *Second, allocator: std.mem.Allocator) ![]u8 { _ = self; return allocator.alloc(u8, 4); } };" ++
+        "fn one(item: *First, allocator: std.mem.Allocator) !void { _ = try item.make(allocator); }" ++
+        "fn two(item: *Second, allocator: std.mem.Allocator) !void { _ = try item.make(allocator); }" ++
+        "fn named(first: *First, allocator: std.mem.Allocator) !void { _ = try first.make(allocator); }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expect(index.ownedReturnCall(source, "item", "make") == null);
+    try std.testing.expect(index.ownedReturnCall(source, "first", "make") != null);
+}
+
+test "lookups by file and function name see only their own file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const helper: [:0]const u8 = "pub fn make(allocator: std.mem.Allocator) ![]u8 { return allocator.alloc(u8, 4); }";
+    const caller: [:0]const u8 =
+        "const helper = @import(\"helper.zig\");" ++
+        "fn make(allocator: std.mem.Allocator) !void { _ = try helper.make(allocator); }" ++
+        "fn make2(allocator: std.mem.Allocator) !void { _ = try helper.make(allocator); }";
+    const sources = [_]Source{
+        .{ .file_index = 7, .path = "src/helper.zig", .source = helper },
+        .{ .file_index = 9, .path = "src/main.zig", .source = caller },
+    };
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(?usize, 7), index.importedFile(caller, "helper"));
+    try std.testing.expectEqual(@as(?usize, null), index.importedFile(helper, "helper"));
+    try std.testing.expect(index.uniqueFunctionInFile(7, "make") != null);
+    try std.testing.expect(index.uniqueFunctionInFile(9, "make") != null);
+    try std.testing.expect(index.uniqueFunctionInFile(9, "missing") == null);
+    try std.testing.expect(index.uniqueFunctionInFile(8, "make") == null);
+    // Two files declare `make`, so the file-agnostic lookup is ambiguous.
+    try std.testing.expect(index.uniqueFunction("make") == null);
+    try std.testing.expect(index.uniqueFunction("make2") != null);
 }
 
 test "parameter effects resolve through local method receivers" {

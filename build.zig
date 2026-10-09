@@ -1,6 +1,20 @@
 const std = @import("std");
 
-const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch |err| @panic(@errorName(err));
+const manifest = @import("build.zig.zon");
+
+const version = std.SemanticVersion.parse(manifest.version) catch |err| @panic(@errorName(err));
+
+/// The Zig release the analyzer and its patched compiler are built for: the
+/// manifest's `minimum_zig_version`, which is exact because the backend is
+/// pinned to it.
+const zig_version = manifest.minimum_zig_version;
+
+/// The upstream commit `zig_version` was tagged at, which the backend checks
+/// out. It changes together with `zig_version`; see compiler/README.md.
+const zig_commit = "7647adab80dd088f4de3610fd245915a912eb6ad";
+
+/// What the patched compiler reports from `zig version`.
+const backend_version = zig_version ++ "+zig-analyzer.1";
 
 /// Digest of the files the patched backend is built from besides upstream Zig:
 /// the compiler patch, then the shared protocol source. Backend bootstrap
@@ -8,7 +22,7 @@ const version = std.SemanticVersion.parse(@import("build.zig.zon").version) catc
 /// rebuilding the backend is detected rather than trusted.
 fn backendSha256(b: *std.Build) []const u8 {
     var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
-    hasher.update(@embedFile("compiler/zig-0.17.0-analysis.patch"));
+    hasher.update(@embedFile("compiler/analysis.patch"));
     hasher.update(@embedFile("src/compiler/protocol.zig"));
     return b.graph.dupeString(&std.fmt.bytesToHex(hasher.finalResult(), .lower));
 }
@@ -20,9 +34,10 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(std.SemanticVersion, "version", version);
-    build_options.addOption([]const u8, "version_string", @import("build.zig.zon").version);
-    build_options.addOption([]const u8, "zig_version", "0.17.0");
-    build_options.addOption([]const u8, "zig_commit", "7647adab80dd088f4de3610fd245915a912eb6ad");
+    build_options.addOption([]const u8, "version_string", manifest.version);
+    build_options.addOption([]const u8, "zig_version", zig_version);
+    build_options.addOption([]const u8, "zig_commit", zig_commit);
+    build_options.addOption([]const u8, "backend_version", backend_version);
     build_options.addOption([]const u8, "backend_sha256", backendSha256(b));
 
     const lsp_module = b.dependency("lsp_kit", .{
@@ -85,6 +100,7 @@ pub fn build(b: *std.Build) void {
     const fixtures_step = b.step("fixtures", "Run the comptime regression fixtures");
     const examples_step = b.step("examples", "Compile and test the language-server examples");
     const fuzz_rules_step = b.step("fuzz-rules", "Generate clean programs and mutations to hunt rule false positives and crashes");
+    const fix_check_step = b.step("fix-check", "Apply every rule's fixes to its catalog example and compile the originals and results together");
     const backend_test_step = b.step("backend-test", "Run tests against the patched compiler backend");
 
     // The analyzer's own unit tests, the contract tests and the language-server
@@ -99,7 +115,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/build_graph.zig"), .imports = tests.imports }).step);
     test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_examples.zig"), .imports = tests.imports }).step);
     test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_docs.zig"), .imports = tests.imports }).step);
-    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_fixes.zig"), .imports = tests.imports }).step);
+    const rule_fixes = tests.run(.{ .root_source_file = b.path("tests/rule_fixes.zig"), .imports = tests.imports });
+    test_step.dependOn(&rule_fixes.step);
+    fix_check_step.dependOn(&rule_fixes.step);
     test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/example_diagnostics.zig"), .imports = tests.imports }).step);
 
     const fixtures = tests.run(.{ .root_source_file = b.path("fixtures/comptime/main.zig") });
@@ -128,6 +146,32 @@ pub fn build(b: *std.Build) void {
         \\
     );
     test_step.dependOn(&no_argument_command.step);
+
+    // The single verification entry point, shared by CI, the release workflow
+    // and contributors: formatting, every test (compiler-backed ones included)
+    // and the analyzer's own lint run over this repository.
+    const ci_step = b.step("ci", "Run every check CI runs: formatting, tests, backend tests and the self-check");
+    const format_check = b.addFmt(.{
+        .paths = &.{
+            b.path("build.zig"),
+            b.path("build.zig.zon"),
+            b.path("compiler"),
+            b.path("examples"),
+            b.path("fixtures"),
+            b.path("src"),
+            b.path("tests"),
+            b.path("tools"),
+        },
+        .check = true,
+    });
+    const self_check = b.addRunArtifact(executable);
+    self_check.addArgs(&.{ "check", "--no-cache", "." });
+    self_check.setCwd(b.path("."));
+    self_check.has_side_effects = true;
+    ci_step.dependOn(&format_check.step);
+    ci_step.dependOn(test_step);
+    ci_step.dependOn(backend_test_step);
+    ci_step.dependOn(&self_check.step);
 
     const rule_docs_module = b.createModule(.{
         .root_source_file = b.path("tools/rule_docs.zig"),

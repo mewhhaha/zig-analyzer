@@ -9,7 +9,6 @@ const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
 const enclosingScopeEnd = @import("../../syntax/tokens.zig").enclosingScopeEnd;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const matchingOpeningToken = @import("../../syntax/tokens.zig").matchingOpeningToken;
-const insideFunctionOrTestBody = @import("../../syntax/tokens.zig").insideFunctionOrTestBody;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const resources = @import("../resources.zig");
@@ -35,7 +34,7 @@ fn findMissingResourceCleanup(context: RuleRun) !void {
     for (tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= tokens.len or
             tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal) continue;
-        if (!insideFunctionOrTestBody(tokens, declaration_index)) continue;
+        if (!context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         const statement_end = statementEnd(tokens, declaration_index) orelse continue;
         var pair: ?resources.Pair = null;
         var resource_acquisition_index: ?usize = null;

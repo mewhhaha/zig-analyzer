@@ -1,6 +1,7 @@
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const support = @import("../test_support.zig");
+const container_types = @import("../container_types.zig");
 
 pub const rules = [_]@import("../types.zig").Rule{
     .returning_deinitialized_view,
@@ -17,9 +18,10 @@ fn findDeinitializedViews(context: RuleRun) !void {
     if (level == .off) return;
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
-            context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
+            context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        if (!containsManagedContainer(context, declaration_index + 3, declaration_end)) continue;
+        const kind = container_types.declaredKind(context.source, context.tokens, declaration_index, declaration_end) orelse continue;
+        if (!kind.hasItems()) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const container_name = context.tokenText(declaration_index + 1);
@@ -31,15 +33,14 @@ fn findDeinitializedViews(context: RuleRun) !void {
             if ((candidate.tag == .keyword_const or candidate.tag == .keyword_var) and index + 6 < scope_end and
                 context.tokens[index + 1].tag == .identifier and context.tokens[index + 2].tag == .equal and
                 context.tokenIs(index + 3, container_name) and context.tokens[index + 4].tag == .period and
-                context.tokenIs(index + 5, "items") and
-                context.tokens[index + 6].tag == .semicolon)
+                context.tokenIs(index + 5, "items") and itemsViewEnd(context, index + 6, scope_end) != null)
             {
                 try borrowed_names.put(context.allocator, context.tokenText(index + 1), {});
             }
             if (candidate.tag != .keyword_return or context.enclosingOpeningBrace(index) != scope_opening or index + 1 >= scope_end) continue;
             const returns_direct_view = context.tokenIs(index + 1, container_name) and index + 4 < scope_end and
                 context.tokens[index + 2].tag == .period and context.tokenIs(index + 3, "items") and
-                context.tokens[index + 4].tag == .semicolon;
+                itemsViewEnd(context, index + 4, scope_end) != null;
             const returns_borrow = borrowed_names.contains(context.tokenText(index + 1)) and
                 index + 2 < scope_end and context.tokens[index + 2].tag == .semicolon;
             if (!returns_direct_view and !returns_borrow) continue;
@@ -55,6 +56,18 @@ fn findDeinitializedViews(context: RuleRun) !void {
             });
         }
     }
+}
+
+/// The `;` ending a borrowed `items` view that starts at `start`: either
+/// directly or after a subslice such as `[0..n]`.
+fn itemsViewEnd(context: RuleRun, start: usize, end: usize) ?usize {
+    if (start >= end) return null;
+    if (context.tokens[start].tag == .semicolon) return start;
+    if (context.tokens[start].tag != .l_bracket) return null;
+    const closing = context.matchingToken(start, .l_bracket, .r_bracket) orelse return null;
+    if (closing + 1 >= end or context.tokens[closing + 1].tag != .semicolon) return null;
+    for (context.tokens[start + 1 .. closing]) |token| if (token.tag == .ellipsis2) return closing + 1;
+    return null;
 }
 
 fn findArenaReturns(context: RuleRun) !void {
@@ -148,12 +161,6 @@ fn returnedAllocationBinding(
         return context.tokenText(index);
     }
     return null;
-}
-
-fn containsManagedContainer(context: RuleRun, start: usize, end: usize) bool {
-    const names = [_][]const u8{ "ArrayList", "ArrayHashMap", "AutoHashMap", "StringHashMap" };
-    for (names) |name| if (containsName(context, start, end, name)) return true;
-    return false;
 }
 
 fn containsName(context: RuleRun, start: usize, end: usize, name: []const u8) bool {
@@ -287,4 +294,21 @@ test "arena allocations embedded in returned aggregates expire with the arena" {
     const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(types.Rule.returning_arena_allocation, findings[0].rule);
+}
+
+fn expectViewReturns(source: [:0]const u8, expected: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const found = try support.findings(arena.allocator(), run, source, @import("../types.zig").Configuration.defaults());
+    try std.testing.expectEqual(expected, found.len);
+}
+
+test "a container declared by type annotation returns a deinitialized view" {
+    try expectViewReturns("fn f(gpa: A) ![]u8 { var l: std.ArrayList(u8) = .empty; defer l.deinit(gpa); return l.items; }", 1);
+    try expectViewReturns("fn f(gpa: A) ![]u8 { var l: std.ArrayList(u8) = try .initCapacity(gpa, 4); defer l.deinit(gpa); return l.items; }", 1);
+    try expectViewReturns("fn f(gpa: A) ![]u8 { var l: std.ArrayList(u8) = .empty; defer l.deinit(gpa); return l.items[0..1]; }", 1);
+}
+
+test "a container returned by owned slice has no deinitialized view" {
+    try expectViewReturns("fn f(gpa: A) ![]u8 { var l: std.ArrayList(u8) = .empty; defer l.deinit(gpa); return try l.toOwnedSlice(gpa); }", 0);
 }

@@ -1,6 +1,7 @@
 //! Draining an `ArrayList` with `orderedRemove(0)` in a loop.
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
+const container_types = @import("../container_types.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const PathRange = @import("../../syntax/tokens.zig").Range;
@@ -129,7 +130,7 @@ fn zeroBelowLength(tag: std.zig.Token.Tag) bool {
 
 fn rangeNamesArrayList(context: RuleRun, start: usize, end: usize) bool {
     for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, "ArrayList")) return true;
+        if (container_types.kindOfToken(context.source, context.tokens, index) == .list) return true;
         if (token.tag == .comma or token.tag == .equal or token.tag == .r_paren or token.tag == .semicolon) return false;
     }
     return false;

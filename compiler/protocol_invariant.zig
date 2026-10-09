@@ -7,7 +7,7 @@ const zig_analyzer = @import("zig_analyzer");
 
 const protocol = zig_analyzer.compiler.protocol;
 const build_options = zig_analyzer.build_options;
-const patch = @embedFile("zig-0.17.0-analysis.patch");
+const patch = @embedFile("analysis.patch");
 
 test "patch imports the shared protocol instead of carrying a copy" {
     try std.testing.expect(std.mem.find(u8, patch, "+++ b/src/AnalysisProtocol.zig") == null);

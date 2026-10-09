@@ -4,7 +4,6 @@ const std = @import("std");
 const syntax_scope = @import("../../syntax/scope.zig");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const lineIndentation = @import("../../syntax/tokens.zig").lineIndentation;
 const rule_context = @import("../context.zig");
@@ -32,7 +31,7 @@ pub fn run(context: RuleRun) !void {
         for (containers.items) |c| allocator.free(c.fields);
         containers.deinit(allocator);
     }
-    const initial_containers = try collectContainers(allocator, context.source, context.tokens);
+    const initial_containers = try collectContainers(context);
     defer allocator.free(initial_containers);
     try containers.appendSlice(allocator, initial_containers);
     for (context.resolved_shapes) |shape| {
@@ -55,9 +54,11 @@ pub fn run(context: RuleRun) !void {
             .has_usingnamespace = false,
         });
     }
-    try findUnresolvedMembers(context, containers.items);
+    var declarations: Declarations = .{};
+    defer declarations.deinit(allocator);
+    try findUnresolvedMembers(context, containers.items, &declarations);
     try findUnresolvedModuleMembers(context);
-    try findComptimeReflectionIssues(context, containers.items);
+    try findComptimeReflectionIssues(context, containers.items, &declarations);
     try findSwitches(context, containers.items);
     try findStructInitializers(context, containers.items);
 }
@@ -86,6 +87,7 @@ const TokenScope = struct {
 fn findUnresolvedMembers(
     context: RuleRun,
     containers: []const Container,
+    declarations: *Declarations,
 ) !void {
     const source = context.source;
     const tokens = context.tokens;
@@ -100,7 +102,7 @@ fn findUnresolvedMembers(
         if (container.has_usingnamespace or container.resolved) continue;
         const member_name = tokenText(source, member_token);
         if (containerHasField(container, member_name) or
-            containerHasDeclaration(source, tokens, container.name, member_name, false)) continue;
+            try declarations.has(context, container.name, member_name, false)) continue;
         try context.emit(.{
             .rule = .unresolved_member,
             .level = level,
@@ -183,11 +185,10 @@ fn tokensBeforeContain(
     return false;
 }
 
-fn collectContainers(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []const std.zig.Token,
-) ![]Container {
+fn collectContainers(context: RuleRun) ![]Container {
+    const allocator = context.allocator;
+    const source = context.source;
+    const tokens = context.tokens;
     var containers: std.ArrayList(Container) = .empty;
     errdefer {
         for (containers.items) |container| allocator.free(container.fields);
@@ -217,14 +218,14 @@ fn collectContainers(
             else => continue,
         }
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
-        const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
         const fields = try collectContainerFields(allocator, source, tokens, opening, closing, kind);
         errdefer allocator.free(fields);
         try containers.append(allocator, .{
             .name = tokenText(source, tokens[index + 1]),
             .kind = kind,
             .fields = fields,
-            .scope = enclosingTokenScope(tokens, index),
+            .scope = enclosingTokenScope(context, index),
             .resolved = false,
             .has_usingnamespace = tokensBeforeContain(source, tokens, opening + 1, closing, "usingnamespace"),
         });
@@ -296,6 +297,7 @@ fn fieldIsRequired(tokens: []const std.zig.Token, colon: usize, closing: usize) 
 fn findComptimeReflectionIssues(
     context: RuleRun,
     containers: []const Container,
+    declarations: *Declarations,
 ) !void {
     const source = context.source;
     const tokens = context.tokens;
@@ -320,9 +322,9 @@ fn findComptimeReflectionIssues(
         if (has_field and container.kind == .enumeration or !has_field and container.resolved) continue;
         const exists = if (has_field)
             containerHasField(container, member_name) or
-                field_lookup and containerHasDeclaration(source, tokens, container.name, member_name, false)
+                field_lookup and try declarations.has(context, container.name, member_name, false)
         else
-            containerHasDeclaration(source, tokens, container.name, member_name, true);
+            try declarations.has(context, container.name, member_name, true);
         if (exists) continue;
         const message = if (field_lookup)
             try context.allocator.print(
@@ -353,43 +355,81 @@ fn containerHasField(container: Container, name: []const u8) bool {
     return false;
 }
 
-fn containerHasDeclaration(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    container_name: []const u8,
-    declaration_name: []const u8,
-    require_public: bool,
-) bool {
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_const or index + 4 >= tokens.len or
-            !identifierNamesEqual(tokenText(source, tokens[index + 1]), container_name) or tokens[index + 2].tag != .equal) continue;
-        var opening = index + 4;
-        if (tokens[index + 3].tag == .keyword_union and opening < tokens.len and tokens[opening].tag == .l_paren) {
-            opening = (matchingToken(tokens, opening, .l_paren, .r_paren) orelse continue) + 1;
+/// The names declared directly inside every `const Name = ... {` container of
+/// the file, collected in one pass the first time a lookup needs them.
+const Declarations = struct {
+    names_by_container: std.StringHashMapUnmanaged(Names) = .empty,
+    built: bool = false,
+
+    const Names = struct {
+        all: std.StringHashMapUnmanaged(void) = .empty,
+        public: std.StringHashMapUnmanaged(void) = .empty,
+    };
+
+    fn deinit(declarations: *Declarations, allocator: std.mem.Allocator) void {
+        var names = declarations.names_by_container.valueIterator();
+        while (names.next()) |entry| {
+            entry.all.deinit(allocator);
+            entry.public.deinit(allocator);
         }
-        if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
-        const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
-        var depth: usize = 1;
-        for (tokens[opening + 1 .. closing], opening + 1..) |member_token, member_index| {
-            switch (member_token.tag) {
-                .l_brace => depth += 1,
-                .r_brace => depth -= 1,
-                .keyword_fn, .keyword_const, .keyword_var => if (depth == 1 and member_index + 1 < closing and
-                    identifierNamesEqual(tokenText(source, tokens[member_index + 1]), declaration_name))
-                {
-                    if (!require_public) return true;
-                    var modifier_index = member_index;
-                    while (modifier_index > opening + 1) {
-                        modifier_index -= 1;
-                        switch (tokens[modifier_index].tag) {
-                            .keyword_pub => return true,
-                            .keyword_inline, .keyword_noinline, .keyword_extern, .keyword_export, .keyword_threadlocal => {},
-                            else => break,
-                        }
-                    }
-                },
-                else => {},
+        declarations.names_by_container.deinit(allocator);
+    }
+
+    fn has(
+        declarations: *Declarations,
+        context: RuleRun,
+        container_name: []const u8,
+        declaration_name: []const u8,
+        require_public: bool,
+    ) !bool {
+        if (!declarations.built) {
+            try declarations.collect(context);
+            declarations.built = true;
+        }
+        const names = declarations.names_by_container.get(identifierName(container_name)) orelse return false;
+        return (if (require_public) names.public else names.all).contains(identifierName(declaration_name));
+    }
+
+    fn collect(declarations: *Declarations, context: RuleRun) !void {
+        const source = context.source;
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, index| {
+            if (token.tag != .keyword_const or index + 4 >= tokens.len or tokens[index + 2].tag != .equal) continue;
+            var opening = index + 4;
+            if (tokens[index + 3].tag == .keyword_union and opening < tokens.len and tokens[opening].tag == .l_paren) {
+                opening = (context.matchingToken(opening, .l_paren, .r_paren) orelse continue) + 1;
             }
+            if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
+            const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+            const entry = try declarations.names_by_container.getOrPut(context.allocator, identifierName(tokenText(source, tokens[index + 1])));
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            var depth: usize = 1;
+            for (tokens[opening + 1 .. closing], opening + 1..) |member_token, member_index| {
+                switch (member_token.tag) {
+                    .l_brace => depth += 1,
+                    .r_brace => depth -= 1,
+                    .keyword_fn, .keyword_const, .keyword_var => if (depth == 1 and member_index + 1 < closing) {
+                        const name = identifierName(tokenText(source, tokens[member_index + 1]));
+                        try entry.value_ptr.all.put(context.allocator, name, {});
+                        if (isPublicMember(tokens, opening + 1, member_index)) try entry.value_ptr.public.put(context.allocator, name, {});
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+};
+
+/// Whether `pub` precedes the declaration keyword at `member_index`, possibly
+/// after other modifiers.
+fn isPublicMember(tokens: []const std.zig.Token, first: usize, member_index: usize) bool {
+    var modifier_index = member_index;
+    while (modifier_index > first) {
+        modifier_index -= 1;
+        switch (tokens[modifier_index].tag) {
+            .keyword_pub => return true,
+            .keyword_inline, .keyword_noinline, .keyword_extern, .keyword_export, .keyword_threadlocal => {},
+            else => break,
         }
     }
     return false;
@@ -410,18 +450,18 @@ fn findSwitches(
         while (site_lists.next()) |list| list.deinit(context.allocator);
         declaration_sites.deinit(context.allocator);
     }
-    var return_types = try collectFunctionReturnTypes(context.allocator, source, tokens);
+    var return_types = try collectFunctionReturnTypes(context);
     defer return_types.deinit(context.allocator);
     for (tokens, 0..) |token, switch_index| {
         if (token.tag != .keyword_switch or switch_index + 4 >= tokens.len or tokens[switch_index + 1].tag != .l_paren) continue;
-        const operand_end = matchingToken(tokens, switch_index + 1, .l_paren, .r_paren) orelse continue;
+        const operand_end = context.matchingToken(switch_index + 1, .l_paren, .r_paren) orelse continue;
         if (tokens[switch_index + 2].tag != .identifier) continue;
         const opening = operand_end + 1;
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
-        const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
         const operand_name = tokenText(source, tokens[switch_index + 2]);
         const type_name = if (operand_end == switch_index + 3)
-            bindingTypeName(source, tokens, &declaration_sites, &return_types, operand_name, switch_index) orelse continue
+            bindingTypeName(context, &declaration_sites, &return_types, operand_name, switch_index) orelse continue
         else if (operand_end == switch_index + 5 and tokens[switch_index + 3].tag == .l_paren and
             tokens[switch_index + 4].tag == .r_paren)
             return_types.get(operand_name) orelse continue
@@ -541,16 +581,15 @@ fn collectBindingDeclarationSites(
     return sites;
 }
 
-fn collectFunctionReturnTypes(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []const std.zig.Token,
-) !FunctionReturnTypes {
+fn collectFunctionReturnTypes(context: RuleRun) !FunctionReturnTypes {
+    const allocator = context.allocator;
+    const source = context.source;
+    const tokens = context.tokens;
     var return_types: FunctionReturnTypes = .empty;
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_fn or index + 3 >= tokens.len or tokens[index + 1].tag != .identifier or
             tokens[index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = context.matchingToken(index + 2, .l_paren, .r_paren) orelse continue;
         // A switch on the call's result sees the error union's payload type.
         var return_start = parameters_end + 1;
         if (return_start < tokens.len and tokens[return_start].tag == .bang) return_start += 1;
@@ -578,13 +617,14 @@ fn collectFunctionReturnTypes(
 }
 
 fn bindingTypeName(
-    source: []const u8,
-    tokens: []const std.zig.Token,
+    context: RuleRun,
     declaration_sites: *const BindingDeclarationSites,
     return_types: *const FunctionReturnTypes,
     binding_name: []const u8,
     before: usize,
 ) ?[]const u8 {
+    const source = context.source;
+    const tokens = context.tokens;
     const site_list = declaration_sites.get(binding_name) orelse return null;
     var remaining = site_list.items.len;
     while (remaining > 0) {
@@ -592,7 +632,7 @@ fn bindingTypeName(
         const index = site_list.items[remaining];
         if (index >= before) continue;
         const is_typed_declaration = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
-        if (!bindingDeclarationContainsUse(tokens, index, before)) continue;
+        if (!bindingDeclarationContainsUse(context, index, before)) continue;
         if (is_typed_declaration) {
             if (index + 2 >= tokens.len or tokens[index + 2].tag != .identifier) return null;
             var type_index = index + 2;
@@ -604,7 +644,7 @@ fn bindingTypeName(
             return tokenText(source, tokens[type_index]);
         }
         if (index + 3 < tokens.len and tokens[index + 1].tag == .equal and tokens[index + 2].tag == .identifier and
-            tokens[index + 3].tag == .l_paren and matchingToken(tokens, index + 3, .l_paren, .r_paren) != null)
+            tokens[index + 3].tag == .l_paren and context.matchingToken(index + 3, .l_paren, .r_paren) != null)
         {
             return return_types.get(tokenText(source, tokens[index + 2]));
         }
@@ -613,18 +653,19 @@ fn bindingTypeName(
     return null;
 }
 
-fn bindingDeclarationContainsUse(tokens: []const std.zig.Token, declaration_index: usize, use_index: usize) bool {
+fn bindingDeclarationContainsUse(context: RuleRun, declaration_index: usize, use_index: usize) bool {
+    const tokens = context.tokens;
     if (declaration_index > 0 and
         (tokens[declaration_index - 1].tag == .keyword_const or tokens[declaration_index - 1].tag == .keyword_var))
     {
-        return scopeContains(enclosingTokenScope(tokens, declaration_index), use_index);
+        return scopeContains(enclosingTokenScope(context, declaration_index), use_index);
     }
     const opening_parenthesis = enclosingOpeningParenthesis(tokens, declaration_index) orelse return false;
-    const closing_parenthesis = matchingToken(tokens, opening_parenthesis, .l_paren, .r_paren) orelse return false;
+    const closing_parenthesis = context.matchingToken(opening_parenthesis, .l_paren, .r_paren) orelse return false;
     var body_opening = closing_parenthesis + 1;
     while (body_opening < tokens.len and tokens[body_opening].tag != .l_brace) : (body_opening += 1) {}
     if (body_opening == tokens.len) return false;
-    const body_closing = matchingToken(tokens, body_opening, .l_brace, .r_brace) orelse return false;
+    const body_closing = context.matchingToken(body_opening, .l_brace, .r_brace) orelse return false;
     return use_index > body_opening and use_index < body_closing;
 }
 
@@ -676,24 +717,9 @@ fn containerDeclared(containers: []const Container, name: []const u8) bool {
     return false;
 }
 
-fn enclosingTokenScope(tokens: []const std.zig.Token, index: usize) TokenScope {
-    var depth: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => depth += 1,
-            .l_brace => {
-                if (depth == 0) {
-                    const closing = matchingToken(tokens, cursor, .l_brace, .r_brace) orelse tokens.len;
-                    return .{ .opening = cursor, .closing = closing };
-                }
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return .{ .opening = null, .closing = tokens.len };
+fn enclosingTokenScope(context: RuleRun, index: usize) TokenScope {
+    const opening = context.enclosingOpeningBrace(index) orelse return .{ .opening = null, .closing = context.tokens.len };
+    return .{ .opening = opening, .closing = context.matchingToken(opening, .l_brace, .r_brace) orelse context.tokens.len };
 }
 
 fn scopeContains(scope: TokenScope, index: usize) bool {
@@ -891,7 +917,7 @@ fn findStructInitializers(
         const type_name = tokenText(source, tokens[type_token_index]);
         const container = containerNamed(containers, context.scopes, type_name, type_token_index) orelse continue;
         if (container.kind != .structure) continue;
-        const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
         var missing: std.ArrayList([]const u8) = .empty;
         for (container.fields) |field| {
             if (!field.required or initializerContainsField(source, tokens, opening, closing, field.name)) continue;

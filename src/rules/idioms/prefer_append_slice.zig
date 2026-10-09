@@ -39,6 +39,8 @@ pub fn run(context: RuleRun) !void {
             " \t\r\n",
         );
         if (iterable.len == 0 or std.mem.findScalar(u8, iterable, ',') != null) continue;
+        // A range such as `0..10` counts; it is not a slice to append.
+        if (hasRangeOperator(context.tokens[for_index + 2 .. paren_end])) continue;
 
         var cursor: usize = capture_end + 2;
         const has_try = context.tokens[cursor].tag == .keyword_try;
@@ -119,6 +121,28 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+fn hasRangeOperator(tokens: []const std.zig.Token) bool {
+    for (tokens) |token| {
+        if (token.tag == .ellipsis2) return true;
+    }
+    return false;
+}
+
+test "a counting range is not a slice to append" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn fill(list: *std.ArrayList(usize), gpa: std.mem.Allocator) !void {\n" ++
+        "    for (0..10) |n| try list.append(gpa, n);\n" ++
+        "    for (0..10) |n| {\n" ++
+        "        try list.append(gpa, n);\n" ++
+        "    }\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "prefer append slice detects element loop" {

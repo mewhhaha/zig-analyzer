@@ -10,5 +10,7 @@
 - [Versioning](versioning.md): how releases track Zig versions
 - [Language-server examples](../examples/README.md)
 - [Architecture](../ARCHITECTURE.md): module boundaries and data flow
-- [Developing](../DEVELOPING.md): local verification and maintenance workflow
+- [Developing](../DEVELOPING.md): setup, verification and releases
+- [Contributing](../CONTRIBUTING.md): where changes go and commit conventions
+- [Patched compiler](../compiler/README.md): maintaining the analysis patch
 - [Extending](../EXTENDING.md): extension seams for rules and editor features

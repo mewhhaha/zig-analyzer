@@ -1,6 +1,6 @@
 {
   "check": {
-    "exclude": [".claude", "examples/diagnostics", "fixtures/projects", "tmp"]
+    "exclude": ["examples/diagnostics", "fixtures/projects"]
   },
   "contracts": {
     "arena-allocators": [

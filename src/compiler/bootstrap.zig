@@ -10,7 +10,7 @@ const pathExists = filesystem.pathExists;
 
 /// Everything the analyzer keeps per project lives under this directory.
 pub const state_directory = ".zig-analyzer";
-pub const source_directory = state_directory ++ "/zig-0.17.0";
+pub const source_directory = state_directory ++ "/zig-" ++ build_options.zig_version;
 pub const build_cache_directory = state_directory ++ "/compiler-cache";
 pub const global_cache_directory = state_directory ++ "/compiler-global-cache";
 pub const analysis_cache_directory = state_directory ++ "/analysis-cache";
@@ -20,7 +20,7 @@ pub const generated_directory = state_directory ++ "/generated";
 pub const backend_directory = "zig-out/backend";
 pub const backend_binary = backend_directory ++ "/bin/zig";
 pub const manifest_path = backend_directory ++ "/zig-analyzer-backend.json";
-pub const patch_path = "compiler/zig-0.17.0-analysis.patch";
+pub const patch_path = "compiler/analysis.patch";
 pub const protocol_source_path = "src/compiler/protocol.zig";
 /// Where the shared protocol file lands inside the compiler checkout; the
 /// patch imports it by this name.
@@ -167,7 +167,7 @@ pub fn bootstrap(io: std.Io, allocator: std.mem.Allocator, environ: std.process.
         "-Ddebug-extensions=true",
         "-Doptimize=safe",
         "-Dstrip=true",
-        "-Dversion-string=0.17.0+zig-analyzer.1",
+        "-Dversion-string=" ++ build_options.backend_version,
         "--cache-dir",
         absolute_local_cache,
         "--prefix",
@@ -380,12 +380,12 @@ fn printFailure(io: std.Io, comptime format: []const u8, arguments: anytype) any
 test "manifest captures the compatibility boundary" {
     const manifest = Manifest{
         .analyzer_version = "0.1.0-dev",
-        .zig_version = "0.17.0",
+        .zig_version = build_options.zig_version,
         .zig_commit = build_options.zig_commit,
         .backend_sha256 = "abc",
         .compiler_protocol_version = 1,
     };
-    try std.testing.expectEqualStrings("0.17.0", manifest.zig_version);
+    try std.testing.expectEqualStrings(build_options.zig_version, manifest.zig_version);
     try std.testing.expectEqual(@as(u16, 1), manifest.compiler_protocol_version);
 }
 

@@ -28,30 +28,19 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
+/// Whether a block enclosing `index` opens within a few tokens after `keyword`.
 fn insideKeywordBlock(context: RuleRun, index: usize, keyword: std.zig.Token.Tag) bool {
-    var keyword_scopes: [256]bool = @splat(false);
-    var depth: usize = 0;
-    for (context.tokens[0..index], 0..) |token, token_index| switch (token.tag) {
-        .l_brace => {
-            if (depth == keyword_scopes.len) return false;
-            const inherited = depth != 0 and keyword_scopes[depth - 1];
-            var belongs = false;
-            var cursor = token_index;
-            while (cursor > 0 and token_index - cursor < 16) {
-                cursor -= 1;
-                if (context.tokens[cursor].tag == keyword) {
-                    belongs = true;
-                    break;
-                }
-                if (context.tokens[cursor].tag == .semicolon or context.tokens[cursor].tag == .r_brace) break;
-            }
-            keyword_scopes[depth] = inherited or belongs;
-            depth += 1;
-        },
-        .r_brace => depth -|= 1,
-        else => {},
-    };
-    return depth != 0 and keyword_scopes[depth - 1];
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        var cursor = opening;
+        while (cursor > 0 and opening - cursor < 16) {
+            cursor -= 1;
+            const tag = context.tokens[cursor].tag;
+            if (tag == keyword) return true;
+            if (tag == .semicolon or tag == .r_brace) break;
+        }
+    }
+    return false;
 }
 
 test "functions beyond the configured length report" {

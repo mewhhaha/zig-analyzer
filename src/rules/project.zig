@@ -65,6 +65,19 @@ pub fn findingsWithCompilerFacts(
     configuration: types.Configuration,
     compiler_facts: CompilerFacts,
 ) ![]const Finding {
+    return findingsConcurrently(null, allocator, files, configuration, compiler_facts);
+}
+
+/// `findingsWithCompilerFacts`, spreading per-file passes over a few threads
+/// when `io` is given. `allocator` must then be safe to use from threads; the
+/// findings are the same either way.
+pub fn findingsConcurrently(
+    io: ?std.Io,
+    allocator: std.mem.Allocator,
+    files: []const SourceFile,
+    configuration: types.Configuration,
+    compiler_facts: CompilerFacts,
+) ![]const Finding {
     if (!enabled(configuration)) return &.{};
     var scratch_arena: std.heap.ArenaAllocator = .init(allocator);
     defer scratch_arena.deinit();
@@ -86,6 +99,7 @@ pub fn findingsWithCompilerFacts(
         .compiler_facts = compiler_facts,
         .findings = &found,
         .syntaxes = syntaxes,
+        .io = io,
     };
 
     const imports = if (configuration.anyEnabled(&graph_rules)) try import_graph.collectImports(run) else &.{};

@@ -38,7 +38,8 @@ pub fn run(context: RuleRun) !void {
         const scope_end = context.enclosingScopeEnd(var_index) orelse context.tokens.len;
         if (context.findIdentifier(body_end + 1, scope_end, name) != null) continue;
         const bound = context.source[context.tokens[while_index + 4].loc.start..context.tokens[condition_end - 1].loc.end];
-        const replacement = try context.allocator.print("for (0..{s}) |{s}| {{", .{ bound, name });
+        const capture = if (context.rangeContainsName(name, continue_end + 2, body_end)) name else "_";
+        const replacement = try context.allocator.print("for (0..{s}) |{s}| {{", .{ bound, capture });
         errdefer context.allocator.free(replacement);
         const fixes = try context.singleFix(.{
             .title = "Use a range for loop",
@@ -85,4 +86,14 @@ test "counted while loops over usize report" {
         "fn f() void { var i: usize = 0; while (i < count) : (i += 1) { use(names[i]); } }";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_range_for}, .information));
     try support.expectRules(found, &.{.prefer_range_for});
+}
+
+test "an unused counter becomes a discarded capture" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn f() void { var i: usize = 0; while (i < count) : (i += 1) { total += 1; } }";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_range_for}, .information));
+    try support.expectRules(found, &.{.prefer_range_for});
+    try std.testing.expectEqualStrings("for (0..count) |_| {", found[0].fixes[0].edits[0].replacement);
 }

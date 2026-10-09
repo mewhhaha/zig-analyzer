@@ -28,6 +28,10 @@ const std = @import("std");
 fn last(list: std.ArrayList(u32)) u32 {
     return list.items[list.items.len - 1];
 }
+
+fn terminate(list: std.ArrayList(u32)) void {
+    list.items[list.items.len - 1] = 0;
+}
 ```
 
 [Rule index](README.md)

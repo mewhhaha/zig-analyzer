@@ -2,6 +2,7 @@ const std = @import("std");
 const nextTagBefore = @import("../../syntax/tokens.zig").nextTagBefore;
 const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = @import("../context.zig").RuleRun;
+const container_types = @import("../container_types.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 
@@ -252,26 +253,7 @@ fn hasProvenStandardContainerType(context: RuleRun, start: usize, equal: usize) 
         context.tokens[start + 2].tag != .period or context.tokens[start + 3].tag != .identifier or
         context.tokens[start + 4].tag != .l_paren) return false;
     if (identifierDeclarationCount(context, "std") != 1 or !hasCanonicalStdImport(context)) return false;
-    const containers = [_][]const u8{
-        "ArrayList",
-        "ArrayListUnmanaged",
-        "ArrayHashMap",
-        "ArrayHashMapUnmanaged",
-        "AutoArrayHashMap",
-        "AutoArrayHashMapUnmanaged",
-        "AutoHashMap",
-        "AutoHashMapUnmanaged",
-        "MultiArrayList",
-        "PriorityDequeue",
-        "PriorityQueue",
-        "SegmentedList",
-        "StringArrayHashMap",
-        "StringArrayHashMapUnmanaged",
-        "StringHashMap",
-        "StringHashMapUnmanaged",
-    };
-    for (containers) |container| if (context.tokenIs(start + 3, container)) return true;
-    return false;
+    return container_types.kindOfName(context.tokenText(start + 3)) != null;
 }
 
 fn hasCanonicalStdImport(context: RuleRun) bool {

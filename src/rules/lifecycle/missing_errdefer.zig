@@ -2,6 +2,7 @@ const std = @import("std");
 const statementStart = @import("../../syntax/tokens.zig").statementStart;
 const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = @import("../context.zig").RuleRun;
+const container_types = @import("../container_types.zig");
 const owned_call = @import("../owned_call.zig");
 const resources = @import("../resources.zig");
 const summaries = @import("../summaries.zig");
@@ -308,7 +309,7 @@ fn declaresEmptyArrayList(context: RuleRun, start: usize, end: usize) bool {
     var names_empty = false;
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier) continue;
-        names_array_list = names_array_list or context.tokenIs(index, "ArrayList") or context.tokenIs(index, "ArrayListUnmanaged");
+        names_array_list = names_array_list or container_types.kindOfToken(context.source, context.tokens, index) == .list;
         names_empty = names_empty or context.tokenIs(index, "empty");
     }
     return names_array_list and names_empty;

@@ -1171,10 +1171,13 @@ fn rangeHasErrdeferForField(
     return false;
 }
 
+/// The element type of every field the file declares as an `ArrayList`,
+/// found in one pass over the file the first time a field is looked up.
 const ElementTypeCache = struct {
-    entries: std.ArrayList(Entry) = .empty,
-
-    const Entry = struct { field_name: []const u8, element_type: ?[]const u8 };
+    /// Element type per field name; null when the file declares the name with
+    /// two different element types.
+    entries: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    built: bool = false,
 
     fn lookup(
         cache: *ElementTypeCache,
@@ -1182,20 +1185,21 @@ const ElementTypeCache = struct {
         file: File,
         field_name: []const u8,
     ) !?[]const u8 {
-        for (cache.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.field_name, field_name)) return entry.element_type;
+        if (!cache.built) {
+            try collectSequenceElementTypes(allocator, file, &cache.entries);
+            cache.built = true;
         }
-        const element_type = sequenceElementType(file, field_name);
-        try cache.entries.append(allocator, .{ .field_name = field_name, .element_type = element_type });
-        return element_type;
+        return cache.entries.get(field_name) orelse null;
     }
 };
 
-fn sequenceElementType(file: File, field_name: []const u8) ?[]const u8 {
-    var selected: ?[]const u8 = null;
+fn collectSequenceElementTypes(
+    allocator: std.mem.Allocator,
+    file: File,
+    entries: *std.StringHashMapUnmanaged(?[]const u8),
+) !void {
     for (file.tokens, 0..) |token, field_index| {
-        if (token.tag != .identifier or !tokenIs(file.source, token, field_name) or
-            field_index + 4 >= file.tokens.len or file.tokens[field_index + 1].tag != .colon) continue;
+        if (token.tag != .identifier or field_index + 4 >= file.tokens.len or file.tokens[field_index + 1].tag != .colon) continue;
         const field_end = fieldTypeEnd(file.tokens, field_index + 2);
         for (file.tokens[field_index + 2 .. field_end], field_index + 2..) |candidate, type_index| {
             if (candidate.tag != .identifier or
@@ -1210,14 +1214,14 @@ fn sequenceElementType(file: File, field_name: []const u8) ?[]const u8 {
             while (element_end + 2 < field_end and file.tokens[element_end + 1].tag == .period and
                 file.tokens[element_end + 2].tag == .identifier) element_end += 2;
             const element_type = tokenText(file.source, file.tokens[element_end]);
-            if (selected) |known| {
-                if (!std.mem.eql(u8, known, element_type)) return null;
-            } else {
-                selected = element_type;
+            const entry = try entries.getOrPut(allocator, tokenText(file.source, token));
+            if (!entry.found_existing) {
+                entry.value_ptr.* = element_type;
+            } else if (entry.value_ptr.*) |known| {
+                if (!std.mem.eql(u8, known, element_type)) entry.value_ptr.* = null;
             }
         }
     }
-    return selected;
 }
 
 fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize) usize {

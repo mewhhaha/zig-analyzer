@@ -5,6 +5,7 @@ const cleanup_after_fallible_operation = @import("cleanup_after_fallible_operati
 const owned_call = @import("../owned_call.zig");
 const resources = @import("../resources.zig");
 const ownership_edge_cases = @import("ownership_edge_cases.zig");
+const container_release = @import("container_release.zig");
 const RuleRun = @import("../context.zig").RuleRun;
 const summaries = @import("../summaries.zig");
 const types = @import("../types.zig");
@@ -38,6 +39,7 @@ pub fn run(context: RuleRun) !void {
     );
     for (found) |finding| try context.emit(finding);
     try ownership_edge_cases.run(context);
+    try container_release.run(context);
     try cleanup_after_fallible_operation.run(context);
 }
 
@@ -279,7 +281,7 @@ fn findOverlappingAggregateErrdefers(
         const owner_binding = scope_index.findBinding(equal_index - 2) orelse continue;
         const owner_type = createdPointerType(source, tokens, scope_index, owner_binding.token_index) orelse continue;
         const assignment_end = scope_index.statementEnd(equal_index) orelse continue;
-        const scope = enclosingScope(tokens, equal_index) orelse continue;
+        const scope = enclosingScope(scope_index, equal_index) orelse continue;
         var field_index = equal_index + 1;
         while (field_index + 3 < assignment_end) : (field_index += 1) {
             if (tokens[field_index].tag != .period or tokens[field_index + 1].tag != .identifier or
@@ -956,13 +958,13 @@ fn findReleaseOrderingIssues(
     configuration: types.Configuration,
     found: *std.ArrayList(types.Finding),
 ) !bool {
-    const declaration_scope = enclosingScope(tokens, declaration_index) orelse return false;
+    const declaration_scope = enclosingScope(scope_index, declaration_index) orelse return false;
     var cleanup_registered_after_fallible_operation = false;
     var releases: std.ArrayList(usize) = .empty;
     defer releases.deinit(allocator);
     for (tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |token, method_index| {
         if (token.tag != .identifier or method_index + 1 >= scope_end or tokens[method_index + 1].tag != .l_paren) continue;
-        const release_scope = enclosingScope(tokens, method_index) orelse continue;
+        const release_scope = enclosingScope(scope_index, method_index) orelse continue;
         if (release_scope.opening != declaration_scope.opening) continue;
         if (statementStartsWithErrdefer(tokens, method_index)) continue;
         const direct_release = tokenIsIdentifier(source, token, allocation.release) and
@@ -997,7 +999,11 @@ fn findReleaseOrderingIssues(
                 ),
             });
         }
-        for (releases.items[1..]) |release_index| {
+        for (releases.items[1..], 1..) |release_index, position| {
+            // Re-acquiring the value between two releases starts a new lifetime,
+            // and `destroy` on a pool or other non-allocator recycles items.
+            if (reassignedBetween(source, tokens, binding_name, releases.items[position - 1], release_index)) continue;
+            if (std.mem.eql(u8, allocation.release, "destroy") and !releaseReceiverIsAllocator(source, tokens, release_index)) continue;
             const fixes = try releaseDeletionFix(allocator, source, tokens, scope_index, release_index);
             errdefer {
                 for (fixes) |fix| allocator.free(fix.edits);
@@ -1047,6 +1053,29 @@ fn findReleaseOrderingIssues(
         });
     }
     return cleanup_registered_after_fallible_operation;
+}
+
+fn reassignedBetween(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    binding_name: []const u8,
+    start: usize,
+    end: usize,
+) bool {
+    for (tokens[start + 1 .. end], start + 1..) |token, index| {
+        if (token.tag == .identifier and tokenIsIdentifier(source, token, binding_name) and
+            tokens[index + 1].tag == .equal and tokens[index - 1].tag != .period) return true;
+    }
+    return false;
+}
+
+/// Whether the receiver of the release call at `method_index` names an
+/// allocator. Unknown receivers count as allocators.
+fn releaseReceiverIsAllocator(source: []const u8, tokens: []const std.zig.Token, method_index: usize) bool {
+    const path = releaseReceiverPath(source, tokens, method_index) orelse return true;
+    const last = if (std.mem.findScalarLast(u8, path, '.')) |dot| path[dot + 1 ..] else path;
+    return std.ascii.findIgnoreCase(last, "alloc") != null or std.ascii.findIgnoreCase(last, "arena") != null or
+        std.mem.eql(u8, last, "gpa") or identifierHasAllocatorType(source, tokens, last);
 }
 
 fn releaseDeletionFix(
@@ -1184,12 +1213,12 @@ fn firstUseAfterRelease(
     end: usize,
     release_indices: []const usize,
 ) ?usize {
-    const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
+    const declaration_scope = enclosingScope(scope_index, binding_index) orelse return null;
     for (start..end) |index| {
         if (!tokenRefersToBinding(source, tokens, index, binding_name) or
             !identifierRefersToBinding(scope_index, binding_index, index)) continue;
-        const use_scope = enclosingScope(tokens, index) orelse continue;
-        if (use_scope.opening != declaration_scope.opening) continue;
+        const use_scope = enclosingScope(scope_index, index) orelse continue;
+        if (use_scope.opening != declaration_scope.opening and !isFormatArgument(source, tokens, index)) continue;
         var belongs_to_release = false;
         for (release_indices) |release_index| {
             const closing = if (release_index + 1 < tokens.len and tokens[release_index + 1].tag == .l_paren)
@@ -1211,6 +1240,7 @@ fn firstUseAfterRelease(
 
 fn useDefinitelyReadsReleasedAllocation(source: []const u8, tokens: []const std.zig.Token, use_index: usize, end: usize) bool {
     if (use_index + 1 >= end) return false;
+    if (isFormatArgument(source, tokens, use_index)) return true;
     if (tokens[use_index + 1].tag == .l_bracket or tokens[use_index + 1].tag == .period_asterisk) return true;
     if (use_index + 2 >= end or tokens[use_index + 1].tag != .period or tokens[use_index + 2].tag != .identifier) return false;
     const member = source[tokens[use_index + 2].loc.start..tokens[use_index + 2].loc.end];
@@ -1218,6 +1248,56 @@ fn useDefinitelyReadsReleasedAllocation(source: []const u8, tokens: []const std.
     if (!std.mem.eql(u8, member, "ptr")) return true;
     return use_index + 3 < end and
         (tokens[use_index + 3].tag == .period_asterisk or tokens[use_index + 3].tag == .l_bracket);
+}
+
+/// A bare binding inside the argument tuple of a formatting call, such as
+/// `std.debug.print("{s}", .{name})`, which reads through it.
+fn isFormatArgument(source: []const u8, tokens: []const std.zig.Token, use_index: usize) bool {
+    if (use_index == 0 or use_index + 1 >= tokens.len) return false;
+    const before = tokens[use_index - 1].tag;
+    const after = tokens[use_index + 1].tag;
+    if ((before != .l_brace and before != .comma) or (after != .r_brace and after != .comma)) return false;
+    var depth: usize = 0;
+    var cursor = use_index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_brace, .r_paren, .r_bracket => depth += 1,
+            .l_paren, .l_bracket => if (depth == 0) return false else {
+                depth -= 1;
+            },
+            .l_brace => if (depth != 0) {
+                depth -= 1;
+            } else {
+                // `.{` after a comma that follows the format string, inside a call.
+                if (cursor < 3 or tokens[cursor - 1].tag != .period or tokens[cursor - 2].tag != .comma) return false;
+                var call = cursor - 2;
+                var call_depth: usize = 0;
+                while (call > 0) {
+                    call -= 1;
+                    switch (tokens[call].tag) {
+                        .r_paren => call_depth += 1,
+                        .l_paren => if (call_depth == 0) {
+                            if (call == 0 or tokens[call - 1].tag != .identifier) return false;
+                            const callee = source[tokens[call - 1].loc.start..tokens[call - 1].loc.end];
+                            for ([_][]const u8{ "print", "err", "warn", "info", "debug", "bufPrint", "allocPrint", "format" }) |name| {
+                                if (std.mem.eql(u8, callee, name)) return true;
+                            }
+                            return false;
+                        } else {
+                            call_depth -= 1;
+                        },
+                        .semicolon => return false,
+                        else => {},
+                    }
+                }
+                return false;
+            },
+            .semicolon => return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn owningAssignment(
@@ -1229,13 +1309,13 @@ fn owningAssignment(
     start: usize,
     end: usize,
 ) ?usize {
-    const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
+    const declaration_scope = enclosingScope(scope_index, binding_index) orelse return null;
     var index = start;
     while (index + 2 < end) : (index += 1) {
         if (!tokenIsIdentifier(source, tokens[index], binding_name) or
             !identifierRefersToBinding(scope_index, binding_index, index) or
             tokens[index + 1].tag != .equal) continue;
-        const assignment_scope = enclosingScope(tokens, index) orelse continue;
+        const assignment_scope = enclosingScope(scope_index, index) orelse continue;
         if (assignment_scope.opening != declaration_scope.opening) continue;
         const statement_end = scope_index.statementEnd(index) orelse continue;
         const value_end = @min(statement_end, end);
@@ -1288,7 +1368,7 @@ fn ownershipLeavesAllPaths(
     summary_index: summaries.Index,
     initial_states: u3,
 ) ?Cleanup {
-    const declaration_scope = enclosingScope(tokens, binding_index) orelse return null;
+    const declaration_scope = enclosingScope(scope_index, binding_index) orelse return null;
     const block = blockNodeForOpening(tree, declaration_scope.opening) orelse return null;
     var buffer: [2]std.zig.Ast.Node.Index = undefined;
     const statements = tree.blockStatements(&buffer, block) orelse return null;
@@ -2741,7 +2821,7 @@ fn deferDeinitializesReceiver(
     declaration_index: usize,
     scope_end: usize,
 ) bool {
-    const scope = enclosingScope(tokens, declaration_index) orelse return false;
+    const scope = enclosingScope(scope_index, declaration_index) orelse return false;
     var index = scope.opening + 1;
     while (index + 3 < scope_end) : (index += 1) {
         // Only 'defer' releases on the success path; 'errdefer' alone still
@@ -2791,29 +2871,9 @@ const Scope = struct {
     closing: usize,
 };
 
-fn enclosingScope(tokens: []const std.zig.Token, index: usize) ?Scope {
-    var depth: usize = 0;
-    var cursor = index;
-    const opening_index = while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => depth += 1,
-            .l_brace => {
-                if (depth == 0) break cursor;
-                depth -= 1;
-            },
-            else => {},
-        }
-    } else return null;
-
-    depth = 0;
-    for (tokens[opening_index..], opening_index..) |token, closing_index| {
-        if (token.tag == .l_brace) depth += 1;
-        if (token.tag != .r_brace) continue;
-        depth -= 1;
-        if (depth == 0) return .{ .opening = opening_index, .closing = closing_index };
-    }
-    return null;
+fn enclosingScope(scope_index: *const syntax_scope.Index, index: usize) ?Scope {
+    const opening = scope_index.enclosingOpeningBrace(index) orelse return null;
+    return .{ .opening = opening, .closing = scope_index.matchingToken(opening) orelse return null };
 }
 
 test "warns when an allocation has no release" {
@@ -4402,4 +4462,52 @@ fn freeFinding(allocator: std.mem.Allocator, finding: types.Finding) void {
 fn freeFindings(allocator: std.mem.Allocator, found: []types.Finding) void {
     for (found) |finding| freeFinding(allocator, finding);
     allocator.free(found);
+}
+
+fn countRule(source: [:0]const u8, rule: types.Rule) !usize {
+    const found = try findings(std.testing.allocator, source);
+    defer freeFindings(std.testing.allocator, found);
+    var count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule == rule) count += 1;
+    }
+    return count;
+}
+
+test "re-acquiring a binding between releases starts a new lifetime" {
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "fn run(a: std.mem.Allocator) !void { var s = try a.alloc(u8, 4); a.free(s); s = try a.alloc(u8, 8); a.free(s); }",
+        .double_release,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "fn run(a: std.mem.Allocator) !void { var l = try make(a); l.deinit(a); l = try make(a); defer l.deinit(a); }" ++
+            "fn make(a: std.mem.Allocator) !std.ArrayList(u8) { return try .initCapacity(a, 1); }",
+        .double_release,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        "fn run(a: std.mem.Allocator) !void { var s = try a.alloc(u8, 4); a.free(s); a.free(s); }",
+        .double_release,
+    ));
+}
+
+test "destroy through a pool is not a double release of a recycled item" {
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "fn run(pool: *Pool) !void { const a = try pool.create(); pool.destroy(a); const b = try pool.create(); _ = b; pool.destroy(a); }",
+        .double_release,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        "fn run(allocator: std.mem.Allocator) !void { const a = try allocator.create(u8); allocator.destroy(a); allocator.destroy(a); }",
+        .double_release,
+    ));
+}
+
+test "a freed duplicate printed afterwards is a use after release" {
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        "fn run(gpa: std.mem.Allocator) !void { const s = try gpa.dupe(u8, \"x\"); gpa.free(s); std.debug.print(\"{s}\", .{s}); }",
+        .use_after_release,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "fn run(gpa: std.mem.Allocator) !void { const s = try gpa.dupe(u8, \"x\"); std.debug.print(\"{s}\", .{s}); gpa.free(s); }",
+        .use_after_release,
+    ));
 }

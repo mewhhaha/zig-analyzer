@@ -12,6 +12,10 @@ A release version has the form `<zig-release>-<n>`, for example `0.17.0-1`.
 - The suffix starts at 1 and increments with each zig-analyzer release for
   that Zig version: `0.17.0-1`, `0.17.0-2`, and so on.
 
+The version is written once, as `.version` in `build.zig.zon`. The supported Zig
+release is that file's `minimum_zig_version`, and every build option, check and
+document derives from it.
+
 The suffix orders releases and nothing more; a bump may contain changes of
 any size, including new rules, changed diagnostics, or changed configuration
 behavior. The base version is the compatibility statement: every release
@@ -21,9 +25,8 @@ When support moves to a new Zig release, the base version changes and the
 suffix resets, so the first release supporting Zig 0.18.0 would be
 `0.18.0-1`.
 
-Development builds between releases carry a `-dev` suffix, as in
-`0.17.0-dev`. `zig-analyzer version` prints the analyzer version, the
-supported Zig version, and the compiler-backend protocol version.
+`zig-analyzer version` prints the analyzer version, the supported Zig
+version, and the compiler-backend protocol version.
 
 ## Relation to semantic versioning
 
@@ -39,9 +42,3 @@ Compiler-backed analysis requires the exact Zig release named by the base
 version. Against a project pinned to a different Zig release, the analyzer
 deliberately falls back to syntax features and lint diagnostics; the
 [installation guide](installation.md) describes this behavior.
-
-## Current status
-
-The current release is `0.17.0-2`. The
-[installation guide](installation.md) describes the release archive and source
-build.

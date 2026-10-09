@@ -22,8 +22,7 @@ It applies when the capture corresponds to the same optional binding.
 ```zig
 fn use(maybe: ?u32) u32 {
     if (maybe) |value| {
-        _ = value;
-        return maybe.?;
+        return value + maybe.?;
     }
     return 0;
 }

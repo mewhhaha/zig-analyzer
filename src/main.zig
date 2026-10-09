@@ -160,7 +160,7 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
         return 1;
     };
 
-    try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: Zig 0.17.0 is available\n");
+    try std.Io.File.stdout().writeStreamingAll(io, "zig-analyzer doctor: Zig " ++ zig_analyzer.build_options.zig_version ++ " is available\n");
 
     var backend = (try zig_analyzer.compiler.bootstrap.findBackend(io, allocator)) orelse {
         try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer doctor: compiler backend is missing; install a release archive or run 'zig build backend'\n");
@@ -195,10 +195,10 @@ fn runDoctor(io: std.Io, allocator: std.mem.Allocator) !u8 {
     defer allocator.free(backend_version.stdout);
     defer allocator.free(backend_version.stderr);
     const version_text = std.mem.trim(u8, backend_version.stdout, " \t\r\n");
-    if (!std.mem.eql(u8, version_text, "0.17.0+zig-analyzer.1")) {
+    if (!std.mem.eql(u8, version_text, zig_analyzer.build_options.backend_version)) {
         var buffer: [256]u8 = undefined;
         var file_writer = std.Io.File.stderr().writer(io, &buffer);
-        try file_writer.interface.print("zig-analyzer doctor: backend reports {s}; expected 0.17.0+zig-analyzer.1\n", .{version_text});
+        try file_writer.interface.print("zig-analyzer doctor: backend reports {s}; expected {s}\n", .{ version_text, zig_analyzer.build_options.backend_version });
         try file_writer.interface.flush();
         return 1;
     }

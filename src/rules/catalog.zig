@@ -886,8 +886,7 @@ const entries = [_]Entry{
         .example = .{ .source =
         \\fn use(maybe: ?u32) u32 {
         \\    if (maybe) |value| {
-        \\        _ = value;
-        \\        return maybe.?;
+        \\        return value + maybe.?;
         \\    }
         \\    return 0;
         \\}
@@ -916,7 +915,7 @@ const entries = [_]Entry{
         \\const std = @import("std");
         \\
         \\fn update(allocator: std.mem.Allocator) !void {
-        \\    var list = std.ArrayList(u8).empty;
+        \\    var list: std.ArrayList(u8) = .empty;
         \\    const old_items = list.items;
         \\    try list.append(allocator, 1);
         \\    consume(old_items);
@@ -935,7 +934,7 @@ const entries = [_]Entry{
         \\const std = @import("std");
         \\
         \\fn items(allocator: std.mem.Allocator) []u8 {
-        \\    var list = std.ArrayList(u8).empty;
+        \\    var list: std.ArrayList(u8) = .empty;
         \\    defer list.deinit(allocator);
         \\    return list.items;
         \\}
@@ -1488,6 +1487,10 @@ const entries = [_]Entry{
         \\
         \\fn last(list: std.ArrayList(u32)) u32 {
         \\    return list.items[list.items.len - 1];
+        \\}
+        \\
+        \\fn terminate(list: std.ArrayList(u32)) void {
+        \\    list.items[list.items.len - 1] = 0;
         \\}
         },
     },
@@ -2526,10 +2529,11 @@ const entries = [_]Entry{
         .fixes = .quick_fix,
         .summary = "Reports an assignment where the left-hand side and right-hand side evaluate to the same variable or field path.",
         .example = .{ .source =
-        \\fn reset(total: u32) u32 {
-        \\    var value = total;
-        \\    value = value;
-        \\    return value;
+        \\fn tally(values: []const u32) u32 {
+        \\    var total: u32 = 0;
+        \\    for (values) |value| total += value;
+        \\    total = total;
+        \\    return total;
         \\}
         },
     },
@@ -2596,11 +2600,11 @@ const entries = [_]Entry{
         .fixes = .fix_all,
         .summary = "Reports an `if` expression or statement where the `then` and `else` branches have identical bodies.",
         .example = .{ .source =
-        \\fn pick(flag: bool) u32 {
-        \\    if (flag) {
-        \\        return 1;
+        \\fn pick(values: []const u32) u32 {
+        \\    if (values.len > 4) {
+        \\        return values[0];
         \\    } else {
-        \\        return 1;
+        \\        return values[0];
         \\    }
         \\}
         },
@@ -2666,8 +2670,9 @@ const entries = [_]Entry{
         .example = .{ .source =
         \\const std = @import("std");
         \\
-        \\fn fields(line: []const u8) std.mem.SplitIterator(u8, .sequence) {
-        \\    return std.mem.splitSequence(u8, line, ",");
+        \\fn firstField(line: []const u8) ?[]const u8 {
+        \\    var parts = std.mem.splitSequence(u8, line, ",");
+        \\    return parts.next();
         \\}
         },
     },
@@ -2866,7 +2871,13 @@ const entries = [_]Entry{
         .fixes = .fix_all,
         .summary = "Reports vector literals initialized with manually written sequential integers (`.{ 0, 1, 2, ... }`) instead of `std.simd.iota`.",
         .example = .{ .source =
+        \\const std = @import("std");
+        \\
         \\const lanes: @Vector(4, u32) = .{ 0, 1, 2, 3 };
+        \\
+        \\test "lanes" {
+        \\    try std.testing.expectEqual(@as(u32, 3), lanes[3]);
+        \\}
         },
     },
     .{

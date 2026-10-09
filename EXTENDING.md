@@ -104,11 +104,10 @@ Compiler changes cross a versioned boundary:
    domain query (with any lookup or caching) in `src/compiler/session.zig`.
 3. Convert the response to a small domain value before rules, actions, hover,
    or completion consume it.
-4. Update the patch in `compiler/` to handle the new tag;
+4. Update `compiler/analysis.patch` to handle the new tag;
    `compiler/protocol_invariant.zig` checks that it only names declarations the
-   protocol file defines. Regenerate the patch from the checkout in
-   `.zig-analyzer/` (`git diff HEAD` of the files it touches, without
-   `src/AnalysisProtocol.zig`) and run `zig build backend`.
+   protocol file defines. See
+   [compiler/README.md](compiler/README.md) for editing and regenerating it.
 
 Core analysis must not depend on raw JSON responses or compiler process state.
 If the query cannot prove a fact, return unavailable and let the language
@@ -133,18 +132,6 @@ analysis.
 
 ## Verification
 
-Run the narrow test for the changed module while iterating, then run:
-
-```sh
-git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
-zig build check
-zig build test
-zig build fixtures
-zig build examples
-zig build -Doptimize=fast
-zig-out/bin/zig-analyzer check --no-cache .
-```
-
-Compiler protocol work also requires `zig build backend-test`. Changes to LSP
-representation require an editor or recorded JSON-RPC exchange in addition to
-unit tests.
+Run the narrow test for the changed module while iterating, then the full list
+in [DEVELOPING.md](DEVELOPING.md#verify). Changes to LSP representation also
+need an editor or recorded JSON-RPC exchange in addition to unit tests.

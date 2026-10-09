@@ -72,12 +72,24 @@ fn findLastElementIndexing(context: RuleRun) !void {
             context.tokens[receiver_index + 11].tag != .r_bracket) continue;
         if (!bindingHasStandardArrayListType(context, receiver_index)) continue;
 
+        // `last()` returns a copy: a place that is written, addressed or
+        // called through needs `lastPtr()` or must stay as it is.
+        if (receiver_index > 0 and context.tokens[receiver_index - 1].tag == .ampersand) continue;
+        var chain_end = receiver_index + 12;
+        while (chain_end + 1 < context.tokens.len and context.tokens[chain_end].tag == .period and
+            context.tokens[chain_end + 1].tag == .identifier) chain_end += 2;
+        if (chain_end < context.tokens.len and context.tokens[chain_end].tag == .l_paren) continue;
+        const written = chain_end < context.tokens.len and switch (context.tokens[chain_end].tag) {
+            .equal, .plus_equal, .minus_equal, .asterisk_equal, .slash_equal, .percent_equal, .ampersand_equal, .pipe_equal, .caret_equal => true,
+            else => false,
+        };
+
         const receiver = context.tokenText(receiver_index);
         const fixes = try context.singleFix(.{
-            .title = "Use ArrayList.last",
+            .title = if (written) "Use ArrayList.lastPtr" else "Use ArrayList.last",
             .kind = .refactor_rewrite,
             .span = .{ .start = token.loc.start, .end = context.tokens[receiver_index + 11].loc.end },
-            .replacement = try context.allocator.print("{s}.last().?", .{receiver}),
+            .replacement = try context.allocator.print("{s}.{s}().?{s}", .{ receiver, if (written) "lastPtr" else "last", if (written) ".*" else "" }),
             .preferred = true,
             .fix_all = true,
         });
@@ -85,7 +97,7 @@ fn findLastElementIndexing(context: RuleRun) !void {
             .rule = .prefer_array_list_last,
             .level = level,
             .span = token.loc,
-            .message = try context.allocator.print("last-element indexing repeats '{s}'; use '{s}.last().?'", .{ receiver, receiver }),
+            .message = try context.allocator.print("last-element indexing repeats '{s}'; use '{s}.{s}().?'", .{ receiver, receiver, if (written) "lastPtr" else "last" }),
             .fixes = fixes,
         });
     }
@@ -264,6 +276,19 @@ test "negative membership and sole pop guards keep their behavior" {
         .{ source[0..pop_edit.span.start], pop_edit.replacement, source[pop_edit.span.end..] },
     );
     try std.testing.expect(std.mem.find(u8, fixed, "{ _ = values.pop(); }") != null);
+}
+
+test "last element writes use lastPtr and addressed places stay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn write(list: std.ArrayList(u8)) void { list.items[list.items.len - 1] = '/'; }\n" ++
+        "fn address(list: std.ArrayList(u8)) *u8 { return &list.items[list.items.len - 1]; }\n" ++
+        "fn call(list: std.ArrayList(Item)) void { list.items[list.items.len - 1].bump(); }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("list.lastPtr().?.*", findings[0].fixes[0].edits[0].replacement);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

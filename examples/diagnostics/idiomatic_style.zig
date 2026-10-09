@@ -40,7 +40,6 @@ fn inspect(optional: ?u32, actual: u32, pointer: *u32) !void {
 }
 
 fn localBytes() []u8 {
-    // expect: never-mutated-var
     var bytes = [_]u8{ 1, 2, 3 };
     // expect: returning-local-slice
     return bytes[0..];

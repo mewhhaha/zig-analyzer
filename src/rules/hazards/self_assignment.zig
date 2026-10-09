@@ -3,6 +3,9 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const containsComment = @import("../../syntax/tokens.zig").containsComment;
+const lineStart = @import("../../syntax/tokens.zig").lineStart;
+const lineEnd = @import("../../syntax/tokens.zig").lineEnd;
+const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
 const pathBefore = @import("../../syntax/tokens.zig").pathBefore;
 const pathAfter = @import("../../syntax/tokens.zig").pathAfter;
 
@@ -52,15 +55,20 @@ pub fn run(context: RuleRun) !void {
 
         const path_text = context.source[context.tokens[lhs_span.start].loc.start..context.tokens[lhs_span.end - 1].loc.end];
 
+        // The assignment does nothing, so the fix deletes it; a discard
+        // `_ = x;` would be an error once `x` is used anywhere else.
         var fixes: []const types.Fix = &.{};
-        if (lhs_len == 1) {
-            const f = try context.singleFix(.{
-                .title = try context.allocator.print("Discard '{s}' with '_ = {s};'", .{ path_text, path_text }),
-                .span = .{ .start = context.tokens[lhs_span.start].loc.start, .end = context.tokens[lhs_span.end - 1].loc.end },
-                .replacement = "_",
+        const statement_start = context.tokens[lhs_span.start].loc.start;
+        const statement_end = context.tokens[rhs_span.end].loc.end;
+        if (std.mem.trim(u8, context.source[lineStart(context.source, statement_start)..statement_start], " \t").len == 0 and
+            std.mem.trim(u8, context.source[statement_end..lineEnd(context.source, statement_end)], " \t\r\n").len == 0)
+        {
+            fixes = try context.singleFix(.{
+                .title = try context.allocator.print("Remove the self-assignment of '{s}'", .{path_text}),
+                .span = removedLinesSpan(context.source, statement_start, statement_end),
+                .replacement = "",
                 .preferred = true,
             });
-            fixes = f;
         }
 
         try context.emit(.{
@@ -103,7 +111,7 @@ test "self-assignment reports simple and dotted paths" {
 
     try std.testing.expectEqual(@as(usize, 3), findings.len);
     try std.testing.expect(std.mem.find(u8, findings[0].message, "self-assignment of 'a'") != null);
-    try std.testing.expectEqualStrings("_", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("", findings[0].fixes[0].edits[0].replacement);
     try std.testing.expect(std.mem.find(u8, findings[1].message, "self-assignment of 'self.field'") != null);
     try std.testing.expect(std.mem.find(u8, findings[2].message, "self-assignment of 'self.ptr.*'") != null);
 }

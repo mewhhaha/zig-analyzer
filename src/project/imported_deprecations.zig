@@ -5,6 +5,7 @@ const std = @import("std");
 const analysis = @import("../analysis.zig");
 const declarations = analysis.deprecated_declarations;
 const zig_environment = @import("../compiler/zig_environment.zig");
+const source_store = @import("source_store.zig");
 
 pub const Source = declarations.Source;
 
@@ -25,7 +26,7 @@ pub const ImportedDeprecations = struct {
     pub fn init(imported: *ImportedDeprecations, io: std.Io, allocator: std.mem.Allocator) void {
         imported.* = .{
             .allocator = allocator,
-            .resolver = .{ .io = io },
+            .resolver = .{ .io = io, .allocator = allocator },
             .index = undefined,
         };
         imported.index = .init(allocator, imported.resolver.loader());
@@ -33,7 +34,19 @@ pub const ImportedDeprecations = struct {
 
     pub fn deinit(imported: *ImportedDeprecations) void {
         imported.index.deinit();
+        for (imported.resolver.held.items) |file| file.release();
+        imported.resolver.held.deinit(imported.allocator);
         imported.* = undefined;
+    }
+
+    /// Reads dependencies through `store`, which keeps them parsed between runs.
+    pub fn useStore(imported: *ImportedDeprecations, store: *source_store.Store) void {
+        imported.resolver.store = store;
+    }
+
+    /// Serves these files, by path, instead of reading them from disk.
+    pub fn useKnownSources(imported: *ImportedDeprecations, known: *const std.StringHashMapUnmanaged(Source)) void {
+        imported.resolver.known = known;
     }
 
     /// Registers a file's current contents; they take precedence over disk, so
@@ -84,6 +97,15 @@ pub const ImportedDeprecations = struct {
 /// toolchains and unreadable files only drop diagnostics, never fail a check.
 const Resolver = struct {
     io: std.Io,
+    /// Files whose contents the caller already holds, by path; they are used
+    /// instead of reading the disk.
+    known: ?*const std.StringHashMapUnmanaged(Source) = null,
+    /// Parsed files shared between runs; dependencies are taken from here
+    /// instead of being read each time.
+    store: ?*source_store.Store = null,
+    /// Files taken from `store`, released with the index that borrows them.
+    held: std.ArrayList(*source_store.Parsed) = .empty,
+    allocator: std.mem.Allocator,
 
     fn loader(resolver: *Resolver) declarations.Loader {
         return .{ .context = resolver, .resolve = resolve, .load = load };
@@ -109,6 +131,13 @@ const Resolver = struct {
 
     fn load(raw_context: *anyopaque, allocator: std.mem.Allocator, path: []const u8) !?declarations.Source {
         const resolver: *Resolver = @ptrCast(@alignCast(raw_context));
+        if (resolver.known) |known| if (known.get(path)) |source| return source;
+        if (resolver.store) |store| {
+            const file = try store.acquire(resolver.io, path) orelse return null;
+            errdefer file.release();
+            try resolver.held.append(resolver.allocator, file);
+            return .{ .path = path, .source = file.source, .tokens = file.tokens, .scopes = &file.scopes };
+        }
         const bytes = std.Io.Dir.cwd().readFileAlloc(resolver.io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
             error.OutOfMemory, error.Canceled => return err,
             else => return null,

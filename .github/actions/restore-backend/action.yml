@@ -1,0 +1,14 @@
+name: Restore the compiler backend
+description: >-
+  Cache zig-out/backend, the patched Zig compiler that `zig build backend`
+  produces in about 15 minutes. The key covers exactly what the backend is
+  built from, so a hit lets the bootstrap find a matching manifest and skip
+  the build.
+runs:
+  using: composite
+  steps:
+    - name: Cache patched compiler
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: zig-out/backend
+        key: backend-${{ runner.os }}-${{ hashFiles('compiler/analysis.patch', 'src/compiler/protocol.zig', 'build.zig', 'build.zig.zon') }}

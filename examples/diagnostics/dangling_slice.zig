@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub fn joinedPair(first: u8, second: u8) []u8 {
-    // expect: never-mutated-var
     var pair = [_]u8{ first, second };
     // expect: returning-local-slice
     return pair[0..];

@@ -141,8 +141,20 @@ fn reportAffix(context: RuleRun, affix: Affix, call_index: usize) !void {
     });
 }
 
+fn namesIteratorType(context: RuleRun) bool {
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .identifier) continue;
+        if (context.tokenIs(index, "SplitIterator") or context.tokenIs(index, "SplitBackwardsIterator") or
+            context.tokenIs(index, "TokenIterator")) return true;
+    }
+    return false;
+}
+
 fn reportRewrite(context: RuleRun, rewrite: Rewrite, call_index: usize) !void {
     const call = try scalarNeedleCall(context, call_index) orelse return;
+    // The scalar variants return another iterator type, which a spelled-out
+    // `SplitIterator(u8, .sequence)` would reject.
+    if (rewrite.rule == .prefer_split_scalar and namesIteratorType(context)) return;
     const edits = try context.allocator.alloc(types.Edit, 2);
     edits[0] = .{ .span = context.tokens[call_index].loc, .replacement = rewrite.replacement };
     edits[1] = .{ .span = context.tokens[call.needle_token].loc, .replacement = call.character };
@@ -369,4 +381,15 @@ test "multi-character or scalar splitting stays unchanged" {
     const findings = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_split_scalar}, .warning));
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "a spelled-out iterator type keeps the sequence variant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn fields(line: []const u8) std.mem.SplitIterator(u8, .sequence) {\n" ++
+        "    return std.mem.splitSequence(u8, line, \",\");\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_split_scalar}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }

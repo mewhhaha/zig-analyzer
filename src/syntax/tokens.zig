@@ -190,6 +190,25 @@ pub fn pathAfter(tokens: []const std.zig.Token, start: usize) ?Range {
     return .{ .start = start, .end = cursor };
 }
 
+/// The operands of the binary `node` when both are the same dotted identifier
+/// path (`a.b.c`, optionally dereferenced). Reasoning over the node rather than
+/// neighbouring tokens keeps operator precedence out of the rule.
+pub fn identicalPathOperands(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) ?[2]std.zig.Ast.Node.Index {
+    const left, const right = tree.nodeData(node).node_and_node;
+    if (!isPathNode(tree, left) or !isPathNode(tree, right)) return null;
+    if (!std.mem.eql(u8, tree.getNodeSource(left), tree.getNodeSource(right))) return null;
+    return .{ left, right };
+}
+
+fn isPathNode(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .identifier => true,
+        .field_access => isPathNode(tree, tree.nodeData(node).node_and_token[0]),
+        .deref => isPathNode(tree, tree.nodeData(node).node),
+        else => false,
+    };
+}
+
 /// Whether `text`, a stretch of Zig source that starts between tokens, holds a
 /// `//` comment (doc comments included). Slashes inside string and character
 /// literals and multiline string lines are not comments.
@@ -423,35 +442,6 @@ pub fn firstCall(tokens: []const std.zig.Token, start: usize, end: usize) ?Call 
 pub fn foreignDeclaration(tokens: []const std.zig.Token, index: usize) bool {
     if (index > 0 and (tokens[index - 1].tag == .keyword_extern or tokens[index - 1].tag == .keyword_export)) return true;
     return index > 1 and tokens[index - 1].tag == .string_literal and tokens[index - 2].tag == .keyword_extern;
-}
-
-pub fn insideFunctionOrTestBody(tokens: []const std.zig.Token, declaration_index: usize) bool {
-    var nested_closing_braces: usize = 0;
-    var cursor = declaration_index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => nested_closing_braces += 1,
-            .l_brace => {
-                if (nested_closing_braces != 0) {
-                    nested_closing_braces -= 1;
-                    continue;
-                }
-                var signature_cursor = cursor;
-                while (signature_cursor > 0) {
-                    signature_cursor -= 1;
-                    switch (tokens[signature_cursor].tag) {
-                        .keyword_fn, .keyword_test => return true,
-                        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return false,
-                        .semicolon, .l_brace, .r_brace => break,
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-    return false;
 }
 
 test "tokenize keeps the trailing eof token" {

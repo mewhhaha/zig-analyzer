@@ -199,11 +199,62 @@ pub const Index = struct {
         return if (target == none_token) null else target;
     }
 
-    pub fn enclosingScopeEnd(index: *const Index, token_index: usize) ?usize {
+    /// Opening brace of the innermost block containing token `token_index`. A
+    /// closing brace belongs to the block it closes.
+    pub fn enclosingOpeningBrace(index: *const Index, token_index: usize) ?usize {
         if (token_index >= index.enclosing_braces.len) return null;
-        const opening = index.enclosing_braces[token_index];
-        if (opening == none_token) return null;
+        const opening = if (index.tokens[token_index].tag == .r_brace)
+            index.matching_tokens[token_index]
+        else
+            index.enclosing_braces[token_index];
+        return if (opening == none_token) null else opening;
+    }
+
+    /// Closing brace of the innermost block containing token `token_index`.
+    pub fn enclosingScopeEnd(index: *const Index, token_index: usize) ?usize {
+        const opening = index.enclosingOpeningBrace(token_index) orelse return null;
         return index.matchingToken(opening);
+    }
+
+    /// Opening brace of the innermost function or test body containing
+    /// `token_index`, looking through nested blocks.
+    pub fn enclosingFunctionBody(index: *const Index, token_index: usize) ?usize {
+        var brace = index.enclosingOpeningBrace(token_index);
+        while (brace) |opening| : (brace = index.enclosingOpeningBrace(opening)) {
+            if (index.braceKind(opening) == .function) return opening;
+        }
+        return null;
+    }
+
+    /// Whether `token_index` is inside a function or test body that no
+    /// container declaration encloses more closely.
+    pub fn insideFunctionOrTestBody(index: *const Index, token_index: usize) bool {
+        var brace = index.enclosingOpeningBrace(token_index);
+        while (brace) |opening| : (brace = index.enclosingOpeningBrace(opening)) {
+            switch (index.braceKind(opening)) {
+                .function => return true,
+                .container => return false,
+                .block => {},
+            }
+        }
+        return false;
+    }
+
+    const BraceKind = enum { function, container, block };
+
+    /// What the signature before the `{` at `opening` introduces.
+    fn braceKind(index: *const Index, opening: usize) BraceKind {
+        var cursor = opening;
+        while (cursor > 0) {
+            cursor -= 1;
+            switch (index.tokens[cursor].tag) {
+                .keyword_fn, .keyword_test => return .function,
+                .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return .container,
+                .semicolon, .l_brace, .r_brace => break,
+                else => {},
+            }
+        }
+        return .block;
     }
 
     pub fn statementEnd(index: *const Index, start: usize) ?usize {
@@ -711,6 +762,112 @@ test "structural index resolves delimiters statements and enclosing scopes" {
     const scope_end = index.enclosingScopeEnd(declaration_index.?);
     try std.testing.expect(scope_end != null);
     try std.testing.expectEqual(std.zig.Token.Tag.r_brace, tokens[scope_end.?].tag);
+}
+
+const nested_blocks_source: [:0]const u8 =
+    \\const top = 1;
+    \\const Outer = struct {
+    \\    field: u8,
+    \\    const member = 2;
+    \\    fn method(self: Outer) u8 {
+    \\        const local = blk: {
+    \\            const inner = self.field;
+    \\            break :blk inner;
+    \\        };
+    \\        const Nested = struct {
+    \\            const declared = 3;
+    \\            fn deep() u8 {
+    \\                if (local) { return declared; }
+    \\                return 0;
+    \\            }
+    \\        };
+    \\        return Nested.deep() + local;
+    \\    }
+    \\};
+    \\test "case" {
+    \\    var x: u8 = 0;
+    \\    for (0..2) |i| { x += i; }
+    \\}
+    \\
+;
+
+fn indexOfText(source: []const u8, tokens: []const std.zig.Token, text: []const u8, occurrence: usize) usize {
+    var seen: usize = 0;
+    for (tokens, 0..) |token, token_index| {
+        if (!std.mem.eql(u8, tokenText(source, token), text)) continue;
+        if (seen == occurrence) return token_index;
+        seen += 1;
+    }
+    unreachable;
+}
+
+test "index scans agree with the token scans at every token" {
+    const tokens = try tokenize(std.testing.allocator, nested_blocks_source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, nested_blocks_source, tokens);
+    defer index.deinit();
+    for (tokens, 0..) |token, token_index| {
+        try std.testing.expectEqual(enclosingOpeningBrace(tokens, token_index), index.enclosingOpeningBrace(token_index));
+        try std.testing.expectEqual(@import("tokens.zig").enclosingScopeEnd(tokens, token_index), index.enclosingScopeEnd(token_index));
+        switch (token.tag) {
+            .keyword_const, .keyword_var, .keyword_return => try std.testing.expectEqual(
+                @import("tokens.zig").statementEnd(tokens, token_index),
+                index.statementEnd(token_index),
+            ),
+            .l_paren, .l_bracket, .l_brace => try std.testing.expectEqual(
+                @import("tokens.zig").matchingDelimiter(tokens, token_index),
+                index.matchingToken(token_index),
+            ),
+            else => {},
+        }
+    }
+}
+
+test "a closing brace belongs to the block it closes" {
+    const tokens = try tokenize(std.testing.allocator, nested_blocks_source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, nested_blocks_source, tokens);
+    defer index.deinit();
+    const opening = indexOfText(nested_blocks_source, tokens, "{", 4);
+    const closing = index.matchingToken(opening).?;
+    try std.testing.expectEqual(std.zig.Token.Tag.r_brace, tokens[closing].tag);
+    try std.testing.expectEqual(@as(?usize, opening), index.enclosingOpeningBrace(closing));
+    try std.testing.expectEqual(@as(?usize, closing), index.enclosingScopeEnd(closing));
+    // The opening brace belongs to the block around it instead.
+    try std.testing.expect(index.enclosingOpeningBrace(opening).? < opening);
+    // Top-level tokens and out-of-range queries have no enclosing block.
+    try std.testing.expectEqual(@as(?usize, null), index.enclosingOpeningBrace(0));
+    try std.testing.expectEqual(@as(?usize, null), index.enclosingScopeEnd(tokens.len));
+}
+
+test "function bodies are found through nested blocks and stop at containers" {
+    const tokens = try tokenize(std.testing.allocator, nested_blocks_source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, nested_blocks_source, tokens);
+    defer index.deinit();
+    const source = nested_blocks_source;
+    const method_body = indexOfText(source, tokens, "{", 1);
+    const deep_body = indexOfText(source, tokens, "{", 4);
+    const test_body = indexOfText(source, tokens, "{", 6);
+    // Top-level and container-level declarations are not inside a body.
+    try std.testing.expect(!index.insideFunctionOrTestBody(indexOfText(source, tokens, "top", 0)));
+    try std.testing.expect(!index.insideFunctionOrTestBody(indexOfText(source, tokens, "member", 0)));
+    try std.testing.expectEqual(@as(?usize, null), index.enclosingFunctionBody(indexOfText(source, tokens, "member", 0)));
+    // A labeled block and the declarations of a container inside a method sit in different bodies.
+    const inner = indexOfText(source, tokens, "inner", 0);
+    try std.testing.expect(index.insideFunctionOrTestBody(inner));
+    try std.testing.expectEqual(@as(?usize, method_body), index.enclosingFunctionBody(inner));
+    const declared = indexOfText(source, tokens, "declared", 0);
+    try std.testing.expect(!index.insideFunctionOrTestBody(declared));
+    try std.testing.expectEqual(@as(?usize, method_body), index.enclosingFunctionBody(declared));
+    // A plain block inside a function still belongs to the function.
+    const deep_return = indexOfText(source, tokens, "return", 0);
+    try std.testing.expectEqual(@as(?usize, deep_body), index.enclosingFunctionBody(deep_return));
+    try std.testing.expect(index.insideFunctionOrTestBody(deep_return));
+    // Test blocks count as bodies too.
+    const test_variable = indexOfText(source, tokens, "x", 0);
+    try std.testing.expectEqual(@as(?usize, test_body), index.enclosingFunctionBody(test_variable));
+    try std.testing.expect(index.insideFunctionOrTestBody(test_variable));
 }
 
 test "usingnamespace uncertainty is limited to its container" {

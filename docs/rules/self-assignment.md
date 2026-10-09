@@ -23,10 +23,11 @@ excluding shadowing variable declarations like `var x = x;`.
 ## Example
 
 ```zig
-fn reset(total: u32) u32 {
-    var value = total;
-    value = value;
-    return value;
+fn tally(values: []const u32) u32 {
+    var total: u32 = 0;
+    for (values) |value| total += value;
+    total = total;
+    return total;
 }
 ```
 

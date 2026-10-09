@@ -2,6 +2,7 @@
 //! the checks that need a callee's summary from another file: the
 //! file-local lifecycle engines re-run with summaries, and the owned-field
 //! cleanup proofs.
+const std = @import("std");
 const allocation_lifecycle = @import("../lifecycle/allocation_lifecycle.zig");
 const summaries = @import("../summaries.zig");
 const types = @import("../types.zig");
@@ -39,5 +40,26 @@ pub fn run(project_run: run_module.ProjectRun) !void {
     const summary_index = try summaries.build(project_run.allocator, sources, project_run.configuration);
     try owned_fields.findIncompleteOwnedFieldCleanup(project_run, summary_index);
     try summary_checks.findDeferredOwnedEscapes(project_run, summary_index);
-    for (0..project_run.files.len) |file_index| try summary_checks.checkFile(project_run, file_index, summary_index);
+    // Files are checked on several threads, each into a list of its own that
+    // is joined in file order, so the findings are the same as in one thread.
+    const per_file = try project_run.allocator.alloc(std.ArrayList(run_module.Finding), project_run.files.len);
+    @memset(per_file, .empty);
+    try run_module.forEachIndex(project_run, project_run.files.len, FileChecks{
+        .run = project_run,
+        .summary_index = summary_index,
+        .per_file = per_file,
+    }, FileChecks.check);
+    for (per_file) |found| try project_run.findings.appendSlice(project_run.results, found.items);
 }
+
+const FileChecks = struct {
+    run: run_module.ProjectRun,
+    summary_index: summaries.Index,
+    per_file: []std.ArrayList(run_module.Finding),
+
+    fn check(checks: FileChecks, file_index: usize) !void {
+        var file_run = checks.run;
+        file_run.findings = &checks.per_file[file_index];
+        try summary_checks.checkFile(file_run, file_index, checks.summary_index);
+    }
+};

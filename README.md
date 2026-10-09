@@ -1,7 +1,7 @@
 # zig-analyzer
 
 A language server and linter for Zig. Instead of reimplementing Zig's
-semantics, zig-analyzer builds a patched Zig 0.17.0 compiler and asks it what
+semantics, zig-analyzer builds a patched Zig compiler and asks it what
 each expression resolved to, falling back to syntax-based analysis when a
 file does not compile.
 
@@ -120,25 +120,27 @@ can be suppressed with source directives;
 [docs/linting.md](docs/linting.md) documents all of it.
 
 The [Zig 0.17.0 audit](docs/zig-0.17.0-lint-audit.md) reviews every existing
-rule. Eight new checks in the `modernize` profile cover removed syntax,
+rule. The `modernize` profile covers removed syntax,
 deprecated builtins and build APIs, changed bit casts, linkage values, and
 container APIs. The idiomatic profile also offers `@divCeil` guidance.
 Deprecation warnings follow standard-library and literal file imports, including
 unsaved editor buffers. A new correctness check flags batch network sends whose
 error result hides partial progress.
 
-The engine runs without crashes over TigerBeetle (244 files), the complete
-Zig standard library (550 files), and roughly 6,100 mangled fuzzing variants
-of those sources — a run that surfaced two real bugs in the standard library.
-Worst-case single-file `check` time on that corpus is about 0.3 s
-(the 15k-line LLVM Builder binding); typical files take a few milliseconds.
+The engine runs without crashes over the complete Zig standard library, and the rule fuzz harness (`zig build fuzz-rules`)
+feeds mutated and generated programs through every rule. Measured with the
+optimized build (`check --no-cache`, 16 threads, wall clock, five runs each):
+this repository (240 files) takes about 1.0 s, a copy of the 0.17.0 standard
+library (563 files) about 5 s, and single files take 0.7 s for the 16.5k-line
+LLVM `Builder.zig` and the 20k-line `Io/Threaded.zig`. Cost grows faster than
+linearly with file size: the compiler's 35.6k-line `Sema.zig` takes about 4.5 s.
 
 ## Installation
 
-The `0.17.0-2` release provides a relocatable x86_64 Linux archive containing
-both zig-analyzer and its patched compiler backend. Verify the published
-SHA-256 checksum before installing it. Building from source requires Zig
-0.17.0 exactly:
+Each release provides a relocatable x86_64 Linux archive containing both
+zig-analyzer and its patched compiler backend. Verify the published SHA-256
+checksum before installing it. Building from source requires exactly the Zig
+release the version names (`0.17.0` for `0.17.0-2`):
 
 ```sh
 zig build -Doptimize=fast
@@ -148,14 +150,14 @@ zig-out/bin/zig-analyzer doctor      # verifies the setup
 
 [docs/installation.md](docs/installation.md) covers the complete setup,
 including how the patched backend is built and how to use it from other
-projects. See the [release notes](docs/release-0.17.0-2.md) for changes and
+projects. Each release has notes under [docs/](docs/README.md) for changes and
 upgrade instructions.
 
 ## Versioning
 
 Release versions track the supported Zig release: the base version names the
 Zig version the analyzer targets, and a numeric suffix increments with each
-zig-analyzer release, as in `0.17.0-1`. The suffix carries no compatibility
+zig-analyzer release, as in `0.17.0-2`. The suffix carries no compatibility
 meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
 ## Project status
@@ -164,8 +166,8 @@ zig-analyzer is pre-1.0 software with a narrow compatibility boundary: each
 release supports exactly one Zig version. The lint rules combine token-level
 file analysis, conservative cross-file summaries, and compiler-backed project
 facts; they stay opaque when a relationship cannot be proven. The compiler
-backend is pinned to exactly Zig 0.17.0 and requires porting work for each new
-Zig release. [TASKS.md](TASKS.md) records which planned work is complete.
+backend is pinned to exactly one Zig release and requires porting work for each
+new one ([compiler/README.md](compiler/README.md)).
 
 The project's claim is narrow: querying the compiler produces better editor
 answers than reimplementing it.
@@ -174,7 +176,8 @@ answers than reimplementing it.
 
 The project is MIT-licensed; distributed third-party licenses are recorded in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Report security issues using
-the private process in [SECURITY.md](SECURITY.md).
+the private process in [SECURITY.md](SECURITY.md). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute;
 [ARCHITECTURE.md](ARCHITECTURE.md) documents the module boundaries,
 [EXTENDING.md](EXTENDING.md) the extension seams, and
 [`src/rules/README.md`](src/rules/README.md) the rule contract.

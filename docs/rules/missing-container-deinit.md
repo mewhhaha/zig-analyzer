@@ -19,12 +19,14 @@ leaks on all exit paths.
 ## When it fires
 
 The rule inspects local `var` declarations of recognized allocating container
-types within functions and tests that call
+types within functions and tests, whether the type comes from the annotation
+(`var list: std.ArrayList(u8) = .empty`) or from the initializer, that call
 allocating methods (`append`, `appendSlice`, `put`, `getOrPut`,
 `ensureTotalCapacity`, etc.). A `defer container.deinit(allocator);`, direct
 `deinit`, conversion via `toOwnedSlice`, or returning the container satisfies
-ownership. An automated quickfix inserts the appropriate `defer
-container.deinit(allocator);`.
+ownership. Managed containers (`std.array_list.Managed`) and containers fed by
+the build graph's `b.allocator` arena are not reported. An automated quickfix
+inserts the appropriate `defer container.deinit(allocator);`.
 
 An `.empty` or `.{}` initializer alone does not establish heap ownership.
 Fixed-storage sets such as `std.EnumSet` and unresolved custom types are left

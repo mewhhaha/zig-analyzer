@@ -462,6 +462,14 @@ fn findOp(context: RuleRun) !void {
     }
 }
 
+/// Whether the file binds `std`, which the rewrite needs.
+fn declaresStd(context: RuleRun) bool {
+    for (context.tokens[0 .. context.tokens.len - 1], 0..) |token, index| {
+        if (token.tag == .keyword_const and context.tokenIs(index + 1, "std")) return true;
+    }
+    return false;
+}
+
 fn findIota(context: RuleRun) !void {
     const level = context.level(.prefer_simd_iota);
     if (level == .off) return;
@@ -547,7 +555,7 @@ fn findIota(context: RuleRun) !void {
             }
         }
 
-        if (!is_iota) continue;
+        if (!is_iota or !declaresStd(context)) continue;
 
         const replacement = try context.allocator.print("std.simd.iota({s}, {s})", .{ type_str, len_str });
 
@@ -729,6 +737,7 @@ test "prefer_simd_iota flags sequential integers in @as" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
         "pub fn testIota() void {\n" ++
         "    const v = @as(@Vector(4, u32), .{ 0, 1, 2, 3 });\n" ++
         "    _ = v;\n" ++
@@ -742,6 +751,7 @@ test "prefer_simd_iota flags sequential integers in typed const" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
         "pub fn testIota() void {\n" ++
         "    const v: @Vector(4, i32) = .{ 0, 1, 2, 3 };\n" ++
         "    _ = v;\n" ++
@@ -749,6 +759,14 @@ test "prefer_simd_iota flags sequential integers in typed const" {
     const findings = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_simd_iota}, .warning));
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqualStrings("std.simd.iota(i32, 4)", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "prefer_simd_iota needs std in scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "const lanes: @Vector(4, u32) = .{ 0, 1, 2, 3 };\n";
+    const findings = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_simd_iota}, .warning));
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "prefer_simd_iota ignores non-sequential values" {

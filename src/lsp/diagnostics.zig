@@ -15,6 +15,7 @@ const build_graph = @import("../compiler/build_graph.zig");
 const project_config = @import("../project/config.zig");
 const imported_deprecations = @import("../project/imported_deprecations.zig");
 const module_sites = @import("../project/module_sites.zig");
+const source_store = @import("../project/source_store.zig");
 const document_module = @import("../syntax/document.zig");
 const uri_module = @import("../uri.zig");
 
@@ -345,6 +346,8 @@ pub const Linter = struct {
     io: std.Io,
     transport: *lsp.Transport,
     configurations: *project_config.Store,
+    /// Dependencies of documents, parsed once and shared by every lint run.
+    sources: *source_store.Store,
 
     /// The lint configuration for `document`: the nearest `zig-analyzer.json`
     /// above its file with the per-path relaxations the CLI applies too. A
@@ -398,10 +401,13 @@ pub const Linter = struct {
         dependencies: ?*Dependencies,
     ) ![]analysis.Finding {
         const origin = try module_sites.File.ofDocument(allocator, document);
+        var module_files: module_sites.Cache = .init(allocator);
+        defer module_files.deinit();
+        module_files.store = linter.sources;
         const modules: []const analysis.ModuleMembers = if (origin == null or lint_configuration.level(.unresolved_member) == .off)
             &.{}
         else
-            try (module_sites.Resolver{ .io = linter.io }).fileModules(allocator, origin.?);
+            try (module_sites.Resolver{ .io = linter.io, .cache = &module_files }).fileModules(allocator, origin.?);
         var document_findings: std.ArrayList(analysis.Finding) = .empty;
         errdefer document_findings.deinit(allocator);
         try document_findings.appendSlice(
@@ -468,12 +474,18 @@ pub const Linter = struct {
         var imported: imported_deprecations.ImportedDeprecations = undefined;
         imported.init(linter.io, allocator);
         defer imported.deinit();
+        imported.useStore(linter.sources);
         // Open buffers take precedence over disk, including unsaved dependencies.
         var open_documents = documents.documents.valueIterator();
         while (open_documents.next()) |open_document| {
             const open_path = try uri_module.toPath(allocator, open_document.uri) orelse continue;
             defer allocator.free(open_path);
-            try imported.addSource(.{ .path = open_path, .source = open_document.source, .tokens = open_document.tokens });
+            try imported.addSource(.{
+                .path = open_path,
+                .source = open_document.source,
+                .tokens = open_document.tokens,
+                .scopes = &open_document.scopes,
+            });
         }
         try imported.check(.{ .path = path, .source = document.source, .tokens = document.tokens }, lint_configuration, findings_list);
         const dependency_paths = try imported.dependencyPaths(allocator);

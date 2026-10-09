@@ -4,10 +4,7 @@ const std = @import("std");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
-const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
-const enclosingScopeEnd = @import("../../syntax/tokens.zig").enclosingScopeEnd;
 const isAssignment = @import("../../syntax/tokens.zig").isAssignment;
-const insideFunctionOrTestBody = @import("../../syntax/tokens.zig").insideFunctionOrTestBody;
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -55,13 +52,13 @@ fn findNeverMutatedVariables(context: RuleRun) !void {
     if (level == .off) return;
     for (tokens, 0..) |token, index| {
         if (token.tag != .keyword_var or index + 1 >= tokens.len or tokens[index + 1].tag != .identifier) continue;
-        if (!insideFunctionOrTestBody(tokens, index)) continue;
+        if (!context.scopes.insideFunctionOrTestBody(index)) continue;
         const name_token = tokens[index + 1];
         const name = tokenText(source, name_token);
         if (std.mem.eql(u8, name, "_")) continue;
         if (declarationUsesUndefined(source, tokens, index + 2)) continue;
-        const scope_end = enclosingScopeEnd(tokens, index) orelse continue;
-        if (bindingIsMutated(source, tokens, name, index + 2, scope_end)) continue;
+        const scope_end = context.enclosingScopeEnd(index) orelse continue;
+        if (bindingIsMutated(context, name, index + 2, scope_end)) continue;
         const fixes = try Fix.single(context.allocator, .{
             .title = try context.allocator.print("Change '{s}' to const", .{name}),
             .span = token.loc,
@@ -90,12 +87,13 @@ fn declarationUsesUndefined(source: []const u8, tokens: []const std.zig.Token, s
 }
 
 fn bindingIsMutated(
-    source: []const u8,
-    tokens: []const std.zig.Token,
+    context: RuleRun,
     name: []const u8,
     start: usize,
     end: usize,
 ) bool {
+    const source = context.source;
+    const tokens = context.tokens;
     var index = start;
     while (index < @min(end, tokens.len)) : (index += 1) {
         if (!tokenIs(source, tokens[index], name)) continue;
@@ -103,7 +101,7 @@ fn bindingIsMutated(
             (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var) or
             identifierIsCaptureBinding(tokens, index);
         if (shadows_binding) {
-            index = enclosingScopeEnd(tokens, index) orelse index;
+            index = context.enclosingScopeEnd(index) orelse index;
             continue;
         }
         if (index > 0 and tokens[index - 1].tag == .ampersand) return true;
@@ -112,9 +110,26 @@ fn bindingIsMutated(
         if (usedByMutableOptionalCapture(tokens, index)) return true;
         if (usedByMutableSwitchCapture(tokens, index)) return true;
         if (index + 1 >= tokens.len) continue;
+        if (usedAsSlice(tokens, index)) return true;
         if (identifierIsLvalueAssignment(tokens, index)) return true;
         if (identifierIsDestructuredAssignmentTarget(tokens, index)) return true;
     }
+    return false;
+}
+
+/// `name[a..b]` borrows a mutable view of the binding's storage, which can be
+/// written through (`@memcpy(name[0..n], ...)`, `name[0..n].* = ...`) or passed
+/// on; treat the slice as a potential mutable alias.
+fn usedAsSlice(tokens: []const std.zig.Token, index: usize) bool {
+    if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_bracket) return false;
+    const closing = matchingToken(tokens, index + 1, .l_bracket, .r_bracket) orelse return false;
+    var depth: usize = 0;
+    for (tokens[index + 2 .. closing]) |token| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .ellipsis2 => if (depth == 0) return true,
+        else => {},
+    };
     return false;
 }
 
@@ -133,6 +148,9 @@ fn identifierIsLvalueAssignment(tokens: []const std.zig.Token, index: usize) boo
             return false;
         } else if (tokens[cursor].tag == .l_bracket) {
             cursor = (matchingToken(tokens, cursor, .l_bracket, .r_bracket) orelse return false) + 1;
+            continue;
+        } else if (tokens[cursor].tag == .period_asterisk) {
+            cursor += 1;
             continue;
         }
         break;
@@ -221,7 +239,7 @@ fn findUndefinedValueEscapes(context: RuleRun) !void {
     for (tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 3 >= tokens.len or
             tokens[declaration_index + 1].tag != .identifier) continue;
-        const statement_end = statementEnd(tokens, declaration_index) orelse continue;
+        const statement_end = context.statementEnd(declaration_index) orelse continue;
         const undefined_index = undefinedInitializer(tokens, source, declaration_index + 2, statement_end) orelse continue;
         var type_contains_array = false;
         for (tokens[declaration_index + 2 .. undefined_index]) |type_token| {
@@ -230,7 +248,7 @@ fn findUndefinedValueEscapes(context: RuleRun) !void {
         if (type_contains_array) continue;
         const binding_name = tokenText(source, tokens[declaration_index + 1]);
         const binding_index = declaration_index + 1;
-        const scope_end = enclosingScopeEnd(tokens, declaration_index) orelse continue;
+        const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         var index = statement_end + 1;
         while (index < scope_end and index < tokens.len) : (index += 1) {
             if (!tokenIs(source, tokens[index], binding_name)) continue;
@@ -240,7 +258,7 @@ fn findUndefinedValueEscapes(context: RuleRun) !void {
             if (index > 0 and (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var) or
                 identifierIsCaptureBinding(tokens, index))
             {
-                index = enclosingScopeEnd(tokens, index) orelse index;
+                index = context.enclosingScopeEnd(index) orelse index;
                 continue;
             }
             if (usedByTypeQuery(source, tokens, index) or useBelongsToErrdefer(tokens, index)) continue;
@@ -253,7 +271,7 @@ fn findUndefinedValueEscapes(context: RuleRun) !void {
             if (index + 3 < tokens.len and tokens[index + 1].tag == .period and
                 tokens[index + 3].tag == .equal) break;
             if (index + 1 < tokens.len and tokens[index + 1].tag == .l_bracket) {
-                const closing = matchingToken(tokens, index + 1, .l_bracket, .r_bracket) orelse continue;
+                const closing = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
                 if (closing + 1 < tokens.len and tokens[closing + 1].tag == .equal) break;
                 break;
             }
@@ -335,11 +353,11 @@ fn findPointerParameterIdioms(context: RuleRun) !void {
     }
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 3 >= tokens.len or tokens[fn_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse continue;
         var body_open = parameters_end + 1;
         while (body_open < tokens.len and tokens[body_open].tag != .l_brace and tokens[body_open].tag != .semicolon) : (body_open += 1) {}
         if (body_open >= tokens.len or tokens[body_open].tag != .l_brace) continue;
-        const body_close = matchingToken(tokens, body_open, .l_brace, .r_brace) orelse continue;
+        const body_close = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         // deinit takes '*T' by convention: it invalidates the value even when its
         // body happens to only read through the pointer.
         if (tokens[fn_index + 1].tag == .identifier and tokenIs(source, tokens[fn_index + 1], "deinit")) continue;
@@ -581,6 +599,24 @@ test "never-mutated analysis identifies variables only read via field or array i
         never_mutated_count += 1;
     };
     try std.testing.expectEqual(@as(usize, 3), never_mutated_count);
+}
+
+test "slicing a var array keeps it mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(src: []const u8, n: usize) void {\n" ++
+        "    var padded: [8]u8 = undefined;\n" ++
+        "    @memcpy(padded[0..n], src[0..n]);\n" ++
+        "    var buf = [_]u8{0} ** 8;\n" ++
+        "    @memset(buf[2..n], 1);\n" ++
+        "    var block = [_]u8{0} ** 4;\n" ++
+        "    block[0..4].* = .{ 1, 2, 3, 4 };\n" ++
+        "    var rest = [_]u8{0} ** 4;\n" ++
+        "    fill(rest[0..]);\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
 }
 
 test "mutation through @field keeps a var mutable" {

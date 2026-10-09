@@ -28,8 +28,9 @@ delimiter character.
 ```zig
 const std = @import("std");
 
-fn fields(line: []const u8) std.mem.SplitIterator(u8, .sequence) {
-    return std.mem.splitSequence(u8, line, ",");
+fn firstField(line: []const u8) ?[]const u8 {
+    var parts = std.mem.splitSequence(u8, line, ",");
+    return parts.next();
 }
 ```
 

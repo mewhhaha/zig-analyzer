@@ -178,6 +178,10 @@ pub const BuildGraph = struct {
     notices: []const Notice = &.{},
     /// Whether `takeNotices` already handed out the messages.
     reported: std.atomic.Value(bool) = .init(false),
+    /// Restored from `NamedModules`: it knows which module each import names
+    /// but nothing about targets or launches, so it only answers
+    /// `importedModuleSource`.
+    modules_only: bool = false,
 
     reach_mutex: std.Io.Mutex = .init,
     /// Files each module root reaches through relative imports, keyed by the
@@ -352,45 +356,118 @@ pub const BuildGraph = struct {
         return entry.value_ptr.contains(file);
     }
 
-    /// Follows `@import("x.zig")` from `root_path`, recording every file seen.
     fn collectReach(graph: *BuildGraph, io: std.Io, root_path: []const u8, reached: *std.StringHashMapUnmanaged(void)) !void {
-        const arena = graph.arena.allocator();
-        var queue: std.ArrayList([]const u8) = .empty;
-        defer queue.deinit(arena);
-        try reached.put(arena, root_path, {});
-        try queue.append(arena, root_path);
-        var scratch: std.heap.ArenaAllocator = .init(arena);
-        defer scratch.deinit();
-        var next: usize = 0;
-        while (next < queue.items.len) : (next += 1) {
-            _ = scratch.reset(.retain_capacity);
-            const temporary = scratch.allocator();
-            const current = queue.items[next];
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, current, temporary, .limited(max_source_bytes)) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => continue,
+        try reachableFiles(io, graph.arena.allocator(), root_path, reached);
+    }
+
+    /// The module structure of this graph, without anything a launch needs.
+    /// Null when discovery failed for a reason that may pass (no compiler,
+    /// a timeout, a dependency that could not be fetched); a build script
+    /// that does not compile or builds no unit stores as having no modules.
+    /// Owned by `arena`.
+    pub fn namedModules(graph: *const BuildGraph, arena: std.mem.Allocator) !?NamedModules {
+        if (graph.modules_only) return null;
+        if (graph.failure) |failure| {
+            const script_error = std.mem.find(u8, failure, ".zig:") != null and std.mem.find(u8, failure, ": error: ") != null;
+            return if (script_error) .{ .units = &.{} } else null;
+        }
+        const units = try arena.alloc([]const NamedModule, graph.units.len);
+        for (graph.units, units) |unit, *stored_unit| {
+            const stored = try arena.alloc(NamedModule, unit.modules.len);
+            for (unit.modules, stored) |module, *entry| entry.* = .{
+                .root = if (module.source.path()) |path| try arena.dupe(u8, path) else null,
+                .imports = try arena.dupe(Import, module.imports),
             };
-            const source = try temporary.dupeSentinel(u8, bytes, 0);
-            const tokens = try tokens_util.tokenize(temporary, source);
-            const directory = std.Io.Dir.path.dirname(current) orelse continue;
-            for (tokens, 0..) |token, index| {
-                if (token.tag != .builtin or !tokens_util.tokenIs(source, token, "@import") or
-                    index + 3 >= tokens.len or tokens[index + 1].tag != .l_paren or
-                    tokens[index + 2].tag != .string_literal or tokens[index + 3].tag != .r_paren) continue;
-                const import_path = std.zig.string_literal.parseAlloc(temporary, tokens_util.tokenText(source, tokens[index + 2])) catch |err| switch (err) {
-                    error.InvalidLiteral => continue,
-                    error.OutOfMemory => return error.OutOfMemory,
-                };
-                if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
-                const resolved = try std.Io.Dir.path.resolveAlloc(temporary, &.{ directory, import_path });
-                if (reached.contains(resolved) or reached.count() == max_reachable_files) continue;
-                const owned = try arena.dupe(u8, resolved);
-                try reached.put(arena, owned, {});
-                try queue.append(arena, owned);
+            stored_unit.* = stored;
+        }
+        return .{ .units = units };
+    }
+
+    /// A graph for `build_root` rebuilt from `table`, or null when the table
+    /// is inconsistent. The caller owns one reference.
+    pub fn restore(backing: std.mem.Allocator, build_root: []const u8, table: NamedModules) !?*BuildGraph {
+        for (table.units) |unit| {
+            if (unit.len == 0) return null;
+            for (unit) |module| {
+                for (module.imports) |import| if (import.module >= unit.len) return null;
             }
         }
+        const graph = try create(backing);
+        errdefer graph.release();
+        const arena = graph.arena.allocator();
+        graph.build_root = try arena.dupe(u8, build_root);
+        graph.modules_only = true;
+        const units = try arena.alloc(Unit, table.units.len);
+        for (table.units, units) |stored_unit, *unit| {
+            const modules = try arena.alloc(Module, stored_unit.len);
+            for (stored_unit, modules) |stored, *module| module.* = .{
+                .name = "",
+                .source = if (stored.root) |root| .{ .file = try arena.dupe(u8, root) } else .none,
+                .imports = try cloneImports(arena, stored.imports),
+            };
+            unit.* = .{ .name = "", .kind = .exe, .modules = modules };
+        }
+        graph.units = units;
+        return graph;
     }
 };
+
+fn cloneImports(arena: std.mem.Allocator, imports: []const Import) ![]const Import {
+    const copy = try arena.dupe(Import, imports);
+    for (copy) |*import| import.name = try arena.dupe(u8, import.name);
+    return copy;
+}
+
+/// One module of a stored unit: where its root source is, if it has one, and
+/// which module each import name stands for (an index into the unit).
+pub const NamedModule = struct {
+    root: ?[]const u8,
+    imports: []const Import,
+};
+
+/// What a build graph says about named modules, in a form the check cache can
+/// keep between runs: per unit, its modules (index 0 is the root module).
+pub const NamedModules = struct {
+    units: []const []const NamedModule,
+};
+
+/// Follows `@import("x.zig")` from `root_path`, recording every file seen.
+pub fn reachableFiles(io: std.Io, arena: std.mem.Allocator, root_path: []const u8, reached: *std.StringHashMapUnmanaged(void)) !void {
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(arena);
+    try reached.put(arena, root_path, {});
+    try queue.append(arena, root_path);
+    var scratch: std.heap.ArenaAllocator = .init(arena);
+    defer scratch.deinit();
+    var next: usize = 0;
+    while (next < queue.items.len) : (next += 1) {
+        _ = scratch.reset(.retain_capacity);
+        const temporary = scratch.allocator();
+        const current = queue.items[next];
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, current, temporary, .limited(max_source_bytes)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        const source = try temporary.dupeSentinel(u8, bytes, 0);
+        const tokens = try tokens_util.tokenize(temporary, source);
+        const directory = std.Io.Dir.path.dirname(current) orelse continue;
+        for (tokens, 0..) |token, index| {
+            if (token.tag != .builtin or !tokens_util.tokenIs(source, token, "@import") or
+                index + 3 >= tokens.len or tokens[index + 1].tag != .l_paren or
+                tokens[index + 2].tag != .string_literal or tokens[index + 3].tag != .r_paren) continue;
+            const import_path = std.zig.string_literal.parseAlloc(temporary, tokens_util.tokenText(source, tokens[index + 2])) catch |err| switch (err) {
+                error.InvalidLiteral => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
+            const resolved = try std.Io.Dir.path.resolveAlloc(temporary, &.{ directory, import_path });
+            if (reached.contains(resolved) or reached.count() == max_reachable_files) continue;
+            const owned = try arena.dupe(u8, resolved);
+            try reached.put(arena, owned, {});
+            try queue.append(arena, owned);
+        }
+    }
+}
 
 fn hashModule(hasher: *std.hash.Wyhash, unit: *const Unit, index: usize, visited: []bool) void {
     if (visited[index]) return;
@@ -635,4 +712,41 @@ test "build problems are reported to the first caller only" {
     try std.testing.expectEqual(.warning, first[0].level);
     try std.testing.expectEqual(.information, first[1].level);
     try std.testing.expectEqual(@as(usize, 0), (try graph.takeNotices(arena_state.allocator())).len);
+}
+
+test "named modules survive a round trip and a failed build script stores as empty" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "main.zig", .data = "const api = @import(\"api\");\n" });
+    const directory = try temporary.dir.realPathFileAlloc(io, ".", arena);
+    const main_path = try std.Io.Dir.path.join(arena, &.{ directory, "main.zig" });
+    const api_path = try std.Io.Dir.path.join(arena, &.{ directory, "api.zig" });
+
+    const modules = [_]Module{
+        .{ .name = "root", .source = .{ .file = main_path }, .imports = &.{.{ .name = "api", .module = 1 }} },
+        .{ .name = "api", .source = .{ .file = api_path }, .imports = &.{} },
+    };
+    const graph = try testGraph(&.{.{ .name = "app", .kind = .exe, .modules = &modules }});
+    defer graph.release();
+    const table = (try graph.namedModules(arena)).?;
+
+    const restored = (try BuildGraph.restore(std.testing.allocator, directory, table)).?;
+    defer restored.release();
+    try std.testing.expectEqualStrings(api_path, (try restored.importedModuleSource(io, main_path, "api")).?);
+    try std.testing.expect(try restored.importedModuleSource(io, main_path, "other") == null);
+    try std.testing.expect(try restored.namedModules(arena) == null);
+
+    const dangling = [_][]const NamedModule{&.{.{ .root = main_path, .imports = &.{.{ .name = "api", .module = 4 }} }}};
+    try std.testing.expect(try BuildGraph.restore(std.testing.allocator, directory, .{ .units = &dangling }) == null);
+
+    const failed = try testGraph(&.{});
+    defer failed.release();
+    failed.failure = "build.zig:3:5: error: expected token";
+    try std.testing.expectEqual(@as(usize, 0), (try failed.namedModules(arena)).?.units.len);
+    failed.failure = "running 'zig build' failed: Timeout";
+    try std.testing.expect(try failed.namedModules(arena) == null);
 }

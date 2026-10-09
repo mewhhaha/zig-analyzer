@@ -1,5 +1,6 @@
 const std = @import("std");
 const analysis = @import("../analysis.zig");
+const build_graph = @import("../compiler/build_graph.zig");
 
 /// Bump when the stored records change meaning. It names the cache directory,
 /// seeds every key, and is stored in each record, so entries of another
@@ -38,6 +39,31 @@ const StoredFile = struct {
 const StoredProject = struct {
     version: u8,
     findings: []const ProjectRecord,
+};
+
+/// A file or build root a cross-file result was computed from. The result is
+/// valid while every dependency still hashes the same.
+pub const DependencyKind = enum { file, build_root };
+
+pub const Dependency = struct {
+    kind: DependencyKind,
+    path: []const u8,
+    /// Null for a file that did not exist.
+    hash: ?u64,
+};
+
+/// What the cross-file passes found for one file: findings that depend on the
+/// files it imports, so the entry also names them.
+pub const CrossEntry = struct {
+    version: u8 = format_version,
+    imports: []const Record,
+    members: []const Record,
+    dependencies: []const Dependency,
+};
+
+const StoredModules = struct {
+    version: u8,
+    units: []const []const build_graph.NamedModule,
 };
 
 pub const Cache = struct {
@@ -231,6 +257,141 @@ pub const Cache = struct {
         try writeEntry(io, dir, file_name, bytes);
     }
 
+    pub fn loadCross(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        relative_path: []const u8,
+        source: []const u8,
+    ) !?CrossEntry {
+        const dir = cache.dir orelse return null;
+        var file_name_buffer: [cross_name_length]u8 = undefined;
+        const file_name = cache.crossFileName(relative_path, source, &file_name_buffer);
+        const bytes = try readEntry(io, dir, file_name, allocator) orelse return null;
+        const parsed = std.json.parseFromSliceLeaky(CrossEntry, allocator, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (parsed.version != format_version) return null;
+        for ([_][]const Record{ parsed.imports, parsed.members }) |records| {
+            for (records) |record| if (record.start > record.end or record.end > source.len) return null;
+        }
+        return parsed;
+    }
+
+    pub fn storeCross(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        relative_path: []const u8,
+        source: []const u8,
+        entry: CrossEntry,
+    ) !void {
+        const dir = cache.dir orelse return;
+        var encoded: std.Io.Writer.Allocating = .init(allocator);
+        defer encoded.deinit();
+        std.json.Stringify.value(entry, .{}, &encoded.writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory, // an allocating writer fails only on allocation
+        };
+        const bytes = try encoded.toOwnedSlice();
+        defer allocator.free(bytes);
+        var file_name_buffer: [cross_name_length]u8 = undefined;
+        const file_name = cache.crossFileName(relative_path, source, &file_name_buffer);
+        try writeEntry(io, dir, file_name, bytes);
+    }
+
+    const cross_name_length = "cross-".len + std.crypto.hash.Blake3.digest_length * 2 + ".json".len;
+
+    fn crossFileName(
+        cache: Cache,
+        relative_path: []const u8,
+        source: []const u8,
+        buffer: *[cross_name_length]u8,
+    ) []const u8 {
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&cache.identity);
+        hasher.update("cross");
+        hasher.update(std.mem.asBytes(&relative_path.len));
+        hasher.update(relative_path);
+        hasher.update(source);
+        var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const hexadecimal = std.fmt.bytesToHex(digest, .lower);
+        @memcpy(buffer[0.."cross-".len], "cross-");
+        @memcpy(buffer["cross-".len..][0..hexadecimal.len], &hexadecimal);
+        @memcpy(buffer["cross-".len + hexadecimal.len ..], ".json");
+        return buffer;
+    }
+
+    /// The named-module table stored for the build in `build_root` when the
+    /// build inputs hashed to `digest` (see `compile_units.buildDigest`).
+    pub fn loadBuildModules(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        build_root: []const u8,
+        digest: [std.crypto.hash.Blake3.digest_length]u8,
+    ) !?build_graph.NamedModules {
+        const dir = cache.dir orelse return null;
+        var file_name_buffer: [build_modules_name_length]u8 = undefined;
+        const file_name = cache.buildModulesFileName(build_root, digest, &file_name_buffer);
+        const bytes = try readEntry(io, dir, file_name, allocator) orelse return null;
+        const parsed = std.json.parseFromSliceLeaky(StoredModules, allocator, bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (parsed.version != format_version) return null;
+        return .{ .units = parsed.units };
+    }
+
+    pub fn storeBuildModules(
+        cache: Cache,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        build_root: []const u8,
+        digest: [std.crypto.hash.Blake3.digest_length]u8,
+        table: build_graph.NamedModules,
+    ) !void {
+        const dir = cache.dir orelse return;
+        var encoded: std.Io.Writer.Allocating = .init(allocator);
+        defer encoded.deinit();
+        std.json.Stringify.value(
+            StoredModules{ .version = format_version, .units = table.units },
+            .{},
+            &encoded.writer,
+        ) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory, // an allocating writer fails only on allocation
+        };
+        const bytes = try encoded.toOwnedSlice();
+        defer allocator.free(bytes);
+        var file_name_buffer: [build_modules_name_length]u8 = undefined;
+        const file_name = cache.buildModulesFileName(build_root, digest, &file_name_buffer);
+        try writeEntry(io, dir, file_name, bytes);
+    }
+
+    const build_modules_name_length = "build-".len + std.crypto.hash.Blake3.digest_length * 2 + ".json".len;
+
+    fn buildModulesFileName(
+        cache: Cache,
+        build_root: []const u8,
+        digest: [std.crypto.hash.Blake3.digest_length]u8,
+        buffer: *[build_modules_name_length]u8,
+    ) []const u8 {
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&cache.identity);
+        hasher.update("build-modules");
+        hasher.update(std.mem.asBytes(&build_root.len));
+        hasher.update(build_root);
+        hasher.update(&digest);
+        var name_digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+        hasher.final(&name_digest);
+        const hexadecimal = std.fmt.bytesToHex(name_digest, .lower);
+        @memcpy(buffer[0.."build-".len], "build-");
+        @memcpy(buffer["build-".len..][0..hexadecimal.len], &hexadecimal);
+        @memcpy(buffer["build-".len + hexadecimal.len ..], ".json");
+        return buffer;
+    }
+
     /// The entry's bytes, or null when it was never stored.
     fn readEntry(io: std.Io, dir: std.Io.Dir, file_name: []const u8, allocator: std.mem.Allocator) !?[]u8 {
         return dir.readFileAlloc(io, file_name, allocator, .limited(cache_file_limit)) catch |err| switch (err) {
@@ -369,4 +530,28 @@ test "project cache invalidates when any source changes" {
         .{ .path = "src/support.zig", .source = "pub const value = 2;" },
     };
     try std.testing.expect(try cache.loadProject(io, allocator, &changed_sources) == null);
+}
+
+test "named module tables are keyed by build root and build inputs" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var cache = Cache.init(io, temporary.dir, analysis.Configuration.defaults());
+    defer cache.deinit(io);
+    const table: build_graph.NamedModules = .{ .units = &.{&.{
+        .{ .root = "/p/main.zig", .imports = &.{.{ .name = "api", .module = 1 }} },
+        .{ .root = "/p/api.zig", .imports = &.{} },
+    }} };
+    const digest: [std.crypto.hash.Blake3.digest_length]u8 = @splat(7);
+    try cache.storeBuildModules(io, allocator, "/p", digest, table);
+    const loaded = (try cache.loadBuildModules(io, allocator, "/p", digest)).?;
+    try std.testing.expectEqualStrings("api", loaded.units[0][0].imports[0].name);
+    try std.testing.expectEqualStrings("/p/api.zig", loaded.units[0][1].root.?);
+    const changed: [std.crypto.hash.Blake3.digest_length]u8 = @splat(8);
+    try std.testing.expect(try cache.loadBuildModules(io, allocator, "/p", changed) == null);
+    try std.testing.expect(try cache.loadBuildModules(io, allocator, "/q", digest) == null);
 }

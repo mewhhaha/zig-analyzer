@@ -856,19 +856,21 @@ fn copyResolvedShapes(
 const TestHarness = struct {
     sink: lsp_diagnostics.TestSink,
     configurations: @import("../project/config.zig").Store,
+    sources: @import("../project/source_store.zig").Store,
     publisher: lsp_diagnostics.Publisher,
     backend: CompilerBackend,
 
     fn start(harness: *TestHarness, options: Options) !void {
         harness.sink = .init();
         harness.configurations = .init(std.testing.io, std.testing.allocator);
+        harness.sources = .init(std.testing.allocator);
         harness.publisher = .init(std.testing.io, std.testing.allocator, &harness.sink.transport);
         try harness.backend.init(
             std.testing.io,
             std.testing.allocator,
             .empty,
             options,
-            .{ .io = std.testing.io, .transport = &harness.sink.transport, .configurations = &harness.configurations },
+            .{ .io = std.testing.io, .transport = &harness.sink.transport, .configurations = &harness.configurations, .sources = &harness.sources },
             &harness.publisher,
         );
     }
@@ -876,6 +878,7 @@ const TestHarness = struct {
     fn stop(harness: *TestHarness) void {
         harness.backend.deinit();
         harness.publisher.deinit();
+        harness.sources.deinit();
         harness.configurations.deinit();
     }
 };

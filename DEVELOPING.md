@@ -1,68 +1,100 @@
 # Developing zig-analyzer
 
-This document covers contributor setup, the compiler backend, verification,
-and manual editor testing. The user-facing motivation and behavior live in
-[README.md](README.md).
+This document covers setup, verification, the editor testbed and releases. The
+user-facing motivation and behavior live in [README.md](README.md), the module
+structure in [ARCHITECTURE.md](ARCHITECTURE.md), and the patched compiler in
+[compiler/README.md](compiler/README.md).
 
-## Build and verify
+## Setup
 
-The project pins Zig 0.17.0 at commit
-`7647adab80dd088f4de3610fd245915a912eb6ad`.
+The project needs the Zig release named by `minimum_zig_version` in
+`build.zig.zon` on `PATH` (`zig version` must print it exactly), plus Git for
+the compiler backend. That manifest and `build.zig` are the only places the
+Zig release and its pinned commit are written down.
 
 ```sh
-zig version # must print 0.17.0
-git ls-files -z '*.zig' '*.zon' | xargs -0 zig fmt --check
 zig build -Doptimize=fast
-zig build backend
-zig build test
-zig build backend-test
-zig build fixtures
-zig build examples
-zig build fuzz-rules
-zig build rule-docs # regenerates docs/rules; `zig build test` fails when it is stale
-zig-out/bin/zig-analyzer check --no-cache .
-zig build run -- doctor
-zig build run -- version
+zig build backend                # builds the patched compiler; about 15 minutes cold
+zig-out/bin/zig-analyzer doctor  # verifies the setup
 ```
+
+## Verify
+
+`zig build ci` is the one entry point; CI and the release workflow run exactly
+it. In order, it runs
+
+1. `zig fmt --check` over the Zig sources;
+2. `zig build test`, which needs no patched compiler;
+3. `zig build backend-test`, which builds the backend if it is missing and runs
+   the tests that need it; and
+4. the analyzer's own `check --no-cache .` over this repository, which must
+   report no findings.
+
+The release workflow additionally builds with `-Doptimize=fast` and runs
+`zig-out/bin/zig-analyzer version` and `doctor`; do the same before tagging.
+Narrower steps for iterating: `zig build check` (compile everything),
+`zig build fixtures`, `zig build examples`, `zig build fuzz-rules`,
+`zig build fix-check` and `zig build rule-docs` (regenerates `docs/rules`;
+`zig build test` fails when they are stale).
 
 Tests are split by what they need. `zig build test` runs the unit tests next
 to each module, the contract tests (`compiler/protocol_invariant.zig`), the
 editor exchanges in `tests/lsp/` (one file per feature, sharing
 `tests/lsp/support.zig`), the build-graph tests (`tests/build_graph.zig`, which
 configure the small projects in `fixtures/projects/` with the host `zig`), the
-rule examples and docs checks, fix round trips, the fixtures, the examples and the fuzz cases;
-none of it needs the patched compiler.
-`zig build backend-test` builds the backend and runs exactly the tests that do:
-`tests/compiler_integration.zig` and `tests/lsp_compiler.zig`. Those fail when
-the backend is missing rather than skip.
+rule examples and docs checks, fix round trips, the fixtures, the examples and
+the fuzz cases. `zig build backend-test` runs `tests/compiler_integration.zig`
+and `tests/lsp_compiler.zig`, which fail when the backend is missing rather
+than skip.
 
-`zig build backend` clones the exact Zig source revision into `.zig-analyzer/`,
-applies the narrow compiler patch, installs `src/compiler/protocol.zig` into
-the checkout as `src/AnalysisProtocol.zig` (the analyzer and the backend compile
-one definition of the wire format), builds without LLVM, and records the source
-commit, a digest of the patch and protocol source, and the protocol version in
-`zig-out/backend/zig-analyzer-backend.json`. Editing either input makes the
-backend stale: the next `zig build backend` resets the checkout to the pinned
-commit, reapplies the inputs, and rebuilds (about 15 minutes), and `doctor`
-reports the mismatch until then. Bump `version` in `src/compiler/protocol.zig`
-whenever the wire format changes (it is 7: `resolve_symbol` batches symbol
-queries, see the comment above `ResolveSymbolsRequest`). The patch adds
-`src/AnalysisSymbols.zig` beside `IncrementalDebugServer.zig`; to iterate on it
-without the 15 minute rebuild, edit the checkout in `.zig-analyzer/zig-0.17.0`
-and type-check with `zig build -Dno-lib -Denable-llvm=false
--Ddebug-extensions=true -Dno-bin` (about 30 s), then regenerate the patch with
-`git add -N src/AnalysisSymbols.zig && git diff -- src/IncrementalDebugServer.zig
-src/AnalysisSymbols.zig src/Zcu.zig src/Zcu/PerThread.zig src/main.zig`. Repeating the command with unchanged inputs
-reuses the verified checkout and compiler caches.
+### Fix gates
 
-At run time the analyzer starts the backend with `ZIG_ANALYZER_PORT=0`; the
-backend binds a free loopback port and announces it on stderr, so concurrent
-analyzers never collide. Backend stderr is kept (bounded) and logged when the
-backend fails to start or exits uncleanly. Compiler caches live in
-`.zig-analyzer/` under the project root: the directory that holds
-`zig-analyzer.json`, else the workspace folder, else the file's directory.
+A rule's fix may not make a program worse, so fixes pass three gates, each
+stricter than the last (`tests/fuzz/round_trip.zig`, `tests/fuzz/compile_batch.zig`):
 
-On x86_64 Linux, keep a compiler running while editing to reuse Zig 0.17.0's
+1. In process, for every fix and every fix-all of a program that parses: the
+   result parses, lowers through `std.zig.AstGen` without an error the original
+   did not report (errors are compared by message), is idempotent under a second
+   fix-all, and stays `zig fmt`-clean when the input was.
+2. Compiled, in one `zig test -fno-emit-bin` for the whole batch: programs and
+   fix results are written to a temporary directory with every container member
+   made `pub` and forced by a generated root, so Sema analyzes the function
+   bodies. A fix result may not report a compile error that its original did not
+   (non-lvalue `last().? = x`, an unused capture that AstGen misses, a type that
+   no longer matches). Programs with AstGen errors or imports of missing files
+   are left out, since either stops Sema for the whole compilation.
+3. The same two gates on generated programs (`tests/rule_fuzz.zig`), which add
+   idiom-breaking templates so the fixes see shapes the catalog examples lack.
+
+`zig build fix-check` runs gates 1 and 2 over the catalog examples
+(`tests/rule_fixes.zig`, a few seconds); `zig build test` includes it. When a
+rule's fix breaks a gate, prefer fixing the rule (or declining the fix) over
+weakening the example; an example that already fails to compile only exempts
+the errors it has.
+
+`tests/rule_fuzz.zig` is deterministic (fixed seeds) and takes about 8 s. It
+checks that generated clean programs, which include zig-fmt-shaped variants
+(trailing-comma headers, labeled blocks and switches, `inline else`, decl
+literals), raise no finding under the default configuration or any lint profile,
+that the same holds for generated multi-file projects run through the project
+engine (the allocating templates are exempt from `allocation-after-init` only),
+that findings survive formatting, comments and renames, and that no input crashes
+a rule. Add a template there when a false positive is fixed.
+
+## The compiler backend
+
+`zig build backend` builds the patched compiler into `zig-out/backend`. Editing
+`compiler/analysis.patch` or `src/compiler/protocol.zig` makes the backend
+stale; the next `zig build backend` rebuilds it and `doctor` reports the
+mismatch until then. [compiler/README.md](compiler/README.md) covers editing the
+patch, the protocol version and porting to a new Zig release.
+
+Compiler caches live in `.zig-analyzer/` under the project root: the directory
+that holds `zig-analyzer.json`, else the workspace folder, else the file's
+directory. Backend stderr is kept (bounded) and logged when the backend fails
+to start or exits uncleanly.
+
+On x86_64 Linux, keep a compiler running while editing to reuse Zig's
 incremental analysis and receive build errors after each saved change:
 
 ```sh
@@ -71,51 +103,13 @@ zig build -fincremental --watch
 zig build test -fincremental --watch
 ```
 
-Stop the watch process with Ctrl-C. A one-shot `zig build` still uses its normal
-file caches; in-memory incremental state is reused by the running watch process.
-See the [Zig 0.17.0 release notes](https://ziglang.org/download/0.17.0/release-notes.html#Incremental-Compilation)
+Stop the watch process with Ctrl-C. See the
+[Zig 0.17.0 release notes](https://ziglang.org/download/0.17.0/release-notes.html#Incremental-Compilation)
 for supported targets.
 
-`TASKS.md` is the authoritative implementation ledger. A feature appearing in
-the repository does not make an unchecked acceptance criterion complete.
+## Editor testing
 
-## Architecture
-
-zig-analyzer is an LSP server backed by an authenticated, versioned analysis
-protocol added to the pinned Zig compiler. Syntax-backed answers remain
-available while a document is incomplete; compiler-resolved shapes, members,
-and top-level constant values augment them when the saved program can be
-analyzed.
-
-Editor diagnostics keep the patched compiler running with `-fincremental` and
-reuse its analysis state across unsaved edits and ordinary source saves. Each
-update also checks saved imports for changes. The compile unit that analyzes a
-document comes from the build graph (`zig build --print-configuration-path`):
-compile steps under the `check` step, else `install`, with their module
-graphs passed to the compiler so `build_options` and dependencies resolve.
-Keep every test binary a dependency of `check` (see `Tests` in `build.zig`):
-that is how a file under test belongs to a unit. Saving `build.zig` or
-`build.zig.zon` discovers the graph again and restarts analysis so a changed
-build configuration can select the appropriate unit. Syntax diagnostics remain available while the
-debounced compiler worker updates; compiler diagnostics publish only for the
-current document version, and edits to several documents inside the debounce
-all reach the compiler.
-
-The project separates thin transport/composition modules from thick proof and
-policy modules. Core rules and actions return byte-span domain values and do
-not depend on LSP types; focused adapters translate them at the boundary. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for dependency direction, module ownership,
-and the maintenance checklist. Rule and action extension contracts live in
-`src/rules/README.md` and `src/actions/README.md`.
-
-Formatting has two profiles. `zig` passes the document directly to the pinned
-`zig fmt --stdin`. `analyzer` gathers the same proven edits used by safe
-fix-all, adds mixed-operator parentheses and optional import organization,
-applies non-overlapping byte-span edits in memory, and then invokes `zig fmt`.
-The LSP still returns one whole-document edit, so clients do not need special
-support for the opinionated profile.
-
-## Local Helix testbed
+### Local Helix testbed
 
 Build the analyzer before opening this repository in Helix:
 
@@ -138,11 +132,9 @@ from that build so they can exercise diagnostics and actions.
 generates clean-by-construction programs that must produce no default
 findings, checks that formatting, comments, and consistent renames leave
 findings unchanged, and feeds byte mutations and generated token soup through
-every rule. The same tests run under `zig build test`; the continuous
-`--fuzz` mode compiles and passes the seed tests, but Zig 0.17.0's continuous
-fuzz driver then panics with `start index 1 is larger than end index 0`. The
-same failure reproduces with a standalone no-op fuzz probe. The normal test
-suite still runs the deterministic fuzz cases.
+every rule. The same tests run under `zig build test`. The continuous `--fuzz`
+mode compiles, but Zig 0.17.0's fuzz driver panics in it with `start index 1 is
+larger than end index 0`, so rely on the deterministic runs.
 
 `tests/rule_fixes.zig` applies each catalog example's quick fixes and fix-all
 edits, then checks that the result still parses, preserves formatting when
@@ -155,7 +147,7 @@ source module with tests participates in the suite.
 See [examples/README.md](examples/README.md) for exact completion, hover,
 navigation, rename, diagnostic, and code-action cases.
 
-## Comptime fixture walkthrough
+### Comptime fixture walkthrough
 
 Start Helix from the repository root so it loads the local language-server
 configuration:
@@ -209,20 +201,27 @@ by `zig-analyzer version` is not compatible with the current analyzer.
 
 ## Publishing a release
 
-Update `build.zig.zon` to the next version described in
-[`docs/versioning.md`](docs/versioning.md), update the release version in the
-installation documentation, and merge only after CI passes on `main`. Then
-create and push an annotated tag with the same version:
+The version lives only in `build.zig.zon`; the Zig version follows from
+`minimum_zig_version` (see [docs/versioning.md](docs/versioning.md)). To
+release:
+
+1. In one commit, set `.version` in `build.zig.zon` to the next version and add
+   `docs/release-<version>.md` (indexed from `docs/README.md`). The release
+   workflow publishes that file as the release notes.
+2. Run the verification above, with the optimized build, and let CI pass on
+   `main`.
+3. Create and push an annotated tag with the same version:
 
 ```sh
 git switch main
 git pull --ff-only
-git tag -a v0.17.0-2 -m "zig-analyzer 0.17.0-2"
-git push origin v0.17.0-2
+git tag -a v<version> -m "zig-analyzer <version>"
+git push origin v<version>
 ```
 
-The Release workflow rejects a tag that differs from `build.zig.zon`, reruns
-formatting and the complete test suite, builds the analyzer and patched
-compiler from pinned inputs, exercises the assembled installation from a
-temporary workspace, and publishes the archive with its SHA-256 checksum.
-Never replace an existing release tag; increment the release suffix instead.
+The Release workflow rejects a tag that differs from `build.zig.zon` or has no
+`docs/release-<version>.md`, runs the CI workflow, builds the analyzer and
+patched compiler, exercises the assembled installation from a temporary
+workspace, and publishes the archive with its SHA-256 checksum and the notes
+file. Never replace an existing release tag; increment the release suffix
+instead.

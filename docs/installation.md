@@ -2,14 +2,16 @@
 
 ## Release archive
 
-Release `0.17.0-2` supports x86_64 Linux and includes the patched compiler
-backend. Download both files from the GitHub release, then verify and extract
-the archive from the [releases page](https://github.com/mewhhaha/zig-analyzer/releases):
+Releases support x86_64 Linux and include the patched compiler backend.
+Download the archive and its checksum from the latest release on the
+[releases page](https://github.com/mewhhaha/zig-analyzer/releases), then verify
+and extract it. Replace `<version>` with the release version, for example
+`0.17.0-2`:
 
 ```sh
-sha256sum --check zig-analyzer-0.17.0-2-x86_64-linux.tar.xz.sha256
-tar -xf zig-analyzer-0.17.0-2-x86_64-linux.tar.xz
-./zig-analyzer-0.17.0-2-x86_64-linux/bin/zig-analyzer doctor
+sha256sum --check zig-analyzer-<version>-x86_64-linux.tar.xz.sha256
+tar -xf zig-analyzer-<version>-x86_64-linux.tar.xz
+./zig-analyzer-<version>-x86_64-linux/bin/zig-analyzer doctor
 ```
 
 Keep the extracted directory together: `bin/zig-analyzer` locates the bundled
@@ -18,11 +20,12 @@ move the directory to a stable location and symlink the executable:
 
 ```sh
 mkdir -p ~/.local/opt ~/.local/bin
-mv zig-analyzer-0.17.0-2-x86_64-linux ~/.local/opt/
-ln -s ~/.local/opt/zig-analyzer-0.17.0-2-x86_64-linux/bin/zig-analyzer ~/.local/bin/zig-analyzer
+mv zig-analyzer-<version>-x86_64-linux ~/.local/opt/
+ln -s ~/.local/opt/zig-analyzer-<version>-x86_64-linux/bin/zig-analyzer ~/.local/bin/zig-analyzer
 ```
 
-The machine still needs Zig 0.17.0 on `PATH`; `zig-analyzer doctor` verifies
+The machine still needs the Zig release named by the base of the version
+(`0.17.0` for `0.17.0-2`) on `PATH`; `zig-analyzer doctor` verifies
 both it and the bundled backend.
 
 ## Build and install from source
