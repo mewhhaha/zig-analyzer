@@ -14,8 +14,8 @@ stale memory or state.
 
 ## When it fires
 
-It applies to a retained `items` slice (whole or subslice), `keys()` or
-`values()` view, or iterator of a container recognized by its declared type,
+It applies to a retained `items` slice (whole or subslice) or `items.ptr`
+pointer, `keys()` or `values()` view, or iterator of a container recognized by its declared type,
 such as `var list: std.ArrayList(u8) = .empty`, followed by an operation that
 may reallocate or rehash it. Container fields and a view retained across
 `realloc` of its source allocation are covered too; across `realloc`, a view is

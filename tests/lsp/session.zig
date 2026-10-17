@@ -272,3 +272,90 @@ test "LSP session covers lifecycle synchronization and broad features" {
     try std.testing.expect(std.mem.find(u8, transport.output(8), "comptime_int") != null);
     try std.testing.expect(std.mem.find(u8, transport.output(9), "\"result\":null") != null);
 }
+
+/// A server that lints edits only once the scripted client pauses.
+fn initDeferring(server: *Server, transport: *TestTransport) !void {
+    try server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport, .{
+        .compiler = .{ .enabled = false },
+        .diagnostics = .{ .quiet_ms = 1, .input = transport.input() },
+    });
+}
+
+test "LSP coalesces a burst of edits into one lint of the last version and answers from its text" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///burst.zig","languageId":"zig","version":1,"text":"const first = 1;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///burst.zig","version":2},"contentChanges":[{"text":"const second = 2;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///burst.zig","version":3},"contentChanges":[{"range":{"start":{"line":0,"character":6},"end":{"line":0,"character":12}},"text":"third"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///burst.zig","version":4},"contentChanges":[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"text":"const broken ="}]}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///burst.zig"}}}
+        ,
+        TestTransport.pause,
+        \\{"jsonrpc":"2.0","id":3,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    defer transport.deinit();
+    var server: Server = undefined;
+    try initDeferring(&server, &transport);
+    defer server.deinit();
+
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    // Open, the symbols of version 4 before any lint of the edits, one lint
+    // of version 4 at the pause, shutdown.
+    try std.testing.expectEqual(@as(usize, 5), transport.output_count);
+    try std.testing.expect(std.mem.find(u8, transport.output(1), "\"version\":1") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "third") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "broken") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(2), "second") == null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "publishDiagnostics") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"version\":4") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "syntax-error") != null);
+}
+
+test "LSP publishes deferred diagnostics per edited document and drops those of a closed one" {
+    const incoming = [_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"capabilities":{}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///kept.zig","languageId":"zig","version":1,"text":"const kept = 1;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///closed.zig","languageId":"zig","version":1,"text":"const closed = 1;\n"}}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///kept.zig","version":2},"contentChanges":[{"text":"const kept = 2;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///closed.zig","version":2},"contentChanges":[{"text":"const closed = 2;\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///kept.zig","version":3},"contentChanges":[{"text":"const kept =\n"}]}}
+        ,
+        \\{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///closed.zig"}}}
+        ,
+        TestTransport.pause,
+        \\{"jsonrpc":"2.0","id":2,"method":"shutdown"}
+        ,
+        \\{"jsonrpc":"2.0","method":"exit"}
+        ,
+    };
+    var transport = TestTransport.init(&incoming);
+    defer transport.deinit();
+    var server: Server = undefined;
+    try initDeferring(&server, &transport);
+    defer server.deinit();
+
+    try runBasicServer(std.testing.io, std.testing.allocator, &transport.transport, &server, null);
+
+    try std.testing.expectEqual(@as(usize, 6), transport.output_count);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "closed.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(3), "\"diagnostics\":[]") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "kept.zig") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "\"version\":3") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(4), "syntax-error") != null);
+    try std.testing.expect(std.mem.find(u8, transport.output(5), "\"result\":null") != null);
+}

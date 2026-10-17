@@ -20,17 +20,109 @@ pub fn run(context: RuleRun) !void {
             context.tokens[call_index + 1].tag != .l_paren) continue;
 
         const method_name = context.tokenText(call_index);
+        const is_write_all = std.mem.eql(u8, method_name, "writeAll");
+        if (!is_write_all and !std.mem.eql(u8, method_name, "print")) continue;
         const call_end = context.matchingToken(call_index + 1, .l_paren, .r_paren) orelse continue;
+        const fix_all = switch (receiverKind(context, call_index - 1)) {
+            .other => continue,
+            .unknown => false,
+            .writer => true,
+        };
 
-        if (std.mem.eql(u8, method_name, "writeAll")) {
-            try checkWriteAll(context, level, call_index, call_end);
-        } else if (std.mem.eql(u8, method_name, "print")) {
-            try checkPrint(context, level, call_index, call_end);
+        if (is_write_all) {
+            try checkWriteAll(context, level, call_index, call_end, fix_all);
+        } else {
+            try checkPrint(context, level, call_index, call_end, fix_all);
         }
     }
 }
 
-fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_end: usize) !void {
+const Receiver = enum {
+    /// Declared as `std.Io.Writer` or a pointer to it, which has `writeByte`.
+    writer,
+    /// A writer of unknown type: `anytype`, an adapter named `*Writer`, a
+    /// field or a call result. The rewrite is offered, not applied by `check --fix`.
+    unknown,
+    /// Not a writer: a namespace function such as `std.debug.print`, a binding
+    /// declared with some other type, or a call under test.
+    other,
+};
+
+/// What the receiver ending before the `.` at `period` is.
+fn receiverKind(context: RuleRun, period: usize) Receiver {
+    return switch (declaredReceiverKind(context, period)) {
+        .writer => .writer,
+        .writer_type => .unknown,
+        // A receiver of unknown type counts only when its name says it is a writer.
+        .unknown => if (writerNamed(context, period)) .unknown else .other,
+        .other => .other,
+    };
+}
+
+/// `Receiver` before the name is consulted: `writer_type` is a binding
+/// declared with some other type named `...Writer`.
+fn declaredReceiverKind(context: RuleRun, period: usize) enum { writer, writer_type, unknown, other } {
+    const tokens = context.tokens;
+    const start = context.pathStartBefore(period) orelse return .unknown;
+    // `expectError(error.WriteFailed, w.writeAll("x"))` asserts on that very call.
+    if (start > 0 and (tokens[start - 1].tag == .comma or
+        (tokens[start - 1].tag == .l_paren and start > 1 and
+            (tokens[start - 2].tag == .identifier or tokens[start - 2].tag == .builtin)))) return .other;
+    // `std.debug.print`, `debug.print` and other namespace functions.
+    if (context.tokenIs(period - 1, "debug") or context.tokenIs(start, "std")) return .other;
+    if (start + 1 != period) return .unknown;
+    const binding = context.scopes.findBinding(start) orelse return .unknown;
+    const declaration = binding.token_index;
+    if (declaration + 2 >= tokens.len) return .unknown;
+    if (tokens[declaration + 1].tag != .colon) {
+        // `const json = @import("json.zig");`
+        if (tokens[declaration + 1].tag == .equal and context.tokenIs(declaration + 2, "@import")) return .other;
+        return .unknown;
+    }
+    var type_start = declaration + 2;
+    if (tokens[type_start].tag == .keyword_anytype) return .unknown;
+    if (tokens[type_start].tag == .asterisk) type_start += 1;
+    if (type_start < tokens.len and tokens[type_start].tag == .keyword_const) type_start += 1;
+    var type_end = type_start;
+    while (type_end + 2 < tokens.len and tokens[type_end].tag == .identifier and
+        tokens[type_end + 1].tag == .period and tokens[type_end + 2].tag == .identifier) type_end += 2;
+    if (type_end >= tokens.len or tokens[type_end].tag != .identifier) return .other;
+    switch (tokens[type_end + 1].tag) {
+        .comma, .r_paren, .equal, .semicolon => {},
+        else => return .other,
+    }
+    const io_writer = context.tokenIs(type_end, "Writer") and type_end >= type_start + 2 and
+        context.tokenIs(type_end - 2, "Io") and (type_end == type_start + 2 or
+        (type_end == type_start + 4 and context.tokenIs(type_start, "std")));
+    if (io_writer) return .writer;
+    return if (std.mem.endsWith(u8, context.tokenText(type_end), "Writer")) .writer_type else .other;
+}
+
+/// Whether the receiver before the `.` at `period`, a name or a call such as
+/// `file.writer()`, is named like a writer: `writer`, `stdout_writer`,
+/// `interface` (the `std.Io.Writer` field of the file and buffer writers),
+/// `w`, `out` or `stdout`. A `terminal` or `ctx` with a `print` method of its
+/// own is not.
+fn writerNamed(context: RuleRun, period: usize) bool {
+    const tokens = context.tokens;
+    if (period == 0) return false;
+    var name = period - 1;
+    if (tokens[name].tag == .r_paren) {
+        const opening = context.scopes.matchingToken(name) orelse return false;
+        if (opening == 0) return false;
+        name = opening - 1;
+    }
+    if (tokens[name].tag != .identifier) return false;
+    const text = context.tokenText(name);
+    var lower: [64]u8 = undefined;
+    if (text.len > lower.len) return false;
+    const folded = std.ascii.lowerString(&lower, text);
+    for ([_][]const u8{ "writer", "stdout", "stderr" }) |part| if (std.mem.find(u8, folded, part) != null) return true;
+    for ([_][]const u8{ "w", "bw", "out", "output", "out_stream", "interface" }) |short| if (std.mem.eql(u8, text, short)) return true;
+    return false;
+}
+
+fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_end: usize, fix_all: bool) !void {
     // Expected arguments: 1 argument: a 1-character string literal
     // Check if there are no top-level commas in arguments
     if (hasTopLevelComma(context, call_index + 2, call_end)) return;
@@ -58,7 +150,7 @@ fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_e
         .kind = .quickfix,
         .edits = edits,
         .preferred = true,
-        .fix_all = true,
+        .fix_all = fix_all,
     };
 
     try context.emit(.{
@@ -73,7 +165,7 @@ fn checkWriteAll(context: RuleRun, level: types.Level, call_index: usize, call_e
     });
 }
 
-fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end: usize) !void {
+fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end: usize, fix_all: bool) !void {
     // print has 2 arguments: format string, and tuple .{}
     const args = twoArguments(context, call_index + 1, call_end) orelse return;
 
@@ -105,7 +197,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
                 .kind = .quickfix,
                 .edits = edits,
                 .preferred = true,
-                .fix_all = true,
+                .fix_all = fix_all,
             };
 
             try context.emit(.{
@@ -144,7 +236,7 @@ fn checkPrint(context: RuleRun, level: types.Level, call_index: usize, call_end:
                 .kind = .quickfix,
                 .edits = edits,
                 .preferred = true,
-                .fix_all = true,
+                .fix_all = fix_all,
             };
 
             try context.emit(.{
@@ -285,6 +377,60 @@ test "prefer write byte ignores multi-byte string in writeAll" {
     const source: [:0]const u8 =
         \\fn writeWord(writer: anytype) !void {
         \\    try writer.writeAll("hello");
+        \\}
+    ;
+
+    const findings = try support.findings(arena.allocator(), run, source, testConfiguration());
+
+    try std.testing.expectEqual(0, findings.len);
+}
+
+test "prefer write byte applies its fix only to a declared std.Io.Writer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn typed(writer: *std.Io.Writer, out: *Io.Writer) !void {
+        \\    try writer.writeAll("\n");
+        \\    try out.print(",", .{});
+        \\    var fixed: std.Io.Writer = .fixed(&.{});
+        \\    try fixed.writeAll(" ");
+        \\}
+        \\fn generic(writer: anytype, self: *Self, file: File) !void {
+        \\    try writer.writeAll("\n");
+        \\    try self.writer.writeAll("\n");
+        \\    try file.writer().writeAll("\n");
+        \\}
+    ;
+
+    const findings = try support.findings(arena.allocator(), run, source, testConfiguration());
+
+    try std.testing.expectEqual(6, findings.len);
+    for (findings[0..3]) |finding| try std.testing.expect(finding.fixes[0].fix_all);
+    for (findings[3..]) |finding| try std.testing.expect(!finding.fixes[0].fix_all);
+}
+
+test "prefer write byte ignores namespace functions, other receiver types and calls under test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const debug = std.debug;
+        \\const Buffer = struct {
+        \\    pub fn print(self: *Buffer, comptime format: []const u8, args: anytype) void {
+        \\        _ = self;
+        \\        _ = format;
+        \\        _ = args;
+        \\    }
+        \\};
+        \\fn emit(buffer: *Buffer, w: *std.Io.Writer, repl: *Repl) !void {
+        \\    try repl.terminal.print("\n", .{});
+        \\    std.debug.print("\n", .{});
+        \\    debug.print(" ", .{});
+        \\    buffer.print("\n", .{});
+        \\    try std.testing.expectError(error.WriteFailed, w.writeAll("x"));
         \\}
     ;
 

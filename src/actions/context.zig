@@ -96,6 +96,14 @@ pub fn spansOverlap(left: std.zig.Token.Loc, right: std.zig.Token.Loc) bool {
     return left.start < right.end and right.start < left.end;
 }
 
+/// The contents of a plain string literal, or null when it has escapes.
+pub fn stringValue(literal: []const u8) ?[]const u8 {
+    if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
+    const value = literal[1 .. literal.len - 1];
+    if (std.mem.findScalar(u8, value, '\\') != null) return null;
+    return value;
+}
+
 pub fn selectedTokenIndex(context: ActionRun) ?usize {
     for (context.tokens, 0..) |token, index| {
         if (context.selected(token.loc)) return index;
@@ -124,6 +132,49 @@ pub fn containingFunction(context: ActionRun, token_index: usize) ?Function {
         };
     }
     return selected;
+}
+
+/// The innermost `struct` declaration whose braces hold the token at `index`.
+pub fn enclosingStruct(tree: *const std.zig.Ast, index: usize) ?std.zig.Ast.Node.Index {
+    var innermost: ?std.zig.Ast.Node.Index = null;
+    var innermost_start: usize = 0;
+    for (1..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const container = tree.fullContainerDecl(&buffer, node) orelse continue;
+        if (tree.tokenTag(container.ast.main_token) != .keyword_struct) continue;
+        const start = container.ast.main_token;
+        if (index <= start or index >= tree.lastToken(node) or (innermost != null and start < innermost_start)) continue;
+        innermost = node;
+        innermost_start = start;
+    }
+    return innermost;
+}
+
+/// The token of the name `const Name = struct {...}` binds to `container`, if any.
+pub fn structName(context: ActionRun, tree: *const std.zig.Ast, container: std.zig.Ast.Node.Index) ?usize {
+    var keyword: usize = tree.nodeMainToken(container);
+    if (keyword > 0 and (context.tokens[keyword - 1].tag == .keyword_extern or context.tokens[keyword - 1].tag == .keyword_packed)) keyword -= 1;
+    if (keyword < 3 or context.tokens[keyword - 1].tag != .equal or context.tokens[keyword - 2].tag != .identifier or
+        (context.tokens[keyword - 3].tag != .keyword_const and context.tokens[keyword - 3].tag != .keyword_var)) return null;
+    return keyword - 2;
+}
+
+/// Whether `name` denotes `container`: the name it is bound to, or a member
+/// `const Self = @This();` inside it.
+pub fn namesStruct(context: ActionRun, tree: *const std.zig.Ast, container: std.zig.Ast.Node.Index, name: []const u8) bool {
+    if (structName(context, tree, container)) |name_index| {
+        if (context.tokenIs(name_index, name)) return true;
+    }
+    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+    for (tree.fullContainerDecl(&buffer, container).?.ast.members) |member| {
+        const variable = tree.fullVarDecl(member) orelse continue;
+        const initializer = variable.ast.init_node.unwrap() orelse continue;
+        if (context.tokenIs(variable.ast.mut_token + 1, name) and
+            (tree.nodeTag(initializer) == .builtin_call_two or tree.nodeTag(initializer) == .builtin_call_two_comma) and
+            std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(initializer)), "@This")) return true;
+    }
+    return false;
 }
 
 pub const Function = struct {

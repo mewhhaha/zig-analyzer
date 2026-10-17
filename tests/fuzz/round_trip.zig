@@ -10,6 +10,7 @@ const zig_analyzer = @import("zig_analyzer");
 
 const analysis = zig_analyzer.analysis;
 const text_edits = zig_analyzer.syntax.text_edits;
+const tokenize = zig_analyzer.syntax.tokens.tokenize;
 const compile_batch = @import("compile_batch.zig");
 
 pub const Verdict = struct {
@@ -181,8 +182,9 @@ pub fn checkEveryReportingRule(
     }
 }
 
-/// The combined property with every rule on at once: all fix-all edits applied
-/// together keep the program parseable.
+/// The combined property with every rule on at once, as `check --fix` applies
+/// it: the fix-all passes of all rules together keep the program parseable and
+/// formatted when it was, and leave nothing for another run to fix.
 pub fn checkCombined(
     arena: std.mem.Allocator,
     verdict: *Verdict,
@@ -191,10 +193,9 @@ pub fn checkCombined(
     everything: analysis.Configuration,
 ) !void {
     if (try parseErrorCount(arena, source) != 0) return;
-    const found = try analysis.findings(arena, source, everything);
-    const edits = try text_edits.safeFixAll(arena, found);
-    if (edits.len == 0) return;
-    const fixed = try text_edits.apply(arena, source, edits);
+    const passes = try text_edits.fixAll(arena, source, try tokenize(arena, source), everything);
+    if (passes.edits == 0) return;
+    const fixed = passes.source;
     verdict.fix_all_applied += 1;
     if (try parseErrorCount(arena, fixed) != 0) {
         verdict.failures += 1;
@@ -208,5 +209,14 @@ pub fn checkCombined(
     } else if (verdict.corpus) |corpus| {
         const program = try corpus.program(label, source, original_astgen.len == 0);
         try program.addVariant("combined", "fix-all", fixed);
+    }
+    if (try isFormatted(arena, source) and !try isFormatted(arena, fixed)) {
+        verdict.unformatted += 1;
+        report(label, "combined fix-all output is not formatted", .unreleased_allocation, "fix-all", source, fixed);
+    }
+    const remaining = try text_edits.safeFixAll(arena, try analysis.findings(arena, fixed, everything));
+    if (remaining.len != 0) {
+        verdict.failures += 1;
+        report(label, "combined fix-all passes do not converge", .unreleased_allocation, "fix-all", source, fixed);
     }
 }

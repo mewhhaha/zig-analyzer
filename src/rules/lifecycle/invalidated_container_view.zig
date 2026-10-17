@@ -4,13 +4,22 @@ const rule_types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const TokenRange = tokens_util.Range;
+const IdentifierTable = @import("../../syntax/scope.zig").IdentifierTable;
 const container_types = @import("../container_types.zig");
 const reach = @import("reach.zig");
 
 const View = struct {
     name_index: usize,
     declaration_end: usize,
-    kind: enum { items, iterator },
+    kind: enum { items, pointer, iterator },
+
+    fn noun(view: View) []const u8 {
+        return switch (view.kind) {
+            .items => "slice",
+            .pointer => "pointer",
+            .iterator => "iterator",
+        };
+    }
 };
 
 pub const rules = [_]rule_types.Rule{
@@ -96,12 +105,18 @@ fn checkContainerViews(
     start: usize,
     scope_end: usize,
 ) !void {
-    var index = start;
-    while (index < scope_end) : (index += 1) {
+    const identifiers = try context.scopes.identifiers();
+    // `const view = container.items;` names the container in its fourth token;
+    // the rest of a reported view's declaration is skipped.
+    var resume_at = start;
+    for (identifiers.within(container_name, start + 3, scope_end)) |position| {
+        const index: usize = position - 3;
+        if (index < resume_at) continue;
         const view = viewDeclaration(context, container_name, index, scope_end) orelse continue;
         const view_name = context.tokenText(view.name_index);
         const invalidation = firstInvalidation(
             context,
+            identifiers,
             container_name,
             kind,
             view_name,
@@ -114,27 +129,38 @@ fn checkContainerViews(
             .span = context.tokens[view.name_index].loc,
             .message = try context.allocator.print(
                 "{s} '{s}' into container '{s}' is used after {s}, which may invalidate the view or its backing storage",
-                .{ if (view.kind == .items) "slice" else "iterator", view_name, container_name, invalidation.method },
+                .{ view.noun(), view_name, container_name, invalidation.method },
             ),
         });
-        index = view.declaration_end;
+        resume_at = view.declaration_end + 1;
     }
 }
 
 fn findArenaResetViews(context: RuleRun, level: rule_types.Level) !void {
     var aliases: AllocatorAliases = .{};
     defer aliases.deinit(context.allocator);
+    // The file's allocating calls in order, so that a declaration's first one is a lookup.
+    var allocations: std.ArrayList(u32) = .empty;
+    defer allocations.deinit(context.allocator);
+    for (0..context.tokens.len) |method_index| {
+        if (allocationCall(context, method_index)) try allocations.append(context.allocator, @intCast(method_index));
+    }
+    if (allocations.items.len == 0) return;
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const allocator = allocationReceiver(context, declaration_index + 2, declaration_end) orelse continue;
+        // `allocationReceiver(context, declaration_index + 2, declaration_end)`.
+        const first = positionsWithin(allocations.items, declaration_index + 2, declaration_end);
+        if (first.len == 0 or first[0] + 1 >= declaration_end) continue;
+        const allocator = context.tokenText(first[0] - 2);
         const arena = try arenaForAllocatorAlias(context, &aliases, allocator, declaration_index) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
-        const reset_index = arenaResetAfter(context, arena, declaration_end + 1, scope_end, scope_opening) orelse continue;
+        const identifiers = try context.scopes.identifiers();
+        const reset_index = arenaResetAfter(context, identifiers, arena, declaration_end + 1, scope_end, scope_opening) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
-        if (!bindingUsedAfterReset(context, binding, reset_index + 1, scope_end)) continue;
+        if (!bindingUsedAfterReset(context, identifiers, binding, reset_index + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .invalidated_container_view,
             .level = level,
@@ -147,28 +173,30 @@ fn findArenaResetViews(context: RuleRun, level: rule_types.Level) !void {
     }
 }
 
-fn bindingUsedAfterReset(context: RuleRun, binding: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, binding)) continue;
-        if (index > start and (context.tokens[index - 1].tag == .keyword_const or
-            context.tokens[index - 1].tag == .keyword_var)) return false;
-        if (index + 1 < end and context.tokens[index + 1].tag == .equal) return false;
-        return true;
-    }
-    return false;
+fn bindingUsedAfterReset(context: RuleRun, identifiers: *const IdentifierTable, binding: []const u8, start: usize, end: usize) bool {
+    const index = identifiers.firstWithin(binding, start, end) orelse return false;
+    if (index > start and (context.tokens[index - 1].tag == .keyword_const or
+        context.tokens[index - 1].tag == .keyword_var)) return false;
+    if (index + 1 < end and context.tokens[index + 1].tag == .equal) return false;
+    return true;
 }
 
 pub fn allocationReceiver(context: RuleRun, start: usize, end: usize) ?[]const u8 {
-    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "dupeSentinel", "print", "printSentinel" };
-    for (context.tokens[start..end], start..) |token, method_index| {
-        if (token.tag != .identifier or method_index < 2 or context.tokens[method_index - 1].tag != .period or
-            context.tokens[method_index - 2].tag != .identifier or method_index + 1 >= end or
-            context.tokens[method_index + 1].tag != .l_paren) continue;
-        for (methods) |method| if (context.tokenIs(method_index, method)) {
-            return context.tokenText(method_index - 2);
-        };
+    for (start..end) |method_index| {
+        if (method_index + 1 < end and allocationCall(context, method_index)) return context.tokenText(method_index - 2);
     }
     return null;
+}
+
+/// Whether `receiver.alloc(`, `.dupe(`, `.print(` or a sibling allocating
+/// method is called at `method_index`.
+fn allocationCall(context: RuleRun, method_index: usize) bool {
+    const methods = [_][]const u8{ "alloc", "allocSentinel", "alignedAlloc", "dupe", "dupeZ", "dupeSentinel", "print", "printSentinel" };
+    const tokens = context.tokens;
+    if (tokens[method_index].tag != .identifier or method_index < 2 or tokens[method_index - 1].tag != .period or
+        tokens[method_index - 2].tag != .identifier or method_index + 1 >= tokens.len or
+        tokens[method_index + 1].tag != .l_paren) return false;
+    return container_types.isOneOf(context.tokenText(method_index), &methods);
 }
 
 /// The `const name = arena.allocator(` declarations of a file by name (the
@@ -210,25 +238,32 @@ pub const AllocatorAliases = struct {
 /// `before` comes from, when the arena is a local `ArenaAllocator`.
 pub fn arenaForAllocatorAlias(context: RuleRun, aliases: *AllocatorAliases, allocator: []const u8, before: usize) !?[]const u8 {
     const declarations = try aliases.named(context, allocator);
-    var position = declarations.len;
-    while (position > 0) {
+    // The aliases with `index + 5 < before`, nearest first, from the
+    // outermost block open at `before` on.
+    const outermost = outermostOpenBrace(context, before) orelse return null;
+    const first = std.sort.partitionPoint(u32, declarations, outermost, positionBefore);
+    var position = std.sort.partitionPoint(u32, declarations, before -| 5, positionBefore);
+    if (position <= first) return null;
+    const identifiers = try context.scopes.identifiers();
+    while (position > first) {
         position -= 1;
         const index: usize = declarations[position];
-        if (index + 5 >= before) continue;
         const alias_scope_end = context.enclosingScopeEnd(index) orelse continue;
         if (alias_scope_end < before) continue;
         const arena = context.tokenText(index + 2);
-        if (localArenaDeclaration(context, arena, index)) return arena;
+        if (localArenaDeclaration(context, identifiers, arena, index)) return arena;
     }
     return null;
 }
 
-fn localArenaDeclaration(context: RuleRun, arena: []const u8, before: usize) bool {
-    var index = before;
-    while (index > 1) {
-        index -= 1;
-        if (!context.tokenIs(index, arena) or
-            (context.tokens[index - 1].tag != .keyword_const and context.tokens[index - 1].tag != .keyword_var)) continue;
+fn localArenaDeclaration(context: RuleRun, identifiers: *const IdentifierTable, arena: []const u8, before: usize) bool {
+    const outermost = outermostOpenBrace(context, before) orelse return false;
+    const positions = identifiers.within(arena, @max(1, outermost), before);
+    var position = positions.len;
+    while (position > 0) {
+        position -= 1;
+        const index: usize = positions[position];
+        if (context.tokens[index - 1].tag != .keyword_const and context.tokens[index - 1].tag != .keyword_var) continue;
         const arena_scope_end = context.enclosingScopeEnd(index) orelse continue;
         if (arena_scope_end < before) continue;
         const declaration_end = context.statementEnd(index - 1) orelse continue;
@@ -240,16 +275,27 @@ fn localArenaDeclaration(context: RuleRun, arena: []const u8, before: usize) boo
     return false;
 }
 
+/// The outermost `{` still open at `index`. A name declared before it is
+/// outside every block open at `index`: its block closed before `index` or
+/// it has none, so `enclosingScopeEnd` rules it out.
+fn outermostOpenBrace(context: RuleRun, index: usize) ?usize {
+    var outermost: ?usize = null;
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) outermost = opening;
+    return outermost;
+}
+
 fn arenaResetAfter(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     arena: []const u8,
     start: usize,
     end: usize,
     scope_opening: usize,
 ) ?usize {
-    var index = start;
-    while (index + 3 < end) : (index += 1) {
-        if (!context.tokenIs(index, arena) or context.enclosingOpeningBrace(index) != scope_opening or
+    for (identifiers.within(arena, start, end)) |position| {
+        const index: usize = position;
+        if (index + 3 >= end or context.enclosingOpeningBrace(index) != scope_opening or
             context.tokens[index + 1].tag != .period or !context.tokenIs(index + 2, "reset") or
             context.tokens[index + 3].tag != .l_paren) continue;
         return index + 2;
@@ -258,6 +304,8 @@ fn arenaResetAfter(
 }
 
 fn findFieldContainerViews(context: RuleRun, level: rule_types.Level) !void {
+    var fields: StructFields = .{};
+    defer fields.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 8 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal or
@@ -265,13 +313,14 @@ fn findFieldContainerViews(context: RuleRun, level: rule_types.Level) !void {
             context.tokens[declaration_index + 5].tag != .identifier or context.tokens[declaration_index + 6].tag != .period or
             !context.tokenIs(declaration_index + 7, "items") or context.tokens[declaration_index + 8].tag != .semicolon) continue;
         const field_name = context.tokenText(declaration_index + 5);
-        const kind = enclosingContainerFieldKind(context, declaration_index, field_name) orelse continue;
+        const kind = try enclosingContainerFieldKind(context, &fields, declaration_index, field_name) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const base_name = context.tokenText(declaration_index + 3);
         const view_name = context.tokenText(declaration_index + 1);
         const invalidation = firstFieldInvalidation(
             context,
+            try context.scopes.identifiers(),
             base_name,
             field_name,
             kind,
@@ -291,53 +340,65 @@ fn findFieldContainerViews(context: RuleRun, level: rule_types.Level) !void {
     }
 }
 
-fn enclosingContainerFieldKind(context: RuleRun, target: usize, field_name: []const u8) ?container_types.Kind {
-    var container_opening: ?usize = null;
-    for (context.tokens[0..target], 0..) |token, struct_index| {
-        if (token.tag != .keyword_struct or struct_index + 1 >= target or
-            context.tokens[struct_index + 1].tag != .l_brace) continue;
-        const closing = context.matchingToken(struct_index + 1, .l_brace, .r_brace) orelse continue;
-        if (target < closing) container_opening = struct_index + 1;
-    }
-    const opening = container_opening orelse return null;
+/// The container kind of the field `field_name` of the innermost `struct`
+/// around `target`, when it invalidates views.
+fn enclosingContainerFieldKind(
+    context: RuleRun,
+    fields: *StructFields,
+    target: usize,
+    field_name: []const u8,
+) !?container_types.Kind {
+    // The open braces around `target`, innermost first; the first matched
+    // `struct {` among them is the latest one that closes after `target`.
+    var brace = context.enclosingOpeningBrace(target);
+    const opening = while (brace) |candidate| : (brace = context.enclosingOpeningBrace(candidate)) {
+        if (candidate > 0 and context.tokens[candidate - 1].tag == .keyword_struct and
+            context.scopes.matchingToken(candidate) != null) break candidate;
+    } else return null;
     const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse return null;
-    var depth: usize = 0;
-    var index = opening + 1;
-    while (index + 2 < closing) : (index += 1) {
-        switch (context.tokens[index].tag) {
-            .l_brace => {
-                depth += 1;
-                continue;
-            },
-            .r_brace => {
-                depth -|= 1;
-                continue;
-            },
-            else => {},
-        }
-        if (depth != 0 or !context.tokenIs(index, field_name) or context.tokens[index + 1].tag != .colon) continue;
-        const field_end = fieldTypeEnd(context.tokens, index + 2, closing);
-        const kind = container_types.firstKindIn(context.source, context.tokens, index + 2, field_end) orelse return null;
-        return if (kind.invalidatesViews()) kind else null;
-    }
-    return null;
+    const index = try fields.first(context, opening, closing, field_name) orelse return null;
+    const field_end = tokens_util.fieldTypeEnd(context.tokens, index + 2, closing);
+    const kind = container_types.firstKindIn(context.source, context.tokens, index + 2, field_end) orelse return null;
+    return if (kind.invalidatesViews()) kind else null;
 }
 
-fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize, end: usize) usize {
-    var depth: usize = 0;
-    var index = start;
-    while (index < end) : (index += 1) switch (tokens[index].tag) {
-        .l_paren, .l_bracket => depth += 1,
-        .r_paren, .r_bracket => depth -|= 1,
-        .comma, .equal => if (depth == 0) return index,
-        .l_brace, .r_brace, .semicolon => if (depth == 0) return index,
-        else => {},
-    };
-    return end;
-}
+/// The `name:` declarations directly in each `struct` body asked about, the
+/// first of each name, found in one pass over the body when it is first asked.
+const StructFields = struct {
+    bodies: std.AutoHashMapUnmanaged(u32, std.StringHashMapUnmanaged(u32)) = .empty,
+
+    fn deinit(fields: *StructFields, allocator: std.mem.Allocator) void {
+        var names = fields.bodies.valueIterator();
+        while (names.next()) |map| map.deinit(allocator);
+        fields.bodies.deinit(allocator);
+    }
+
+    /// The first `name:` outside nested braces of the body `{` at `opening`.
+    /// Only identifiers are spelled like the field names asked for.
+    fn first(fields: *StructFields, context: RuleRun, opening: usize, closing: usize, name: []const u8) !?usize {
+        const entry = try fields.bodies.getOrPut(context.allocator, @intCast(opening));
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+            var depth: usize = 0;
+            var index = opening + 1;
+            while (index + 2 < closing) : (index += 1) switch (context.tokens[index].tag) {
+                .l_brace => depth += 1,
+                .r_brace => depth -|= 1,
+                .identifier => if (depth == 0 and context.tokens[index + 1].tag == .colon) {
+                    const field = try entry.value_ptr.getOrPut(context.allocator, context.tokenText(index));
+                    if (!field.found_existing) field.value_ptr.* = @intCast(index);
+                },
+                else => {},
+            };
+        }
+        const index = entry.value_ptr.get(name) orelse return null;
+        return index;
+    }
+};
 
 fn firstFieldInvalidation(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     base_name: []const u8,
     field_name: []const u8,
     kind: container_types.Kind,
@@ -345,22 +406,31 @@ fn firstFieldInvalidation(
     start: usize,
     end: usize,
 ) ?Invalidation {
-    var index = start;
-    while (index + 5 < end) : (index += 1) {
-        if (!context.tokenIs(index, base_name) or (index > 0 and context.tokens[index - 1].tag == .period) or
+    // A call from the view's last mention on leaves no use of it to reach.
+    const last = reach.lastMention(identifiers, view_name, start, end);
+    for (identifiers.within(base_name, start, last)) |position| {
+        const index: usize = position;
+        if (index + 5 >= end or (index > 0 and context.tokens[index - 1].tag == .period) or
             context.tokens[index + 1].tag != .period or !context.tokenIs(index + 2, field_name) or
             context.tokens[index + 3].tag != .period or context.tokens[index + 4].tag != .identifier or
             context.tokens[index + 5].tag != .l_paren) continue;
         const method = context.tokenText(index + 4);
         if (!invalidatesView(kind, method)) continue;
         const call_end = reach.callEnd(context, index + 4) orelse continue;
-        if (reach.firstReachedUse(context, view_name, index + 4, call_end + 1, end) == null) continue;
+        if (reach.firstReachedUse(context, identifiers, view_name, index + 4, call_end + 1, end) == null) continue;
         return .{ .index = index, .method = method };
     }
     return null;
 }
 
 fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
+    var reallocations: Reallocations = .{};
+    defer reallocations.deinit(context.allocator);
+    try reallocations.collect(context);
+    if (reallocations.calls.items.len == 0) return;
+    const identifiers = try context.scopes.identifiers();
+    var calls: std.ArrayList(u32) = .empty;
+    defer calls.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or
             declaration_index + 3 >= context.tokens.len or context.tokens[declaration_index + 1].tag != .identifier or
@@ -369,17 +439,16 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const view_name = context.tokenText(declaration_index + 1);
-        for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, method_index| {
-            if (candidate.tag != .identifier or !context.tokenIs(method_index, "realloc") or
-                method_index + 1 >= scope_end or context.tokens[method_index + 1].tag != .l_paren) continue;
-            if (method_index < 2 or context.tokens[method_index - 1].tag != .period or
-                context.tokens[method_index - 2].tag != .identifier or
-                !allocatorBinding(context, context.tokenText(method_index - 2), method_index)) continue;
-            const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
-            const allocation = firstArgument(context, method_index + 2, call_end) orelse continue;
-            if (!rangeContainsBorrowingPath(context, declaration_index + 3, declaration_end, allocation)) continue;
+        // The other calls after the declaration cannot find their allocation in it.
+        try reallocations.spelledIn(context.allocator, declaration_index + 3, declaration_end, scope_end, &calls);
+        for (calls.items) |call_index| {
+            const call = reallocations.calls.items[call_index];
+            const method_index = call.method_index;
+            const call_end = call.call_end;
+            const recurrences = if (call.recurrences) |range| reallocations.recurrences.items[range.start..range.end] else null;
+            if (!rangeContainsBorrowingPath(context, recurrences, declaration_index + 3, declaration_end, call.allocation)) continue;
             if (reallocationReplacesBorrowedField(context, view_name, method_index, call_end)) continue;
-            if (reach.firstReachedUse(context, view_name, method_index, call_end + 1, scope_end) == null) continue;
+            if (reach.firstReachedUse(context, identifiers, view_name, method_index, call_end + 1, scope_end) == null) continue;
             try context.emit(.{
                 .rule = .invalidated_container_view,
                 .level = level,
@@ -392,6 +461,135 @@ fn findReallocatedViews(context: RuleRun, level: rule_types.Level) !void {
             break;
         }
     }
+}
+
+/// The file's `allocator.realloc(allocation, ..)` calls in order, with where
+/// the tokens of each allocation recur, so that a declaration meets only the
+/// later calls whose allocation it spells.
+const Reallocations = struct {
+    calls: std.ArrayList(Call) = .empty,
+    /// The recurrences of each call's allocation, call after call.
+    recurrences: std.ArrayList(u32) = .empty,
+    /// Every recurrence with its call, by position.
+    spellings: std.ArrayList(Spelling) = .empty,
+    /// The calls whose allocation names no identifier to find it by.
+    unindexed: std.ArrayList(u32) = .empty,
+
+    const Call = struct {
+        method_index: usize,
+        call_end: usize,
+        allocation: TokenRange,
+        /// Its part of `recurrences`, null when the call is unindexed.
+        recurrences: ?struct { start: usize, end: usize },
+    };
+
+    const Spelling = struct { position: u32, call: u32 };
+
+    fn deinit(reallocations: *Reallocations, allocator: std.mem.Allocator) void {
+        reallocations.calls.deinit(allocator);
+        reallocations.recurrences.deinit(allocator);
+        reallocations.spellings.deinit(allocator);
+        reallocations.unindexed.deinit(allocator);
+    }
+
+    fn collect(reallocations: *Reallocations, context: RuleRun) !void {
+        const tokens = context.tokens;
+        const allocator = context.allocator;
+        var identifiers: ?*const IdentifierTable = null;
+        for (tokens, 0..) |token, method_index| {
+            if (token.tag != .identifier or !context.tokenIs(method_index, "realloc") or
+                method_index + 1 >= tokens.len or tokens[method_index + 1].tag != .l_paren) continue;
+            if (method_index < 2 or tokens[method_index - 1].tag != .period or tokens[method_index - 2].tag != .identifier) continue;
+            const table = identifiers orelse try context.scopes.identifiers();
+            identifiers = table;
+            if (!allocatorBinding(context, table, context.tokenText(method_index - 2), method_index)) continue;
+            const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
+            const allocation = firstArgument(context, method_index + 2, call_end) orelse continue;
+            const call: u32 = @intCast(reallocations.calls.items.len);
+            const first = reallocations.recurrences.items.len;
+            const indexed = try appendRecurrences(context, table, allocation, &reallocations.recurrences);
+            try reallocations.calls.append(allocator, .{
+                .method_index = method_index,
+                .call_end = call_end,
+                .allocation = allocation,
+                .recurrences = if (indexed) .{ .start = first, .end = reallocations.recurrences.items.len } else null,
+            });
+            if (!indexed) try reallocations.unindexed.append(allocator, call);
+            for (reallocations.recurrences.items[first..]) |position| {
+                try reallocations.spellings.append(allocator, .{ .position = position, .call = call });
+            }
+        }
+        std.mem.sort(Spelling, reallocations.spellings.items, {}, struct {
+            fn lessThan(_: void, left: Spelling, right: Spelling) bool {
+                return left.position < right.position;
+            }
+        }.lessThan);
+    }
+
+    /// The calls in `(declaration_end, scope_end)` whose allocation recurs at
+    /// a position in `[start, declaration_end)`, or is unindexed, in order.
+    fn spelledIn(
+        reallocations: *const Reallocations,
+        allocator: std.mem.Allocator,
+        start: usize,
+        declaration_end: usize,
+        scope_end: usize,
+        calls: *std.ArrayList(u32),
+    ) !void {
+        calls.clearRetainingCapacity();
+        const spellings = reallocations.spellings.items;
+        const first = std.sort.partitionPoint(Spelling, spellings, start, struct {
+            fn before(bound: usize, spelling: Spelling) bool {
+                return spelling.position < bound;
+            }
+        }.before);
+        for (spellings[first..]) |spelling| {
+            if (spelling.position >= declaration_end) break;
+            const method_index = reallocations.calls.items[spelling.call].method_index;
+            if (method_index > declaration_end and method_index < scope_end) try calls.append(allocator, spelling.call);
+        }
+        // Rare: a first argument such as `.{}` or a string literal.
+        for (reallocations.unindexed.items) |call| {
+            const method_index = reallocations.calls.items[call].method_index;
+            if (method_index >= scope_end) break;
+            if (method_index > declaration_end) try calls.append(allocator, call);
+        }
+        std.mem.sort(u32, calls.items, {}, std.sort.asc(u32));
+        var kept: usize = 0;
+        for (calls.items) |call| {
+            if (kept > 0 and calls.items[kept - 1] == call) continue;
+            calls.items[kept] = call;
+            kept += 1;
+        }
+        calls.shrinkRetainingCapacity(kept);
+    }
+};
+
+/// Appends the positions where the tokens of `path` recur, found from the
+/// identifiers spelled like its rarest identifier; false when it has none.
+fn appendRecurrences(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    path: TokenRange,
+    positions: *std.ArrayList(u32),
+) !bool {
+    var anchor: ?usize = null;
+    var anchor_positions: []const u32 = &.{};
+    for (path.start..path.end) |index| {
+        if (context.tokens[index].tag != .identifier) continue;
+        const spelled = identifiers.all(context.tokenText(index));
+        if (anchor == null or spelled.len < anchor_positions.len) {
+            anchor = index - path.start;
+            anchor_positions = spelled;
+        }
+    }
+    const offset = anchor orelse return false;
+    const path_length = path.end - path.start;
+    for (anchor_positions) |position| {
+        if (position < offset or position - offset + path_length > context.tokens.len) continue;
+        if (spelledAt(context, path, position - offset)) try positions.append(context.allocator, @intCast(position - offset));
+    }
+    return true;
 }
 
 fn reallocationReplacesBorrowedField(context: RuleRun, view_name: []const u8, method_index: usize, call_end: usize) bool {
@@ -421,13 +619,14 @@ fn reallocationReplacesBorrowedField(context: RuleRun, view_name: []const u8, me
     return false;
 }
 
-fn allocatorBinding(context: RuleRun, name: []const u8, before: usize) bool {
+fn allocatorBinding(context: RuleRun, identifiers: *const IdentifierTable, name: []const u8, before: usize) bool {
     if (std.ascii.findIgnoreCase(name, "alloc") != null or std.mem.eql(u8, name, "gpa")) return true;
-    var name_index = before;
-    while (name_index > 0) {
-        name_index -= 1;
-        if (!context.tokenIs(name_index, name) or name_index + 2 >= before or
-            context.tokens[name_index + 1].tag != .colon) continue;
+    const positions = identifiers.within(name, 0, before);
+    var position = positions.len;
+    while (position > 0) {
+        position -= 1;
+        const name_index: usize = positions[position];
+        if (name_index + 2 >= before or context.tokens[name_index + 1].tag != .colon) continue;
         var type_index = name_index + 2;
         while (type_index < before) : (type_index += 1) {
             if (context.tokens[type_index].tag == .identifier and context.tokenIs(type_index, "Allocator")) return true;
@@ -450,37 +649,67 @@ fn firstArgument(context: RuleRun, start: usize, end: usize) ?TokenRange {
     return .{ .start = start, .end = end };
 }
 
-fn rangeContainsBorrowingPath(context: RuleRun, start: usize, end: usize, path: TokenRange) bool {
+/// Whether `[start, end)` spells `path` as an operand borrowing its storage.
+/// `recurrences` lists every position where the tokens of `path` recur, when
+/// known; it is an existence question, so only those positions are tried.
+fn rangeContainsBorrowingPath(context: RuleRun, recurrences: ?[]const u32, start: usize, end: usize, path: TokenRange) bool {
     const path_length = path.end - path.start;
     if (path_length == 0 or path_length > end - start) return false;
+    if (recurrences) |positions| {
+        for (positionsWithin(positions, start, end - path_length + 1)) |candidate| {
+            if (borrowsAt(context, start, end, path, candidate)) return true;
+        }
+        return false;
+    }
     var candidate = start;
     while (candidate + path_length <= end) : (candidate += 1) {
-        for (0..path_length) |offset| {
-            if (context.tokens[candidate + offset].tag != context.tokens[path.start + offset].tag or
-                !std.mem.eql(u8, context.tokenText(candidate + offset), context.tokenText(path.start + offset))) break;
-        } else {
-            const after_path = candidate + path_length;
-            if (after_path + 1 < end and context.tokens[after_path].tag == .period and
-                context.tokenIs(after_path + 1, "len")) continue;
-            var operand_end = after_path;
-            if (after_path < end and context.tokens[after_path].tag == .l_bracket) {
-                const bracket_end = context.matchingToken(after_path, .l_bracket, .r_bracket) orelse continue;
-                var is_slice = false;
-                for (context.tokens[after_path + 1 .. @min(bracket_end, end)]) |token| {
-                    if (token.tag == .ellipsis2 or token.tag == .ellipsis3) {
-                        is_slice = true;
-                        break;
-                    }
-                }
-                const address_taken = candidate > start and context.tokens[candidate - 1].tag == .ampersand;
-                if (!is_slice and !address_taken) continue;
-                operand_end = bracket_end + 1;
-            }
-            if (candidate > start and byValueLoopOperand(context, candidate, operand_end)) continue;
-            return true;
-        }
+        if (borrowsAt(context, start, end, path, candidate)) return true;
     }
     return false;
+}
+
+/// Whether `path` is spelled at `candidate` as more than its `.len`, an
+/// element read or a by-value loop operand.
+fn borrowsAt(context: RuleRun, start: usize, end: usize, path: TokenRange, candidate: usize) bool {
+    if (!spelledAt(context, path, candidate)) return false;
+    const after_path = candidate + (path.end - path.start);
+    if (after_path + 1 < end and context.tokens[after_path].tag == .period and
+        context.tokenIs(after_path + 1, "len")) return false;
+    var operand_end = after_path;
+    if (after_path < end and context.tokens[after_path].tag == .l_bracket) {
+        const bracket_end = context.matchingToken(after_path, .l_bracket, .r_bracket) orelse return false;
+        var is_slice = false;
+        for (context.tokens[after_path + 1 .. @min(bracket_end, end)]) |token| {
+            if (token.tag == .ellipsis2 or token.tag == .ellipsis3) {
+                is_slice = true;
+                break;
+            }
+        }
+        const address_taken = candidate > start and context.tokens[candidate - 1].tag == .ampersand;
+        if (!is_slice and !address_taken) return false;
+        operand_end = bracket_end + 1;
+    }
+    return !(candidate > start and byValueLoopOperand(context, candidate, operand_end));
+}
+
+/// Whether the tokens of `path` recur at `candidate`.
+fn spelledAt(context: RuleRun, path: TokenRange, candidate: usize) bool {
+    for (0..path.end - path.start) |offset| {
+        if (context.tokens[candidate + offset].tag != context.tokens[path.start + offset].tag or
+            !std.mem.eql(u8, context.tokenText(candidate + offset), context.tokenText(path.start + offset))) return false;
+    }
+    return true;
+}
+
+/// The positions in `[start, end)` of a sorted list.
+fn positionsWithin(positions: []const u32, start: usize, end: usize) []const u32 {
+    const first = std.sort.partitionPoint(u32, positions, start, positionBefore);
+    const last = first + std.sort.partitionPoint(u32, positions[first..], end, positionBefore);
+    return positions[first..last];
+}
+
+fn positionBefore(bound: usize, position: u32) bool {
+    return position < bound;
 }
 
 /// Whether `[start, end)` is an operand of a `for` that captures its elements
@@ -525,6 +754,10 @@ fn viewDeclaration(context: RuleRun, container_name: []const u8, index: usize, s
         if (context.tokens[index + 6].tag == .semicolon) {
             return .{ .name_index = index + 1, .declaration_end = declaration_end, .kind = .items };
         }
+        // `items.ptr` points at the same storage.
+        if (context.tokens[index + 6].tag == .period and context.tokenIs(index + 7, "ptr") and index + 8 == declaration_end) {
+            return .{ .name_index = index + 1, .declaration_end = declaration_end, .kind = .pointer };
+        }
         // A subslice `items[a..b]` borrows the same storage.
         if (context.tokens[index + 6].tag == .l_bracket) {
             const closing = context.matchingToken(index + 6, .l_bracket, .r_bracket) orelse return null;
@@ -555,21 +788,24 @@ const Invalidation = struct { index: usize, method: []const u8 };
 /// after which `view_name` is still used.
 fn firstInvalidation(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     container_name: []const u8,
     kind: container_types.Kind,
     view_name: []const u8,
     start: usize,
     end: usize,
 ) ?Invalidation {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, container_name) or
-            (index > 0 and context.tokens[index - 1].tag == .period) or index + 3 >= end or
+    // A call from the view's last mention on leaves no use of it to reach.
+    const last = reach.lastMention(identifiers, view_name, start, end);
+    for (identifiers.within(container_name, start, last)) |position| {
+        const index: usize = position;
+        if ((index > 0 and context.tokens[index - 1].tag == .period) or index + 3 >= end or
             context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
             context.tokens[index + 3].tag != .l_paren) continue;
         const method = context.tokenText(index + 2);
         if (!invalidatesView(kind, method)) continue;
         const call_end = reach.callEnd(context, index + 2) orelse continue;
-        if (reach.firstReachedUse(context, view_name, index + 2, call_end + 1, end) == null) continue;
+        if (reach.firstReachedUse(context, identifiers, view_name, index + 2, call_end + 1, end) == null) continue;
         return .{ .index = index, .method = method };
     }
     return null;
@@ -804,6 +1040,9 @@ test "appending a container's own items to itself reports" {
 test "views of a container passed by pointer are tracked" {
     try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { const v = l.items; try l.append(g, 1); return v[0]; }", 1);
     try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { const v = l.items; return v[0]; }", 0);
+    try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { const p = l.items.ptr; try l.ensureTotalCapacity(g, 9); return p[0]; }", 1);
+    try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { try l.ensureTotalCapacity(g, 9); const p = l.items.ptr; l.appendAssumeCapacity(1); return p[0]; }", 0);
+    try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !bool { const p = l.items.ptr; try l.append(g, 1); return p == l.items.ptr; }", 0);
     try expectViews("fn f(self: *const Page, y: usize) *Row { return &self.rows.ptr(m)[y]; }", 0);
 }
 
@@ -820,4 +1059,27 @@ test "values and indices a by-value for capture yields are not views of a reallo
         "g.nodes = try gpa.realloc(g.nodes, 4); n.t = false; }", 1);
     try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (g.nodes, 0..) |node, i| { if (node.t) break &g.nodes[i]; } else return; " ++
         "g.nodes = try gpa.realloc(g.nodes, 4); n.t = false; }", 1);
+}
+
+test "a declaration borrows from each later reallocation whose source it spells" {
+    try expectViews("fn f(gpa: Allocator, b: []u8, c: []u8) !void { const v = b; const w = c; " ++
+        "c = try gpa.realloc(c, 8); b = try gpa.realloc(b, 8); use(v, w); }", 2);
+    try expectViews("fn f(gpa: Allocator, b: []u8) !void { const v = .{ b.len, b }; b = try gpa.realloc(b, 8); use(v); }", 1);
+    try expectViews("fn f(gpa: Allocator, b: []u8) !void { const v = .{ b.len, b[0] }; b = try gpa.realloc(b, 8); use(v); }", 0);
+    try expectViews("fn f(gpa: Allocator, b: []u8) !void { b = try gpa.realloc(b, 8); const v = b; use(v); }", 0);
+    // A source without an identifier is still compared token by token.
+    try expectViews("fn f(gpa: Allocator) !void { const v = \"abc\"; _ = try gpa.realloc(\"abc\", 4); use(v); }", 1);
+}
+
+test "field views resolve the field in the innermost enclosing struct" {
+    const source =
+        "const Outer = struct { output: std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, " ++
+        "const Nested = struct { names: std.ArrayListUnmanaged(u8), " ++
+        "fn finish(self: *Outer, n: *Nested) ![]u8 { const view = self.output.items; const names = n.names.items; " ++
+        "try self.output.appendSlice(self.allocator, \"END\"); try n.names.appendSlice(self.allocator, \"END\"); return .{ view, names }; } }; };";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const found = try support.findings(arena.allocator(), run, source, rule_types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expect(std.mem.find(u8, found[0].message, "'n.names'") != null);
 }

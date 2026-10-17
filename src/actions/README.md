@@ -10,6 +10,9 @@ Add an action to the closest existing family. A genuinely new family is
 registered once in `registry.zig`'s ordered `action_modules` tuple; the tuple is
 the composition order and the test-import list.
 
+Actions that need expression structure (arithmetic operands, struct members)
+parse the source only once the selection is on a token they act on.
+
 An action must establish its preconditions before appearing. Syntax facts are
 enough for explicit error sets, optional annotations, allocator provenance,
 format literals, and simple build declarations. Tagged-union materialization and

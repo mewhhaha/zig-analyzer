@@ -35,6 +35,7 @@ pub fn codeAction(
         .services = services,
         .arena = arena,
         .document = document,
+        .configuration = lint_configuration,
         .only = params.context.only,
         .requested_span = .{
             .start = document.byteOffset(params.range.start),
@@ -61,10 +62,14 @@ const Offers = struct {
     services: Services,
     arena: std.mem.Allocator,
     document: *const Document,
+    configuration: analysis.Configuration,
     only: ?[]const Kind,
     requested_span: std.zig.Token.Loc,
     actions: std.ArrayList(lsp.types.CodeAction.Result) = .empty,
     fix_all_fixes: std.ArrayList([]const analysis.Edit) = .empty,
+    /// The edits of the diagnostic fixes listed, so a native action making
+    /// the same edit is not listed again.
+    offered_fixes: std.ArrayList([]const analysis.Edit) = .empty,
     line_suppressions: std.ArrayList(OfferedSuppression) = .empty,
     file_suppressions: std.ArrayList(OfferedSuppression) = .empty,
     rule_fix_alls: std.ArrayList(analysis.Rule) = .empty,
@@ -110,6 +115,7 @@ const Offers = struct {
                 .isPreferred = fix.preferred,
                 .edit = try offers.documentEdit(fix.edits),
             } });
+            try offers.offered_fixes.append(arena, fix.edits);
             if (fix.fix_all and offers.overlaps(finding.span)) try offers.ruleFixAll(finding.rule, all_findings);
         }
     }
@@ -127,7 +133,8 @@ const Offers = struct {
                 if (other_fix.fix_all) try rule_fixes.append(arena, other_fix.edits);
             }
         }
-        const safe_edits = try text_edits.wholeFixes(arena, rule_fixes.items);
+        const document = offers.document;
+        const safe_edits = try text_edits.collapseEmptiedBlocks(arena, document.source, document.tokens, try text_edits.wholeFixes(arena, rule_fixes.items));
         if (safe_edits.len == 0) return;
         if (!offers.requested(.@"source.fixAll") and !offers.requested(.quickfix)) return;
         try offers.add(
@@ -202,8 +209,22 @@ const Offers = struct {
         for (native_actions) |native_action| {
             const kind = action_lsp.kind(native_action.kind);
             if (!offers.requested(kind)) continue;
+            // 'Poison after deinit' is also `missing-deinit-poison`'s fix.
+            if (offers.fixOffered(native_action.edits)) continue;
             try offers.add(native_action.title, kind, native_action.preferred, try offers.documentEdit(native_action.edits));
         }
+    }
+
+    /// Whether a diagnostic fix already listed makes exactly `edits`.
+    fn fixOffered(offers: Offers, edits: []const analysis.Edit) bool {
+        offered: for (offers.offered_fixes.items) |offered| {
+            if (offered.len != edits.len) continue;
+            for (offered, edits) |left, right| {
+                if (!std.meta.eql(left.span, right.span) or !std.mem.eql(u8, left.replacement, right.replacement)) continue :offered;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// Actions that edit several files, over the open documents.
@@ -251,10 +272,14 @@ const Offers = struct {
         );
     }
 
-    /// One action applying every safe fix-all edit of the file.
+    /// One action applying every safe fix-all edit of the file, pass after
+    /// pass as `check --fix` does, so it leaves nothing more to fix.
     fn fixAllSafe(offers: *Offers) !void {
         if (!offers.requested(.@"source.fixAll")) return;
-        const safe_edits = try text_edits.wholeFixes(offers.arena, offers.fix_all_fixes.items);
+        const first_pass = try text_edits.wholeFixes(offers.arena, offers.fix_all_fixes.items);
+        if (first_pass.len == 0) return;
+        const document = offers.document;
+        const safe_edits = try text_edits.convergedFixAll(offers.arena, document.source, document.tokens, first_pass, offers.configuration);
         if (safe_edits.len == 0) return;
         try offers.actions.append(offers.arena, .{ .code_action = .{
             .title = "Fix all safe zig-analyzer findings",

@@ -86,16 +86,36 @@ version and the last known compiler shapes) and the compiler layer (compile
 errors of exactly one version). `lsp/diagnostics.zig` holds the only code that
 writes `publishDiagnostics`, merging the layers of one version, so a lint-only
 republish keeps that version's compiler errors and a result for an outdated or
-closed document is dropped. Tests drive the real worker and wait for it with
-`CompilerBackend.waitIdle`; a server started with `Server.Options.syntax_only`
-never starts a compiler.
+closed document is dropped. A client that pulls diagnostics and accepts
+`workspace/diagnostic/refresh` gets the same merged layers only by pulling
+(`lsp/pull_diagnostics.zig`); the publisher then keeps them for the next pull
+and asks for one when a version the client already has changes. Tests drive
+the real worker and wait for it with `CompilerBackend.waitIdle`; a server
+started with `Server.Options.syntax_only` never starts a compiler.
+
+The stdio server defers the lint layer of edits (`lsp/deferred_diagnostics.zig`):
+`didChange` only applies the text, `Reader` (between the transport and the
+dispatcher) parses edited documents before any other message, and once the
+client has been quiet for `default_quiet_ms` (at most `default_max_delay_ms`
+after the oldest edit) it lints each edited document once, at its last version.
+Servers built with default `Server.Options`, as in the exchange tests, lint
+every edit at once; tests opt into deferral with a scripted input and pauses.
+Documents convert byte offsets to positions through a line index, and a file
+nested past the limits of `tokens.excessiveNesting` (brackets, `else if`
+chains) is skipped with one information diagnostic instead of being parsed:
+the parser recurses per level and would overflow the stack.
 
 `lsp/server.zig` is the `Server` struct, document synchronization and
 diagnostics publishing; each feature request forwards to one module that takes
 `lsp/services.zig` (documents, compiler worker facts, linter, resolver) rather
 than the whole server: `hover`, `navigation`, `completion`, `code_actions`,
-`rename`, `presentation` (symbols, semantic tokens, inlay hints, signature
-help, code lens, call hierarchy, formatting). Those modules order strategies and
+`rename` (and its prepare step), `presentation` (symbols, semantic tokens, inlay
+hints, signature help, code lens, call hierarchy, formatting), `structure`
+(document highlights, folding and selection ranges, document links, decided in
+`syntax/structure.zig`), `range_formatting` (the separable part of `zig fmt`'s
+changes, decided in `syntax/format_diff.zig`), `ownership_hints` ("caller
+frees" hints from `rules/owned_results.zig`), `test_runner` ("Run test" lenses
+and the background `zig test` they start) and `pull_diagnostics`. Those modules order strategies and
 convert answers to LSP positions and shapes; what a name resolves to, what a
 declaration looks like and which tokens carry hints are decided inward, in
 `project/module_sites.zig`, `project/describe.zig` and `syntax/`.

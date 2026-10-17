@@ -50,7 +50,7 @@ fn externExpression(context: RuleRun, scopes: *const syntax_scope.Index, start: 
     if (context.tokenIs(start, "@as") and start + 2 < end and context.tokens[start + 1].tag == .l_paren) {
         const close = scopes.matchingToken(start + 1) orelse return false;
         if (close + 1 != end) return false;
-        const comma = topLevelComma(context, scopes, start + 2, close) orelse return false;
+        const comma = context.topLevelComma(start + 2, close) orelse return false;
         return externTypeEnd(context, scopes, start + 2, depth + 1) == comma;
     }
     if (context.tokens[start].tag == .identifier and end == start + 1) {
@@ -157,7 +157,7 @@ fn findGlobalLinkage(context: RuleRun, scopes: *const syntax_scope.Index) !void 
         if (token.tag != .builtin or (!context.tokenIs(index, "@export") and !context.tokenIs(index, "@extern")) or
             index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .l_paren) continue;
         const close = scopes.matchingToken(index + 1) orelse continue;
-        const comma = topLevelComma(context, scopes, index + 2, close) orelse continue;
+        const comma = context.topLevelComma(index + 2, close) orelse continue;
         const options_start = comma + 1;
         const options_end = withoutTrailingComma(context, options_start, close);
         if (options_start >= options_end) continue;
@@ -168,7 +168,7 @@ fn findGlobalLinkage(context: RuleRun, scopes: *const syntax_scope.Index) !void 
             stdLangTypeEnd(context, scopes, options_start, if (context.tokenIs(index, "@export")) "ExportOptions" else "ExternOptions", 0) orelse continue;
         if (opening >= options_end or context.tokens[opening].tag != .l_brace or
             (scopes.matchingToken(opening) orelse continue) + 1 != options_end) continue;
-        try findOptionLinkage(context, scopes, opening + 1, options_end - 1, level);
+        try findOptionLinkage(context, opening + 1, options_end - 1, level);
     }
 }
 
@@ -201,10 +201,10 @@ fn stdImportEnd(context: RuleRun, start: usize) ?usize {
     return start + 4;
 }
 
-fn findOptionLinkage(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize, level: types.Level) !void {
+fn findOptionLinkage(context: RuleRun, start: usize, end: usize, level: types.Level) !void {
     var cursor = start;
     while (cursor < end) {
-        const field_end = topLevelComma(context, scopes, cursor, end) orelse end;
+        const field_end = context.topLevelComma(cursor, end) orelse end;
         if (field_end == cursor + 5 and context.tokens[cursor].tag == .period and
             context.tokenIs(cursor + 1, "linkage") and context.tokens[cursor + 2].tag == .equal and
             context.tokens[cursor + 3].tag == .period)
@@ -231,18 +231,6 @@ fn emitLinkage(context: RuleRun, index: usize, name: []const u8, level: types.Le
         else
             "GlobalLinkage.link_once was removed in Zig 0.17; review whether weak linkage provides the intended symbol behavior",
     });
-}
-
-fn topLevelComma(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize) ?usize {
-    var cursor = start;
-    while (cursor < end) : (cursor += 1) {
-        switch (context.tokens[cursor].tag) {
-            .l_paren, .l_bracket, .l_brace => cursor = scopes.matchingToken(cursor) orelse return null,
-            .comma => return cursor,
-            else => {},
-        }
-    }
-    return null;
 }
 
 fn withoutTrailingComma(context: RuleRun, start: usize, end: usize) usize {

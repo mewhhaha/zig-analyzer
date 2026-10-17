@@ -45,6 +45,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("lsp");
 
+    // `zig-analyzer explain` prints the rule documents, embedded from where
+    // `zig build rule-docs` writes them. Only `explain` reads them, so the
+    // rule-docs tool still builds while a new rule's document is missing.
+    const rule_pages = b.addWriteFiles();
+    _ = rule_pages.addCopyDirectory(b.path("docs/rules"), ".", .{ .include_extensions = &.{".md"} });
+    const rule_pages_module = b.createModule(.{
+        .root_source_file = rule_pages.add("rule_pages.zig",
+            \\//! The rule documents of docs/rules, copied next to this file by the build.
+            \\
+            \\pub fn page(comptime code: []const u8) []const u8 {
+            \\    return @embedFile(code ++ ".md");
+            \\}
+            \\
+        ),
+    });
+
     const analyzer_module = b.addModule("zig_analyzer", .{
         .root_source_file = b.path("src/zig_analyzer.zig"),
         .target = target,
@@ -52,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "lsp", .module = lsp_module },
+            .{ .name = "rule_pages", .module = rule_pages_module },
         },
     });
 
@@ -119,6 +136,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&rule_fixes.step);
     fix_check_step.dependOn(&rule_fixes.step);
     test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/example_diagnostics.zig"), .imports = tests.imports }).step);
+    test_step.dependOn(&tests.run(.{ .root_source_file = b.path("tests/rule_scaling.zig"), .imports = tests.imports }).step);
 
     const fixtures = tests.run(.{ .root_source_file = b.path("fixtures/comptime/main.zig") });
     fixtures_step.dependOn(&fixtures.step);
@@ -139,7 +157,11 @@ pub fn build(b: *std.Build) void {
         \\
         \\Usage:
         \\  zig-analyzer lsp
-        \\  zig-analyzer check [--fix] [--no-cache] [path]
+        \\  zig-analyzer check [--fix] [--no-cache] [--strict-config]
+        \\                     [--baseline <file>] [--write-baseline <file>]
+        \\                     [--format <format>] [--rule <code>]... [--fail-on <level>]
+        \\                     [path]
+        \\  zig-analyzer explain [rule]
         \\  zig-analyzer doctor
         \\  zig-analyzer backend bootstrap
         \\  zig-analyzer version

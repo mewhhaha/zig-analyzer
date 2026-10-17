@@ -5,6 +5,7 @@ const support = @import("../test_support.zig");
 const lineEnd = @import("../../syntax/tokens.zig").lineEnd;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
+const isAssignment = @import("../../syntax/tokens.zig").isAssignment;
 
 pub const rules = [_]types.Rule{
     .redundant_optional_unwrap,
@@ -118,34 +119,9 @@ fn bindingIsMutatedThroughUnwrap(context: RuleRun, name: []const u8, start: usiz
         if (index > start and context.tokens[index - 1].tag == .ampersand) return true;
         if (index + 3 < end and context.tokens[index + 1].tag == .period and
             context.tokens[index + 2].tag == .question_mark and
-            isAssignmentOperator(context.tokens[index + 3].tag)) return true;
+            isAssignment(context.tokens[index + 3].tag)) return true;
     }
     return false;
-}
-
-fn isAssignmentOperator(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .equal,
-        .plus_equal,
-        .minus_equal,
-        .asterisk_equal,
-        .slash_equal,
-        .percent_equal,
-        .ampersand_equal,
-        .pipe_equal,
-        .caret_equal,
-        .plus_percent_equal,
-        .minus_percent_equal,
-        .asterisk_percent_equal,
-        .plus_pipe_equal,
-        .minus_pipe_equal,
-        .asterisk_pipe_equal,
-        .angle_bracket_angle_bracket_left_equal,
-        .angle_bracket_angle_bracket_left_pipe_equal,
-        .angle_bracket_angle_bracket_right_equal,
-        => true,
-        else => false,
-    };
 }
 
 test "optional captures replace repeated force unwraps" {

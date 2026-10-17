@@ -71,6 +71,8 @@ const Shared = struct {
     io: std.Io,
     cache: check_cache.Cache,
     roots: []const []const u8,
+    /// What each root needs.
+    graph: enum { modules, units },
     next: std.atomic.Value(usize) = .init(0),
 };
 
@@ -78,24 +80,46 @@ const Shared = struct {
 /// `.modules` mode find them ready. Failures are not reported here: a root
 /// that cannot be prepared is looked up, and fails the same way, later.
 pub fn prepare(io: std.Io, cache: check_cache.Cache, roots: []const []const u8) !void {
-    if (roots.len == 0) return;
-    var shared: Shared = .{ .io = io, .cache = cache, .roots = roots };
+    var shared: Shared = .{ .io = io, .cache = cache, .roots = roots, .graph = .modules };
+    try configureAll(&shared);
+}
+
+/// Configures the complete build graph, compile units included, of every
+/// root in `roots` that has none, so lookups in `.discover` mode find them
+/// ready. Failures are left to those lookups, which meet them again.
+pub fn discover(io: std.Io, roots: []const []const u8) !void {
+    var shared: Shared = .{ .io = io, .cache = .{}, .roots = roots, .graph = .units };
+    try configureAll(&shared);
+}
+
+fn configureAll(shared: *Shared) !void {
+    if (shared.roots.len == 0) return;
     var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    const workers = @min(roots.len, max_parallel_configurations);
-    for (1..workers) |_| group.concurrent(io, work, .{&shared}) catch break;
-    work(&shared);
-    try group.await(io);
+    defer group.cancel(shared.io);
+    const workers = @min(shared.roots.len, max_parallel_configurations);
+    for (1..workers) |_| group.concurrent(shared.io, work, .{shared}) catch break;
+    work(shared);
+    try group.await(shared.io);
 }
 
 fn work(shared: *Shared) void {
     while (true) {
         const index = shared.next.fetchAdd(1, .monotonic);
         if (index >= shared.roots.len) return;
-        prepareRoot(shared.io, shared.cache, shared.roots[index]) catch |err| switch (err) {
-            error.Canceled => return,
-            else => std.log.warn("build modules for '{s}' unavailable: {t}", .{ shared.roots[index], err }),
-        };
+        const root = shared.roots[index];
+        switch (shared.graph) {
+            .modules => prepareRoot(shared.io, shared.cache, root) catch |err| switch (err) {
+                error.Canceled => return,
+                else => std.log.warn("build modules for '{s}' unavailable: {t}", .{ root, err }),
+            },
+            .units => {
+                const graph = (compile_units.buildGraph(shared.io, root, .discover) catch |err| switch (err) {
+                    error.Canceled => return,
+                    else => continue,
+                }) orelse continue;
+                graph.release();
+            },
+        }
     }
 }
 

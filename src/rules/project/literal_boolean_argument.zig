@@ -83,8 +83,18 @@ pub fn find(
         }
     }
 
+    var hidden: std.ArrayList([]const u8) = .empty;
+    defer hidden.deinit(run.allocator);
     for (run.files, 0..) |file, file_index| {
+        // A test passes each mode on purpose; the production calls judge
+        // the signature.
+        var test_end: usize = 0;
         for (file.tokens, 0..) |token, call_index| {
+            if (call_index < test_end) continue;
+            if (token.tag == .keyword_test) {
+                test_end = tokens_util.testBlockEnd(file.tokens, call_index) orelse continue;
+                continue;
+            }
             if (token.tag != .identifier or call_index + 1 >= file.tokens.len or
                 file.tokens[call_index + 1].tag != .l_paren or
                 (call_index > 0 and file.tokens[call_index - 1].tag == .keyword_fn)) continue;
@@ -100,6 +110,8 @@ pub fn find(
                 0
             else
                 continue;
+            hidden.clearRetainingCapacity();
+            var first_literal: ?usize = null;
             for (function.boolean_parameters) |parameter| {
                 if (parameter.index < parameter_offset) continue;
                 const argument_index = parameter.index - parameter_offset;
@@ -107,18 +119,33 @@ pub fn find(
                 if (argument.end != argument.start + 1 or
                     (!tokenIs(file.source, file.tokens[argument.start], "true") and
                         !tokenIs(file.source, file.tokens[argument.start], "false"))) continue;
-                try run.report(.{
-                    .file_index = file_index,
-                    .rule = .literal_boolean_argument,
-                    .span = file.tokens[argument.start].loc,
-                    .message = try run.allocator.print(
-                        "literal boolean argument hides parameter '{s}' in call to '{s}'; use an enum or options struct",
-                        .{ parameter.name, function_name },
-                    ),
-                });
+                if (first_literal == null) first_literal = argument.start;
+                try hidden.append(run.allocator, parameter.name);
             }
+            // One finding per call: its literals share one remedy.
+            const literal = first_literal orelse continue;
+            try run.report(.{
+                .file_index = file_index,
+                .rule = .literal_boolean_argument,
+                .span = file.tokens[literal].loc,
+                .message = try hiddenParametersMessage(run.allocator, hidden.items, function_name),
+            });
         }
     }
+}
+
+/// "literal boolean arguments hide parameters 'a', 'b' and 'c' in call to 'f'; ...".
+fn hiddenParametersMessage(allocator: std.mem.Allocator, names: []const []const u8, function_name: []const u8) ![]const u8 {
+    var message: std.Io.Writer.Allocating = .init(allocator);
+    defer message.deinit();
+    const writer = &message.writer;
+    try writer.writeAll(if (names.len == 1) "literal boolean argument hides parameter " else "literal boolean arguments hide parameters ");
+    for (names, 0..) |name, index| {
+        if (index != 0) try writer.writeAll(if (index + 1 == names.len) " and " else ", ");
+        try writer.print("'{s}'", .{name});
+    }
+    try writer.print(" in call to '{s}'; use an enum or options struct", .{function_name});
+    return message.toOwnedSlice();
 }
 
 fn functionDescribesBoolean(function_name: []const u8, parameter_name: []const u8) bool {
@@ -212,4 +239,24 @@ test "literal boolean arguments skip self-describing and ambiguous functions" {
     const found = try project.findings(arena.allocator(), &files, configuration);
 
     try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "literal boolean arguments report once per call and not in tests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = support.only(&.{.literal_boolean_argument}, .information);
+    const files = [_]project.SourceFile{.{
+        .path = "src/watch.zig",
+        .source =
+        \\fn watch(id: u8, external_input: bool, broad: bool, deep: bool) void { _ = id; _ = external_input; _ = broad; _ = deep; }
+        \\pub fn run(id: u8) void { watch(id, true, false, id == 1); watch(id, false, true, true); }
+        \\test "watch" { watch(1, true, true, true); }
+        ,
+    }};
+    const found = try project.findings(arena.allocator(), &files, configuration);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    const source = files[0].source;
+    try std.testing.expectEqual(std.mem.find(u8, source, "true, false, id").?, found[0].finding.span.start);
+    try std.testing.expectEqualStrings("literal boolean arguments hide parameters 'external_input' and 'broad' in call to 'watch'; use an enum or options struct", found[0].finding.message);
+    try std.testing.expectEqualStrings("literal boolean arguments hide parameters 'external_input', 'broad' and 'deep' in call to 'watch'; use an enum or options struct", found[1].finding.message);
 }

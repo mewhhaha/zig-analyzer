@@ -13,15 +13,21 @@ const analysis = @import("../analysis.zig");
 const code_actions = @import("code_actions.zig");
 const compiler_backend = @import("compiler_backend.zig");
 const completion = @import("completion.zig");
+const deferred_diagnostics = @import("deferred_diagnostics.zig");
 const diagnostics = @import("diagnostics.zig");
 const document_module = @import("../syntax/document.zig");
 const hover = @import("hover.zig");
 const navigation = @import("navigation.zig");
+const ownership_hints = @import("ownership_hints.zig");
 const presentation = @import("presentation.zig");
 const project_config = @import("../project/config.zig");
+const pull_diagnostics = @import("pull_diagnostics.zig");
+const range_formatting = @import("range_formatting.zig");
 const rename = @import("rename.zig");
 const services_module = @import("services.zig");
 const source_store = @import("../project/source_store.zig");
+const structure = @import("structure.zig");
+const test_runner = @import("test_runner.zig");
 const uri_module = @import("../uri.zig");
 
 const Document = document_module.Document;
@@ -35,7 +41,9 @@ pub fn runBasicServer(
     log_fn: anytype,
 ) !void {
     @setEvalBranchQuota(50_000);
-    return lsp.basic_server.run(io, allocator, transport, server, log_fn);
+    if (!server.diagnostics_options.defers()) return lsp.basic_server.run(io, allocator, transport, server, log_fn);
+    var reader: deferred_diagnostics.Reader = .init(transport, server);
+    return lsp.basic_server.run(io, allocator, &reader.transport, server, log_fn);
 }
 
 pub fn run(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Environ) !void {
@@ -46,7 +54,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, environ: std.process.Enviro
         .thread_safe_write = true,
     }).init(&stdio.transport);
     var server: Server = undefined;
-    try server.init(io, allocator, environ, &thread_safe_transport.transport, .{});
+    try server.init(io, allocator, environ, &thread_safe_transport.transport, .{ .diagnostics = .{
+        .quiet_ms = deferred_diagnostics.default_quiet_ms,
+        .max_delay_ms = deferred_diagnostics.default_max_delay_ms,
+        .input = .stdio(&stdio),
+    } });
     defer server.deinit();
     try runBasicServer(io, allocator, &thread_safe_transport.transport, &server, std.log.err);
     if (!server.shutdown_requested) return error.ExitWithoutShutdown;
@@ -63,14 +75,24 @@ pub const Server = struct {
     publisher: diagnostics.Publisher,
     /// Deprecation findings' file dependencies per open document.
     dependencies: diagnostics.Dependencies,
+    /// The "caller frees" hints' calls per open document.
+    ownership_hints: ownership_hints.Cache,
     /// Dependencies of open documents, parsed once for every lint run.
     sources: source_store.Store,
     /// The compiler worker: queued, never waited on by requests.
     backend: compiler_backend.CompilerBackend,
+    /// Runs `zig-analyzer.runTest` in the background.
+    tests: test_runner.TestRunner,
+    /// When edits are linted; see `deferred_diagnostics.zig`.
+    diagnostics_options: deferred_diagnostics.Options,
+    /// Edited documents whose diagnostics wait for the client to pause.
+    deferred: deferred_diagnostics.Pending = .{},
     shutdown_requested: bool = false,
 
     pub const Options = struct {
         compiler: compiler_backend.Options = .{},
+        /// Lints every edit at once unless set up to defer.
+        diagnostics: deferred_diagnostics.Options = .{},
 
         /// No compiler is ever started: syntax and lint services only.
         pub const syntax_only: Options = .{ .compiler = .{ .enabled = false } };
@@ -94,17 +116,23 @@ pub const Server = struct {
             .project_config = .init(io, allocator),
             .publisher = .init(io, allocator, transport),
             .dependencies = .init(allocator),
+            .ownership_hints = .init(allocator),
             .sources = .init(allocator),
             .backend = undefined,
+            .tests = .init(io, allocator, transport),
+            .diagnostics_options = options.diagnostics,
         };
         errdefer server.deinit();
         try server.backend.init(io, allocator, environ, options.compiler, server.linter(), &server.publisher);
     }
 
     pub fn deinit(server: *Server) void {
+        server.tests.deinit();
         server.backend.deinit();
+        server.deferred.deinit(server.allocator);
         server.publisher.deinit();
         server.dependencies.deinit();
+        server.ownership_hints.deinit();
         server.sources.deinit();
         server.project_config.deinit();
         server.documents.deinit();
@@ -122,6 +150,7 @@ pub const Server = struct {
             .backend = &server.backend,
             .linter = server.linter(),
             .dependencies = &server.dependencies,
+            .ownership_hints = &server.ownership_hints,
         };
     }
 
@@ -137,6 +166,8 @@ pub const Server = struct {
         } else if (params.rootPath) |root_path| {
             try server.addWorkspaceRoot(root_path);
         }
+        // A client that pulls diagnostics gets them only that way.
+        server.publisher.pull = pull_diagnostics.clientPulls(params.capabilities);
         return .{
             .capabilities = .{
                 .positionEncoding = .{ .@"utf-16" = {} },
@@ -154,8 +185,10 @@ pub const Server = struct {
                 .definitionProvider = .{ .bool = true },
                 .typeDefinitionProvider = .{ .bool = true },
                 .referencesProvider = .{ .bool = true },
+                .documentHighlightProvider = .{ .bool = true },
                 .documentSymbolProvider = .{ .bool = true },
                 .codeLensProvider = .{ .resolveProvider = false },
+                .documentLinkProvider = .{ .resolveProvider = false },
                 .codeActionProvider = .{ .code_action_options = .{
                     .codeActionKinds = &.{
                         .quickfix,
@@ -168,7 +201,10 @@ pub const Server = struct {
                 } },
                 .workspaceSymbolProvider = .{ .bool = true },
                 .documentFormattingProvider = .{ .bool = true },
-                .renameProvider = .{ .rename_options = .{ .prepareProvider = false } },
+                .documentRangeFormattingProvider = .{ .bool = true },
+                .renameProvider = .{ .rename_options = .{ .prepareProvider = rename.clientPrepares(params.capabilities) } },
+                .foldingRangeProvider = .{ .bool = true },
+                .selectionRangeProvider = .{ .bool = true },
                 .semanticTokensProvider = .{ .semantic_tokens_options = .{
                     .legend = .{
                         .tokenTypes = presentation.semantic_token_types,
@@ -178,8 +214,9 @@ pub const Server = struct {
                     .full = .{ .bool = true },
                 } },
                 .inlayHintProvider = .{ .inlay_hint_options = .{ .resolveProvider = false } },
-                .executeCommandProvider = .{ .commands = &.{ "zig-analyzer.peekResolvedType", "zig-analyzer.typeAtPosition" } },
+                .executeCommandProvider = .{ .commands = &.{ "zig-analyzer.peekResolvedType", "zig-analyzer.typeAtPosition", test_runner.command } },
                 .callHierarchyProvider = .{ .call_hierarchy_options = .{} },
+                .diagnosticProvider = if (server.publisher.pull) pull_diagnostics.options else null,
                 .workspace = .{ .workspaceFolders = .{
                     .supported = true,
                     .changeNotifications = .{ .bool = true },
@@ -258,6 +295,7 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        server.deferred.remove(server.allocator, params.textDocument.uri);
         try server.publishDeprecationDependents(arena, params.textDocument.uri);
         try server.publishDiagnostics(arena, params.textDocument.uri);
         try server.backend.documentChanged(server.documents.getConst(params.textDocument.uri).?, .edited);
@@ -268,14 +306,21 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("textDocument/didChange"),
     ) !void {
-        try server.documents.change(
-            params.textDocument.uri,
-            params.textDocument.version,
-            params.contentChanges,
-        );
-        try server.publishDeprecationDependents(arena, params.textDocument.uri);
-        try server.publishDiagnostics(arena, params.textDocument.uri);
-        try server.backend.documentChanged(server.documents.getConst(params.textDocument.uri).?, .edited);
+        const uri = params.textDocument.uri;
+        if (!server.diagnostics_options.defers()) {
+            try server.documents.change(uri, params.textDocument.version, params.contentChanges);
+            try server.publishDeprecationDependents(arena, uri);
+            try server.publishDiagnostics(arena, uri);
+            try server.backend.documentChanged(server.documents.getConst(uri).?, .edited);
+            return;
+        }
+        // Parsing waits for the next request and linting for a pause.
+        try server.documents.changeText(uri, params.textDocument.version, params.contentChanges);
+        const document = server.documents.getConst(uri).?;
+        try server.publisher.expect(uri, document.version);
+        try server.deferred.add(server.allocator, server.io, uri);
+        try server.publishDeprecationDependents(arena, uri);
+        try server.backend.documentChanged(document, .edited);
     }
 
     pub fn @"textDocument/didClose"(
@@ -285,7 +330,9 @@ pub const Server = struct {
     ) !void {
         try server.backend.documentClosed(params.textDocument.uri);
         _ = server.documents.close(params.textDocument.uri);
+        server.deferred.remove(server.allocator, params.textDocument.uri);
         server.dependencies.remove(params.textDocument.uri);
+        server.ownership_hints.remove(params.textDocument.uri);
         try server.publishDeprecationDependents(arena, params.textDocument.uri);
         try server.publisher.close(params.textDocument.uri, arena);
     }
@@ -404,6 +451,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: lsp.ParamsType("workspace/executeCommand"),
     ) !lsp.ResultType("workspace/executeCommand") {
+        if (std.mem.eql(u8, params.command, test_runner.command)) return server.tests.execute(arena, params.arguments);
         return hover.executeCommand(server.services(), arena, params);
     }
 
@@ -455,6 +503,62 @@ pub const Server = struct {
         return presentation.formatting(server.services(), arena, params);
     }
 
+    pub fn @"textDocument/rangeFormatting"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/rangeFormatting"),
+    ) !lsp.ResultType("textDocument/rangeFormatting") {
+        return range_formatting.rangeFormatting(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/prepareRename"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/prepareRename"),
+    ) !lsp.ResultType("textDocument/prepareRename") {
+        return rename.prepareRename(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/documentHighlight"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/documentHighlight"),
+    ) !lsp.ResultType("textDocument/documentHighlight") {
+        return structure.documentHighlight(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/foldingRange"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/foldingRange"),
+    ) !lsp.ResultType("textDocument/foldingRange") {
+        return structure.foldingRange(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/selectionRange"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/selectionRange"),
+    ) !lsp.ResultType("textDocument/selectionRange") {
+        return structure.selectionRange(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/documentLink"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/documentLink"),
+    ) !lsp.ResultType("textDocument/documentLink") {
+        return structure.documentLink(server.services(), arena, params);
+    }
+
+    pub fn @"textDocument/diagnostic"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: lsp.ParamsType("textDocument/diagnostic"),
+    ) !lsp.ResultType("textDocument/diagnostic") {
+        return pull_diagnostics.documentDiagnostic(server.services(), &server.publisher, arena, params);
+    }
+
     /// Every rule finding for `document` under `lint_configuration`, using the
     /// compiler facts already known for it.
     pub fn documentFindings(
@@ -474,6 +578,21 @@ pub const Server = struct {
         const shapes = try server.backend.knownShapes(arena, uri);
         const lint = try server.linter().diagnostics(arena, &server.documents, document, shapes, &server.dependencies);
         try server.publisher.publishLint(uri, document.version, lint);
+    }
+
+    /// Publishes the diagnostics deferred for edited documents (see
+    /// `deferred_diagnostics.zig`), linting their latest text.
+    pub fn publishDeferredDiagnostics(server: *Server) !void {
+        var pending = server.deferred;
+        server.deferred = .{};
+        defer pending.deinit(server.allocator);
+        try server.documents.refresh();
+        var scratch: std.heap.ArenaAllocator = .init(server.allocator);
+        defer scratch.deinit();
+        for (pending.uris.keys()) |uri| {
+            if (server.documents.getConst(uri) == null) continue;
+            try server.publishDiagnostics(scratch.allocator(), uri);
+        }
     }
 
     /// The open document a save of `saved_uri` should be analyzed through: the
@@ -510,7 +629,14 @@ pub const Server = struct {
         }
         // Publishing recomputes and replaces dependency records; the list above
         // is already a copy, so that cannot invalidate it.
-        for (affected) |uri| if (server.documents.getConst(uri) != null) try server.publishDiagnostics(allocator, uri);
+        for (affected) |uri| {
+            if (server.documents.getConst(uri) == null) continue;
+            if (server.diagnostics_options.defers()) {
+                try server.deferred.add(server.allocator, server.io, uri);
+            } else {
+                try server.publishDiagnostics(allocator, uri);
+            }
+        }
     }
 };
 

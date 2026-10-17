@@ -106,6 +106,54 @@ pub fn rename(
     }
 }
 
+/// Whether the client asks before renaming, so `prepareProvider` may be set.
+pub fn clientPrepares(capabilities: lsp.types.ClientCapabilities) bool {
+    const text_document = capabilities.textDocument orelse return false;
+    const rename_capabilities = text_document.rename orelse return false;
+    return rename_capabilities.prepareSupport orelse false;
+}
+
+/// What a rename at the cursor would replace, with its current text as the
+/// placeholder: the identifier, or the inside of a reflection string such as
+/// `@field(x, "name")`. Null off any name. Fails with `RequestFailed` on a
+/// name `rename` would not edit: a primitive, `_`, a name no scope or
+/// declaration of the open documents binds, or a reflection string while no
+/// compiler runs.
+pub fn prepareRename(
+    services: Services,
+    arena: std.mem.Allocator,
+    params: lsp.ParamsType("textDocument/prepareRename"),
+) !lsp.ResultType("textDocument/prepareRename") {
+    const origin = services.documents.getConst(params.textDocument.uri) orelse return null;
+    const offset = origin.byteOffset(params.position);
+    const identifier = origin.identifierAt(offset);
+    const site = try symbol_query.siteAt(arena, origin, offset);
+    const span = if (site) |found| found.span else identifier orelse return null;
+    const name = origin.source[span.start..span.end];
+    if (std.mem.eql(u8, name, "_") or std.zig.isPrimitive(name)) return error.RequestFailed;
+    const by_compiler = if (site) |found| switch (found.role) {
+        .member => |query| query != null and services.backend.options.enabled,
+        .local => false,
+    } else false;
+    if (!by_compiler and !try renamesBySyntax(services, arena, origin, identifier)) return error.RequestFailed;
+    return .{ .prepare_rename_placeholder = .{ .range = origin.range(span), .placeholder = name } };
+}
+
+/// Whether `workspaceEdit` finds the declaration of `identifier`: a binding
+/// the scope index resolves, or a declaration exactly one open document has.
+fn renamesBySyntax(services: Services, arena: std.mem.Allocator, origin: *const Document, identifier: ?std.zig.Token.Loc) !bool {
+    const span = identifier orelse return false;
+    if (try origin.scopedIdentifierSpans(arena, span.start) != null) return true;
+    const name = origin.source[span.start..span.end];
+    if (origin.declarationNamed(name) == null) return false;
+    var declaration_count: usize = 0;
+    var documents = services.documents.documents.valueIterator();
+    while (documents.next()) |document| {
+        if (document.declarationNamed(name) != null) declaration_count += 1;
+    }
+    return declaration_count == 1;
+}
+
 fn plan(
     services: Services,
     arena: std.mem.Allocator,

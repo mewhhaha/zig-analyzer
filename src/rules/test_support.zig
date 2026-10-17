@@ -95,6 +95,27 @@ pub fn expectRules(found: []const types.Finding, expected: []const types.Rule) !
     for (expected, found) |rule, finding| try std.testing.expectEqual(rule, finding.rule);
 }
 
+/// `source` with the edits of `fix` applied; they must not overlap.
+pub fn applyFix(allocator: std.mem.Allocator, source: []const u8, fix: types.Fix) ![]const u8 {
+    const edits = try allocator.dupe(types.Edit, fix.edits);
+    defer allocator.free(edits);
+    std.mem.sort(types.Edit, edits, {}, struct {
+        fn lessThan(_: void, left: types.Edit, right: types.Edit) bool {
+            return left.span.start < right.span.start;
+        }
+    }.lessThan);
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var offset: usize = 0;
+    for (edits) |edit| {
+        try result.appendSlice(allocator, source[offset..edit.span.start]);
+        try result.appendSlice(allocator, edit.replacement);
+        offset = edit.span.end;
+    }
+    try result.appendSlice(allocator, source[offset..]);
+    return try result.toOwnedSlice(allocator);
+}
+
 /// Asserts the findings' spans cover exactly the `expected` texts of `source`, in order.
 pub fn expectSpans(source: []const u8, found: []const types.Finding, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, found.len);

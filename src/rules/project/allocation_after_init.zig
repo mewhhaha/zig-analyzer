@@ -6,6 +6,7 @@ const File = run_module.File;
 const types = @import("../types.zig");
 const project = @import("../project.zig");
 const support = @import("../test_support.zig");
+const resources = @import("../resources.zig");
 const syntax_scope = @import("../../syntax/scope.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const tokenText = tokens_util.tokenText;
@@ -62,15 +63,42 @@ pub fn find(
                 if (std.mem.find(u8, receiver, "alloc") == null and !bindingHasAllocatorType(file, fn_index, opening, receiver)) continue;
                 if (test_only == null) test_only = try syntax_scope.testOnlyBodies(run.allocator, file.source, file.tokens);
                 if (test_only.?.contains(opening)) break;
+                const message = if (freedByDefer(file, scopes, index))
+                    try run.allocator.print("function '{s}' allocates scratch memory through '{s}' outside a recognized initialization path; reserve it during initialization and reuse it", .{ function_name, receiver })
+                else
+                    try run.allocator.print("function '{s}' allocates through '{s}' outside a recognized initialization path", .{ function_name, receiver });
                 try run.report(.{
                     .file_index = file_index,
                     .rule = .allocation_after_init,
                     .span = body_token.loc,
-                    .message = try run.allocator.print("function '{s}' allocates through '{s}' outside a recognized initialization path", .{ function_name, receiver }),
+                    .message = message,
                 });
             }
         }
     }
+}
+
+/// Whether the allocation by the method at `method_index` is scratch memory:
+/// it initializes a declaration that the next statement releases with a
+/// `defer`, as `const buffer = try gpa.alloc(u8, n); defer gpa.free(buffer);`
+/// does. Such memory is still allocated after initialization, but the remedy
+/// differs from sizing long-lived state: a reusable buffer reserved up front.
+fn freedByDefer(file: File, scopes: *const syntax_scope.Index, method_index: usize) bool {
+    const tokens = file.tokens;
+    const release = resources.allocationRelease(tokenText(file.source, tokens[method_index])) orelse return false;
+    const start = tokens_util.statementStart(tokens, method_index);
+    if (start + 2 >= method_index or (tokens[start].tag != .keyword_const and tokens[start].tag != .keyword_var) or
+        tokens[start + 1].tag != .identifier) return false;
+    const end = scopes.statementEnd(start) orelse return false;
+    if (end + 1 >= tokens.len or tokens[end + 1].tag != .keyword_defer) return false;
+    const defer_end = scopes.statementEnd(end + 1) orelse return false;
+    const receiver = tokenText(file.source, tokens[method_index - 2]);
+    const name = tokenText(file.source, tokens[start + 1]);
+    // `defer receiver.release(name);`, where the receiver may be a path.
+    return defer_end >= end + 8 and tokenIs(file.source, tokens[defer_end - 6], receiver) and
+        tokens[defer_end - 5].tag == .period and tokenIs(file.source, tokens[defer_end - 4], release) and
+        tokens[defer_end - 3].tag == .l_paren and tokenIs(file.source, tokens[defer_end - 2], name) and
+        tokens[defer_end - 1].tag == .r_paren;
 }
 
 fn bindingHasAllocatorType(file: File, start: usize, end: usize, name: []const u8) bool {
@@ -122,6 +150,34 @@ test "main, tests and non-production files may allocate" {
         try std.testing.expect(std.mem.find(u8, finding.finding.message, "function 'grow'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), allocations);
+}
+
+test "scratch allocations freed by the next defer say so" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = support.only(&.{.allocation_after_init}, .information);
+    const files = [_]project.SourceFile{.{
+        .path = "src/render.zig",
+        .source =
+        \\fn render(self: *Renderer, count: usize) ![]u8 {
+        \\    const scratch = try self.allocator.alloc(u8, count);
+        \\    defer self.allocator.free(scratch);
+        \\    const kept = try self.allocator.alloc(u8, count);
+        \\    errdefer self.allocator.free(kept);
+        \\    return kept;
+        \\}
+        ,
+    }};
+    const found = try project.findings(arena.allocator(), &files, configuration);
+    var messages: [2][]const u8 = undefined;
+    var allocations: usize = 0;
+    for (found) |finding| if (finding.finding.rule == .allocation_after_init) {
+        messages[allocations] = finding.finding.message;
+        allocations += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), allocations);
+    try std.testing.expect(std.mem.find(u8, messages[0], "scratch memory through 'allocator'") != null);
+    try std.testing.expect(std.mem.find(u8, messages[1], "scratch") == null);
 }
 
 test "allocation policy attributes nested function work only to the nested function" {

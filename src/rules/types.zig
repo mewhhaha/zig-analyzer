@@ -139,6 +139,8 @@ pub const Rule = enum {
     modernize_global_linkage,
     modernize_array_list_access,
     modernize_container_init,
+    modernize_reify_type,
+    legacy_format_method,
     prefer_div_ceil,
     function_length,
     assertion_free_branching,
@@ -214,6 +216,18 @@ pub const Rule = enum {
     unflushed_writer,
     unawaited_async,
     unconsumed_delimiter,
+    unused_suppression,
+    uninitialized_getorput_value,
+    missing_deinit_poison,
+    assumed_concurrency,
+    identity_operation,
+    unsigned_comparison_constant,
+    never_loop,
+    mutated_range_bound,
+    unused_local,
+    pointless_discard,
+    unreachable_code,
+    misplaced_try,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -249,7 +263,8 @@ pub const ResourceContract = struct {
 
 pub const Configuration = struct {
     levels: [@typeInfo(Rule).@"enum".field_names.len]Level,
-    lint_profile: LintProfile = .none,
+    /// The profiles `lints.profile` selects; their rules are on.
+    lint_profiles: std.EnumSet(LintProfile) = .empty,
     banned: []const BannedIdentifier = &.{},
     import_boundaries: []const ImportBoundary = &.{},
     resource_contracts: []const ResourceContract = &.{},
@@ -261,6 +276,14 @@ pub const Configuration = struct {
     line_length_allow_unsplittable: bool = true,
     todo_markers: []const []const u8 = &.{ "TODO", "FIXME", "XXX" },
     function_case: FunctionCase = .camel_case,
+    /// Whether `function-case` was set in `zig-analyzer.json`, globally or by
+    /// an override matching the file; an explicit choice outranks the casing
+    /// `naming_conventions` detects.
+    function_case_explicit: bool = false,
+    naming_conventions: NamingConventions = .{},
+    /// Per-path changes, applied in order to the files they match after the
+    /// built-in per-path relaxations (`configuration.forPath`).
+    overrides: []const Override = &.{},
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {
@@ -282,6 +305,33 @@ pub const Configuration = struct {
 
 pub const LintProfile = enum { none, official, idiomatic, strict, modernize, disciplined };
 
+/// One entry of `overrides`: the `lints` changes for the files matching any
+/// of `paths`, glob patterns relative to the project root.
+pub const Override = struct {
+    paths: []const []const u8,
+    lints: LintChanges,
+};
+
+/// What an override's `lints` object asks for, kept as steps rather than
+/// levels so it applies on top of each matching file's configuration: its
+/// profiles are enabled first, then its tier levels, then its rules by name.
+pub const LintChanges = struct {
+    profiles: std.EnumSet(LintProfile) = .empty,
+    correctness: ?Level = null,
+    style: ?Level = null,
+    rule_levels: []const RuleLevel = &.{},
+    function_length_limit: ?usize = null,
+    line_length_limit: ?usize = null,
+    line_length_allow_unsplittable: ?bool = null,
+    todo_markers: ?[]const []const u8 = null,
+    function_case: ?FunctionCase = null,
+};
+
+pub const RuleLevel = struct {
+    rule: Rule,
+    level: Level,
+};
+
 /// How `non-idiomatic-name` expects functions that do not return a type to be
 /// spelled. Zig's style guide uses camelCase; some projects use snake_case.
 pub const FunctionCase = enum {
@@ -295,6 +345,37 @@ pub const FunctionCase = enum {
             .snake_case => "snake_case",
         };
     }
+
+    pub fn nameCase(case: FunctionCase) NameCase {
+        return switch (case) {
+            .camel_case => .camel_case,
+            .snake_case => .snake_case,
+        };
+    }
+};
+
+pub const NameCase = enum {
+    snake_case,
+    camel_case,
+    title_case,
+
+    pub fn text(case: NameCase) []const u8 {
+        return switch (case) {
+            .snake_case => "snake_case",
+            .camel_case => "camelCase",
+            .title_case => "TitleCase",
+        };
+    }
+};
+
+/// The casing a strong majority of the scanned project gives each kind of
+/// declaration (`project/conventions.zig`), which `non-idiomatic-name` accepts
+/// as the project's own convention. The project scan fills it in before files
+/// are checked; `zig-analyzer.json` cannot set it.
+pub const NamingConventions = struct {
+    function: ?NameCase = null,
+    type_name: ?NameCase = null,
+    constant: ?NameCase = null,
 };
 
 pub const Edit = struct {
@@ -357,6 +438,18 @@ pub const ResolvedShape = struct {
 pub const ModuleMembers = struct {
     receiver: []const u8,
     members: []const []const u8,
+};
+
+/// How much of a file the project's module roots expose, which decides the
+/// declarations `public-declaration-docs` asks to document.
+pub const ModuleExposure = union(enum) {
+    /// No module root is known, so the file's own root is its surface.
+    whole,
+    /// No module root the build exports reaches the file.
+    none,
+    /// The module roots reach only these top-level declarations of the file,
+    /// with what they contain.
+    declarations: []const []const u8,
 };
 
 /// The last segment of a compiler-qualified declaration name

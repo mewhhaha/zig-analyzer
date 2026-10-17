@@ -22,8 +22,9 @@ pub fn run(context: RuleRun) !void {
             context.tokens[use_index + 2].tag != .number_literal or !context.tokenIs(use_index + 2, "0") or
             context.tokens[use_index + 3].tag != .r_bracket) continue;
         const declaration_index = try plainSliceDeclaration(context, &bodies, context.tokenText(use_index), use_index) orelse continue;
-        if (!isPublicFunctionParameter(context, declaration_index)) continue;
-        if (bindingShadowed(context, context.tokenText(use_index), declaration_index + 1, use_index)) continue;
+        const function_index = publicFunctionOfParameter(context, declaration_index) orelse continue;
+        if (context.rangeDeclaresName(context.tokenText(use_index), declaration_index + 1, use_index)) continue;
+        if (insideAssertion(context, use_index) or documentsAssertions(context, function_index)) continue;
         if (hasNonEmptyProof(context, context.tokenText(use_index), declaration_index, use_index)) continue;
         try context.emit(.{
             .rule = .unchecked_first_element,
@@ -37,22 +38,55 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
-fn isPublicFunctionParameter(context: RuleRun, declaration_index: usize) bool {
+/// The `fn` keyword of the public function that declares the parameter at
+/// `declaration_index`.
+fn publicFunctionOfParameter(context: RuleRun, declaration_index: usize) ?usize {
     var opening = declaration_index;
     while (opening > 0) {
         opening -= 1;
         switch (context.tokens[opening].tag) {
             .l_paren => break,
-            .l_brace, .semicolon => return false,
+            .l_brace, .semicolon => return null,
             else => {},
         }
     }
-    if (context.tokens[opening].tag != .l_paren) return false;
+    if (context.tokens[opening].tag != .l_paren) return null;
     var function_index = opening;
     while (function_index > 0 and opening - function_index < 4) {
         function_index -= 1;
         if (context.tokens[function_index].tag != .keyword_fn) continue;
-        return function_index > 0 and context.tokens[function_index - 1].tag == .keyword_pub;
+        if (function_index > 0 and context.tokens[function_index - 1].tag == .keyword_pub) return function_index;
+        return null;
+    }
+    return null;
+}
+
+/// Whether the use is an argument of `assert(...)`: indexing an empty slice
+/// there fails the same way the assertion would.
+fn insideAssertion(context: RuleRun, use_index: usize) bool {
+    var cursor = use_index;
+    while (cursor > 1) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .semicolon, .l_brace, .r_brace => return false,
+            .l_paren => if (context.tokenIs(cursor - 1, "assert")) {
+                const closing = context.matchingToken(cursor, .l_paren, .r_paren) orelse return false;
+                return use_index < closing;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether the doc comment of the `pub fn` at `function_index` states the
+/// function's preconditions ("Asserts the value fits within `buffer`").
+fn documentsAssertions(context: RuleRun, function_index: usize) bool {
+    var index = function_index - 1;
+    while (index > 0 and context.tokens[index - 1].tag == .doc_comment) {
+        index -= 1;
+        if (std.mem.find(u8, context.tokenText(index), "Asserts") != null or
+            std.mem.find(u8, context.tokenText(index), "asserts") != null) return true;
     }
     return false;
 }
@@ -113,14 +147,6 @@ fn plainSliceDeclaration(context: RuleRun, bodies: *FunctionBodies, name: []cons
     return null;
 }
 
-fn bindingShadowed(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if ((token.tag == .keyword_const or token.tag == .keyword_var) and
-            index + 1 < end and context.tokenIs(index + 1, name)) return true;
-    }
-    return false;
-}
-
 fn hasNonEmptyProof(context: RuleRun, name: []const u8, declaration_index: usize, use_index: usize) bool {
     if (conditionBeforeUseProvesNonEmpty(context, name, declaration_index, use_index)) return true;
     if (functionEntryProvesNonEmpty(context, name, declaration_index, use_index)) return true;
@@ -132,7 +158,7 @@ fn hasNonEmptyProof(context: RuleRun, name: []const u8, declaration_index: usize
     var opening = context.enclosingOpeningBrace(use_index);
     while (opening) |brace| {
         if (brace >= 6 and context.tokens[brace - 1].tag == .r_paren) {
-            const condition_open = matchingOpeningParenthesis(context, brace - 1);
+            const condition_open = context.scopes.matchingToken(brace - 1);
             if (condition_open) |start| if (conditionProvesNonEmpty(context, name, start + 1, brace - 1)) return true;
         }
         opening = context.enclosingOpeningBrace(brace);
@@ -209,30 +235,43 @@ fn functionReturnsTrueForEmptySlice(context: RuleRun, function_name: []const u8)
 fn shortCircuitProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, use_index: usize) bool {
     var index = @max(start, use_index -| proof_window_tokens);
     while (index + 4 < use_index) : (index += 1) {
-        if (!context.tokenIs(index, name) or context.tokens[index + 1].tag != .period or
-            !context.tokenIs(index + 2, "len")) continue;
-        const bound = positiveIntegerBound(context, index + 4) orelse continue;
-        const true_proof = switch (context.tokens[index + 3].tag) {
-            .angle_bracket_right, .bang_equal => bound == 0,
+        const comparison = lengthComparison(context, name, index) orelse continue;
+        const bound = comparison.bound;
+        // `name.len < 2 or name[0] ...` and `2 > name.len or ...`: the right
+        // operand runs only when the guard is false.
+        const true_proof = switch (comparison.operator) {
+            .angle_bracket_right => true,
+            .bang_equal => bound == 0,
             .angle_bracket_right_equal, .equal_equal => bound > 0,
             else => false,
         };
-        const false_proof = switch (context.tokens[index + 3].tag) {
+        const false_proof = switch (comparison.operator) {
             .equal_equal => bound == 0,
             .angle_bracket_left => bound > 0,
+            .angle_bracket_left_equal => true,
             .bang_equal => bound > 0,
             else => false,
         };
         var saw_boolean = false;
         var only_and = true;
         var only_or = true;
+        // Operators nested in a group around the use apply after the proof.
+        var depth: usize = 0;
         var cursor = index + 5;
         while (cursor < use_index) : (cursor += 1) switch (context.tokens[cursor].tag) {
-            .keyword_and => {
+            .l_paren, .l_bracket => depth += 1,
+            .r_paren, .r_bracket => {
+                if (depth == 0) {
+                    saw_boolean = false;
+                    break;
+                }
+                depth -= 1;
+            },
+            .keyword_and => if (depth == 0) {
                 saw_boolean = true;
                 only_or = false;
             },
-            .keyword_or => {
+            .keyword_or => if (depth == 0) {
                 saw_boolean = true;
                 only_and = false;
             },
@@ -245,6 +284,34 @@ fn shortCircuitProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, 
         if (saw_boolean and ((true_proof and only_and) or (false_proof and only_or))) return true;
     }
     return false;
+}
+
+/// The five tokens `name.len OP N` or `N OP name.len` at `index`, read as
+/// `name.len OP N`.
+fn lengthComparison(context: RuleRun, name: []const u8, index: usize) ?struct {
+    operator: std.zig.Token.Tag,
+    bound: usize,
+} {
+    const tokens = context.tokens;
+    if (context.tokenIs(index, name) and tokens[index + 1].tag == .period and context.tokenIs(index + 2, "len")) {
+        return .{ .operator = tokens[index + 3].tag, .bound = positiveIntegerBound(context, index + 4) orelse return null };
+    }
+    if (index == 0 or !context.tokenIs(index + 2, name) or tokens[index + 3].tag != .period or
+        !context.tokenIs(index + 4, "len")) return null;
+    // A bound that ends a longer operand (`offset + 2 > s.len`) is not the bound.
+    switch (tokens[index - 1].tag) {
+        .l_paren, .keyword_and, .keyword_or, .keyword_return, .equal => {},
+        else => return null,
+    }
+    const operator: std.zig.Token.Tag = switch (tokens[index + 1].tag) {
+        .angle_bracket_left => .angle_bracket_right,
+        .angle_bracket_left_equal => .angle_bracket_right_equal,
+        .angle_bracket_right => .angle_bracket_left,
+        .angle_bracket_right_equal => .angle_bracket_left_equal,
+        .equal_equal, .bang_equal => |tag| tag,
+        else => return null,
+    };
+    return .{ .operator = operator, .bound = positiveIntegerBound(context, index) orelse return null };
 }
 
 fn inlineConditionalProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, use_index: usize) bool {
@@ -351,7 +418,7 @@ fn switchProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, use_in
 
 fn switchConditionNamesLength(context: RuleRun, name: []const u8, body_start: usize) bool {
     if (body_start == 0 or context.tokens[body_start - 1].tag != .r_paren) return false;
-    const condition_start = matchingOpeningParenthesis(context, body_start - 1) orelse return false;
+    const condition_start = context.scopes.matchingToken(body_start - 1) orelse return false;
     if (condition_start == 0 or context.tokens[condition_start - 1].tag != .keyword_switch) return false;
     return conditionRangeNamesLength(context, name, condition_start + 1, body_start - 1);
 }
@@ -454,7 +521,8 @@ fn conditionProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, end
             !context.tokenIs(index + 2, "len")) continue;
         const bound = positiveIntegerBound(context, index + 4) orelse continue;
         switch (context.tokens[index + 3].tag) {
-            .angle_bracket_right, .bang_equal => if (bound == 0) return true,
+            .angle_bracket_right => return true,
+            .bang_equal => if (bound == 0) return true,
             .angle_bracket_right_equal, .equal_equal => if (bound > 0) return true,
             else => {},
         }
@@ -482,19 +550,6 @@ fn positiveIntegerBound(context: RuleRun, bound_index: usize) ?usize {
                 error.InvalidCharacter, error.Overflow => null,
             };
         }
-    }
-    return null;
-}
-
-fn matchingOpeningParenthesis(context: RuleRun, closing: usize) ?usize {
-    var depth: usize = 0;
-    var index = closing + 1;
-    while (index > 0) {
-        index -= 1;
-        if (context.tokens[index].tag == .r_paren) depth += 1;
-        if (context.tokens[index].tag != .l_paren) continue;
-        depth -= 1;
-        if (depth == 0) return index;
     }
     return null;
 }
@@ -597,9 +652,44 @@ test "short circuit inline conditionals and switch guards prove a first element"
         "pub fn left(bytes: []const u8) bool { return bytes.len > 0 and bytes[0] == 1; }\n" ++
         "pub fn right(bytes: []const u8) bool { return bytes.len == 0 or bytes[0] == 1; }\n" ++
         "pub fn fallback(bytes: []const u8) u8 { return if (bytes.len == 0) 0 else bytes[0]; }\n" ++
-        "pub fn switched(bytes: []const u8) u8 { switch (bytes.len) { 0 => return 0, 1 => return bytes[0], else => {} } return bytes[0]; }";
+        "pub fn switched(bytes: []const u8) u8 { switch (bytes.len) { 0 => return 0, 1 => return bytes[0], else => {} } return bytes[0]; }\n" ++
+        "pub fn short(name: []const u8) bool { return name.len < 2 or (name[0] != 'u' and name[1] != 'i'); }\n" ++
+        "pub fn atMost(bytes: []const u8) bool { if (bytes.len <= 1 or bytes[0] == 1) return true; return false; }\n" ++
+        "pub fn reversed(bytes: []const u8) bool { return 2 > bytes.len or bytes[0] == 1; }\n" ++
+        "pub fn reversedAnd(bytes: []const u8) bool { return 0 < bytes.len and bytes[0] == 1; }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "assertions, documented preconditions and grouped short circuits prove a first element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn parse(s: []const u8) u8 { std.debug.assert(s[0] == '{'); return 0; }\n" ++
+        "pub fn pushd(path: []const u8) void { assert(path[0] == '.' or path[0] == '/'); }\n" ++
+        "/// `value` is a primitive integer type.\n" ++
+        "/// Asserts the value fits within the provided `limbs_buffer`.\n" ++
+        "pub fn init(limbs_buffer: []u64, value: anytype) void { limbs_buffer[0] = value; }\n" ++
+        "pub fn rooted(path: []const u8) bool { return path.len >= 1 and (path[0] == '/' or path[0] == '\\\\'); }\n" ++
+        "pub fn leading(text: []const u8) bool { return text.len > 1 and text[0] == '0'; }\n" ++
+        "pub fn wide(text: []const u8) bool { if (text.len > 2) return text[0] == '0'; return false; }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "uses outside the asserted expression and unrelated docs still report" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn after(s: []const u8) u8 { assert(ready()); return s[0]; }\n" ++
+        "/// Returns the first byte.\n" ++
+        "pub fn first(s: []const u8) u8 { return s[0]; }\n" ++
+        "pub fn grouped(s: []const u8, x: bool) bool { return (s.len > 0 and x) or s[0] == 1; }\n" ++
+        "pub fn reversed(s: []const u8) bool { return 2 < s.len or s[0] == 1; }\n" ++
+        "pub fn offset(s: []const u8, start: isize) bool { return start + 2 > s.len or s[0] == 1; }\n" ++
+        "pub fn atMost(s: []const u8) bool { return s.len <= 1 and s[0] == 1; }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 6), findings.len);
 }
 
 test "an unbraced then-branch of a length test proves a first element" {

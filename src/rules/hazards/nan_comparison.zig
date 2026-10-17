@@ -2,6 +2,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const containsComment = @import("../../syntax/tokens.zig").containsComment;
+const isComparison = @import("../../syntax/tokens.zig").isComparison;
 const support = @import("../test_support.zig");
 
 pub const rules = [_]types.Rule{
@@ -13,7 +14,7 @@ pub fn run(context: RuleRun) !void {
     if (level == .off) return;
 
     for (context.tokens, 0..) |token, op_index| {
-        if (!isComparisonOp(token.tag) or op_index == 0 or op_index + 1 >= context.tokens.len) continue;
+        if (!isComparison(token.tag) or op_index == 0 or op_index + 1 >= context.tokens.len) continue;
 
         // Check if RHS is a NaN call
         if (parseNanCall(context, op_index + 1)) |nan_call| {
@@ -40,19 +41,6 @@ const NanCall = struct {
     span: TokenSpan,
     prefix: []const u8,
 };
-
-fn isComparisonOp(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .equal_equal,
-        .bang_equal,
-        .angle_bracket_left,
-        .angle_bracket_left_equal,
-        .angle_bracket_right,
-        .angle_bracket_right_equal,
-        => true,
-        else => false,
-    };
-}
 
 fn parseNanCall(context: RuleRun, start: usize) ?NanCall {
     if (start >= context.tokens.len) return null;

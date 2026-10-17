@@ -99,7 +99,7 @@ fn callHasDirectoryProvenance(context: RuleRun, method_index: usize) bool {
         return dottedPathStartsWithStd(context, method_index - 2);
     }
     if (context.tokens[method_index - 2].tag != .r_paren) return false;
-    const opening = matchingOpeningParenthesis(context, method_index - 2) orelse return false;
+    const opening = context.scopes.matchingToken(method_index - 2) orelse return false;
     if (opening == 0 or context.tokens[opening - 1].tag != .identifier) return false;
     return dottedPathStartsWithStd(context, opening - 1);
 }
@@ -110,19 +110,6 @@ fn dottedPathStartsWithStd(context: RuleRun, last_identifier: usize) bool {
         context.tokens[first_identifier - 2].tag == .identifier) : (first_identifier -= 2)
     {}
     return context.tokenIs(first_identifier, "std");
-}
-
-fn matchingOpeningParenthesis(context: RuleRun, closing: usize) ?usize {
-    var depth: usize = 0;
-    var index = closing + 1;
-    while (index > 0) {
-        index -= 1;
-        if (context.tokens[index].tag == .r_paren) depth += 1;
-        if (context.tokens[index].tag != .l_paren) continue;
-        depth -= 1;
-        if (depth == 0) return index;
-    }
-    return null;
 }
 
 fn bindingHasDirectoryType(context: RuleRun, binding: []const u8, before: usize) bool {

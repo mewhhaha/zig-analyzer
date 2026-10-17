@@ -6,6 +6,7 @@ const support = @import("../test_support.zig");
 const topLevelComma = @import("../../syntax/tokens.zig").topLevelComma;
 const nextTagBefore = @import("../../syntax/tokens.zig").nextTagBefore;
 const lineSpan = @import("../../syntax/tokens.zig").lineSpan;
+const isComparison = @import("../../syntax/tokens.zig").isComparison;
 const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{.assertion_free_branching};
@@ -26,11 +27,22 @@ pub fn run(context: RuleRun) !void {
             hasLengthComparison(context, body_open, bracket)) continue;
         if (test_only == null) test_only = try syntax_scope.testOnlyBodies(context.allocator, context.source, context.tokens);
         if (test_only.?.contains(body_open)) continue;
+        const index_name = context.tokenText(bracket + 1);
+        const message = if (context.pathStartBefore(bracket)) |sequence_start| message: {
+            const sequence = context.source[context.tokens[sequence_start].loc.start..context.tokens[bracket - 1].loc.end];
+            break :message try context.allocator.print(
+                "function '{s}' asserts nothing, and no loop bound, length check, or early exit limits the computed index '{s}' into '{s}'; assert its range",
+                .{ context.tokenText(fn_index + 1), index_name, sequence },
+            );
+        } else try context.allocator.print(
+            "function '{s}' asserts nothing, and no loop bound, length check, or early exit limits the computed index '{s}'; assert its range",
+            .{ context.tokenText(fn_index + 1), index_name },
+        );
         try context.emit(.{
             .rule = .assertion_free_branching,
             .level = level,
             .span = context.tokens[bracket].loc,
-            .message = "computed indexing has no visible assertion, loop bound, unreachable arm, or early-exit validation stating its bounds",
+            .message = message,
         });
     }
 }
@@ -199,19 +211,6 @@ fn hasLengthComparison(context: RuleRun, body_open: usize, bracket: usize) bool 
         }
     }
     return false;
-}
-
-fn isComparison(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .angle_bracket_left,
-        .angle_bracket_left_equal,
-        .angle_bracket_right,
-        .angle_bracket_right_equal,
-        .equal_equal,
-        .bang_equal,
-        => true,
-        else => false,
-    };
 }
 
 fn hasDominatingWhileBound(context: RuleRun, body_open: usize, bracket: usize) bool {
@@ -596,6 +595,10 @@ test "unchecked computed indexing reports" {
         "return buffer[index];\n}\n";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.assertion_free_branching}, .information));
     try support.expectRules(found, &.{.assertion_free_branching});
+    try std.testing.expectEqualStrings(
+        "function 'inspect' asserts nothing, and no loop bound, length check, or early exit limits the computed index 'index' into 'buffer'; assert its range",
+        found[0].message,
+    );
 }
 
 fn expectBranchingFindings(source: [:0]const u8, expected: usize) !void {

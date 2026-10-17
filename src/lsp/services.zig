@@ -11,6 +11,7 @@ const document_module = @import("../syntax/document.zig");
 const syntax_types = @import("../syntax/types.zig");
 const compiler_backend = @import("compiler_backend.zig");
 const diagnostics = @import("diagnostics.zig");
+const ownership_hints = @import("ownership_hints.zig");
 
 const Document = document_module.Document;
 
@@ -20,6 +21,7 @@ pub const Services = struct {
     backend: *compiler_backend.CompilerBackend,
     linter: diagnostics.Linter,
     dependencies: *diagnostics.Dependencies,
+    ownership_hints: *ownership_hints.Cache,
 
     pub fn resolver(services: Services) module_sites.Resolver {
         return .{ .io = services.io };

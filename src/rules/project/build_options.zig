@@ -3,6 +3,8 @@ const std = @import("std");
 const run_module = @import("run.zig");
 const ProjectRun = run_module.ProjectRun;
 const types = @import("../types.zig");
+const project = @import("../project.zig");
+const support = @import("../test_support.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const tokenIs = tokens_util.tokenIs;
 const matchingToken = tokens_util.matchingToken;
@@ -116,4 +118,51 @@ fn optionValue(source: []const u8, tokens: []const std.zig.Token, start: usize, 
         return std.mem.trim(u8, source[tokens[index + 2].loc.start..tokens[value_end - 1].loc.end], " \t\r\n");
     }
     return null;
+}
+
+test "a root configured with different options reports each conflicting signature once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const build_source: [:0]const u8 =
+        \\const native = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = host, .optimize = .Debug });
+        \\const cross = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = windows, .optimize = .Debug });
+        \\const again = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = windows, .optimize = .Debug });
+        \\const same = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = host, .optimize = .Debug });
+    ;
+    const files = [_]project.SourceFile{.{ .path = "build.zig", .source = build_source }};
+    const found = try project.findings(arena.allocator(), &files, support.only(&.{.conflicting_build_options}, .information));
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    const finding = found[0].finding;
+    try std.testing.expectEqual(types.Rule.conflicting_build_options, finding.rule);
+    const second_line = std.mem.findScalar(u8, build_source, '\n').? + 1;
+    try std.testing.expect(finding.span.start > second_line and finding.span.start < std.mem.find(u8, build_source, "const again").?);
+    try std.testing.expectEqualStrings("\"src/main.zig\"", build_source[finding.span.start..finding.span.end]);
+    try std.testing.expectEqualStrings(
+        "root source 'src/main.zig' is configured with both 'target=host;optimize=.Debug' and " ++
+            "'target=windows;optimize=.Debug'; semantic results may differ between compile units",
+        finding.message,
+    );
+}
+
+test "default options, other roots and other build scripts' roots are not compared" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const files = [_]project.SourceFile{
+        .{ .path = "build.zig", .source =
+        \\const plain = b.createModule(.{ .root_source_file = b.path("src/main.zig") });
+        \\const cross = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = windows });
+        \\const tool = b.createModule(.{ .root_source_file = b.path("src/tool.zig"), .target = host });
+        },
+        // Its roots resolve against its own directory: `examples/src/main.zig`.
+        .{ .path = "examples/build.zig", .source =
+        \\const example = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = host });
+        },
+        // Only build scripts configure compile units.
+        .{ .path = "tools/configure.zig", .source =
+        \\const one = b.createModule(.{ .root_source_file = b.path("../src/main.zig"), .target = host });
+        \\const two = b.createModule(.{ .root_source_file = b.path("../src/main.zig"), .target = linux });
+        },
+    };
+    const found = try project.findings(arena.allocator(), &files, support.only(&.{.conflicting_build_options}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }

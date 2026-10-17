@@ -96,7 +96,6 @@ pub const CompilerBackend = struct {
     idle_condition: std.Io.Condition = .init,
     pending: std.StringHashMapUnmanaged(Job) = .empty,
     // Backend.deinit frees these owned URIs and then releases the list.
-    // zig-analyzer: disable-next-line incomplete-owned-field-cleanup
     closed: std.ArrayList([]u8) = .empty,
     /// Newest event (edit or close) per document; a result is only published
     /// while its job is still the newest event for its document.
@@ -197,7 +196,7 @@ pub const CompilerBackend = struct {
         if (!backend.options.enabled) return;
         const uri = try backend.allocator.dupe(u8, document.uri);
         errdefer backend.allocator.free(uri);
-        const source = try backend.allocator.dupe(u8, document.source);
+        const source = try backend.allocator.dupe(u8, document.text());
         errdefer backend.allocator.free(source);
 
         backend.queue_mutex.lockUncancelable(backend.io);

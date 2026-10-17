@@ -27,6 +27,10 @@ pub const Kind = enum {
 /// The top-level build step the units were discovered from.
 pub const Selection = enum { check, install };
 
+/// `BuildGraph.failure` of a build that configures but builds no Zig compile
+/// unit under either step.
+pub const no_units_failure = "neither the check nor the install step builds a Zig compile unit";
+
 /// Where a module's root source comes from.
 pub const Source = union(enum) {
     /// A file in the source tree or in a dependency package.
@@ -369,7 +373,7 @@ pub const BuildGraph = struct {
         if (graph.modules_only) return null;
         if (graph.failure) |failure| {
             const script_error = std.mem.find(u8, failure, ".zig:") != null and std.mem.find(u8, failure, ": error: ") != null;
-            return if (script_error) .{ .units = &.{} } else null;
+            return if (script_error or std.mem.eql(u8, failure, no_units_failure)) .{ .units = &.{} } else null;
         }
         const units = try arena.alloc([]const NamedModule, graph.units.len);
         for (graph.units, units) |unit, *stored_unit| {
@@ -746,6 +750,8 @@ test "named modules survive a round trip and a failed build script stores as emp
     const failed = try testGraph(&.{});
     defer failed.release();
     failed.failure = "build.zig:3:5: error: expected token";
+    try std.testing.expectEqual(@as(usize, 0), (try failed.namedModules(arena)).?.units.len);
+    failed.failure = no_units_failure;
     try std.testing.expectEqual(@as(usize, 0), (try failed.namedModules(arena)).?.units.len);
     failed.failure = "running 'zig build' failed: Timeout";
     try std.testing.expect(try failed.namedModules(arena) == null);

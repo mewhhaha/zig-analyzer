@@ -104,7 +104,7 @@ fn localBindingIsArrayList(context: RuleRun, name: []const u8, before: usize) bo
 }
 
 fn selfFieldIsArrayList(context: RuleRun, field_name: []const u8, before: usize) bool {
-    const function_body = functionBodyContaining(context, before) orelse return false;
+    const function_body = context.scopes.functionBodyContaining(before) orelse return false;
     const type_body = context.enclosingOpeningBrace(function_body) orelse return false;
     for (context.tokens[type_body + 1 .. function_body], type_body + 1..) |token, field_index| {
         if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or
@@ -134,21 +134,6 @@ fn rangeNamesArrayList(context: RuleRun, start: usize, end: usize) bool {
         if (token.tag == .comma or token.tag == .equal or token.tag == .r_paren or token.tag == .semicolon) return false;
     }
     return false;
-}
-
-fn functionBodyContaining(context: RuleRun, target_index: usize) ?usize {
-    var selected: ?usize = null;
-    for (context.tokens[0..target_index], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn) continue;
-        var body_start = function_index + 1;
-        while (body_start < target_index and context.tokens[body_start].tag != .l_brace and
-            context.tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start >= target_index or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (target_index < body_end) selected = body_start;
-    }
-    return selected;
 }
 
 test "draining an array list with ordered front removal reports" {

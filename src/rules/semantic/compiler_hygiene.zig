@@ -27,6 +27,10 @@ pub fn run(context: RuleRun) !void {
 fn findUselessErrorReturns(context: RuleRun) !void {
     const level = context.level(.useless_error_return);
     if (level == .off) return;
+    var candidates: std.ArrayList(UselessErrorReturn) = .empty;
+    defer candidates.deinit(context.allocator);
+    var uses: std.StringHashMapUnmanaged(FunctionUses) = .empty;
+    defer uses.deinit(context.allocator);
     for (context.tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or isExported(context, fn_index) or isPublic(context, fn_index) or
             fn_index + 2 >= context.tokens.len or context.tokens[fn_index + 1].tag != .identifier) continue;
@@ -34,15 +38,33 @@ fn findUselessErrorReturns(context: RuleRun) !void {
         const parameters_end = context.matchingToken(opening, .l_paren, .r_paren) orelse continue;
         const body_open = syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
         const error_separator = firstTag(context.tokens, parameters_end + 1, body_open, .bang) orelse continue;
+        // A named error set is a contract the function fulfils, as is the
+        // signature of a function an anonymous struct hands to its caller.
+        if (namesErrorSet(context, parameters_end, error_separator) or insideHandedStruct(context, fn_index)) continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (!bodyIsProvenInfallible(context, body_open + 1, body_end)) continue;
-        const name = context.tokenText(fn_index + 1);
-        if (functionIsUsedAsValue(context, fn_index + 1, name) or
-            functionCallRequiresErrorUnion(context, fn_index + 1, name)) continue;
+        try candidates.append(context.allocator, .{ .name_index = fn_index + 1, .error_separator = error_separator });
+        try uses.put(context.allocator, context.tokenText(fn_index + 1), .{});
+    }
+    if (candidates.items.len == 0) return;
+    // Every mention of a candidate's name, found in one pass for all of them.
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .identifier) continue;
+        const found = uses.getPtr(context.tokenText(index)) orelse continue;
+        if (index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .l_paren) {
+            found.value.add(index);
+        } else if (callRequiresErrorUnion(context, index)) {
+            found.error_union_call.add(index);
+        }
+    }
+    for (candidates.items) |candidate| {
+        const name = context.tokenText(candidate.name_index);
+        const found = uses.get(name).?;
+        if (found.value.besides(candidate.name_index) or found.error_union_call.besides(candidate.name_index)) continue;
         try context.emit(.{
             .rule = .useless_error_return,
             .level = level,
-            .span = context.tokens[error_separator].loc,
+            .span = context.tokens[candidate.error_separator].loc,
             .message = try context.allocator.print(
                 "function '{s}' returns an error union, but its fully visible body has no operation that can fail",
                 .{name},
@@ -51,30 +73,72 @@ fn findUselessErrorReturns(context: RuleRun) !void {
     }
 }
 
-fn functionCallRequiresErrorUnion(context: RuleRun, declaration_index: usize, name: []const u8) bool {
-    for (context.tokens, 0..) |token, index| {
-        if (index == declaration_index or token.tag != .identifier or !context.tokenIs(index, name) or
-            index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .l_paren) continue;
-        const closing = context.matchingToken(index + 1, .l_paren, .r_paren) orelse continue;
-        if (closing + 1 < context.tokens.len and context.tokens[closing + 1].tag == .keyword_catch) return true;
-        var cursor = index;
-        while (cursor > 0) {
-            cursor -= 1;
-            switch (context.tokens[cursor].tag) {
-                .keyword_try => return true,
-                .semicolon, .l_brace, .r_brace => break,
-                else => {},
-            }
+/// A private function whose infallible body still returns an error union,
+/// reported unless its name is used where the error union is needed.
+const UselessErrorReturn = struct { name_index: usize, error_separator: usize };
+
+/// Where a name occurs as a value (`f` not called) and in calls whose result
+/// is tried or caught.
+const FunctionUses = struct {
+    value: Occurrences = .{},
+    error_union_call: Occurrences = .{},
+
+    /// How many times, and where first, enough to tell whether one occurs
+    /// anywhere but at a given token.
+    const Occurrences = struct {
+        count: usize = 0,
+        first: usize = 0,
+
+        fn add(occurrences: *Occurrences, index: usize) void {
+            if (occurrences.count == 0) occurrences.first = index;
+            occurrences.count += 1;
         }
-    }
-    return false;
+
+        fn besides(occurrences: Occurrences, index: usize) bool {
+            return occurrences.count > 1 or (occurrences.count == 1 and occurrences.first != index);
+        }
+    };
+};
+
+/// Whether the return type names its error set (`Error!T`, `error{A}!T`)
+/// rather than inferring it (`!T`), looking past `align`, `addrspace`,
+/// `linksection` and `callconv` after the parameters.
+fn namesErrorSet(context: RuleRun, parameters_end: usize, bang: usize) bool {
+    const tokens = context.tokens;
+    var cursor = parameters_end + 1;
+    while (cursor + 1 < bang and tokens[cursor + 1].tag == .l_paren) switch (tokens[cursor].tag) {
+        .keyword_align, .keyword_addrspace, .keyword_linksection, .keyword_callconv => {
+            cursor = (context.matchingToken(cursor + 1, .l_paren, .r_paren) orelse return true) + 1;
+        },
+        else => break,
+    };
+    return cursor != bang;
 }
 
-fn functionIsUsedAsValue(context: RuleRun, declaration_index: usize, name: []const u8) bool {
-    for (context.tokens, 0..) |token, index| {
-        if (index == declaration_index or token.tag != .identifier or !context.tokenIs(index, name)) continue;
-        if (index + 1 < context.tokens.len and context.tokens[index + 1].tag == .l_paren) continue;
-        return true;
+/// Whether the function at `fn_index` belongs to an anonymous struct passed
+/// as an argument or accessed in place (`struct { fn f() ... }.f`), whose
+/// receiver sets the signature.
+fn insideHandedStruct(context: RuleRun, fn_index: usize) bool {
+    const tokens = context.tokens;
+    const opening = context.enclosingOpeningBrace(fn_index) orelse return false;
+    if (opening < 2 or tokens[opening - 1].tag != .keyword_struct) return false;
+    if (tokens[opening - 2].tag == .l_paren or tokens[opening - 2].tag == .comma) return true;
+    const closing = context.scopes.matchingToken(opening) orelse return false;
+    return closing + 1 < tokens.len and tokens[closing + 1].tag == .period;
+}
+
+/// Whether the call whose name is at `index` is caught or tried.
+fn callRequiresErrorUnion(context: RuleRun, index: usize) bool {
+    const closing = context.matchingToken(index + 1, .l_paren, .r_paren) orelse return false;
+    if (closing + 1 < context.tokens.len and context.tokens[closing + 1].tag == .keyword_catch) return true;
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .keyword_try => return true,
+            .semicolon, .l_brace, .r_brace => return false,
+            else => {},
+        }
     }
     return false;
 }
@@ -132,6 +196,7 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             else => {},
         }
     }
+    if (declarations.items.len == 0) return;
 
     for (context.tokens, 0..) |token, pub_index| {
         if (token.tag != .keyword_pub or pub_index + 1 >= context.tokens.len or
@@ -154,10 +219,15 @@ fn findExposedPrivateTypes(context: RuleRun) !void {
             const level = if (declaration.error_set) error_level else type_level;
             if (level == .off) continue;
             const related = try relatedDeclaration(context, declaration);
-            const message = try context.allocator.print(
-                "public declaration exposes private {s} '{s}', which callers cannot name",
-                .{ if (declaration.error_set) "error set" else "type", declaration.name },
-            );
+            // Error values are global, so callers can still match the errors;
+            // what they lose is the set itself, absent from the documented API.
+            const message = if (declaration.error_set)
+                try context.allocator.print(
+                    "public declaration exposes private error set '{s}': callers can match its errors but cannot refer to the set, which is missing from the documented API",
+                    .{declaration.name},
+                )
+            else
+                try context.allocator.print("public declaration exposes private type '{s}', which callers cannot name", .{declaration.name});
             errdefer context.allocator.free(message);
             try context.emit(.{
                 .rule = rule,
@@ -224,11 +294,12 @@ fn relatedDeclaration(context: RuleRun, declaration: PrivateDeclaration) ![]cons
 fn findMutatedContainerCopies(context: RuleRun) !void {
     const level = context.level(.mutated_container_copy);
     if (level == .off) return;
+    var canonical_std: ?bool = null;
     for (context.tokens, 0..) |token, var_index| {
         if (token.tag != .keyword_var or var_index + 7 >= context.tokens.len or
             context.tokens[var_index + 1].tag != .identifier) continue;
         const equal = nextTagBefore(context.tokens, var_index + 2, .equal, .semicolon) orelse continue;
-        if (!hasProvenStandardContainerType(context, var_index + 2, equal)) continue;
+        if (!hasProvenStandardContainerType(context, var_index + 2, equal, &canonical_std)) continue;
         if (equal + 4 >= context.tokens.len or context.tokens[equal + 1].tag != .identifier or
             context.tokens[equal + 2].tag != .period or context.tokens[equal + 3].tag != .identifier or
             context.tokens[equal + 4].tag != .semicolon) continue;
@@ -250,13 +321,19 @@ fn findMutatedContainerCopies(context: RuleRun) !void {
     }
 }
 
-fn hasProvenStandardContainerType(context: RuleRun, start: usize, equal: usize) bool {
+/// `canonical_std` remembers, once a declaration asked, whether the file
+/// declares `std` once, as the standard-library import.
+fn hasProvenStandardContainerType(context: RuleRun, start: usize, equal: usize, canonical_std: *?bool) bool {
     if (start + 4 >= equal or context.tokens[start].tag != .colon or
         context.tokens[start + 1].tag != .identifier or !context.tokenIs(start + 1, "std") or
         context.tokens[start + 2].tag != .period or context.tokens[start + 3].tag != .identifier or
         context.tokens[start + 4].tag != .l_paren) return false;
-    if (identifierDeclarationCount(context, "std") != 1 or !hasCanonicalStdImport(context)) return false;
-    return container_types.kindOfName(context.tokenText(start + 3)) != null;
+    if (container_types.kindOfName(context.tokenText(start + 3)) == null) return false;
+    return canonical_std.* orelse {
+        const canonical = identifierDeclarationCount(context, "std") == 1 and hasCanonicalStdImport(context);
+        canonical_std.* = canonical;
+        return canonical;
+    };
 }
 
 fn hasCanonicalStdImport(context: RuleRun) bool {
@@ -411,6 +488,25 @@ test "compiler hygiene ignores function types callbacks and public error contrac
         "fn constructed() !struct { value: u8 } { return .{ .value = try load() }; }\n";
     const found = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .useless_error_return);
+}
+
+test "named error sets and handed-over callbacks keep their error unions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const TimeoutError = error{Canceled};\n" ++
+        "fn submit(comptime Op: type) void { _ = Op; }\n" ++
+        "fn timeout() void { submit(struct { fn operation() !void {} }); }\n" ++
+        "const handler = struct { fn handle() !void {} }.handle;\n" ++
+        "fn named() TimeoutError!u32 { return 1; }\n" ++
+        "fn explicit() error{Bad}!u32 { return 1; }\n" ++
+        "fn aligned() align(4) !u32 { return 1; }\n" ++
+        "fn inferred() !u32 { return 1; }\n";
+    const configuration = support.only(&.{.useless_error_return}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expect(found[0].span.start > std.mem.find(u8, source, "fn aligned").?);
+    try std.testing.expect(found[1].span.start > std.mem.find(u8, source, "fn inferred").?);
 }
 
 test "infallible implementations keep error unions required by their callers" {

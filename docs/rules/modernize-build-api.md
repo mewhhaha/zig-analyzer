@@ -4,7 +4,7 @@
 Tier: style · Profile: modernize · Default: off · Fixes: fix all · Options: none
 
 Reports removed `std.Build.args` and `LazyPath.basename` access, the deprecated
-`addTranslateC` build step, Windows resource compilation APIs, legacy Run
+`addTranslateC` build step, Windows resource compilation APIs, deprecated Run
 argument wrappers, `lazyDependency`, and the old two-argument `findProgram`
 call.
 <!-- /rule-docs:header -->
@@ -20,14 +20,16 @@ Zig 0.18; the corresponding module API is deprecated in 0.17.
 ## When it fires
 
 Run argument methods now accept options for prefixes, suffixes, and absolute
-paths. The seven plain wrappers (`addArtifactArg`, `addFileArg`,
+paths. The six deprecated plain wrappers (`addArtifactArg`,
 `addOutputFileArg`, `addFileContentArg`, `addOutputDirectoryArg`,
 `addDirectoryArg`, and `addDepFileOutputArg`) delegate to the corresponding
 `*Arg2` method with empty options (`.{}`). Their fixes rename the method and
 insert the empty options argument, preserving expressions, comments, and
-trailing commas. Prefixed and decorated wrappers receive guidance: moving
-prefixes or suffixes into options changes argument order and requires reviewing
-evaluation order.
+trailing commas. The deprecated prefixed and decorated wrappers receive
+guidance: moving prefixes or suffixes into options changes argument order and
+requires reviewing evaluation order. `addFileArg` and `addPrefixedFileArg` are
+not deprecated in Zig 0.17 (they only point to `addFileArg2`) and are not
+reported.
 
 `dependencyLazy` returns `error.LazyDependencyNeeded` instead of an optional.
 Propagate that error through helpers to `build()` so the build runner can fetch

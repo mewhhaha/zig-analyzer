@@ -449,6 +449,52 @@ fn emitMergedMembers(builder: *ProgramBuilder) !void {
     });
 }
 
+/// A system call retried only while it reports an interruption, which
+/// `unbounded-loop` accepts as bounded.
+fn emitInterruptedRetry(builder: *ProgramBuilder) !void {
+    const attempt = try builder.functionName();
+    defer builder.allocator.free(attempt);
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(value: u32) std.posix.E {{
+        \\    return if (value == {d}) .SUCCESS else .INTR;
+        \\}}
+        \\fn {s}(value: u32) error{{Unexpected}}!void {{
+        \\    while (true) {{
+        \\        switch ({s}(value)) {{
+        \\            .SUCCESS => return,
+        \\            .INTR, .AGAIN => {{}},
+        \\            else => return error.Unexpected,
+        \\        }}
+        \\    }}
+        \\}}
+        \\
+    , .{ attempt, builder.random.intRangeAtMost(u8, 0, 9), function, attempt });
+}
+
+/// An empty loop repeating a fallible step until it reports no progress.
+fn emitProgressStep(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const Countdown{d} = struct {{
+        \\    remaining: u32,
+        \\
+        \\    fn step(countdown: *Countdown{d}) error{{Stalled}}!bool {{
+        \\        if (countdown.remaining > {d}) return error.Stalled;
+        \\        if (countdown.remaining == 0) return false;
+        \\        countdown.remaining -= 1;
+        \\        return true;
+        \\    }}
+        \\}};
+        \\fn {s}(countdown: *Countdown{d}) error{{Stalled}}!void {{
+        \\    while (try countdown.step()) {{}}
+        \\}}
+        \\
+    , .{ builder.sequence, builder.sequence, builder.random.intRangeAtMost(u16, 100, 999), function, builder.sequence });
+}
+
 fn emitFlushingHelper(builder: *ProgramBuilder) !void {
     const helper = try builder.functionName();
     defer builder.allocator.free(helper);
@@ -615,6 +661,7 @@ fn emitGuardedRelease(builder: *ProgramBuilder) !void {
         \\    items: std.ArrayList(u8) = .empty,
         \\    fn deinit(self: *Pool{d}, allocator: std.mem.Allocator) void {{
         \\        self.items.deinit(allocator);
+        \\        self.* = undefined;
         \\    }}
         \\}};
         \\fn {s}(allocator: std.mem.Allocator, value: u8) !usize {{
@@ -675,6 +722,51 @@ fn emitScopedPush(builder: *ProgramBuilder) !void {
 }
 
 /// A struct declared undefined and then written field by field.
+/// A `var` mutated only through a slice of one of its fields.
+fn emitFieldSliceMutation(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const length = builder.random.intRangeAtMost(u8, 2, 16);
+    try builder.append(
+        \\const Block{d} = struct {{ bytes: [{d}]u8 = @splat(0) }};
+        \\fn {s}(seed: u8) u8 {{
+        \\    var block: Block{d} = .{{}};
+        \\    @memset(block.bytes[1..], seed);
+        \\    return block.bytes[{d}];
+        \\}}
+        \\
+    , .{ builder.sequence, length, function, builder.sequence, length - 1 });
+}
+
+/// An allocator implementation whose own type is named `Allocator`, and a
+/// test's debug print of a single character, which has no `writeByte`.
+fn emitAllocatorImplementation(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const counting_{d} = struct {{
+        \\    const Allocator = struct {{
+        \\        parent: std.mem.Allocator,
+        \\        count: usize = 0,
+        \\        fn note(context: *anyopaque) void {{
+        \\            const self: *Allocator = @ptrCast(@alignCast(context));
+        \\            self.count += 1;
+        \\        }}
+        \\    }};
+        \\}};
+        \\fn {s}(parent: std.mem.Allocator) usize {{
+        \\    var counting: counting_{d}.Allocator = .{{ .parent = parent }};
+        \\    counting_{d}.Allocator.note(&counting);
+        \\    return counting.count;
+        \\}}
+        \\test "{s} counts one note" {{
+        \\    std.debug.print("\n", .{{}});
+        \\    try std.testing.expectEqual(@as(usize, 1), {s}(std.testing.allocator));
+        \\}}
+        \\
+    , .{ builder.sequence, function, builder.sequence, builder.sequence, function, function });
+}
+
 fn emitFieldwiseStruct(builder: *ProgramBuilder) !void {
     const function = try builder.functionName();
     defer builder.allocator.free(function);
@@ -801,6 +893,57 @@ fn emitBoundedRecursion(builder: *ProgramBuilder) !void {
     , .{ function, builder.random.intRangeAtMost(u8, 8, 64), function, drain });
 }
 
+/// Recursion counting a by-value depth down from a constant its only caller
+/// passes, and recursion over a type's optional payloads and fields.
+fn emitCountdownRecursion(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const walker = try builder.functionName();
+    defer builder.allocator.free(walker);
+    try builder.append(
+        \\const Walk{d} = struct {{
+        \\    fn sum(values: []const u32) u64 {{
+        \\        return visit(values, {d});
+        \\    }}
+        \\    fn visit(values: []const u32, remaining: usize) u64 {{
+        \\        if (remaining == 0 or remaining > values.len) return 0;
+        \\        return values[remaining - 1] + visit(values, remaining - 1);
+        \\    }}
+        \\}};
+        \\fn {s}(values: []const u32) u64 {{
+        \\    return Walk{d}.sum(values);
+        \\}}
+        \\fn {s}(value: anytype) usize {{
+        \\    switch (@typeInfo(@TypeOf(value))) {{
+        \\        .optional => return if (value) |inner| 1 + {s}(inner) else 0,
+        \\        .@"struct" => |info| {{
+        \\            var total: usize = 0;
+        \\            inline for (info.field_names) |name| total += {s}(@field(value, name));
+        \\            return total;
+        \\        }},
+        \\        else => return 1,
+        \\    }}
+        \\}}
+        \\
+    , .{ builder.sequence, builder.random.intRangeAtMost(u8, 8, 64), function, builder.sequence, walker, walker, walker });
+}
+
+/// A boolean mode a test passes as a literal; production code would name it.
+fn emitTestedMode(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const half = builder.random.intRangeAtMost(u8, 1, 9);
+    try builder.append(
+        \\fn {s}(value: u32, halve: bool) u32 {{
+        \\    return if (halve) value / 2 else value;
+        \\}}
+        \\test "{s} halves on request" {{
+        \\    try std.testing.expectEqual(@as(u32, {d}), {s}({d}, true));
+        \\}}
+        \\
+    , .{ function, function, half, function, @as(u16, half) * 2 });
+}
+
 /// Indexing bounded by a loop range that starts past zero, by a comparison
 /// with the length, and indexing inside a helper only a test calls.
 fn emitStatedIndexBounds(builder: *ProgramBuilder) !void {
@@ -899,6 +1042,7 @@ fn emitArenaAggregate(builder: *ProgramBuilder) !void {
         \\    /// Releases both labels with the arena.
         \\    pub fn deinit(self: *Labels{d}) void {{
         \\        self.arena.deinit();
+        \\        self.* = undefined;
         \\    }}
         \\}};
         \\
@@ -972,6 +1116,637 @@ fn emitIoMutexCounter(builder: *ProgramBuilder) !void {
     , .{ sequence, sequence });
 }
 
+/// A buffer shrunk in place and resliced to its new length, and one released
+/// through a full-length reslice, both under a deferred `free`.
+fn emitResizedReslice(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
+    const length = builder.smallLength() + 1;
+    try builder.append(
+        \\fn {s}(allocator: std.mem.Allocator, count: usize) !usize {{
+        \\    var {s} = try allocator.alloc(u8, {d});
+        \\    defer allocator.free({s});
+        \\    if (allocator.resize({s}, {d})) {s} = {s}[0..{d}];
+        \\    const scratch = try allocator.alloc(u8, count);
+        \\    defer allocator.free(scratch[0..count]);
+        \\    @memset(scratch, 0);
+        \\    return {s}.len + scratch.len;
+        \\}}
+        \\
+    , .{ function, buffer, length, buffer, buffer, length - 1, buffer, buffer, length - 1, buffer });
+}
+
+/// A copy released by hand before an early error, then handed to the caller.
+fn emitReleasedBeforeError(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const copy = try builder.localName();
+    defer builder.allocator.free(copy);
+    try builder.append(
+        \\fn {s}(allocator: std.mem.Allocator, text: []const u8) ![]u8 {{
+        \\    const {s} = try allocator.dupe(u8, text);
+        \\    if ({s}.len > {d}) {{
+        \\        allocator.free({s});
+        \\        return error.TooLong;
+        \\    }}
+        \\    return {s};
+        \\}}
+        \\
+    , .{ function, copy, copy, builder.smallLength(), copy, copy });
+}
+
+/// Input consumed in chunks: a bounded copy per chunk with the remainder
+/// sliced from a running offset, sums bounded by the loop condition or made of
+/// lengths, and a cursor that starts at zero compared before it advances.
+fn emitChunkedCopy(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const search = try builder.functionName();
+    defer builder.allocator.free(search);
+    const pack = try builder.functionName();
+    defer builder.allocator.free(pack);
+    try builder.append(
+        \\fn {s}(out: []u8, seed: u8) void {{
+        \\    var block: [8]u8 = @splat(seed);
+        \\    var i: usize = 0;
+        \\    while (i < out.len) : (block[0] +%= {d}) {{
+        \\        const n = @min(block.len, out.len - i);
+        \\        @memcpy(out[i..][0..n], block[0..n]);
+        \\        i += n;
+        \\    }}
+        \\}}
+        \\fn {s}(haystack: []const u8, needle: []const u8, limit: usize) ?usize {{
+        \\    if (needle.len > haystack.len) return null;
+        \\    var i: usize = 0;
+        \\    while (i <= haystack.len - needle.len) : (i += 1) {{
+        \\        if (std.mem.eql(u8, haystack[i .. i + needle.len], needle)) return @min(limit, haystack.len + needle.len);
+        \\    }}
+        \\    return null;
+        \\}}
+        \\fn {s}(buffer: []u8, header: []const u8, body: []const u8) error{{NoSpaceLeft}}!usize {{
+        \\    var written: usize = 0;
+        \\    if (written + header.len > buffer.len) return error.NoSpaceLeft;
+        \\    @memcpy(buffer[written..][0..header.len], header);
+        \\    written += header.len;
+        \\    if (written + body.len > buffer.len) return error.NoSpaceLeft;
+        \\    @memcpy(buffer[written..][0..body.len], body);
+        \\    written += body.len;
+        \\    return written;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 9), search, pack });
+}
+
+/// A tuple of two iterator calls, a pointer restored from a widened integer
+/// and a rotation bounded by the shift that produced it.
+fn emitIteratorPair(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const restore = try builder.functionName();
+    defer builder.allocator.free(restore);
+    const rotate = try builder.functionName();
+    defer builder.allocator.free(rotate);
+    try builder.append(
+        \\fn {s}(text: []const u8) ?[2][]const u8 {{
+        \\    var it = std.mem.splitScalar(u8, text, '.');
+        \\    return .{{ it.first(), it.next() orelse return null }};
+        \\}}
+        \\fn {s}(user_data: u128) *const u8 {{
+        \\    return @ptrFromInt(@as(usize, @intCast(user_data)));
+        \\}}
+        \\fn {s}(state: u64, word: u32) u32 {{
+        \\    const rot: u32 = @intCast(state >> 59);
+        \\    return word >> @as(u5, @intCast(rot)) | word << {d};
+        \\}}
+        \\
+    , .{ function, restore, rotate, builder.random.intRangeAtMost(u8, 1, 31) });
+}
+
+/// Empty catches with no caller left to tell: a deferred flush and a cleanup
+/// on the path that returns the original error.
+fn emitFailurePathCleanup(builder: *ProgramBuilder) !void {
+    const release = try builder.functionName();
+    defer builder.allocator.free(release);
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(value: u32) error{{Busy}}!void {{
+        \\    if (value == {d}) return error.Busy;
+        \\}}
+        \\fn {s}(value: u32, writer: *std.Io.Writer) error{{Busy}}!u32 {{
+        \\    defer writer.flush() catch {{}};
+        \\    {s}(value) catch |err| {{
+        \\        {s}(value + 1) catch {{}};
+        \\        return err;
+        \\    }};
+        \\    return value;
+        \\}}
+        \\
+    , .{ release, builder.random.intRangeAtMost(u8, 1, 9), function, release, release });
+}
+
+/// `catch unreachable` and `orelse unreachable` on invariants the code
+/// establishes: compile-time-known arguments and a stated precondition.
+fn emitStatedInvariants(builder: *ProgramBuilder) !void {
+    const parse = try builder.functionName();
+    defer builder.allocator.free(parse);
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(text: []const u8) error{{Empty}}!usize {{
+        \\    if (text.len == 0) return error.Empty;
+        \\    return text.len;
+        \\}}
+        \\fn {s}(text: []const u8) usize {{
+        \\    const fixed = {s}("{d}") catch unreachable;
+        \\    // Callers pass the text a separator was found in.
+        \\    const separator = std.mem.findScalar(u8, text, ',') orelse unreachable;
+        \\    return fixed + separator;
+        \\}}
+        \\
+    , .{ parse, function, parse, builder.random.intRangeAtMost(u8, 1, 200) });
+}
+
+/// Tests that assert by construction: a reference list, one in a `comptime`
+/// block, and a declaration check.
+fn emitReferenceTests(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}() u32 {{
+        \\    return {d};
+        \\}}
+        \\test {{
+        \\    _ = {s};
+        \\    comptime {{
+        \\        _ = {s};
+        \\    }}
+        \\}}
+        \\test {{
+        \\    std.testing.refAllDecls(@This());
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 200), function, function });
+}
+
+/// A test releasing each allocation from the leak-checking allocator.
+fn emitLeakCheckedTest(builder: *ProgramBuilder) !void {
+    try builder.append(
+        \\test "generated {d} releases each allocation" {{
+        \\    const allocator = std.testing.allocator;
+        \\    const first = try allocator.alloc(u8, {d});
+        \\    defer allocator.free(first);
+        \\    const second = try allocator.alloc(u8, {d});
+        \\    defer allocator.free(second);
+        \\    const third = try allocator.alloc(u8, {d});
+        \\    defer allocator.free(third);
+        \\    try std.testing.expect(first.len + second.len + third.len > 0);
+        \\}}
+        \\
+    , .{ builder.sequence, builder.smallLength(), builder.smallLength(), builder.smallLength() });
+    builder.sequence += 1;
+}
+
+/// Failures with one meaning collapsed to absence, translated to a writer's
+/// error, and kept by a predicate's `else`.
+fn emitSingleMeaningFailures(builder: *ProgramBuilder) !void {
+    const parse = try builder.functionName();
+    defer builder.allocator.free(parse);
+    const render = try builder.functionName();
+    defer builder.allocator.free(render);
+    const predicate = try builder.functionName();
+    defer builder.allocator.free(predicate);
+    const id = builder.sequence;
+    try builder.append(
+        \\fn {s}(text: []const u8, limit: u32) ?u32 {{
+        \\    const value = std.fmt.parseInt(u32, text, 10) catch 0;
+        \\    return std.math.add(u32, value, limit) catch null;
+        \\}}
+        \\fn {s}(writer: *std.Io.Writer, gpa: std.mem.Allocator) std.Io.Writer.Error!void {{
+        \\    const scratch = gpa.alloc(u8, {d}) catch return error.WriteFailed;
+        \\    defer gpa.free(scratch);
+        \\    @memset(scratch, 'x');
+        \\    try writer.writeAll(scratch);
+        \\}}
+        \\const Stage{d} = enum {{ ready, waiting, done }};
+        \\const StageError{d} = error{{Canceled}};
+        \\fn {s}(stage: Stage{d}) StageError{d}!bool {{
+        \\    return switch (stage) {{
+        \\        .done => true,
+        \\        else => false,
+        \\    }};
+        \\}}
+        \\
+    , .{ parse, render, builder.smallLength(), id, id, predicate, id, id });
+}
+
+/// Constants whose values document themselves, a C-style constant table, an
+/// addition-chain local, a first doc sentence that says more than the name
+/// and a qualified `...Data` type.
+fn emitSelfDescribingConstants(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const id = builder.sequence;
+    try builder.append(
+        \\pub const max_entries_{d} = {d};
+        \\pub const Limit{d} = u32;
+        \\/// Poll events.
+        \\pub const POLL{d} = struct {{
+        \\    pub const IN = 0x001;
+        \\    pub const OUT = IN << 2;
+        \\}};
+        \\/// Shaper{d} that counts entries.
+        \\pub const Shaper{d} = struct {{ count: Limit{d} }};
+        \\/// Image formats.
+        \\pub const image_{d} = struct {{
+        \\    /// Packed image bytes.
+        \\    pub const ImageData = struct {{ bytes: u32 }};
+        \\}};
+        \\fn {s}(value: u32) u32 {{
+        \\    const _10 = value +% value;
+        \\    return _10 +% POLL{d}.OUT +% max_entries_{d};
+        \\}}
+        \\
+    , .{ id, builder.random.intRangeAtMost(u16, 8, 4096), id, id, id, id, id, id, function, id, id });
+}
+
+/// A type whose nested type declares its own `deinit` first, with a union
+/// payload freed through a `switch` capture and a field set through a nested
+/// literal: the outer `deinit` releases every field.
+fn emitNestedCleanup(builder: *ProgramBuilder) !void {
+    const sequence = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\const Shelf{d} = struct {{
+        \\    allocator: std.mem.Allocator,
+        \\    label: Label,
+        \\    pair: Pair,
+        \\    slots: std.ArrayList(Slot),
+        \\
+        \\    const Slot = struct {{
+        \\        codes: std.ArrayList(u32),
+        \\
+        \\        fn deinit(slot: *Slot, allocator: std.mem.Allocator) void {{
+        \\            slot.codes.deinit(allocator);
+        \\            slot.* = undefined;
+        \\        }}
+        \\    }};
+        \\    const Label = union(enum) {{ named: []u8, numbered: u32 }};
+        \\    const Pair = struct {{ left: []u8, count: usize }};
+        \\
+        \\    /// Copies the name into the label and the pair.
+        \\    pub fn init(allocator: std.mem.Allocator, name: []const u8) !Shelf{d} {{
+        \\        const left = try allocator.dupe(u8, name);
+        \\        errdefer allocator.free(left);
+        \\        const named = try allocator.dupe(u8, name);
+        \\        return .{{
+        \\            .allocator = allocator,
+        \\            .label = .{{ .named = named }},
+        \\            .pair = .{{ .left = left, .count = {d} }},
+        \\            .slots = .empty,
+        \\        }};
+        \\    }}
+        \\
+        \\    /// Releases the slots, the label and the pair.
+        \\    pub fn deinit(self: *Shelf{d}) void {{
+        \\        for (self.slots.items) |*slot| slot.deinit(self.allocator);
+        \\        self.slots.deinit(self.allocator);
+        \\        switch (self.label) {{
+        \\            .named => |name| self.allocator.free(name),
+        \\            .numbered => {{}},
+        \\        }}
+        \\        self.allocator.free(self.pair.left);
+        \\        self.* = undefined;
+        \\    }}
+        \\}};
+        \\
+    , .{ sequence, sequence, builder.random.intRangeAtMost(u8, 1, 9), sequence });
+}
+
+/// A container handed on whole through a pointer parameter's field.
+fn emitHandedContainer(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const sequence = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\const Inbox{d} = struct {{
+        \\    pending: std.ArrayList(u8) = .empty,
+        \\}};
+        \\fn {s}(allocator: std.mem.Allocator, inbox: *Inbox{d}) !usize {{
+        \\    var fresh: std.ArrayList(u8) = .empty;
+        \\    try fresh.append(allocator, {d});
+        \\    inbox.pending.deinit(allocator);
+        \\    inbox.pending = fresh;
+        \\    return inbox.pending.items.len;
+        \\}}
+        \\
+    , .{ sequence, function, sequence, builder.random.intRangeAtMost(u8, 1, 200) });
+}
+
+/// A writer flushed before an early return and after its last write.
+fn emitFlushedEarlyExit(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
+    try builder.append(
+        \\fn {s}(io: std.Io, file: std.Io.File, quiet: bool) std.Io.Writer.Error!void {{
+        \\    var {s}: [{d}]u8 = undefined;
+        \\    var file_writer = file.writer(io, &{s});
+        \\    const out = &file_writer.interface;
+        \\    if (quiet) {{
+        \\        try out.writeAll("quiet\n");
+        \\        try out.flush();
+        \\        return;
+        \\    }}
+        \\    for (0..{d}) |index| {{
+        \\        try out.print("{{d}}\n", .{{index}});
+        \\    }}
+        \\    try out.flush();
+        \\}}
+        \\
+    , .{ function, buffer, builder.smallLength() + 16, buffer, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+/// A write before an `if`/`else` and a `switch` that flush in every branch.
+fn emitFlushedEveryBranch(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const buffer = try builder.localName();
+    defer builder.allocator.free(buffer);
+    try builder.append(
+        \\fn {s}(io: std.Io, file: std.Io.File, verbose: bool, mode: enum {{ plain, wide, none }}) std.Io.Writer.Error!void {{
+        \\    var {s}: [{d}]u8 = undefined;
+        \\    var file_writer = file.writer(io, &{s});
+        \\    const out = &file_writer.interface;
+        \\    try out.writeAll("head\n");
+        \\    if (verbose) {{
+        \\        try out.print("{{d}}\n", .{{{d}}});
+        \\        try out.flush();
+        \\    }} else {{
+        \\        try out.flush();
+        \\    }}
+        \\    try out.writeAll("tail\n");
+        \\    switch (mode) {{
+        \\        .plain => try out.flush(),
+        \\        .wide => {{
+        \\            try out.writeAll("wide\n");
+        \\            try out.flush();
+        \\        }},
+        \\        .none => unreachable,
+        \\    }}
+        \\}}
+        \\
+    , .{ function, buffer, builder.smallLength() + 16, buffer, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+/// A capture named like the var it initializes, mutated later, and a table
+/// built in a labeled `comptime` block whose address is returned.
+fn emitShadowedInitializers(builder: *ProgramBuilder) !void {
+    const sequence = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\const Slot{d} = struct {{ id: u32 = 0 }};
+        \\fn takeSlot{d}(pending: ?*const Slot{d}) u32 {{
+        \\    var slot: Slot{d} = if (pending) |slot| slot: {{
+        \\        break :slot slot.*;
+        \\    }} else .{{}};
+        \\    if (slot.id == 0) slot.id = {d};
+        \\    return slot.id;
+        \\}}
+        \\fn table{d}(comptime count: usize) []const u8 {{
+        \\    const result = comptime result: {{
+        \\        var result: [count]u8 = undefined;
+        \\        for (&result, 0..) |*byte, index| byte.* = @intCast(index);
+        \\        break :result result;
+        \\    }};
+        \\    return &result;
+        \\}}
+        \\
+    , .{ sequence, sequence, sequence, sequence, builder.random.intRangeAtMost(u8, 1, 9), sequence });
+}
+
+/// An undefined local that an errdefer block reads after its first
+/// statement; the block runs only once the local is set.
+fn emitErrdeferBlockRead(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const value = try builder.localName();
+    defer builder.allocator.free(value);
+    try builder.append(
+        \\fn {s}(failures: *u32, last: *u8, input: []const u8) !u8 {{
+        \\    var {s}: u8 = undefined;
+        \\    errdefer {{
+        \\        failures.* += 1;
+        \\        last.* = {s};
+        \\    }}
+        \\    {s} = if (input.len > 0) input[0] else 0;
+        \\    if ({s} > {d}) return error.Rejected;
+        \\    return {s};
+        \\}}
+        \\
+    , .{ function, value, value, value, value, builder.random.intRangeAtMost(u8, 1, 200), value });
+}
+
+/// A function whose parameter has a struct type: the pointer field it only
+/// reads is no parameter, and `[]const u8` in its body declares no `u8`.
+fn emitFullCapacityItemsReturn(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(allocator: std.mem.Allocator, text: []const u8) ![]u8 {{
+        \\    var output: std.ArrayList(u8) = try .initCapacity(allocator, text.len);
+        \\    errdefer comptime unreachable;
+        \\    for (text) |byte| output.appendAssumeCapacity(byte);
+        \\    std.debug.assert(output.items.len == output.capacity);
+        \\    return output.items;
+        \\}}
+        \\
+    , .{function});
+}
+
+fn emitStructParameterSize(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const id = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\const Header{d} = struct {{
+        \\    tag: u8,
+        \\    const size = @sizeOf(u32);
+        \\}};
+        \\fn {s}(allocator: std.mem.Allocator, args: struct {{ header: *Header{d}, label: []const u8 }}) ![]u8 {{
+        \\    var parts: std.ArrayList([]const u8) = .empty;
+        \\    defer parts.deinit(allocator);
+        \\    try parts.append(allocator, args.label);
+        \\    const size = @sizeOf(u8) + Header{d}.size;
+        \\    const bytes = try allocator.alloc(u8, size);
+        \\    @memset(bytes, args.header.tag);
+        \\    return bytes;
+        \\}}
+        \\
+    , .{ id, function, id, id });
+}
+
+/// A field reset to an empty literal before it is filled again.
+fn emitResetField(builder: *ProgramBuilder) !void {
+    const sequence = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\const Note{d} = struct {{
+        \\    allocator: std.mem.Allocator,
+        \\    text: []const u8 = "",
+        \\
+        \\    /// Releases the text when one was copied.
+        \\    pub fn deinit(self: *const Note{d}) void {{
+        \\        if (self.text.len > 0) self.allocator.free(self.text);
+        \\    }}
+        \\
+        \\    /// Copies `source` unless it is empty.
+        \\    pub fn fill(self: *Note{d}, source: []const u8) !void {{
+        \\        self.text = "";
+        \\        if (source.len > 0) self.text = try self.allocator.dupe(u8, source);
+        \\    }}
+        \\}};
+        \\
+    , .{ sequence, sequence, sequence });
+}
+
+/// Length guards on the left of `or` protect the index on its right, whichever
+/// way round they compare.
+fn emitShortCircuitLengthGuards(builder: *ProgramBuilder) !void {
+    const sequence = builder.sequence;
+    builder.sequence += 1;
+    try builder.append(
+        \\/// Whether `name` spells a sized integer type.
+        \\pub fn isIntegerName{d}(name: []const u8) bool {{
+        \\    if (name.len < 2 or (name[0] != 'u' and name[0] != 'i')) return false;
+        \\    return {d} > name.len or name.len <= {d} or name[0] != '0';
+        \\}}
+        \\
+    , .{ sequence, builder.random.intRangeAtMost(u8, 1, 9), builder.random.intRangeAtMost(u8, 0, 9) });
+}
+
+/// Guard clauses whose body drops to the next line, and a labeled block after
+/// a condition `zig fmt` continued: none of them can make a later line look
+/// guarded.
+fn emitGuardClauses(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(values: []const u32, limit: u32) error{{Empty}}!u64 {{
+        \\    if (values.len == 0)
+        \\        return error.Empty;
+        \\    var total: u64 = 0;
+        \\    for (values) |value| {{
+        \\        if (value > limit)
+        \\            continue;
+        \\        total += value;
+        \\    }}
+        \\    if (total > {d} and
+        \\        values.len > 1)
+        \\    rounded: {{
+        \\        if (total % 2 == 0) break :rounded;
+        \\        total += 1;
+        \\    }}
+        \\    return total;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u16, 10, 900) });
+}
+
+/// A public method's receiver is API, whatever its body reads.
+fn emitPublicReader(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const Gauge{d} = struct {{
+        \\    level: u32,
+        \\
+        \\    /// The current level.
+        \\    pub fn read(gauge: *Gauge{d}) u32 {{
+        \\        return gauge.level;
+        \\    }}
+        \\}};
+        \\fn {s}(level: u32) u32 {{
+        \\    var gauge: Gauge{d} = .{{ .level = level }};
+        \\    return gauge.read() +| {d};
+        \\}}
+        \\
+    , .{ builder.sequence, builder.sequence, function, builder.sequence, builder.random.intRangeAtMost(u8, 1, 9) });
+    builder.sequence += 1;
+}
+
+/// A dump helper writes to stderr on purpose.
+fn emitDumpHelper(builder: *ProgramBuilder) !void {
+    try builder.append(
+        \\fn dumpTotals{d}(values: []const u32) void {{
+        \\    for (values) |value| std.debug.print("{{d}}\n", .{{value}});
+        \\}}
+        \\
+    , .{builder.sequence});
+    builder.sequence += 1;
+}
+
+/// Prongs a comment documents, and the one-status-per-row table of a C
+/// status enum, stay separate.
+fn emitStatusTable(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const value = builder.random.intRangeAtMost(u8, 1, 200);
+    try builder.append(
+        \\const Status{d} = enum {{ SUCCESS, AGAIN, INTR, BADF, FAULT }};
+        \\fn {s}(status: Status{d}) error{{Retry}}!u8 {{
+        \\    return switch (status) {{
+        \\        .SUCCESS => {d},
+        \\        // Interrupted calls are retried like busy ones.
+        \\        .AGAIN => error.Retry,
+        \\        .INTR => error.Retry,
+        \\        .BADF => unreachable,
+        \\        .FAULT => unreachable,
+        \\    }};
+        \\}}
+        \\
+    , .{ builder.sequence, function, builder.sequence, value });
+    builder.sequence += 1;
+}
+
+/// Shapes that look like no-ops or one-pass loops but are written on purpose:
+/// a checked `getOrPut` counter, a loop expression with an `else`, a table
+/// row starting at `* 0`, a breakable `while (true)` block and an asserted
+/// lower bound.
+fn emitDeliberateShapes(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(allocator: std.mem.Allocator, words: []const u32) !u32 {{
+        \\    var counts: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        \\    defer counts.deinit(allocator);
+        \\    for (words) |word| {{
+        \\        const gop = try counts.getOrPut(allocator, word);
+        \\        if (!gop.found_existing) gop.value_ptr.* = 0;
+        \\        gop.value_ptr.* += 1;
+        \\    }}
+        \\    const first = for (words) |word| {{
+        \\        if (word > {d}) break word;
+        \\    }} else 0;
+        \\    const offsets = [_]u32{{ first * 0, first * 1, first * 2 }};
+        \\    var total: u32 = 0;
+        \\    while (true) {{
+        \\        if (words.len == 0) break;
+        \\        total +|= offsets[1];
+        \\        break;
+        \\    }}
+        \\    std.debug.assert(words.len >= 0);
+        \\    return total +| counts.count();
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 2, 9) });
+}
+
 const templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitFormattedLength,
     emitLoopCarriedStep,
@@ -998,6 +1773,8 @@ const templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitConstantProng,
     emitMergedMembers,
     emitFlushingHelper,
+    emitInterruptedRetry,
+    emitProgressStep,
     emitCancelledGroup,
     emitCoercedReturn,
     emitSymmetricExits,
@@ -1011,12 +1788,41 @@ const templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitJsonStringify,
     emitCountedZero,
     emitBoundedRecursion,
+    emitCountdownRecursion,
+    emitTestedMode,
     emitStatedIndexBounds,
     emitSingleErrorTranslation,
+    emitDeliberateShapes,
+    emitGuardClauses,
+    emitPublicReader,
+    emitDumpHelper,
+    emitStatusTable,
     emitArenaAggregate,
     emitPartialInitialization,
     emitArrayBlock,
     emitIoMutexCounter,
+    emitResizedReslice,
+    emitReleasedBeforeError,
+    emitChunkedCopy,
+    emitIteratorPair,
+    emitFailurePathCleanup,
+    emitStatedInvariants,
+    emitReferenceTests,
+    emitLeakCheckedTest,
+    emitSingleMeaningFailures,
+    emitFieldSliceMutation,
+    emitAllocatorImplementation,
+    emitSelfDescribingConstants,
+    emitNestedCleanup,
+    emitHandedContainer,
+    emitFlushedEarlyExit,
+    emitResetField,
+    emitShortCircuitLengthGuards,
+    emitFlushedEveryBranch,
+    emitShadowedInitializers,
+    emitErrdeferBlockRead,
+    emitStructParameterSize,
+    emitFullCapacityItemsReturn,
 };
 
 /// Programs that break idioms, so the fix gates see more than clean code
@@ -1243,6 +2049,115 @@ fn emitDirtyDeferredUnreachable(builder: *ProgramBuilder) !void {
     , .{ release, builder.random.intRangeAtMost(u8, 1, 9), function, release, release });
 }
 
+/// `expect(actual == literal)` over a length, an optional and a call, which
+/// `expectEqual` must still compile for.
+fn emitDirtyFieldExpectations(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const id = builder.sequence;
+    const value = builder.random.intRangeAtMost(u8, 1, 200);
+    try builder.append(
+        \\const Record{d} = struct {{ value: ?u32 = null, items: []const u8 = "ab" }};
+        \\fn {s}() u32 {{
+        \\    return {d};
+        \\}}
+        \\test "generated {d} expectations" {{
+        \\    const record: Record{d} = .{{}};
+        \\    const value = record.value;
+        \\    try std.testing.expect(record.items.len == 2);
+        \\    try std.testing.expect(value == null);
+        \\    try std.testing.expect({s}() == {d});
+        \\}}
+        \\
+    , .{ id, function, value, id, id, function, value });
+    builder.sequence += 1;
+}
+
+/// An unbraced body after a condition `zig fmt` continued onto a second line.
+fn emitDirtyContinuedGuard(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(values: []const u32, limit: u32) u64 {{
+        \\    var total: u64 = 0;
+        \\    for (values) |value| {{
+        \\        if (value > limit and
+        \\            value % {d} == 0)
+        \\            total += value;
+        \\    }}
+        \\    return total;
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 2, 9) });
+}
+
+/// A defer block holding one statement that spans lines.
+fn emitDirtyDeferredReset(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\const Span{d} = struct {{ start: usize, len: usize }};
+        \\fn {s}(span: *Span{d}, length: usize) usize {{
+        \\    defer {{
+        \\        span.* = .{{
+        \\            .start = span.start +| length,
+        \\            .len = {d},
+        \\        }};
+        \\    }}
+        \\    return span.len;
+        \\}}
+        \\
+    , .{ builder.sequence, function, builder.sequence, builder.random.intRangeAtMost(u8, 0, 9) });
+    builder.sequence += 1;
+}
+
+/// An unused import set off by a blank line.
+fn emitDirtyUnusedImport(builder: *ProgramBuilder) !void {
+    try builder.append(
+        \\
+        \\const unused_{d} = @import("builtin");
+        \\
+    , .{builder.sequence});
+    builder.sequence += 1;
+}
+
+/// A main path nested under a condition whose else branch only returns.
+fn emitDirtyNestedMainPath(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    try builder.append(
+        \\fn {s}(values: []const u32) error{{Empty}}!u32 {{
+        \\    var first: u32 = 0;
+        \\    if (values.len != 0) {{
+        \\        first = values[0];
+        \\    }} else {{
+        \\        return error.Empty;
+        \\    }}
+        \\    return first +| {d};
+        \\}}
+        \\
+    , .{ function, builder.random.intRangeAtMost(u8, 1, 9) });
+}
+
+/// Adjacent prongs with one body.
+fn emitDirtyRepeatedProngs(builder: *ProgramBuilder) !void {
+    const function = try builder.functionName();
+    defer builder.allocator.free(function);
+    const value = builder.random.intRangeAtMost(u8, 1, 200);
+    try builder.append(
+        \\const Pace{d} = enum {{ fast, turbo, safe }};
+        \\fn {s}(pace: Pace{d}) u8 {{
+        \\    return switch (pace) {{
+        \\        .fast => {d},
+        \\        .turbo => {d},
+        \\        .safe => 0,
+        \\    }};
+        \\}}
+        \\
+    , .{ builder.sequence, function, builder.sequence, value, value });
+    builder.sequence += 1;
+}
+
 const dirty_templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitDirtyCounter,
     emitDirtyLastElement,
@@ -1258,6 +2173,12 @@ const dirty_templates = [_]*const fn (*ProgramBuilder) anyerror!void{
     emitDirtyAffixes,
     emitDirtyErrorExpectation,
     emitDirtyDeferredUnreachable,
+    emitDirtyContinuedGuard,
+    emitDirtyDeferredReset,
+    emitDirtyUnusedImport,
+    emitDirtyNestedMainPath,
+    emitDirtyRepeatedProngs,
+    emitDirtyFieldExpectations,
 };
 
 fn generateCleanProgram(allocator: std.mem.Allocator, seed: u64) ![:0]const u8 {
@@ -1459,6 +2380,11 @@ test "fixes of every rule on generated programs parse, lower and compile" {
         .redundant_optional_unwrap,
         .unsafe_orelse_unreachable,
         .prefer_doctest,
+        .unbraced_multiline_if,
+        .needless_defer_block,
+        .unused_import,
+        .prefer_early_return,
+        .combine_identical_switch_prongs,
     }) |rule| {
         if (verdict.fixed_rules.contains(rule)) continue;
         std.debug.print("no generated program had a fix for {s}\n", .{rule.code()});
@@ -1571,9 +2497,19 @@ test "a seeded project defect is still reported" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var files = try allocator.dupe(project_rules.SourceFile, try generateProject(allocator, 0));
-    files[0].source = "const part0 = @import(\"part0.zig\");\n";
+    files[0].source =
+        \\const part0 = @import("part0.zig");
+        \\/// Walks without a bound.
+        \\pub fn walk(depth: u32) u32 {
+        \\    return walk(depth + 1);
+        \\}
+        \\
+    ;
     const found = try project_rules.findings(allocator, files, everythingOnConfiguration());
-    try std.testing.expect(found.len != 0);
+    for (found) |entry| {
+        if (entry.file_index == 0 and entry.finding.rule == .recursive_call) return;
+    }
+    return error.TestExpectedSeededFinding;
 }
 
 test "every rule survives generated projects" {

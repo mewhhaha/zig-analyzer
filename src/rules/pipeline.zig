@@ -4,12 +4,15 @@
 const std = @import("std");
 
 const syntax_scope = @import("../syntax/scope.zig");
-const tokenize = @import("../syntax/tokens.zig").tokenize;
+const tokens_util = @import("../syntax/tokens.zig");
+const tokenize = tokens_util.tokenize;
 const configuration_parser = @import("configuration.zig");
 const generated_source_detection = @import("generated_source.zig");
 const containers = @import("semantic/containers.zig");
 const Syntax = @import("context.zig").Syntax;
 const registry = @import("registry.zig");
+const RuleRun = @import("context.zig").RuleRun;
+const unused_suppression = @import("style/unused_suppression.zig");
 const types = @import("types.zig");
 const support = @import("test_support.zig");
 
@@ -30,7 +33,15 @@ pub const Options = struct {
     scopes: ?*const syntax_scope.Index = null,
     resolved_shapes: []const types.ResolvedShape = &.{},
     module_members: []const types.ModuleMembers = &.{},
+    module_exposure: types.ModuleExposure = .whole,
 };
+
+/// Why a file `tokens.excessiveNesting` flags has no findings: it is skipped
+/// rather than parsed.
+pub const excessive_nesting_notice = std.fmt.comptimePrint(
+    "skipped: nested too deeply to parse safely (over {d} levels of brackets or {d} 'else if' links)",
+    .{ tokens_util.max_nesting_depth, tokens_util.max_else_if_chain },
+);
 
 pub fn findings(
     allocator: std.mem.Allocator,
@@ -47,16 +58,21 @@ pub fn findingsWith(
     options: Options,
 ) ![]Finding {
     if (generated_source_detection.isTranslateCOutput(source)) return &.{};
+    const file_configuration = if (generated_source_detection.hasGeneratedHeader(source))
+        configuration_parser.forGeneratedSource(configuration)
+    else
+        configuration;
+    const owned_tokens = if (options.tokens == null) try tokenize(allocator, source) else null;
+    defer if (owned_tokens) |owned| allocator.free(owned);
+    const tokens = options.tokens orelse owned_tokens.?;
+    if (tokens_util.excessiveNesting(tokens) != null) return &.{};
     var owned_tree: ?std.zig.Ast = null;
     defer if (owned_tree) |*owned| owned.deinit(allocator);
     const tree: *const std.zig.Ast = options.tree orelse tree: {
         owned_tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
         break :tree &owned_tree.?;
     };
-    if (options.tokens) |tokens| return try findingsFromSyntax(allocator, source, tree, tokens, configuration, options);
-    const tokens = try tokenize(allocator, source);
-    defer allocator.free(tokens);
-    return try findingsFromSyntax(allocator, source, tree, tokens, configuration, options);
+    return try findingsFromSyntax(allocator, source, tree, tokens, file_configuration, options);
 }
 
 /// Only the `unresolved_member` findings that follow from `modules`, the
@@ -71,6 +87,7 @@ pub fn moduleMemberFindings(
     modules: []const types.ModuleMembers,
 ) ![]Finding {
     if (modules.len == 0 or configuration.level(.unresolved_member) == .off) return &.{};
+    if (tokens_util.excessiveNesting(tokens) != null) return &.{};
     var syntax = try Syntax.init(allocator, source, tokens);
     defer syntax.deinit(allocator);
     var found: std.ArrayList(Finding) = .empty;
@@ -101,7 +118,7 @@ fn findingsFromSyntax(
     const suppressions = try Suppressions.init(allocator, source);
     defer suppressions.deinit(allocator);
 
-    try registry.run(.{
+    const run: RuleRun = .{
         .allocator = allocator,
         .source = source,
         .tokens = tokens,
@@ -111,8 +128,13 @@ fn findingsFromSyntax(
         .scopes = scope_index,
         .resolved_shapes = options.resolved_shapes,
         .module_members = options.module_members,
-    });
+        .module_exposure = options.module_exposure,
+    };
+    try registry.run(run);
     suppressions.filter(&found);
+    if (!suppressions.isEmpty() and configuration.level(.unused_suppression) != .off) {
+        try unused_suppression.run(run, &suppressions);
+    }
 
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
@@ -357,6 +379,51 @@ test "a caller-provided tree gives the same findings as parsing in the driver" {
     }
 }
 
+test "a file nested past the parser's depth limit is skipped instead of overflowing the stack" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var every_rule = Configuration.defaults();
+    @memset(&every_rule.levels, .information);
+
+    const blob = try repeated(allocator, &.{ .{ "const x = ", 1 }, .{ "(", 100_000 }, .{ "1", 1 }, .{ ")", 100_000 }, .{ ";\n", 1 } });
+    try std.testing.expectEqual(@as(usize, 0), (try findings(allocator, blob, every_rule)).len);
+    const unclosed = try repeated(allocator, &.{ .{ "fn f() void {", 1 }, .{ "{(", 50_000 } });
+    try std.testing.expectEqual(@as(usize, 0), (try findings(allocator, unclosed, every_rule)).len);
+    const modules = [_]types.ModuleMembers{.{ .receiver = "x", .members = &.{} }};
+    try std.testing.expectEqual(@as(usize, 0), (try moduleMemberFindings(allocator, blob, try tokenize(allocator, blob), every_rule, &modules)).len);
+
+    // At the limit itself every rule still runs within a Debug build's stack.
+    const half = tokens_util.max_nesting_depth / 2;
+    const at_limit = try repeated(allocator, &.{
+        .{ "fn f(a: u32) u32 {", 1 },
+        .{ "{ _ = a; ", half - 1 },
+        .{ "return ", 1 },
+        .{ "(a + ", half },
+        .{ "1", 1 },
+        .{ ")", half },
+        .{ ";", 1 },
+        .{ "}", half },
+        .{ "\n", 1 },
+    });
+    try std.testing.expect(tokens_util.excessiveNesting(try tokenize(allocator, at_limit)) == null);
+    _ = try findings(allocator, at_limit, every_rule);
+    const longest_chain = try repeated(allocator, &.{
+        .{ "fn g(a: u32) u32 { if (a == 0) { return 0; }", 1 },
+        .{ " else if (a == 1) { return 1; }", tokens_util.max_else_if_chain },
+        .{ " return 2; }\n", 1 },
+    });
+    try std.testing.expect(tokens_util.excessiveNesting(try tokenize(allocator, longest_chain)) == null);
+    _ = try findings(allocator, longest_chain, every_rule);
+}
+
+/// `parts` joined, each repeated its count of times.
+fn repeated(allocator: std.mem.Allocator, parts: []const struct { []const u8, usize }) ![:0]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    for (parts) |part| for (0..part[1]) |_| try text.appendSlice(allocator, part[0]);
+    return try text.toOwnedSliceSentinel(allocator, 0);
+}
+
 test "scope-sensitive quick fixes are excluded from fix all" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -384,7 +451,7 @@ test "lint profiles enable official idiomatic and strict rules incrementally" {
     const official = try parseConfiguration(std.testing.allocator,
         \\{"lints":{"profile":"official"}}
     );
-    try std.testing.expectEqual(LintProfile.official, official.lint_profile);
+    try std.testing.expect(official.lint_profiles.contains(.official));
     try std.testing.expectEqual(Level.information, official.level(.redundant_qualified_name));
     try std.testing.expectEqual(Level.off, official.level(.prefer_optional_capture));
 

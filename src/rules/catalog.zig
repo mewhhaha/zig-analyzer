@@ -164,11 +164,14 @@ pub fn entry(rule: Rule) *const Entry {
     return &table[@backingInt(rule)];
 }
 
+/// The analyzer's home page, which the rule pages live under.
+pub const repository_url = "https://github.com/mewhhaha/zig-analyzer";
+
 /// The rule's page in the repository, which every diagnostic links to.
 pub fn documentationUrl(rule: Rule) []const u8 {
     @setEvalBranchQuota(100_000);
     return switch (rule) {
-        inline else => |known| "https://github.com/mewhhaha/zig-analyzer/blob/main/docs/rules/" ++ comptime known.code() ++ ".md",
+        inline else => |known| repository_url ++ "/blob/main/docs/rules/" ++ comptime known.code() ++ ".md",
     };
 }
 
@@ -185,7 +188,7 @@ test "every entry is coherent" {
         errdefer std.debug.print("incoherent catalog entry {s}\n", .{rule.code()});
         try std.testing.expectEqual(rule, row.rule);
         try std.testing.expect(row.summary.len != 0);
-        try std.testing.expect(row.summary[row.summary.len - 1] == '.');
+        try std.testing.expectEqual('.', row.summary[row.summary.len - 1]);
         try std.testing.expect(std.mem.findScalar(u8, row.summary, '\n') == null);
         if (row.tier == .semantic) {
             try std.testing.expectEqual(@as(?LintProfile, null), row.profile);
@@ -623,10 +626,10 @@ const entries = [_]Entry{
         .rule = .vague_type_name,
         .tier = .style,
         .profile = .strict,
-        .summary = "Reports type names containing generic words that do not describe a domain role.",
+        .summary = "Reports a public type named by a bare generic word (`Data`, `State`, `Value`) that does not describe a domain role.",
         .reference = "https://ziglang.org/documentation/master/#Avoid-Redundancy-in-Names",
         .example = .{ .source =
-        \\pub const Context = struct { key: u32 };
+        \\pub const Data = struct { key: u32 };
         },
     },
     .{
@@ -666,15 +669,15 @@ const entries = [_]Entry{
         .summary = "Reports a doc comment that merely repeats information already supplied by the declaration name.",
         .reference = "https://ziglang.org/documentation/master/#Doc-Comment-Guidance",
         .example = .{ .source =
-        \\/// render draws the frame.
-        \\pub fn render() void {}
+        \\/// renderFrame renders the frame.
+        \\pub fn renderFrame() void {}
         },
     },
     .{
         .rule = .public_declaration_docs,
         .tier = .style,
         .profile = .strict,
-        .summary = "Reports a public declaration on its file's public surface without a doc comment.",
+        .summary = "Reports a public declaration on a module root's public surface without a doc comment.",
         .reference = "https://ziglang.org/documentation/master/#Doc-Comment-Guidance",
         .example = .{ .source =
         \\pub fn run() void {}
@@ -1002,12 +1005,12 @@ const entries = [_]Entry{
         .profile = .strict,
         .summary = "Reports a catch that converts every error to `null` or another empty optional result.",
         .example = .{ .source =
-        \\fn parse(text: []const u8) ?u32 {
-        \\    return parseInt(text) catch null;
+        \\fn cachedSize(path: []const u8) ?u32 {
+        \\    return readSize(path) catch null;
         \\}
         \\
-        \\fn parseInt(text: []const u8) !u32 {
-        \\    return @intCast(text.len);
+        \\fn readSize(path: []const u8) !u32 {
+        \\    return @intCast(path.len);
         \\}
         },
     },
@@ -1439,8 +1442,11 @@ const entries = [_]Entry{
         .rule = .prefer_index_of,
         .tier = .style,
         .profile = .idiomatic,
+        .fixes = .quick_fix,
         .summary = "Reports a simple loop whose only purpose is comparing elements and returning a matching index or boolean presence result.",
         .example = .{ .source =
+        \\const std = @import("std");
+        \\
         \\fn find(items: []const u32, needle: u32) ?usize {
         \\    for (items, 0..) |item, i| {
         \\        if (item == needle) return i;
@@ -1528,6 +1534,7 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_expression_initializer,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports a local initialized with `undefined` and then assigned exactly once by every branch of an adjacent `if` or `switch`.",
         .example = .{ .source =
         \\fn pick(flag: bool) u32 {
@@ -1544,6 +1551,7 @@ const entries = [_]Entry{
     .{
         .rule = .combine_identical_switch_prongs,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports adjacent switch prongs with identical bodies and no payload capture.",
         .example = .{ .source =
         \\fn run(n: u8) u8 {
@@ -1593,6 +1601,7 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_orelse,
         .tier = .style,
+        .fixes = .fix_all,
         .summary = "Reports an optional `if` expression whose present branch returns the captured payload unchanged.",
         .example = .{ .source =
         \\fn valueOr(opt: ?u32) u32 {
@@ -1603,6 +1612,7 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_starts_with,
         .tier = .style,
+        .fixes = .fix_all,
         .summary = "Reports `std.mem.find(..., haystack, needle) == 0` (including legacy `indexOf` calls) prefix tests.",
         .example = .{ .source =
         \\const std = @import("std");
@@ -1615,6 +1625,7 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_ends_with,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports a length-guarded `std.mem.eql` comparison against the tail slice of the same sequence.",
         .example = .{ .source =
         \\const std = @import("std");
@@ -1627,8 +1638,11 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_count_scalar,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports a loop that increments one counter for elements equal to one scalar.",
         .example = .{ .source =
+        \\const std = @import("std");
+        \\
         \\fn countOf(values: []const u8, needle: u8) usize {
         \\    var count: usize = 0;
         \\    for (values) |value| {
@@ -1643,8 +1657,11 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_replace_scalar,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports a pointer-capture loop that replaces every element equal to one scalar.",
         .example = .{ .source =
+        \\const std = @import("std");
+        \\
         \\fn replace(values: []u8, old: u8, replacement: u8) void {
         \\    for (values) |*value| {
         \\        if (value.* == old) {
@@ -1657,6 +1674,7 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_multi_sequence_for,
         .tier = .style,
+        .fixes = .quick_fix,
         .summary = "Reports a zero-based indexed `for` that uses its index only to read a second sequence with an asserted equal length.",
         .example = .{ .source =
         \\const std = @import("std");
@@ -1674,14 +1692,17 @@ const entries = [_]Entry{
     .{
         .rule = .prefer_early_return,
         .tier = .style,
-        .summary = "Reports an `if` whose `else` block contains only a return.",
+        .fixes = .quick_fix,
+        .summary = "Reports an `if` whose `else` block contains only a return while the main path continues.",
         .example = .{ .source =
-        \\fn parse(s: []const u8) !u32 {
-        \\    if (s.len > 0) {
-        \\        return s[0];
+        \\fn first(items: []const u32) !u32 {
+        \\    var value: u32 = 0;
+        \\    if (items.len != 0) {
+        \\        value = items[0];
         \\    } else {
         \\        return error.Empty;
         \\    }
+        \\    return value + 1;
         \\}
         },
     },
@@ -1707,6 +1728,7 @@ const entries = [_]Entry{
         .rule = .prefer_string_switch,
         .tier = .style,
         .profile = .idiomatic,
+        .fixes = .quick_fix,
         .summary = "Reports three or more adjacent-style `std.mem.eql` string comparisons that map the same subject to simple values.",
         .example = .{ .source =
         \\const std = @import("std");
@@ -1858,7 +1880,7 @@ const entries = [_]Entry{
         .tier = .style,
         .profile = .modernize,
         .fixes = .fix_all,
-        .summary = "Reports removed Zig 0.17 syntax: `@cImport`, obvious array multiplication expressions using `**`, `void{}`, `errdefer` error captures, and the `i0` primitive type.",
+        .summary = "Reports removed syntax: `@cImport`, obvious array multiplication expressions using `**`, `void{}`, `errdefer` error captures and the `i0` primitive type (Zig 0.17), `usingnamespace` (0.15), and the `async`, `await`, `suspend` and `resume` keywords of async functions.",
         .example = .{ .source =
         \\const unit = void{};
         },
@@ -1868,7 +1890,7 @@ const entries = [_]Entry{
         .tier = .style,
         .profile = .modernize,
         .fixes = .fix_all,
-        .summary = "Reports removed `std.Build.args` and `LazyPath.basename` access, the deprecated `addTranslateC` build step, Windows resource compilation APIs, legacy Run argument wrappers, `lazyDependency`, and the old two-argument `findProgram` call.",
+        .summary = "Reports removed `std.Build.args` and `LazyPath.basename` access, the deprecated `addTranslateC` build step, Windows resource compilation APIs, deprecated Run argument wrappers, `lazyDependency`, and the old two-argument `findProgram` call.",
         .example = .{ .source =
         \\const std = @import("std");
         \\
@@ -1951,6 +1973,36 @@ const entries = [_]Entry{
         },
     },
     .{
+        .rule = .modernize_reify_type,
+        .tier = .style,
+        .profile = .modernize,
+        .fixes = .fix_all,
+        .summary = "Reports `@Type` calls, which Zig 0.16 replaced with `@Int`, `@Struct`, `@Tuple`, `@Union`, `@Enum`, `@Pointer`, `@Fn` and `@EnumLiteral`, rewriting integer, enum-literal and primitive reifications.",
+        .reference = "https://ziglang.org/download/0.16.0/release-notes.html",
+        .example = .{ .source =
+        \\const Byte = @Type(.{ .int = .{ .signedness = .unsigned, .bits = 8 } });
+        },
+    },
+    .{
+        .rule = .legacy_format_method,
+        .tier = .correctness,
+        .summary = "Reports a `format` method with the pre-0.15 `(self, comptime fmt, options, writer)` signature, which `std.fmt` no longer calls.",
+        .reference = "https://ziglang.org/download/0.15.1/release-notes.html",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\const Point = struct {
+        \\    x: i32,
+        \\
+        \\    pub fn format(self: Point, comptime fmt: []const u8, options: std.fmt.Options, writer: *std.Io.Writer) !void {
+        \\        _ = fmt;
+        \\        _ = options;
+        \\        try writer.print("({d})", .{self.x});
+        \\    }
+        \\};
+        },
+    },
+    .{
         .rule = .prefer_div_ceil,
         .tier = .style,
         .profile = .idiomatic,
@@ -1975,7 +2027,7 @@ const entries = [_]Entry{
         .rule = .assertion_free_branching,
         .tier = .style,
         .profile = .disciplined,
-        .summary = "Reports a nontrivial function with computed indexing but no visible assertion, unreachable arm, loop bound, or early-exit bounds validation.",
+        .summary = "Reports a function that asserts nothing yet indexes by a computed index that no loop bound, length check, or early exit limits.",
         .example = .{ .source =
         \\fn pick(table: []const u32, key: u32, mode: u32) u32 {
         \\    var total: u32 = 0;
@@ -2032,7 +2084,9 @@ const entries = [_]Entry{
         .settings = .line_length,
         .summary = "Reports source lines wider than the configured number of display columns.",
         .example = .{ .source =
-        \\const message = "this string literal is deliberately long so that the whole declaration line goes past one hundred columns";
+        \\fn volume(width: u32, height: u32, depth: u32) u32 {
+        \\    return width * height * depth + width * height + height * depth + depth * width + width + height + depth;
+        \\}
         },
     },
     .{
@@ -2697,8 +2751,8 @@ const entries = [_]Entry{
         .rule = .pointer_to_allocator,
         .tier = .style,
         .profile = .idiomatic,
-        .fixes = .fix_all,
-        .summary = "Reports function parameters or struct fields typed as `*std.mem.Allocator` or `*Allocator`.",
+        .fixes = .quick_fix,
+        .summary = "Reports struct fields, and function parameters used only through their members, typed as a pointer to `std.mem.Allocator` under any alias.",
         .example = .{ .source =
         \\const std = @import("std");
         \\
@@ -2874,9 +2928,11 @@ const entries = [_]Entry{
         .tier = .style,
         .profile = .idiomatic,
         .fixes = .fix_all,
-        .summary = "Reports writing a single character via `writeAll` or `print`, recommending `writeByte` instead.",
+        .summary = "Reports writing a single character via `writeAll` or `print` on a writer, recommending `writeByte` instead.",
         .example = .{ .source =
-        \\fn newline(writer: anytype) !void {
+        \\const std = @import("std");
+        \\
+        \\fn newline(writer: *std.Io.Writer) !void {
         \\    try writer.writeAll("\n");
         \\}
         },
@@ -2949,7 +3005,7 @@ const entries = [_]Entry{
     .{
         .rule = .unflushed_writer,
         .tier = .correctness,
-        .summary = "Reports a buffered `std.Io` file or stream writer that is written but never flushed, ended, returned, stored, or passed to a callee that flushes it.",
+        .summary = "Reports a buffered `std.Io` file or stream writer that is written but not flushed on every path: never flushed, flushed only in a branch, or left behind by an early `return`.",
         .example = .{ .source =
         \\const std = @import("std");
         \\
@@ -2989,6 +3045,164 @@ const entries = [_]Entry{
         \\        count += 1;
         \\    } else |_| {}
         \\    return count;
+        \\}
+        },
+    },
+    .{
+        .rule = .unused_suppression,
+        .tier = .style,
+        .profile = .idiomatic,
+        .fixes = .quick_fix,
+        .summary = "Reports a suppression directive, or a rule it names, that suppressed no finding of an enabled rule.",
+        .example = .{ .source =
+        \\fn answer() u32 {
+        \\    // zig-analyzer: disable-next-line
+        \\    return 42;
+        \\}
+        },
+    },
+    .{
+        .rule = .uninitialized_getorput_value,
+        .tier = .correctness,
+        .summary = "Reports a read, in-place update, or method call through the `value_ptr` of a `getOrPut` result before the value is assigned on the path where `found_existing` is false.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn count(gpa: std.mem.Allocator, counts: *std.AutoHashMapUnmanaged(u32, u32), key: u32) !void {
+        \\    const gop = try counts.getOrPut(gpa, key);
+        \\    gop.value_ptr.* += 1;
+        \\}
+        },
+    },
+    .{
+        .rule = .missing_deinit_poison,
+        .tier = .style,
+        .profile = .strict,
+        .fixes = .quick_fix,
+        .summary = "Reports a `deinit` method that releases resources through a mutable receiver pointer but does not end with `self.* = undefined;`.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\const Buffer = struct {
+        \\    bytes: []u8,
+        \\
+        \\    fn deinit(self: *Buffer, gpa: std.mem.Allocator) void {
+        \\        gpa.free(self.bytes);
+        \\    }
+        \\};
+        },
+    },
+    .{
+        .rule = .assumed_concurrency,
+        .tier = .correctness,
+        .summary = "Reports `std.Io` `concurrent` calls whose `error.ConcurrencyUnavailable` is discarded with `catch unreachable`.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn work() void {}
+        \\
+        \\fn start(io: std.Io) void {
+        \\    var pending = io.concurrent(work, .{}) catch unreachable;
+        \\    pending.await(io);
+        \\}
+        },
+    },
+    .{
+        .rule = .identity_operation,
+        .tier = .correctness,
+        .summary = "Reports an operation whose literal operand fixes the result, such as `x * 0`, `x & 0`, or an integer `x % 1`, and an assignment such as `x += 0` or `x *= 1` that changes nothing.",
+        .example = .{ .source =
+        \\fn area(width: u32, height: u32) u32 {
+        \\    return width * height * 0;
+        \\}
+        },
+    },
+    .{
+        .rule = .unsigned_comparison_constant,
+        .tier = .correctness,
+        .summary = "Reports `x >= 0` (always true) and `x < 0` (always false), or the mirrored forms, when `x` is proven unsigned by its declared type, a `for` range capture, or `.len`.",
+        .example = .{ .source =
+        \\fn hasItems(items: []const u8) bool {
+        \\    return items.len >= 0;
+        \\}
+        },
+    },
+    .{
+        .rule = .never_loop,
+        .tier = .correctness,
+        .summary = "Reports a `while` or `for` loop whose body ends with an unconditional `break` or `return` and has no `continue` for the loop, so it never runs a second iteration.",
+        .example = .{ .source =
+        \\fn firstEven(values: []const u32) ?u32 {
+        \\    for (values) |value| {
+        \\        if (value % 2 == 1) return null;
+        \\        return value;
+        \\    }
+        \\    return null;
+        \\}
+        },
+    },
+    .{
+        .rule = .mutated_range_bound,
+        .tier = .correctness,
+        .summary = "Reports an assignment to a local `var` used as a `for` range bound inside that loop's body, which does not change how many times the loop runs.",
+        .example = .{ .source =
+        \\fn dropZeros(values: []u32) usize {
+        \\    var count = values.len;
+        \\    for (0..count) |index| {
+        \\        if (values[index] == 0) {
+        \\            values[index] = values[count - 1];
+        \\            count -= 1;
+        \\        }
+        \\    }
+        \\    return count;
+        \\}
+        },
+    },
+    .{
+        .rule = .unused_local,
+        .tier = .semantic,
+        .fixes = .quick_fix,
+        .summary = "Reports a local constant or variable, function parameter, or capture that nothing references, which AstGen rejects.",
+        .example = .{ .source =
+        \\pub fn main() void {
+        \\    const answer = 42;
+        \\}
+        },
+    },
+    .{
+        .rule = .pointless_discard,
+        .tier = .semantic,
+        .fixes = .fix_all,
+        .summary = "Reports `_ = x;` for a local binding that is also referenced elsewhere, which AstGen rejects as a pointless discard.",
+        .example = .{ .source =
+        \\fn double(value: u32) u32 {
+        \\    _ = value;
+        \\    return value * 2;
+        \\}
+        },
+    },
+    .{
+        .rule = .unreachable_code,
+        .tier = .semantic,
+        .fixes = .quick_fix,
+        .summary = "Reports statements after `return`, `break`, `continue`, `unreachable`, `@panic`, `@trap`, or `@compileError` in the same block, which AstGen rejects as unreachable code.",
+        .example = .{ .source =
+        \\fn answer() u32 {
+        \\    return 42;
+        \\    @import("std").debug.print("done\n", .{});
+        \\}
+        },
+    },
+    .{
+        .rule = .misplaced_try,
+        .tier = .semantic,
+        .fixes = .quick_fix,
+        .summary = "Reports `try` outside any function body, and `try` on a provably fallible call in a function whose declared return type is not an error union; the compiler rejects both.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn duplicate(gpa: std.mem.Allocator, name: []const u8) []u8 {
+        \\    return try gpa.dupe(u8, name);
         \\}
         },
     },

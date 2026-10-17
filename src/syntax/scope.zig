@@ -2,6 +2,7 @@ const std = @import("std");
 const tokenize = @import("tokens.zig").tokenize;
 const tokenText = @import("tokens.zig").tokenText;
 const tokenIs = @import("tokens.zig").tokenIs;
+const identifierName = @import("tokens.zig").identifierName;
 const enclosingOpeningBrace = @import("tokens.zig").enclosingOpeningBrace;
 const matchingToken = @import("tokens.zig").matchingToken;
 
@@ -20,10 +21,16 @@ pub const Binding = struct {
 };
 
 pub const none_token: u32 = std.math.maxInt(u32);
+/// A `LexicalScope.parenthesis` left to the backward scan.
+const unknown_token: u32 = none_token - 1;
 
 const LexicalScope = struct {
     opening: ?usize,
     closing: usize,
+    /// What `enclosingOpeningParenthesis` returns for the token (`none_token`
+    /// for null), so finding parameters does not scan back over every field
+    /// of a container; `unknown_token` when the scan has to tell.
+    parenthesis: u32 = unknown_token,
 };
 
 pub const Index = struct {
@@ -34,6 +41,12 @@ pub const Index = struct {
     usingnamespace_scopes: std.ArrayList(std.zig.Token.Loc) = .empty,
     matching_tokens: []u32 = &.{},
     enclosing_braces: []u32 = &.{},
+    /// Every named `fn` declaration with a body, sorted by the body's `{`.
+    function_bodies: []FunctionBody = &.{},
+    /// Built by the first `identifiers` call; most indexes never need it.
+    identifier_table: std.atomic.Value(?*IdentifierTable) = .init(null),
+
+    pub const FunctionBody = struct { keyword: u32, body: u32 };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -80,7 +93,14 @@ pub const Index = struct {
             else => {},
         };
         scope_openings.clearRetainingCapacity();
+        var parentheses: ParenthesisTracker = .{ .nested = tokens.len < unknown_token };
+        defer parentheses.groups.deinit(allocator);
+        try parentheses.groups.ensureTotalCapacity(allocator, 32);
         for (tokens, 0..) |token, token_index| {
+            // Only `name:`, a parameter candidate, reads it.
+            const parenthesis = if (token.tag == .identifier and token_index + 1 < tokens.len and
+                tokens[token_index + 1].tag == .colon) parentheses.current() else unknown_token;
+            try parentheses.step(allocator, token.tag, token_index);
             if (token.tag == .r_brace) _ = scope_openings.pop();
             index.enclosing_braces[token_index] = if (scope_openings.last()) |opening|
                 opening
@@ -88,14 +108,14 @@ pub const Index = struct {
                 none_token;
             if (token.tag == .identifier) {
                 const lexical_scope: LexicalScope = if (scope_openings.last()) |opening|
-                    .{ .opening = opening, .closing = index.matchingToken(opening) orelse tokens.len - 1 }
+                    .{ .opening = opening, .closing = index.matchingToken(opening) orelse tokens.len - 1, .parenthesis = parenthesis }
                 else
-                    .{ .opening = null, .closing = tokens.len - 1 };
+                    .{ .opening = null, .closing = tokens.len - 1, .parenthesis = parenthesis };
                 if (bindingWithIndex(tokens, source, token_index, lexical_scope, &index)) |unindexed_candidate| {
                     var candidate = unindexed_candidate;
                     candidate.alias_target = aliasTarget(source, tokens, token_index);
                     candidate.scope_rank = if (scope_openings.last()) |opening| opening + 1 else 0;
-                    const entry = try index.bindings.getOrPut(allocator, tokenText(source, token));
+                    const entry = try index.bindings.getOrPut(allocator, identifierName(tokenText(source, token)));
                     if (!entry.found_existing) entry.value_ptr.* = .empty;
                     try entry.value_ptr.append(allocator, candidate);
                 }
@@ -110,6 +130,22 @@ pub const Index = struct {
             }
             if (token.tag == .l_brace and token_index <= std.math.maxInt(u32)) try scope_openings.append(allocator, @intCast(token_index));
         }
+        var function_bodies: std.ArrayList(FunctionBody) = .empty;
+        errdefer function_bodies.deinit(allocator);
+        for (tokens, 0..) |token, keyword| {
+            if (token.tag != .keyword_fn or keyword + 2 >= tokens.len or tokens[keyword + 1].tag != .identifier or
+                tokens[keyword + 2].tag != .l_paren or keyword > std.math.maxInt(u32)) continue;
+            const parameters_end = index.matchingToken(keyword + 2) orelse continue;
+            const body = functionBodyAfterParametersWithIndex(tokens, parameters_end, &index) orelse continue;
+            try function_bodies.append(allocator, .{ .keyword = @intCast(keyword), .body = @intCast(body) });
+        }
+        // A function declared inside another's return type has its body first.
+        std.mem.sort(FunctionBody, function_bodies.items, {}, struct {
+            fn lessThan(_: void, left: FunctionBody, right: FunctionBody) bool {
+                return left.body < right.body;
+            }
+        }.lessThan);
+        index.function_bodies = try function_bodies.toOwnedSlice(allocator);
         var binding_lists = index.bindings.valueIterator();
         while (binding_lists.next()) |bindings| {
             std.mem.sort(Binding, bindings.items, {}, struct {
@@ -130,7 +166,66 @@ pub const Index = struct {
         index.usingnamespace_scopes.deinit(index.allocator);
         index.allocator.free(index.matching_tokens);
         index.allocator.free(index.enclosing_braces);
+        index.allocator.free(index.function_bodies);
+        if (index.identifier_table.load(.acquire)) |table| {
+            table.deinit(index.allocator);
+            index.allocator.destroy(table);
+        }
     }
+
+    /// The file's identifiers by spelling, built by the first caller. Threads
+    /// sharing an index may race to build it; the first table published wins.
+    pub fn identifiers(index: *const Index) !*const IdentifierTable {
+        // The table is a cache: filling it does not change what the index answers.
+        const slot = &@constCast(index).identifier_table;
+        if (slot.load(.acquire)) |table| return table;
+        const table = try index.allocator.create(IdentifierTable);
+        errdefer index.allocator.destroy(table);
+        table.* = try .init(index.allocator, index.source, index.tokens);
+        if (slot.cmpxchgStrong(null, table, .acq_rel, .acquire)) |published| {
+            table.deinit(index.allocator);
+            index.allocator.destroy(table);
+            return published.?;
+        }
+        return table;
+    }
+
+    /// The identifiers spelled exactly `name` in `[start, end)`, in token
+    /// order: looked up in the identifier table once `identifiers` has built
+    /// it, and scanned from the tokens until then, so a pass that asks for the
+    /// table first gets the lookups and every caller gets the same answers.
+    pub fn identifiersNamed(index: *const Index, name: []const u8, start: usize, end: usize) NameIterator {
+        const bounded_end = @min(end, index.tokens.len);
+        if (index.identifier_table.load(.acquire)) |table| {
+            return .{ .index = index, .name = name, .positions = table.within(name, start, bounded_end), .cursor = 0, .end = bounded_end };
+        }
+        return .{ .index = index, .name = name, .positions = null, .cursor = start, .end = bounded_end };
+    }
+
+    pub const NameIterator = struct {
+        index: *const Index,
+        name: []const u8,
+        /// The table's positions in range, or null when scanning tokens.
+        positions: ?[]const u32,
+        /// The next position in `positions`, or the next token to scan.
+        cursor: usize,
+        end: usize,
+
+        pub fn next(iterator: *NameIterator) ?usize {
+            if (iterator.positions) |positions| {
+                if (iterator.cursor >= positions.len) return null;
+                defer iterator.cursor += 1;
+                return positions[iterator.cursor];
+            }
+            while (iterator.cursor < iterator.end) {
+                const token_index = iterator.cursor;
+                iterator.cursor += 1;
+                const token = iterator.index.tokens[token_index];
+                if (token.tag == .identifier and std.mem.eql(u8, tokenText(iterator.index.source, token), iterator.name)) return token_index;
+            }
+            return null;
+        }
+    };
 
     pub fn findBinding(index: *const Index, use_index: usize) ?Binding {
         if (use_index >= index.tokens.len or index.tokens[use_index].tag != .identifier) return null;
@@ -141,7 +236,7 @@ pub const Index = struct {
     /// binding it refers to.
     pub fn resolve(index: *const Index, token_index: usize) ?Binding {
         if (token_index >= index.tokens.len or index.tokens[token_index].tag != .identifier) return null;
-        if (index.bindings.get(tokenText(index.source, index.tokens[token_index]))) |candidates| {
+        if (index.bindings.get(identifierName(tokenText(index.source, index.tokens[token_index])))) |candidates| {
             for (candidates.items) |candidate| if (candidate.token_index == token_index) return candidate;
         }
         return index.findBinding(token_index);
@@ -163,9 +258,10 @@ pub const Index = struct {
         return declaration + 3 >= tokens.len or tokens[declaration + 3].tag != .period;
     }
 
+    /// The binding `name` (spelled plainly or as `@"name"`) refers to at `use_index`.
     pub fn findBindingNamed(index: *const Index, name: []const u8, use_index: usize) ?Binding {
         if (use_index >= index.tokens.len) return null;
-        const candidates = index.bindings.get(name) orelse return null;
+        const candidates = index.bindings.get(identifierName(name)) orelse return null;
         const occurrence = index.tokens[use_index].loc;
         var low: usize = 0;
         var high = candidates.items.len;
@@ -180,7 +276,12 @@ pub const Index = struct {
         while (cursor > 0) {
             cursor -= 1;
             const candidate = candidates.items[cursor];
-            if (spanContains(candidate.scope, occurrence)) return candidate;
+            if (!spanContains(candidate.scope, occurrence)) continue;
+            // Only the quoted spelling reaches an `@"u8"` declaration; a plain
+            // `u8` is always the primitive.
+            if ((name.len == 0 or name[0] != '@') and index.source[index.tokens[candidate.token_index].loc.start] == '@' and
+                std.zig.isPrimitive(name)) return null;
+            return candidate;
         }
         return null;
     }
@@ -231,18 +332,53 @@ pub const Index = struct {
         return null;
     }
 
-    /// Whether `token_index` is inside a function or test body that no
-    /// container declaration encloses more closely.
-    pub fn insideFunctionOrTestBody(index: *const Index, token_index: usize) bool {
+    /// Opening brace of the innermost named `fn` declaration body that
+    /// strictly contains `token_index`, looking through nested blocks and
+    /// containers. Unlike `enclosingFunctionBody`, `test` blocks do not count,
+    /// and the body is found by parsing the signature, so braces in a return
+    /// type (`error{...}!T`, `struct {...}`) do not hide it.
+    pub fn functionBodyContaining(index: *const Index, token_index: usize) ?usize {
+        if (token_index >= index.enclosing_braces.len) return null;
+        // The raw table leaves a body's own braces outside it.
+        var brace = index.enclosing_braces[token_index];
+        while (brace != none_token) : (brace = index.enclosing_braces[brace]) {
+            if (index.functionKeyword(brace) != null) return brace;
+        }
+        return null;
+    }
+
+    /// The `fn` keyword of the declaration whose body opens at `body`.
+    pub fn functionKeyword(index: *const Index, body: usize) ?usize {
+        var low: usize = 0;
+        var high = index.function_bodies.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const candidate = index.function_bodies[middle];
+            if (candidate.body == body) return candidate.keyword;
+            if (candidate.body < body) low = middle + 1 else high = middle;
+        }
+        return null;
+    }
+
+    /// Opening brace of the innermost function or test body holding
+    /// `token_index`, or null when a container declaration holds it more
+    /// closely.
+    pub fn functionOrTestBodyHolding(index: *const Index, token_index: usize) ?usize {
         var brace = index.enclosingOpeningBrace(token_index);
         while (brace) |opening| : (brace = index.enclosingOpeningBrace(opening)) {
             switch (index.braceKind(opening)) {
-                .function => return true,
-                .container => return false,
+                .function => return opening,
+                .container => return null,
                 .block => {},
             }
         }
-        return false;
+        return null;
+    }
+
+    /// Whether `token_index` is inside a function or test body that no
+    /// container declaration encloses more closely.
+    pub fn insideFunctionOrTestBody(index: *const Index, token_index: usize) bool {
+        return index.functionOrTestBodyHolding(token_index) != null;
     }
 
     /// Whether `token_index` is inside a `test` block, looking through nested
@@ -259,15 +395,25 @@ pub const Index = struct {
         return false;
     }
 
-    const BraceKind = enum { function, container, block };
+    pub const BraceKind = enum { function, container, block };
 
-    /// What the signature before the `{` at `opening` introduces.
-    fn braceKind(index: *const Index, opening: usize) BraceKind {
+    /// What the `{` at `opening` opens. A function body is the one its
+    /// signature's parse found (`function_bodies`), so braces in a return
+    /// type (`error{...}!T`, `struct {...}`) neither hide the body nor count
+    /// as one.
+    pub fn braceKind(index: *const Index, opening: usize) BraceKind {
+        if (index.functionKeyword(opening) != null) return .function;
+        const tokens = index.tokens;
+        if (opening > 0) {
+            const before = tokens[opening - 1].tag;
+            if (before == .keyword_test) return .function;
+            if (opening >= 2 and tokens[opening - 2].tag == .keyword_test and
+                (before == .string_literal or before == .identifier)) return .function;
+        }
         var cursor = opening;
         while (cursor > 0) {
             cursor -= 1;
-            switch (index.tokens[cursor].tag) {
-                .keyword_fn, .keyword_test => return .function,
+            switch (tokens[cursor].tag) {
                 .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return .container,
                 .semicolon, .l_brace, .r_brace => break,
                 else => {},
@@ -290,6 +436,58 @@ pub const Index = struct {
         return false;
     }
 
+    /// The first token of the statement holding `token_index` in its innermost
+    /// block. The groups before it and around it and braced literals
+    /// (`.{...}`, `T{...}`, `[_]T{...}`) belong to the statement; a block that
+    /// closes before it ends the previous one.
+    pub fn statementStart(index: *const Index, token_index: usize) usize {
+        var cursor = token_index;
+        while (cursor > 0) {
+            const previous = cursor - 1;
+            switch (index.tokens[previous].tag) {
+                .semicolon, .l_brace => return cursor,
+                .r_paren, .r_bracket => cursor = index.matchingToken(previous) orelse return cursor,
+                .r_brace => {
+                    const opening = index.matchingToken(previous) orelse return cursor;
+                    if (opening == 0) return cursor;
+                    switch (index.tokens[opening - 1].tag) {
+                        .period, .identifier, .r_bracket => cursor = opening,
+                        else => return cursor,
+                    }
+                },
+                else => cursor = previous,
+            }
+        }
+        return cursor;
+    }
+
+    /// `statementEnd` of every token inside the block opened at `opening`,
+    /// found in one backward pass, for a pass that asks it of many tokens of
+    /// one block: a scan from each `return` of a long `switch` reads the rest
+    /// of the switch.
+    pub fn statementEndsIn(index: *const Index, allocator: std.mem.Allocator, opening: usize) !StatementEnds {
+        const closing = index.matchingToken(opening) orelse return .{ .opening = opening, .ends = &.{} };
+        if (closing <= opening) return .{ .opening = opening, .ends = &.{} };
+        const ends = try allocator.alloc(u32, closing - opening + 1);
+        // A `;` ends at itself, a `}` that is reached ends the scan without
+        // one, and a group goes on after its closer.
+        ends[closing - opening] = none_token;
+        var position = closing;
+        while (position > opening + 1) {
+            position -= 1;
+            ends[position - opening] = switch (index.tokens[position].tag) {
+                .semicolon => @intCast(position),
+                .r_brace => none_token,
+                .l_paren, .l_bracket, .l_brace => if (index.matchingToken(position)) |matching|
+                    if (matching < closing) ends[matching + 1 - opening] else none_token
+                else
+                    none_token,
+                else => ends[position + 1 - opening],
+            };
+        }
+        return .{ .opening = opening, .ends = ends };
+    }
+
     /// The `;` ending the statement that starts at `start`, or null when none
     /// ends inside the block holding `start` (on unbalanced input a group's
     /// closer can lie past the end of that block).
@@ -306,6 +504,109 @@ pub const Index = struct {
             cursor += 1;
         }
         return null;
+    }
+};
+
+/// `Index.statementEnd` for the tokens of one block (`Index.statementEndsIn`).
+pub const StatementEnds = struct {
+    opening: usize,
+    /// By position after `opening`, through the block's `}`; `none_token`
+    /// for none. Empty when the block has no closing brace.
+    ends: []u32,
+
+    pub fn deinit(statement_ends: *StatementEnds, allocator: std.mem.Allocator) void {
+        allocator.free(statement_ends.ends);
+    }
+
+    /// `Index.statementEnd(start)` for `start` after the block's `{`, through its `}`.
+    pub fn at(statement_ends: StatementEnds, index: *const Index, start: usize) ?usize {
+        if (start <= statement_ends.opening or start - statement_ends.opening >= statement_ends.ends.len) return index.statementEnd(start);
+        const end = statement_ends.ends[start - statement_ends.opening];
+        return if (end == none_token) null else end;
+    }
+};
+
+/// The identifier tokens of a file grouped by exact spelling (`@"name"` and
+/// `name` are different spellings), each group in token order.
+pub const IdentifierTable = struct {
+    positions: []u32 = &.{},
+    groups: std.StringHashMapUnmanaged(Group) = .empty,
+
+    const Group = struct { start: u32, len: u32 };
+
+    /// One hash lookup per identifier numbers its spelling; the numbers then
+    /// place every identifier in its spelling's group.
+    fn init(allocator: std.mem.Allocator, source: []const u8, tokens: []const std.zig.Token) !IdentifierTable {
+        var table: IdentifierTable = .{};
+        errdefer table.deinit(allocator);
+        if (tokens.len > std.math.maxInt(u32)) return error.OutOfMemory;
+        var spellings: std.ArrayList(u32) = .empty;
+        defer spellings.deinit(allocator);
+        var counts: std.ArrayList(u32) = .empty;
+        defer counts.deinit(allocator);
+        try table.groups.ensureTotalCapacity(allocator, @intCast(tokens.len / 16 + 16));
+        for (tokens) |token| {
+            if (token.tag != .identifier) continue;
+            const entry = try table.groups.getOrPut(allocator, tokenText(source, token));
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{ .start = @intCast(counts.items.len), .len = 0 };
+                try counts.append(allocator, 0);
+            }
+            counts.items[entry.value_ptr.start] += 1;
+            try spellings.append(allocator, entry.value_ptr.start);
+        }
+        // Each spelling's first slot, then its next free slot as positions fill.
+        var next_start: u32 = 0;
+        for (counts.items) |*count| {
+            const group_start = next_start;
+            next_start += count.*;
+            count.* = group_start;
+        }
+        var groups = table.groups.valueIterator();
+        while (groups.next()) |group| {
+            const spelling = group.start;
+            group.start = counts.items[spelling];
+            group.len = (if (spelling + 1 < counts.items.len) counts.items[spelling + 1] else next_start) - group.start;
+        }
+        table.positions = try allocator.alloc(u32, spellings.items.len);
+        var identifier: usize = 0;
+        for (tokens, 0..) |token, token_index| {
+            if (token.tag != .identifier) continue;
+            const slot = &counts.items[spellings.items[identifier]];
+            table.positions[slot.*] = @intCast(token_index);
+            slot.* += 1;
+            identifier += 1;
+        }
+        return table;
+    }
+
+    fn deinit(table: *IdentifierTable, allocator: std.mem.Allocator) void {
+        allocator.free(table.positions);
+        table.groups.deinit(allocator);
+    }
+
+    /// The positions of the identifiers spelled exactly `name`.
+    pub fn all(table: *const IdentifierTable, name: []const u8) []const u32 {
+        const group = table.groups.get(name) orelse return &.{};
+        return table.positions[group.start..][0..group.len];
+    }
+
+    /// The positions of the identifiers spelled exactly `name` in `[start, end)`.
+    pub fn within(table: *const IdentifierTable, name: []const u8, start: usize, end: usize) []const u32 {
+        const positions = table.all(name);
+        const first = std.sort.partitionPoint(u32, positions, start, positionBefore);
+        const last = first + std.sort.partitionPoint(u32, positions[first..], end, positionBefore);
+        return positions[first..last];
+    }
+
+    /// The first identifier spelled exactly `name` in `[start, end)`.
+    pub fn firstWithin(table: *const IdentifierTable, name: []const u8, start: usize, end: usize) ?usize {
+        const positions = table.within(name, start, end);
+        return if (positions.len == 0) null else positions[0];
+    }
+
+    fn positionBefore(bound: usize, position: u32) bool {
+        return position < bound;
     }
 };
 
@@ -358,10 +659,13 @@ pub fn findBinding(
     use_index: usize,
 ) ?Binding {
     if (use_index >= tokens.len or tokens[use_index].tag != .identifier) return null;
-    const name = tokenText(source, tokens[use_index]);
+    const spelling = tokenText(source, tokens[use_index]);
+    // A plain primitive spelling never refers to a quoted `@"u8"` declaration.
+    if ((spelling.len == 0 or spelling[0] != '@') and std.zig.isPrimitive(spelling)) return null;
+    const name = identifierName(spelling);
     var selected: ?Binding = null;
     for (tokens, 0..) |token, candidate_index| {
-        if (token.tag != .identifier or !std.mem.eql(u8, tokenText(source, token), name)) continue;
+        if (token.tag != .identifier or !std.mem.eql(u8, identifierName(tokenText(source, token)), name)) continue;
         const candidate = binding(tokens, source, candidate_index, null) orelse continue;
         if (!spanContains(candidate.scope, tokens[use_index].loc)) continue;
         if (selected == null or scopeLength(candidate.scope) < scopeLength(selected.?.scope) or
@@ -434,8 +738,8 @@ fn bindingWithIndex(
                 initializerKind(source, tokens, identifier_index),
         };
     }
-    if (identifierIsFunctionParameter(tokens, identifier_index, opt_idx)) {
-        const body = functionBodyAfterParameter(tokens, identifier_index, opt_idx) orelse return null;
+    if (identifierIsFunctionParameter(tokens, identifier_index, lexical_scope, opt_idx)) {
+        const body = functionBodyAfterParameter(tokens, identifier_index, lexical_scope, opt_idx) orelse return null;
         const closing = if (opt_idx) |idx| idx.matchingToken(body) orelse return null else matchingToken(tokens, body, .l_brace, .r_brace) orelse return null;
         return .{
             .token_index = identifier_index,
@@ -554,16 +858,16 @@ fn declarationScopeWithIndex(
     };
 }
 
-fn identifierIsFunctionParameter(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) bool {
+fn identifierIsFunctionParameter(tokens: []const std.zig.Token, index: usize, lexical_scope: ?LexicalScope, opt_idx: ?*const Index) bool {
     if (index + 1 >= tokens.len or tokens[index + 1].tag != .colon) return false;
-    const opening = enclosingOpeningParenthesis(tokens, index) orelse return false;
+    const opening = enclosingOpeningParenthesisIn(tokens, index, lexical_scope) orelse return false;
     if (opening < 2 or tokens[opening - 1].tag != .identifier or tokens[opening - 2].tag != .keyword_fn) return false;
     const closing = if (opt_idx) |idx| idx.matchingToken(opening) orelse return false else matchingToken(tokens, opening, .l_paren, .r_paren) orelse return false;
     return index < closing;
 }
 
-fn functionBodyAfterParameter(tokens: []const std.zig.Token, index: usize, opt_idx: ?*const Index) ?usize {
-    const opening = enclosingOpeningParenthesis(tokens, index) orelse return null;
+fn functionBodyAfterParameter(tokens: []const std.zig.Token, index: usize, lexical_scope: ?LexicalScope, opt_idx: ?*const Index) ?usize {
+    const opening = enclosingOpeningParenthesisIn(tokens, index, lexical_scope) orelse return null;
     const closing = if (opt_idx) |idx| idx.matchingToken(opening) orelse return null else matchingToken(tokens, opening, .l_paren, .r_paren) orelse return null;
     return functionBodyAfterParametersWithIndex(tokens, closing, opt_idx);
 }
@@ -902,6 +1206,54 @@ fn enclosingOpeningBraceWithIndex(tokens: []const std.zig.Token, index: usize, o
     return enclosingOpeningBrace(tokens, index);
 }
 
+/// `enclosingOpeningParenthesis`, from `lexical_scope` when that knows it.
+fn enclosingOpeningParenthesisIn(tokens: []const std.zig.Token, index: usize, lexical_scope: ?LexicalScope) ?usize {
+    const known = if (lexical_scope) |scope| scope.parenthesis else unknown_token;
+    if (known == unknown_token) return enclosingOpeningParenthesis(tokens, index);
+    return if (known == none_token) null else known;
+}
+
+/// `enclosingOpeningParenthesis` of each token of a forward pass. While each
+/// closer closes the innermost open group, that scan skips the closed groups
+/// before a token and stops at the innermost open one: a `(` is the answer, a
+/// `{` or a `;` directly inside it ends the scan, and a `[` is looked through.
+/// Past a closer that does not, the scan's separate depth counts no longer
+/// follow the nesting, and the answers are `unknown_token`.
+const ParenthesisTracker = struct {
+    groups: std.ArrayList(Group) = .empty,
+    /// Token indexes must fit below the sentinels.
+    nested: bool,
+
+    const Group = struct {
+        closer: std.zig.Token.Tag,
+        /// What tokens directly inside the group resolve to.
+        parenthesis: u32,
+    };
+
+    /// The answer for the token `step` is given next.
+    fn current(tracker: *const ParenthesisTracker) u32 {
+        if (!tracker.nested) return unknown_token;
+        return if (tracker.groups.last()) |group| group.parenthesis else none_token;
+    }
+
+    fn step(tracker: *ParenthesisTracker, allocator: std.mem.Allocator, tag: std.zig.Token.Tag, token_index: usize) !void {
+        if (!tracker.nested) return;
+        switch (tag) {
+            .l_paren => try tracker.groups.append(allocator, .{ .closer = .r_paren, .parenthesis = @intCast(token_index) }),
+            .l_brace => try tracker.groups.append(allocator, .{ .closer = .r_brace, .parenthesis = none_token }),
+            .l_bracket => try tracker.groups.append(allocator, .{ .closer = .r_bracket, .parenthesis = tracker.current() }),
+            .r_paren, .r_brace, .r_bracket => {
+                const closes_innermost = if (tracker.groups.pop()) |group| group.closer == tag else false;
+                if (!closes_innermost) tracker.nested = false;
+            },
+            .semicolon => if (tracker.groups.lastPtr()) |group| {
+                group.parenthesis = none_token;
+            },
+            else => {},
+        }
+    }
+};
+
 fn enclosingOpeningParenthesis(tokens: []const std.zig.Token, index: usize) ?usize {
     var parenthesis_depth: usize = 0;
     var brace_depth: usize = 0;
@@ -1113,6 +1465,90 @@ test "index scans agree with the token scans at every token" {
     }
 }
 
+test "block statement ends agree with statementEnd at every token" {
+    const sources = [_][:0]const u8{
+        nested_blocks_source,
+        \\fn f(k: u8, xs: []u8) !u8 {
+        \\    switch (k) {
+        \\        0 => return 1,
+        \\        1 => return error.Bad,
+        \\        else => {},
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < xs.len) : (i = i + 1) { xs[i] = .{ .a = 1, .b = (2) }[0]; }
+        \\    if (k > 2) |c| g(c) else return 0;
+        \\    return @intCast(i);
+        \\}
+        ,
+    };
+    for (sources) |source| {
+        const tokens = try tokenize(std.testing.allocator, source);
+        defer std.testing.allocator.free(tokens);
+        var index = try Index.init(std.testing.allocator, source, tokens);
+        defer index.deinit();
+        for (tokens, 0..) |token, opening| {
+            if (token.tag != .l_brace) continue;
+            var ends = try index.statementEndsIn(std.testing.allocator, opening);
+            defer ends.deinit(std.testing.allocator);
+            const closing = index.matchingToken(opening) orelse continue;
+            for (opening + 1..closing + 1) |start| {
+                try std.testing.expectEqual(index.statementEnd(start), ends.at(&index, start));
+            }
+        }
+    }
+}
+
+test "identifier positions agree with a token scan over every range" {
+    const tokens = try tokenize(std.testing.allocator, nested_blocks_source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, nested_blocks_source, tokens);
+    defer index.deinit();
+    for ([_]bool{ false, true }) |built| {
+        const identifiers = if (built) try index.identifiers() else null;
+        for (tokens) |named| {
+            if (named.tag != .identifier) continue;
+            const name = tokenText(nested_blocks_source, named);
+            for (0..tokens.len + 1) |start| {
+                const end = @min(tokens.len, start + 7);
+                var expected: std.ArrayList(u32) = .empty;
+                defer expected.deinit(std.testing.allocator);
+                for (tokens[start..end], start..) |token, token_index| {
+                    if (token.tag == .identifier and std.mem.eql(u8, tokenText(nested_blocks_source, token), name)) {
+                        try expected.append(std.testing.allocator, @intCast(token_index));
+                    }
+                }
+                var named_positions = index.identifiersNamed(name, start, end);
+                for (expected.items) |position| try std.testing.expectEqual(@as(usize, position), named_positions.next().?);
+                try std.testing.expectEqual(null, named_positions.next());
+                const table = identifiers orelse continue;
+                try std.testing.expectEqualSlices(u32, expected.items, table.within(name, start, end));
+                try std.testing.expectEqual(
+                    if (expected.items.len == 0) null else @as(usize, expected.items[0]),
+                    table.firstWithin(name, start, end),
+                );
+            }
+        }
+    }
+    try std.testing.expectEqual(0, (try index.identifiers()).all("absent").len);
+}
+
+test "the index stays iterative over brackets nested far past the parser's limit" {
+    // Dependencies read from disk are indexed without being parsed, so a file
+    // the parse guard skips still reaches the index.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    try text.appendSlice(std.testing.allocator, "fn f() void {");
+    for (0..50_000) |_| try text.appendSlice(std.testing.allocator, "{ const a = (");
+    try text.append(std.testing.allocator, 0);
+    const source = text.items[0 .. text.items.len - 1 :0];
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    try std.testing.expectEqual(@as(?usize, tokens.len - 6), index.enclosingOpeningBrace(tokens.len - 4));
+    _ = index.resolve(tokens.len - 4);
+}
+
 test "fallible operations between two tokens agree with the token scan" {
     const source: [:0]const u8 =
         \\fn run(allocator: Allocator) !void {
@@ -1188,6 +1624,54 @@ test "function bodies are found through nested blocks and stop at containers" {
     try std.testing.expect(index.insideFunctionOrTestBody(test_variable));
 }
 
+test "declaration bodies are found past braces in return types and skip test blocks" {
+    const source: [:0]const u8 =
+        \\fn failing() error{Oops}!void {
+        \\    const a = 1;
+        \\}
+        \\fn shaped() struct { ok: bool } {
+        \\    const Inner = struct {
+        \\        fn method() void { const b = 2; }
+        \\        field: u8 = 3,
+        \\    };
+        \\    return .{ .ok = Inner.c };
+        \\}
+        \\test "case" { const d = 4; }
+        \\
+    ;
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    const failing_body = indexOfText(source, tokens, "{", 1);
+    const shaped_body = indexOfText(source, tokens, "{", 3);
+    const method_body = indexOfText(source, tokens, "{", 5);
+    try std.testing.expectEqual(@as(?usize, failing_body), index.functionBodyContaining(indexOfText(source, tokens, "a", 0)));
+    try std.testing.expectEqual(@as(?usize, indexOfText(source, tokens, "fn", 0)), index.functionKeyword(failing_body));
+    try std.testing.expectEqual(@as(?usize, method_body), index.functionBodyContaining(indexOfText(source, tokens, "b", 0)));
+    // Container fields inside a body, and the body's own braces, belong to the enclosing function.
+    try std.testing.expectEqual(@as(?usize, shaped_body), index.functionBodyContaining(indexOfText(source, tokens, "field", 0)));
+    try std.testing.expectEqual(@as(?usize, shaped_body), index.functionBodyContaining(method_body));
+    try std.testing.expectEqual(@as(?usize, null), index.functionBodyContaining(shaped_body));
+    try std.testing.expectEqual(@as(?usize, null), index.functionBodyContaining(index.matchingToken(shaped_body).?));
+    try std.testing.expectEqual(@as(?usize, null), index.functionKeyword(indexOfText(source, tokens, "{", 2)));
+    try std.testing.expectEqual(@as(?usize, null), index.functionBodyContaining(indexOfText(source, tokens, "d", 0)));
+    // The scope walks agree: a braced return type neither hides the body nor
+    // counts as one.
+    const a = indexOfText(source, tokens, "a", 0);
+    try std.testing.expectEqual(@as(?usize, failing_body), index.enclosingFunctionBody(a));
+    try std.testing.expectEqual(@as(?usize, failing_body), index.functionOrTestBodyHolding(a));
+    try std.testing.expect(index.insideFunctionOrTestBody(a));
+    try std.testing.expect(!index.insideFunctionOrTestBody(indexOfText(source, tokens, "Oops", 0)));
+    try std.testing.expectEqual(@as(?usize, null), index.enclosingFunctionBody(indexOfText(source, tokens, "Oops", 0)));
+    try std.testing.expectEqual(Index.BraceKind.block, index.braceKind(indexOfText(source, tokens, "{", 0)));
+    try std.testing.expectEqual(Index.BraceKind.container, index.braceKind(indexOfText(source, tokens, "{", 2)));
+    try std.testing.expectEqual(@as(?usize, shaped_body), index.functionOrTestBodyHolding(indexOfText(source, tokens, "return", 0)));
+    try std.testing.expectEqual(@as(?usize, null), index.functionOrTestBodyHolding(indexOfText(source, tokens, "field", 0)));
+    try std.testing.expectEqual(@as(?usize, null), index.functionOrTestBodyHolding(indexOfText(source, tokens, "ok", 0)));
+    try std.testing.expect(index.insideFunctionOrTestBody(indexOfText(source, tokens, "d", 0)));
+}
+
 test "test blocks are found through the blocks and containers declared in them" {
     const source: [:0]const u8 =
         "fn run() void { const plain = 1; }\n" ++
@@ -1203,6 +1687,24 @@ test "test blocks are found through the blocks and containers declared in them" 
     try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "nested", 0)));
     try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "block", 0)));
     try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "anonymous", 0)));
+}
+
+test "statement starts look past groups and literals but not earlier blocks" {
+    const source: [:0]const u8 =
+        "fn run() void {\n" ++
+        "    if (ready) { prepare(); }\n" ++
+        "    defer report(.{ .code = 1 }, [_]u8{ 2 }, Point{ .x = 3 }) catch first;\n" ++
+        "    call(nested(inner) catch second);\n" ++
+        "}\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    const deferred = indexOfText(source, tokens, "defer", 0);
+    try std.testing.expectEqual(deferred, index.statementStart(indexOfText(source, tokens, "first", 0)));
+    try std.testing.expectEqual(indexOfText(source, tokens, "call", 0), index.statementStart(indexOfText(source, tokens, "second", 0)));
+    try std.testing.expectEqual(indexOfText(source, tokens, "prepare", 0), index.statementStart(indexOfText(source, tokens, "prepare", 0) + 1));
+    try std.testing.expectEqual(@as(usize, 0), index.statementStart(0));
 }
 
 test "usingnamespace uncertainty is limited to its container" {
@@ -1398,4 +1900,56 @@ test "test-only bodies are private functions only tests and other test-only func
     const expected = [_][]const u8{ "scenario", "fixture", "left", "right", "method" };
     try std.testing.expectEqual(expected.len, inside.items.len);
     for (expected, inside.items) |name, found| try std.testing.expectEqualStrings(name, found);
+}
+
+fn expectTrackedParenthesesMatchScan(tokens: []const std.zig.Token) !void {
+    var tracker: ParenthesisTracker = .{ .nested = true };
+    defer tracker.groups.deinit(std.testing.allocator);
+    for (tokens, 0..) |token, token_index| {
+        const tracked = tracker.current();
+        try tracker.step(std.testing.allocator, token.tag, token_index);
+        if (tracked == unknown_token) continue;
+        const expected = enclosingOpeningParenthesis(tokens, token_index);
+        try std.testing.expectEqual(expected, if (tracked == none_token) null else @as(?usize, tracked));
+    }
+}
+
+test "tracked enclosing parentheses agree with the backward scan" {
+    const sources = [_][:0]const u8{
+        "const Big = struct { a: u8, b: u16 = 0, c: [n: 0]u8, };\n",
+        "fn run(a: u8, b: struct { c: u8 }, d: [k: 0]u8) void { call(e: u8); const f = (g: { h; }); }\n",
+        "fn broken(a: u8 }, b: u8) void { x(]; y: u8, }\n",
+    };
+    for (sources) |source| {
+        const tokens = try tokenize(std.testing.allocator, source);
+        defer std.testing.allocator.free(tokens);
+        try expectTrackedParenthesesMatchScan(tokens);
+    }
+    // Generated delimiter sequences, mostly well nested, some not.
+    const tags = [_]std.zig.Token.Tag{ .l_paren, .r_paren, .l_brace, .r_brace, .l_bracket, .r_bracket, .semicolon, .identifier };
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const random = prng.random();
+    var tokens: [96]std.zig.Token = undefined;
+    for (0..400) |_| {
+        var open: std.ArrayList(std.zig.Token.Tag) = .empty;
+        defer open.deinit(std.testing.allocator);
+        for (&tokens, 0..) |*token, position| {
+            var tag = tags[random.uintLessThan(usize, tags.len)];
+            if (open.last()) |closer| if (random.uintLessThan(u8, 10) < 7) switch (tag) {
+                .r_paren, .r_brace, .r_bracket => tag = closer,
+                else => {},
+            };
+            switch (tag) {
+                .l_paren => try open.append(std.testing.allocator, .r_paren),
+                .l_brace => try open.append(std.testing.allocator, .r_brace),
+                .l_bracket => try open.append(std.testing.allocator, .r_bracket),
+                .r_paren, .r_brace, .r_bracket => if (open.last() == tag) {
+                    _ = open.pop();
+                },
+                else => {},
+            }
+            token.* = .{ .tag = tag, .loc = .{ .start = position, .end = position + 1 } };
+        }
+        try expectTrackedParenthesesMatchScan(&tokens);
+    }
 }

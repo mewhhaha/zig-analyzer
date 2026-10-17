@@ -12,7 +12,6 @@ const Options = struct {
 fn analyze(mode: Mode, enabled: bool, err: anyerror) void {
     // expect: never-mutated-var
     var attempts = 3;
-    _ = attempts;
 
     // expect: missing-struct-field
     _ = Options{};

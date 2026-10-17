@@ -126,7 +126,7 @@ fn resolve(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, en
         if (cursor + 1 >= end or context.tokens[cursor + 1].tag != .l_paren) return .unknown;
         const closing = scopes.matchingToken(cursor + 1) orelse return .unknown;
         if (closing >= end) return .unknown;
-        const comma = topLevelComma(context, scopes, cursor + 2, closing) orelse return .unknown;
+        const comma = context.topLevelComma(cursor + 2, closing) orelse return .unknown;
         family = instanceFamily(resolve(context, scopes, cursor + 2, comma, depth + 1));
         cursor = closing + 1;
     } else if (context.tokens[cursor].tag == .identifier) {
@@ -252,18 +252,6 @@ fn chainStart(context: RuleRun, scopes: *const syntax_scope.Index, final: usize)
         }
         while (start > 0 and context.tokens[start - 1].tag == .ampersand) start -= 1;
         return start;
-    }
-    return null;
-}
-
-fn topLevelComma(context: RuleRun, scopes: *const syntax_scope.Index, start: usize, end: usize) ?usize {
-    var cursor = start;
-    while (cursor < end) : (cursor += 1) {
-        switch (context.tokens[cursor].tag) {
-            .l_paren, .l_bracket, .l_brace => cursor = scopes.matchingToken(cursor) orelse return null,
-            .comma => return cursor,
-            else => {},
-        }
     }
     return null;
 }

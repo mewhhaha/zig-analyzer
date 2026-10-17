@@ -252,6 +252,20 @@ pub fn isIdentifier(name: []const u8) bool {
     return identifier.tag == .identifier and identifier.loc.end == name.len and tokenizer.next().tag == .eof;
 }
 
+/// Whether `name` spells a fixed-width integer type: `u8`, `i64`, `usize`,
+/// `c_int` and the other C integer types; `comptime_int` is not one.
+pub fn isIntegerTypeName(name: []const u8) bool {
+    const named = [_][]const u8{
+        "usize",  "isize",  "c_char",  "c_short",    "c_ushort",    "c_int",
+        "c_uint", "c_long", "c_ulong", "c_longlong", "c_ulonglong",
+    };
+    for (named) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    if (name.len < 2) return false;
+    if (name[0] != 'u' and name[0] != 'i') return false;
+    for (name[1..]) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 pub fn isDottedIdentifier(source: []const u8) bool {
     if (source.len == 0 or source[0] == '.' or source[source.len - 1] == '.') return false;
     var segment_start: usize = 0;

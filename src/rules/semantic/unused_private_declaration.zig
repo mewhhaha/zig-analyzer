@@ -3,6 +3,7 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
+const identifierName = @import("../../syntax/tokens.zig").identifierName;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
@@ -26,6 +27,8 @@ pub fn run(context: RuleRun) !void {
 const PrivateDeclaration = struct {
     name_index: usize,
     kind: enum { constant, function },
+    /// The `fn_decl` of a function; unused for a constant.
+    node: std.zig.Ast.Node.Index = .root,
 };
 
 fn findUnusedPrivateDeclarations(context: RuleRun) !void {
@@ -57,18 +60,26 @@ fn findUnusedPrivateDeclarations(context: RuleRun) !void {
         const keyword_index: usize = function.ast.fn_token;
         if (keyword_index + 1 >= tokens.len or tokens[keyword_index + 1].tag != .identifier or
             !declarationIsPrivate(tokens, keyword_index)) continue;
-        try declarations.append(context.allocator, .{ .name_index = keyword_index + 1, .kind = .function });
+        try declarations.append(context.allocator, .{ .name_index = keyword_index + 1, .kind = .function, .node = node });
     }
     if (declarations.items.len == 0) return;
-    var occurrence_counts: std.StringHashMapUnmanaged(usize) = .empty;
-    defer occurrence_counts.deinit(context.allocator);
-    for (tokens) |token| {
-        const entry = try occurrence_counts.getOrPutValue(context.allocator, tokenText(source, token), 0);
-        entry.value_ptr.* += 1;
-    }
     var reflected_names = try collectReflectedNames(context.allocator, context.scopes);
     defer reflected_names.names.deinit(context.allocator);
     if (reflected_names.wildcard) return;
+    // Only the declared names are counted, and only identifier tokens can
+    // spell one.
+    var occurrence_counts: std.StringHashMapUnmanaged(usize) = .empty;
+    defer occurrence_counts.deinit(context.allocator);
+    try occurrence_counts.ensureTotalCapacity(context.allocator, @intCast(declarations.items.len));
+    for (declarations.items) |declaration| {
+        occurrence_counts.putAssumeCapacity(tokenText(source, tokens[declaration.name_index]), 0);
+    }
+    for (tokens) |token| {
+        if (token.tag != .identifier) continue;
+        // `@"name"` refers to the declaration `name`.
+        const count = occurrence_counts.getPtr(identifierName(tokenText(source, token))) orelse continue;
+        count.* += 1;
+    }
     for (declarations.items) |declaration| {
         const name_token = tokens[declaration.name_index];
         const name = tokenText(source, name_token);
@@ -108,7 +119,7 @@ fn unusedDeclarationFixes(
     }
     const last_index: ?usize = switch (declaration.kind) {
         .constant => statementEnd(tokens, keyword_index),
-        .function => functionEnd(tree, declaration.name_index),
+        .function => functionEnd(tree, declaration.node),
     };
     const end_index = last_index orelse return &.{};
     const line_start = lineStart(source, tokens[declaration_start].loc.start);
@@ -122,17 +133,15 @@ fn unusedDeclarationFixes(
     return fixes;
 }
 
-/// The last token of the function whose name token is `name_index`; a body
-/// cannot be found by scanning for `{`, since the return type may hold one
-/// (`error{Empty}!usize`).
-fn functionEnd(tree: *const std.zig.Ast, name_index: usize) ?usize {
-    for (0..tree.nodes.len) |raw_node| {
-        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const prototype, const body = tree.nodeData(node).node_and_node;
-        if (tree.nodeMainToken(prototype) + 1 == name_index) return tree.lastToken(body);
-    }
-    return null;
+/// The last token of the function declared by `function`, a `fn_decl`; a
+/// body cannot be found by scanning for `{`, since the return type may hold
+/// one (`error{Empty}!usize`).
+fn functionEnd(tree: *const std.zig.Ast, function: std.zig.Ast.Node.Index) ?usize {
+    // A recovered tree can hold prototypes without a return type, which
+    // `lastToken` cannot walk.
+    if (tree.errors.len != 0) return null;
+    _, const body = tree.nodeData(function).node_and_node;
+    return tree.lastToken(body);
 }
 
 fn declarationIsPrivate(tokens: []const std.zig.Token, keyword_index: usize) bool {
@@ -231,6 +240,16 @@ test "unused private declarations omit public used and reflected names" {
     try std.testing.expectEqual(@as(usize, 2), names.items.len);
     try std.testing.expectEqualStrings("unused", names.items[0]);
     try std.testing.expectEqualStrings("private_unused", names.items[1]);
+}
+
+test "a quoted reference uses a plainly spelled private declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn translate(message: []const u8) []const u8 { return message; }\n" ++
+        "pub fn run() void { _ = @\"translate\"(\"x\"); }\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unused_private_declaration}, .warning));
+    for (found) |finding| try std.testing.expect(finding.rule != .unused_private_declaration);
 }
 
 test "unused private declarations offer whole declaration removal" {

@@ -82,6 +82,9 @@ fn findSummaryContainerInvalidations(
     const iterator_level = run.configuration.level(.iterator_invalidated_during_loop);
     if (pointer_level == .off and iterator_level == .off) return;
     const scopes = try run.scopes(file_index);
+    var mutations: SummarizedMutations = .{};
+    var exits: Exits = .{};
+    const paths: PathTokens = try .init(run.allocator, file);
 
     for (file.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= file.tokens.len or
@@ -91,9 +94,11 @@ fn findSummaryContainerInvalidations(
         const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
 
         if (pointer_level != .off) {
-            if (borrowedElementPath(file, declaration_index + 2, declaration_end)) |path| {
-                if (firstSummarizedMutation(file, scopes, summary_index, path, declaration_end + 1, scope_end)) |mutation| {
-                    if (bindingUsedAfter(file, scopes, binding, mutation.method_index + 1, scope_end)) {
+            if (paths.borrowedElement(declaration_index + 2, declaration_end)) |path| {
+                const sites = try mutations.get(run.allocator, file, scopes, summary_index);
+                if (firstSummarizedMutation(file, sites, path, declaration_end + 1, scope_end)) |mutation| {
+                    _ = try scopes.identifiers();
+                    if (bindingUsedAfter(file, scopes, try exits.get(run.allocator, file, scopes), binding, mutation.method_index + 1, scope_end)) {
                         try run.report(.{
                             .file_index = file_index,
                             .rule = .invalidated_element_pointer,
@@ -109,9 +114,11 @@ fn findSummaryContainerInvalidations(
         }
 
         if (iterator_level == .off) continue;
-        const iterated_path = iteratorReceiverPath(file, declaration_index + 2, declaration_end) orelse continue;
-        const mutation = firstSummarizedMutation(file, scopes, summary_index, iterated_path, declaration_end + 1, scope_end) orelse continue;
-        if (!iteratorActiveAt(file, scopes, binding, mutation.method_index, declaration_end + 1, scope_end)) continue;
+        const iterated_path = paths.iteratorReceiver(file, declaration_index + 2, declaration_end) orelse continue;
+        const sites = try mutations.get(run.allocator, file, scopes, summary_index);
+        const mutation = firstSummarizedMutation(file, sites, iterated_path, declaration_end + 1, scope_end) orelse continue;
+        _ = try scopes.identifiers();
+        if (!iteratorActiveAt(file, scopes, paths, binding, mutation.method_index, declaration_end + 1, scope_end)) continue;
         try run.report(.{
             .file_index = file_index,
             .rule = .iterator_invalidated_during_loop,
@@ -124,58 +131,193 @@ fn findSummaryContainerInvalidations(
     }
 }
 
-fn borrowedElementPath(file: File, start: usize, end: usize) ?PathRange {
-    for (file.tokens[start..end], start..) |token, address_index| {
-        if (token.tag != .ampersand or address_index + 3 >= end) continue;
-        var items_index = address_index + 1;
-        while (items_index + 1 < end) : (items_index += 1) {
-            if (tokenIs(file.source, file.tokens[items_index], "items") and
-                file.tokens[items_index - 1].tag == .period and file.tokens[items_index + 1].tag == .l_bracket)
-            {
-                return .{ .start = address_index + 1, .end = items_index - 2 };
+/// The positions, in order, of every `&`, every `.items[` (the `items`) and
+/// every `.iterator(` (the `iterator`) of a file, so finding the first in a
+/// declaration does not rescan a declaration that holds a large container,
+/// and of every `while` and every `{`, so finding the loops around a
+/// mutation does not rescan the scope before it.
+const PathTokens = struct {
+    addresses: []const u32,
+    items: []const u32,
+    iterators: []const u32,
+    loops: []const u32,
+    braces: []const u32,
+
+    fn init(allocator: std.mem.Allocator, file: File) !PathTokens {
+        var addresses: std.ArrayList(u32) = .empty;
+        errdefer addresses.deinit(allocator);
+        var items: std.ArrayList(u32) = .empty;
+        errdefer items.deinit(allocator);
+        var iterators: std.ArrayList(u32) = .empty;
+        errdefer iterators.deinit(allocator);
+        var loops: std.ArrayList(u32) = .empty;
+        errdefer loops.deinit(allocator);
+        var braces: std.ArrayList(u32) = .empty;
+        errdefer braces.deinit(allocator);
+        for (file.tokens, 0..) |token, index| {
+            switch (token.tag) {
+                .ampersand => try addresses.append(allocator, @intCast(index)),
+                .keyword_while => try loops.append(allocator, @intCast(index)),
+                .l_brace => try braces.append(allocator, @intCast(index)),
+                else => {},
+            }
+            if (index == 0 or index + 1 >= file.tokens.len or file.tokens[index - 1].tag != .period) continue;
+            if (tokenIs(file.source, token, "items") and file.tokens[index + 1].tag == .l_bracket) {
+                try items.append(allocator, @intCast(index));
+            } else if (tokenIs(file.source, token, "iterator") and file.tokens[index + 1].tag == .l_paren) {
+                try iterators.append(allocator, @intCast(index));
             }
         }
-        // A later address is followed by no `.items[` either.
-        return null;
+        const owned_addresses = try addresses.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_addresses);
+        const owned_items = try items.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_items);
+        const owned_iterators = try iterators.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_iterators);
+        const owned_loops = try loops.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_loops);
+        return .{
+            .addresses = owned_addresses,
+            .items = owned_items,
+            .iterators = owned_iterators,
+            .loops = owned_loops,
+            .braces = try braces.toOwnedSlice(allocator),
+        };
     }
-    return null;
-}
 
-fn iteratorReceiverPath(file: File, start: usize, end: usize) ?PathRange {
-    for (file.tokens[start..end], start..) |token, method_index| {
-        if (!tokenIs(file.source, token, "iterator") or method_index < start + 2 or
-            file.tokens[method_index - 1].tag != .period or method_index + 1 >= end or
-            file.tokens[method_index + 1].tag != .l_paren) continue;
+    /// The first of `positions` in `[start, end)`.
+    fn first(positions: []const u32, start: usize, end: usize) ?usize {
+        const index = std.sort.lowerBound(u32, positions, start, order);
+        if (index == positions.len or positions[index] >= end) return null;
+        return positions[index];
+    }
+
+    /// The last of `positions` before `end`.
+    fn lastBefore(positions: []const u32, end: usize) ?usize {
+        const index = std.sort.lowerBound(u32, positions, end, order);
+        return if (index == 0) null else positions[index - 1];
+    }
+
+    fn order(target: usize, position: u32) std.math.Order {
+        return std.math.order(target, position);
+    }
+
+    /// The path `p` of the first `&p.items[` in `[start, end)`.
+    fn borrowedElement(paths: PathTokens, start: usize, end: usize) ?PathRange {
+        if (end < start + 4) return null;
+        const address_index = first(paths.addresses, start, end - 3) orelse return null;
+        // A later address is followed by no `.items[` either.
+        const items_index = first(paths.items, address_index + 1, end - 1) orelse return null;
+        return .{ .start = address_index + 1, .end = items_index - 2 };
+    }
+
+    /// The receiver path of the first `path.iterator(` in `[start, end)`.
+    fn iteratorReceiver(paths: PathTokens, file: File, start: usize, end: usize) ?PathRange {
+        if (end < start + 3) return null;
+        const method_index = first(paths.iterators, start + 2, end - 1) orelse return null;
         var path_start = method_index - 2;
         while (path_start >= start + 2 and file.tokens[path_start - 1].tag == .period and
             file.tokens[path_start - 2].tag == .identifier) path_start -= 2;
         return .{ .start = path_start, .end = method_index - 2 };
     }
-    return null;
-}
+};
 
 const SummaryMutation = struct { method_index: usize, method: []const u8 };
 
+/// A call `helper(...)` (not `receiver.helper(...)`) whose summary mutates a
+/// container its argument reaches.
+const MutationSite = struct {
+    /// `pathKey` of the argument's tokens and the mutated field: every path
+    /// `mutationArgumentMatchesPath` matches to the site has this key.
+    key: u64,
+    opening: u32,
+    closing: u32,
+    argument: PathRange,
+    mutation: summaries.ContainerMutation,
+
+    const Position = struct { key: u64, opening: usize };
+
+    fn order(position: Position, site: MutationSite) std.math.Order {
+        return std.math.order(position.key, site.key).differ() orelse std.math.order(position.opening, site.opening);
+    }
+
+    fn lessThan(_: void, left: MutationSite, right: MutationSite) bool {
+        return order(.{ .key = left.key, .opening = left.opening }, right) == .lt;
+    }
+};
+
+/// Every `MutationSite` of a file, by key and then in order, found the first
+/// time a declaration needs them, so a declaration reads only the sites in
+/// its scope whose argument could name its path.
+const SummarizedMutations = struct {
+    sites: ?[]const MutationSite = null,
+
+    fn get(
+        mutations: *SummarizedMutations,
+        allocator: std.mem.Allocator,
+        file: File,
+        scopes: *const syntax_scope.Index,
+        summary_index: summaries.Index,
+    ) ![]const MutationSite {
+        if (mutations.sites) |sites| return sites;
+        var sites: std.ArrayList(MutationSite) = .empty;
+        errdefer sites.deinit(allocator);
+        for (file.tokens, 0..) |token, opening| {
+            if (token.tag != .l_paren or opening == 0 or file.tokens[opening - 1].tag != .identifier or
+                (opening >= 2 and file.tokens[opening - 2].tag == .period)) continue;
+            const closing = scopes.matchingToken(opening) orelse continue;
+            const method = tokenText(file.source, file.tokens[opening - 1]);
+            const mutation = summary_index.containerMutationCall(file.source, null, method) orelse continue;
+            const argument = callArgumentRange(file.tokens, opening + 1, closing, mutation.parameter) orelse continue;
+            const path = argumentPath(file, argument);
+            try sites.append(allocator, .{
+                .key = pathKey(file, path.start, path.count, mutation.field),
+                .opening = @intCast(opening),
+                .closing = @intCast(closing),
+                .argument = argument,
+                .mutation = mutation,
+            });
+        }
+        std.mem.sort(MutationSite, sites.items, {}, MutationSite.lessThan);
+        const found = try sites.toOwnedSlice(allocator);
+        mutations.sites = found;
+        return found;
+    }
+};
+
 fn firstSummarizedMutation(
     file: File,
-    scopes: *const syntax_scope.Index,
-    summary_index: summaries.Index,
+    sites: []const MutationSite,
     expected_path: PathRange,
     start: usize,
     end: usize,
 ) ?SummaryMutation {
-    for (file.tokens[start..end], start..) |token, opening| {
-        if (token.tag != .l_paren or opening == 0 or file.tokens[opening - 1].tag != .identifier or
-            (opening >= 2 and file.tokens[opening - 2].tag == .period)) continue;
-        const closing = scopes.matchingToken(opening) orelse continue;
-        if (closing >= end) continue;
-        const method = tokenText(file.source, file.tokens[opening - 1]);
-        const mutation = summary_index.containerMutationCall(file.source, null, method) orelse continue;
-        const argument = callArgumentRange(file.tokens, opening + 1, closing, mutation.parameter) orelse continue;
-        if (!mutationArgumentMatchesPath(file, argument, mutation.field, expected_path)) continue;
-        return .{ .method_index = opening - 1, .method = method };
+    const key = pathKey(file, expected_path.start, expected_path.end + 1 - expected_path.start, "");
+    const first = std.sort.lowerBound(MutationSite, sites, MutationSite.Position{ .key = key, .opening = start }, MutationSite.order);
+    for (sites[first..]) |site| {
+        if (site.key != key or site.opening >= end) break;
+        if (site.closing >= end) continue;
+        if (!mutationArgumentMatchesPath(file, site.argument, site.mutation.field, expected_path)) continue;
+        return .{ .method_index = site.opening - 1, .method = tokenText(file.source, file.tokens[site.opening - 1]) };
     }
     return null;
+}
+
+/// A hash of the spellings of the `count` tokens from `first`, then of `.`
+/// and `field` when there is one: paths spelled alike hash alike.
+fn pathKey(file: File, first: usize, count: usize, field: []const u8) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    for (file.tokens[first..][0..count]) |token| hashSpelling(&hasher, tokenText(file.source, token));
+    if (field.len != 0) {
+        hashSpelling(&hasher, ".");
+        hashSpelling(&hasher, field);
+    }
+    return hasher.final();
+}
+
+fn hashSpelling(hasher: *std.hash.Wyhash, spelling: []const u8) void {
+    hasher.update(std.mem.asBytes(&spelling.len));
+    hasher.update(spelling);
 }
 
 fn callArgumentRange(tokens: []const std.zig.Token, start: usize, end: usize, wanted: usize) ?PathRange {
@@ -204,9 +346,9 @@ fn mutationArgumentMatchesPath(
     field: []const u8,
     expected: PathRange,
 ) bool {
-    var argument_start = argument.start;
-    if (argument_start <= argument.end and file.tokens[argument_start].tag == .ampersand) argument_start += 1;
-    const argument_count = if (argument_start <= argument.end) argument.end - argument_start + 1 else 0;
+    const path = argumentPath(file, argument);
+    const argument_start = path.start;
+    const argument_count = path.count;
     const expected_count = expected.end - expected.start + 1;
     const field_tokens: usize = if (field.len == 0) 0 else 2;
     if (argument_count + field_tokens != expected_count) return false;
@@ -222,18 +364,42 @@ fn mutationArgumentMatchesPath(
         tokenIs(file.source, file.tokens[expected.start + argument_count + 1], field);
 }
 
-fn iteratorActiveAt(file: File, scopes: *const syntax_scope.Index, iterator: []const u8, mutation: usize, start: usize, end: usize) bool {
-    for (file.tokens[start..end], start..) |token, while_index| {
-        if (token.tag != .keyword_while or while_index >= mutation) continue;
-        var body_start = while_index + 1;
-        while (body_start < mutation and file.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
-        if (body_start >= mutation) continue;
+/// The tokens of a mutation argument that a path spells: all but a leading `&`.
+fn argumentPath(file: File, argument: PathRange) struct { start: usize, count: usize } {
+    var start = argument.start;
+    if (start <= argument.end and file.tokens[start].tag == .ampersand) start += 1;
+    return .{ .start = start, .count = if (start <= argument.end) argument.end - start + 1 else 0 };
+}
+
+/// Whether a `while` in `[start, end)` before `mutation` calls
+/// `iterator.next(` between itself and the first `{` after it, and that `{`
+/// opens a block holding `mutation`. Reads the calls from the identifier
+/// table once a caller has built it.
+fn iteratorActiveAt(
+    file: File,
+    scopes: *const syntax_scope.Index,
+    paths: PathTokens,
+    iterator: []const u8,
+    mutation: usize,
+    start: usize,
+    end: usize,
+) bool {
+    // A `{` before `mutation` that closes after it, or never closes, is
+    // still open at it, so it is one of the braces enclosing it.
+    const loops_end = @min(end, mutation);
+    var brace = scopes.enclosingOpeningBrace(mutation);
+    while (brace) |body_start| : (brace = scopes.enclosingOpeningBrace(body_start)) {
+        if (body_start <= start) break;
         const body_end = scopes.matchingToken(body_start) orelse continue;
-        if (mutation >= body_end) continue;
-        var index = while_index + 1;
-        while (index + 3 < body_start) : (index += 1) {
-            if (tokenIs(file.source, file.tokens[index], iterator) and file.tokens[index + 1].tag == .period and
-                tokenIs(file.source, file.tokens[index + 2], "next") and file.tokens[index + 3].tag == .l_paren) return true;
+        if (body_start >= mutation or mutation >= body_end) continue;
+        // The loops whose first `{` this is follow the `{` before it, and
+        // the earliest one's condition range holds every later one's.
+        const loops_start = if (PathTokens.lastBefore(paths.braces, body_start)) |previous| @max(start, previous + 1) else start;
+        const loop = PathTokens.first(paths.loops, loops_start, @min(body_start, loops_end)) orelse continue;
+        var calls = scopes.identifiersNamed(iterator, loop + 1, body_start -| 3);
+        while (calls.next()) |index| {
+            if (file.tokens[index + 1].tag == .period and tokenIs(file.source, file.tokens[index + 2], "next") and
+                file.tokens[index + 3].tag == .l_paren) return true;
         }
     }
     return false;
@@ -286,6 +452,7 @@ fn findBorrowedReturnInvalidations(
     if (run.configuration.level(.invalidated_element_pointer) == .off and
         run.configuration.level(.invalidated_container_view) == .off) return;
     const scopes = try run.scopes(file_index);
+    var exits: Exits = .{};
     for (file.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
@@ -308,7 +475,8 @@ fn findBorrowedReturnInvalidations(
             scope_end,
         ) orelse continue;
         const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
-        if (!bindingUsedAfter(file, scopes, binding, invalidation.method_index + 1, scope_end)) continue;
+        _ = try scopes.identifiers();
+        if (!bindingUsedAfter(file, scopes, try exits.get(run.allocator, file, scopes), binding, invalidation.method_index + 1, scope_end)) continue;
         const rule: types.Rule = if (borrowed.kind == .pointer) .invalidated_element_pointer else .invalidated_container_view;
         const level = run.configuration.level(rule);
         if (level == .off) continue;
@@ -383,42 +551,96 @@ fn firstBorrowInvalidation(
     return null;
 }
 
-fn bindingUsedAfter(file: File, scopes: *const syntax_scope.Index, binding: []const u8, start: usize, end: usize) bool {
+/// Whether `binding` is read after `start`: in the rest of the block holding
+/// `start`, by its first use there unless that assigns it or an exit of the
+/// block comes first (then by the exit's statement), or else anywhere up to
+/// `end`. Reads the uses from the identifier table once a caller has built it.
+fn bindingUsedAfter(
+    file: File,
+    scopes: *const syntax_scope.Index,
+    exits: []const Exit,
+    binding: []const u8,
+    start: usize,
+    end: usize,
+) bool {
     const path_scope = scopes.enclosingOpeningBrace(start);
     const path_end = if (path_scope) |opening|
         @min(scopes.matchingToken(opening) orelse end, end)
     else
         end;
-    for (file.tokens[start..path_end], start..) |token, index| {
-        if (token.tag != .identifier or !tokenIs(file.source, token, binding) or
-            (index > 0 and file.tokens[index - 1].tag == .period))
-        {
-            const direct_terminator = index == 0 or switch (file.tokens[index - 1].tag) {
+    var first_use: ?usize = null;
+    var block_uses = scopes.identifiersNamed(binding, start, path_end);
+    while (block_uses.next()) |index| {
+        if (index > 0 and file.tokens[index - 1].tag == .period) continue;
+        first_use = index;
+        break;
+    }
+    if (path_scope) |opening| {
+        if (firstExit(exits, opening, start, first_use orelse path_end)) |index| {
+            const statement_end = scopes.statementEnd(index) orelse return false;
+            for (file.tokens[index + 1 .. @min(statement_end, path_end)], index + 1..) |value_token, value_index| {
+                if (value_token.tag == .identifier and tokenIs(file.source, value_token, binding) and
+                    (value_index == 0 or file.tokens[value_index - 1].tag != .period)) return true;
+            }
+            return false;
+        }
+    }
+    if (first_use) |index| return index + 1 >= end or file.tokens[index + 1].tag != .equal;
+    if (path_end == end) return false;
+    var uses = scopes.identifiersNamed(binding, path_end + 1, end);
+    while (uses.next()) |index| {
+        if (index == 0 or file.tokens[index - 1].tag != .period) return true;
+    }
+    return false;
+}
+
+/// A `return`, `break`, `continue` or `unreachable` starting a statement, and
+/// the block directly holding it.
+const Exit = struct { block: u32, position: u32 };
+
+/// Every `Exit` of a file, by block and then in order, found the first time
+/// a binding's later uses are looked up, so finding the first exit of a block
+/// does not read the statements before it.
+const Exits = struct {
+    all: ?[]const Exit = null,
+
+    fn get(exits: *Exits, allocator: std.mem.Allocator, file: File, scopes: *const syntax_scope.Index) ![]const Exit {
+        if (exits.all) |found| return found;
+        var list: std.ArrayList(Exit) = .empty;
+        errdefer list.deinit(allocator);
+        for (file.tokens, 0..) |token, index| {
+            switch (token.tag) {
+                .keyword_return, .keyword_continue, .keyword_break, .keyword_unreachable => {},
+                else => continue,
+            }
+            const starts_statement = index == 0 or switch (file.tokens[index - 1].tag) {
                 .semicolon, .l_brace, .r_brace => true,
                 else => false,
             };
-            if (direct_terminator and path_scope != null and scopes.enclosingOpeningBrace(index) == path_scope) switch (token.tag) {
-                .keyword_return, .keyword_continue, .keyword_break, .keyword_unreachable => {
-                    const statement_end = scopes.statementEnd(index) orelse return false;
-                    for (file.tokens[index + 1 .. @min(statement_end, path_end)], index + 1..) |value_token, value_index| {
-                        if (value_token.tag == .identifier and tokenIs(file.source, value_token, binding) and
-                            (value_index == 0 or file.tokens[value_index - 1].tag != .period)) return true;
-                    }
-                    return false;
-                },
-                else => {},
-            };
-            continue;
+            if (!starts_statement) continue;
+            const block = scopes.enclosingOpeningBrace(index) orelse continue;
+            try list.append(allocator, .{ .block = @intCast(block), .position = @intCast(index) });
         }
-        if (index + 1 < end and file.tokens[index + 1].tag == .equal) return false;
-        return true;
+        std.mem.sort(Exit, list.items, {}, struct {
+            fn lessThan(_: void, left: Exit, right: Exit) bool {
+                return left.block < right.block or left.block == right.block and left.position < right.position;
+            }
+        }.lessThan);
+        const found = try list.toOwnedSlice(allocator);
+        exits.all = found;
+        return found;
     }
-    if (path_end == end) return false;
-    for (file.tokens[path_end + 1 .. end], path_end + 1..) |token, index| {
-        if (token.tag == .identifier and tokenIs(file.source, token, binding) and
-            (index == 0 or file.tokens[index - 1].tag != .period)) return true;
-    }
-    return false;
+};
+
+/// The first exit that `block` directly holds in `[start, end)`.
+fn firstExit(exits: []const Exit, block: usize, start: usize, end: usize) ?usize {
+    const index = std.sort.lowerBound(Exit, exits, Exit{ .block = @intCast(block), .position = @intCast(start) }, struct {
+        fn order(target: Exit, exit: Exit) std.math.Order {
+            return std.math.order(target.block, exit.block).differ() orelse std.math.order(target.position, exit.position);
+        }
+    }.order);
+    if (index == exits.len or exits[index].block != block or exits[index].position >= end) return null;
+    return exits[index].position;
 }
 
 fn findEscapingLocalStorage(

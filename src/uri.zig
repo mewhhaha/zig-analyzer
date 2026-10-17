@@ -17,7 +17,21 @@ pub fn fromPath(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocato
         try uri.appendSlice(allocator, path[0..2]);
         rest = path[2..];
     }
-    for (rest) |byte| {
+    try appendEncodedPath(allocator, &uri, rest);
+    return uri.toOwnedSlice(allocator);
+}
+
+/// The relative URI reference for a relative filesystem path, such as
+/// `src/a%20b.zig`, with `/` separators.
+pub fn fromRelativePath(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error![]u8 {
+    var reference: std.ArrayList(u8) = .empty;
+    errdefer reference.deinit(allocator);
+    try appendEncodedPath(allocator, &reference, path);
+    return reference.toOwnedSlice(allocator);
+}
+
+fn appendEncodedPath(allocator: std.mem.Allocator, uri: *std.ArrayList(u8), path: []const u8) std.mem.Allocator.Error!void {
+    for (path) |byte| {
         const separator = byte == '/' or byte == '\\';
         if (separator) {
             try uri.append(allocator, '/');
@@ -27,7 +41,6 @@ pub fn fromPath(allocator: std.mem.Allocator, path: []const u8) std.mem.Allocato
             try uri.appendSlice(allocator, &.{ '%', hex_digits[byte >> 4], hex_digits[byte & 0xf] });
         }
     }
-    return uri.toOwnedSlice(allocator);
 }
 
 /// The filesystem path of a `file://` URI, or null when `uri` is not a local
@@ -115,6 +128,12 @@ test "path characters are percent-encoded" {
     const uri = try fromPath(std.testing.allocator, "/a b/%/é.zig");
     defer std.testing.allocator.free(uri);
     try std.testing.expectEqualStrings("file:///a%20b/%25/%C3%A9.zig", uri);
+}
+
+test "relative paths become relative references" {
+    const reference = try fromRelativePath(std.testing.allocator, "src\\a b/é.zig");
+    defer std.testing.allocator.free(reference);
+    try std.testing.expectEqualStrings("src/a%20b/%C3%A9.zig", reference);
 }
 
 test "percent escapes decode into a freshly owned path" {

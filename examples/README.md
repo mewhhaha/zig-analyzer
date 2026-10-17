@@ -34,6 +34,11 @@ and overflow repair, pointer casts, `inline else`, resolved-type materialization
 reflected-member generation, and test harnesses.
 Format calls with a simple missing or extra tuple argument also offer an explicit
 arity repair.
+An arithmetic operator whose left operand is a proven fixed-width integer offers
+its wrapping and saturating spellings, and an overflow-checked
+`@addWithOverflow` form inside a function that can return `error.Overflow`. A
+struct whose fields own containers or stored allocations offers a generated
+`deinit`, or the releases its existing `deinit` omits.
 Build-module repair appears on a package `@import` when its uniquely named Zig
 file and `build.zig` are both open.
 

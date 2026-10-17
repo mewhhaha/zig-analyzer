@@ -4,6 +4,7 @@ const std = @import("std");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
+const foreignDeclaration = @import("../../syntax/tokens.zig").foreignDeclaration;
 const syntax_scope = @import("../../syntax/scope.zig");
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
@@ -26,8 +27,70 @@ pub const rules = [_]types.Rule{
 };
 
 pub fn run(context: RuleRun) !void {
-    try findNonIdiomaticNames(context);
-    try findOfficialStyleIssues(context);
+    var foreign_names: ForeignNames = try .init(context);
+    defer foreign_names.deinit(context.allocator);
+    try findNonIdiomaticNames(context, &foreign_names);
+    try findOfficialStyleIssues(context, &foreign_names);
+}
+
+/// Declarations spelled as an external symbol, a name the Zig source does not
+/// get to choose: `extern` and `export` declarations, functions with a calling
+/// convention other than Zig's, which C or the linker call by name
+/// (`callconv(.c)`, `callconv(lib.calling_conv)`), and declarations the file
+/// exports with `@export(&name, ...)`.
+const ForeignNames = struct {
+    /// Name tokens of the declarations an `@export` in the file names.
+    exported: std.AutoHashMapUnmanaged(usize, void) = .empty,
+
+    fn init(context: RuleRun) !ForeignNames {
+        var names: ForeignNames = .{};
+        errdefer names.deinit(context.allocator);
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, index| {
+            if (token.tag != .builtin or index + 3 >= tokens.len or tokens[index + 1].tag != .l_paren or
+                !context.tokenIs(index, "@export")) continue;
+            const target = if (tokens[index + 2].tag == .ampersand) index + 3 else index + 2;
+            if (tokens[target].tag != .identifier or target + 1 >= tokens.len or tokens[target + 1].tag != .comma) continue;
+            const binding = context.scopes.findBinding(target) orelse continue;
+            try names.exported.put(context.allocator, binding.token_index, {});
+        }
+        return names;
+    }
+
+    fn deinit(names: *ForeignNames, allocator: std.mem.Allocator) void {
+        names.exported.deinit(allocator);
+    }
+
+    /// Whether the declaration named at `identifier_index`, after its `fn`,
+    /// `const` or `var` keyword, is spelled as an external symbol.
+    fn contains(names: *const ForeignNames, scopes: *const syntax_scope.Index, identifier_index: usize) bool {
+        const tokens = scopes.tokens;
+        if (foreignDeclaration(tokens, identifier_index - 1)) return true;
+        if (tokens[identifier_index - 1].tag == .keyword_fn and hasForeignCallingConvention(scopes, identifier_index)) return true;
+        return names.exported.contains(identifier_index);
+    }
+};
+
+/// Whether the function named at `name_index` declares a calling convention
+/// other than Zig's own `.auto` and `.@"inline"`.
+fn hasForeignCallingConvention(scopes: *const syntax_scope.Index, name_index: usize) bool {
+    const tokens = scopes.tokens;
+    if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return false;
+    var cursor = (scopes.matchingToken(name_index + 1) orelse return false) + 1;
+    // 'align(4)', 'addrspace(.gs)' and 'linksection(".text")' come first.
+    while (cursor + 1 < tokens.len and tokens[cursor + 1].tag == .l_paren) {
+        const closing = scopes.matchingToken(cursor + 1) orelse return false;
+        switch (tokens[cursor].tag) {
+            .keyword_align, .keyword_addrspace, .keyword_linksection => cursor = closing + 1,
+            .keyword_callconv => {
+                if (closing != cursor + 4 or tokens[cursor + 2].tag != .period) return true;
+                const convention = tokenText(scopes.source, tokens[cursor + 3]);
+                return !std.mem.eql(u8, convention, "auto") and !std.mem.eql(u8, convention, "@\"inline\"");
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 pub fn fileNameFinding(
@@ -69,7 +132,7 @@ pub fn fileNameFinding(
     };
 }
 
-fn findNonIdiomaticNames(context: RuleRun) !void {
+fn findNonIdiomaticNames(context: RuleRun, foreign_names: *const ForeignNames) !void {
     const source = context.source;
     const tokens = context.tokens;
     const level = context.level(.non_idiomatic_name);
@@ -112,9 +175,7 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
         const declaration_tag = tokens[index - 1].tag;
         if (declaration_tag != .keyword_fn and declaration_tag != .keyword_const and declaration_tag != .keyword_var) continue;
         if (!identifierIsDeclaration(tokens, index)) continue;
-        if (index >= 2 and (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export)) continue;
-        // 'extern "lib" fn name(...)' binds an ABI symbol whose name is fixed.
-        if (index >= 3 and tokens[index - 2].tag == .string_literal and tokens[index - 3].tag == .keyword_extern) continue;
+        if (foreign_names.contains(context.scopes, index)) continue;
         if (declaration_tag == .keyword_const and declarationInitializedByExternBuiltin(source, tokens, index)) continue;
         if (foreign_binding_dominated and declaration_tag == .keyword_const and declarationHasLiteralInitializer(tokens, index)) continue;
         if (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index)) continue;
@@ -144,6 +205,20 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
         if (declaration_tag == .keyword_const and isConstantCase(name)) continue;
         // A deprecated declaration keeps its old name for existing callers.
         if (deprecated_declarations.deprecationAdvice(source, tokens, index) != null) continue;
+        // A project that spells a kind of declaration another way by a strong
+        // majority, as tigerbeetle does its snake_case functions, has made
+        // that its convention; `minority-naming-style` holds names to it.
+        const project = context.configuration.naming_conventions;
+        const project_case = if (is_namespace)
+            null
+        else if (type_function or is_type)
+            project.type_name
+        else if (declaration_tag == .keyword_fn)
+            // An explicit `function-case` is the project's own statement.
+            (if (context.configuration.function_case_explicit) null else project.function)
+        else
+            project.constant;
+        if (project_case) |case| if (followsCase(case, name)) continue;
         const convention = if (is_namespace)
             "snake_case or TitleCase"
         else if (type_function or is_type)
@@ -152,11 +227,15 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
             function_case.text()
         else
             "snake_case";
+        const project_convention = if (project_case) |case| case.text() else convention;
         try context.emit(.{
             .rule = .non_idiomatic_name,
             .level = level,
             .span = token.loc,
-            .message = try context.allocator.print("declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention }),
+            .message = if (std.mem.eql(u8, project_convention, convention))
+                try context.allocator.print("declaration '{s}' does not follow Zig's {s} naming convention", .{ name, convention })
+            else
+                try context.allocator.print("declaration '{s}' follows neither Zig's {s} naming convention nor the project's {s}", .{ name, convention, project_convention }),
         });
     }
 }
@@ -188,13 +267,14 @@ fn nodeIsValueExpression(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index)
         .struct_init,
         .struct_init_comma,
         => true,
-        .identifier => {
-            const name = tree.tokenSlice(tree.nodeMainToken(node));
-            return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or
-                std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined");
-        },
+        .identifier => identifierIsLiteral(tree.tokenSlice(tree.nodeMainToken(node))),
         else => false,
     };
+}
+
+fn identifierIsLiteral(name: []const u8) bool {
+    return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or
+        std.mem.eql(u8, name, "null") or std.mem.eql(u8, name, "undefined");
 }
 
 fn resolvedShapeNamesType(name: []const u8, resolved_shapes: []const ResolvedShape) bool {
@@ -469,6 +549,27 @@ fn declarationIsSameNameAlias(source: []const u8, tokens: []const std.zig.Token,
     return std.mem.eql(u8, name, tokenText(source, tokens[end - 1]));
 }
 
+/// Whether an underscore-prefixed name keeps a spelling the Zig source does
+/// not choose: `_` before a digit, which no name may start with (`_1011` in
+/// an addition chain), a reserved C or ABI name (`__tls_base`, `_SC`,
+/// `_DYNAMIC`), the linker's `_start`, a C-layout type mirroring a C tag
+/// (`const _umtx_time = extern struct {...}`), or a constant selecting a
+/// foreign symbol whose name starts with `_` too (`pub const _errno = private.__errno;`).
+fn underscoreIsForeignSpelling(scopes: *const syntax_scope.Index, identifier_index: usize) bool {
+    const tokens = scopes.tokens;
+    const name = tokenText(scopes.source, tokens[identifier_index]);
+    if (std.ascii.isDigit(name[1]) or name[1] == '_' or isConstantCase(name[1..]) or std.mem.eql(u8, name, "_start")) return true;
+    if (tokens[identifier_index - 1].tag != .keyword_const or identifier_index + 2 >= tokens.len or
+        tokens[identifier_index + 1].tag != .equal) return false;
+    if (tokens[identifier_index + 2].tag == .keyword_extern) return true;
+    const end = scopes.statementEnd(identifier_index + 2) orelse return false;
+    for (tokens[identifier_index + 2 .. end], identifier_index + 2..) |token, index| {
+        if (token.tag == .identifier and tokens[index - 1].tag == .period and
+            tokenText(scopes.source, token)[0] == '_') return true;
+    }
+    return false;
+}
+
 fn identifierIsDeclaration(tokens: []const std.zig.Token, identifier_index: usize) bool {
     if (identifier_index == 0 or identifier_index + 1 >= tokens.len) return false;
     return switch (tokens[identifier_index - 1].tag) {
@@ -534,6 +635,15 @@ fn withoutTrailingUnderscores(name: []const u8) []const u8 {
     return std.mem.trimEnd(u8, name, "_");
 }
 
+/// Whether `name` is spelled in `case` as this rule judges it.
+pub fn followsCase(case: types.NameCase, name: []const u8) bool {
+    return switch (case) {
+        .snake_case => isSnakeCase(name),
+        .camel_case => isCamelCase(name),
+        .title_case => isTitleCase(name),
+    };
+}
+
 fn isCamelCase(full_name: []const u8) bool {
     const name = withoutTrailingUnderscores(full_name);
     return name.len != 0 and std.ascii.isLower(name[0]) and std.mem.findScalar(u8, name, '_') == null;
@@ -566,7 +676,7 @@ fn isSnakeCase(name: []const u8) bool {
     return true;
 }
 
-fn findOfficialStyleIssues(context: RuleRun) !void {
+fn findOfficialStyleIssues(context: RuleRun, foreign_names: *const ForeignNames) !void {
     const source = context.source;
     const tokens = context.tokens;
     const vague_level = context.level(.vague_type_name);
@@ -581,11 +691,11 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
         if (declaration_tag != .keyword_fn and declaration_tag != .keyword_const and declaration_tag != .keyword_var) continue;
         if (!identifierIsDeclaration(tokens, index)) continue;
         const name = tokenText(source, token);
-        const externally_named = (index >= 2 and
-            (tokens[index - 2].tag == .keyword_extern or tokens[index - 2].tag == .keyword_export)) or
-            (index >= 3 and tokens[index - 2].tag == .string_literal and tokens[index - 3].tag == .keyword_extern) or
+        const externally_named = foreign_names.contains(context.scopes, index) or
             (declaration_tag == .keyword_const and declarationIsSameNameAlias(source, tokens, index));
-        if (underscore_level != .off and name.len > 1 and name[0] == '_' and !externally_named) {
+        if (underscore_level != .off and name.len > 1 and name[0] == '_' and !externally_named and
+            !underscoreIsForeignSpelling(context.scopes, index))
+        {
             try context.emit(.{
                 .rule = .underscore_private_name,
                 .level = underscore_level,
@@ -598,14 +708,14 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
         }
         const public_declaration = index >= 2 and tokens[index - 2].tag == .keyword_pub;
         if (vague_level != .off and public_declaration and declaration_tag == .keyword_const and declarationInitializesType(context.scopes, index)) {
-            if (vagueTypeWord(name)) |word| {
+            if (isVagueTypeName(name)) {
                 try context.emit(.{
                     .rule = .vague_type_name,
                     .level = vague_level,
                     .span = token.loc,
                     .message = try context.allocator.print(
-                        "type '{s}' contains the vague word '{s}', which does not describe its domain role",
-                        .{ name, word },
+                        "type '{s}' is named by a vague word, which does not describe its domain role",
+                        .{name},
                     ),
                 });
             }
@@ -619,9 +729,7 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
         if (docs_level != .off and doc_index != null) {
             var first_doc_index = doc_index.?;
             while (first_doc_index > 0 and tokens[first_doc_index - 1].tag == .doc_comment) first_doc_index -= 1;
-            const raw_comment = tokenText(source, tokens[first_doc_index]);
-            const comment = std.mem.trim(u8, raw_comment[@min(raw_comment.len, 3)..], " \t");
-            if (commentStartsWithName(comment, name)) {
+            if (commentRestatesName(source, tokens, first_doc_index, name)) {
                 try context.emit(.{
                     .rule = .doc_comment_style,
                     .level = docs_level,
@@ -661,9 +769,11 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
         }
     }
 
-    if (public_docs_level != .off) {
+    if (public_docs_level != .off and context.module_exposure != .none) {
         var surface: PublicSurface = try .init(context);
         defer surface.deinit();
+        var exemptions: DocumentationExemptions = try .init(context);
+        defer exemptions.deinit(context.allocator);
         for (tokens, 0..) |token, pub_index| {
             if (token.tag != .keyword_pub or pub_index + 2 >= tokens.len) continue;
             const declaration_tag = tokens[pub_index + 1].tag;
@@ -673,6 +783,10 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
             const declaration_name = tokenText(source, tokens[pub_index + 2]);
             if (isProtocolName(declaration_name)) continue;
             if (declaration_tag == .keyword_fn and isBuildEntryPoint(context.scopes, pub_index + 2)) continue;
+            if (exemptions.self_describing.contains(pub_index)) continue;
+            if (exemptions.table_entries.get(pub_index)) |whole_table| {
+                if (whole_table or surface.documentsTable(pub_index)) continue;
+            }
             if (!surface.contains(pub_index)) continue;
             try context.emit(.{
                 .rule = .public_declaration_docs,
@@ -694,6 +808,143 @@ fn isProtocolName(name: []const u8) bool {
     };
     for (protocol_names) |protocol_name| if (std.mem.eql(u8, name, protocol_name)) return true;
     return false;
+}
+
+/// The `pub` constants that need no comment of their own, found in one pass
+/// over the tree.
+const DocumentationExemptions = struct {
+    /// `pub` keywords of constants whose value tells what a comment would.
+    self_describing: std.AutoHashMapUnmanaged(usize, void) = .empty,
+    /// `pub` keywords of the constant-expression entries of constant tables,
+    /// mapped to whether every member of their table is one.
+    table_entries: std.AutoHashMapUnmanaged(usize, bool) = .empty,
+
+    fn init(context: RuleRun) !DocumentationExemptions {
+        const tree = context.tree;
+        var exemptions: DocumentationExemptions = .{};
+        errdefer exemptions.deinit(context.allocator);
+        for (0..tree.nodes.len) |raw_node| {
+            const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+            if (tree.fullVarDecl(node)) |declaration| {
+                const pub_index = declaration.visib_token orelse continue;
+                const initializer = declaration.ast.init_node.unwrap() orelse continue;
+                if (context.tokens[declaration.ast.mut_token].tag == .keyword_const and valueDescribesItself(tree, initializer)) {
+                    try exemptions.self_describing.put(context.allocator, pub_index, {});
+                }
+                continue;
+            }
+            var buffer: [2]std.zig.Ast.Node.Index = undefined;
+            const container = tree.fullContainerDecl(&buffer, node) orelse continue;
+            try exemptions.putTable(context, container.ast.members);
+        }
+        try exemptions.putTable(context, tree.rootDecls());
+        return exemptions;
+    }
+
+    fn deinit(exemptions: *DocumentationExemptions, allocator: std.mem.Allocator) void {
+        exemptions.self_describing.deinit(allocator);
+        exemptions.table_entries.deinit(allocator);
+    }
+
+    /// Records the entries of `members` when they make a constant table: a
+    /// namespace like `pub const SO = struct { pub const DEBUG = 1; ... };`
+    /// holding constants alone, with no field, function or variable.
+    fn putTable(exemptions: *DocumentationExemptions, context: RuleRun, members: []const std.zig.Ast.Node.Index) !void {
+        const tree = context.tree;
+        var whole_table = true;
+        for (members) |member| {
+            const declaration = tree.fullVarDecl(member) orelse return;
+            const initializer = declaration.ast.init_node.unwrap() orelse return;
+            if (context.tokens[declaration.ast.mut_token].tag != .keyword_const) return;
+            if (!constantExpression(tree, initializer)) whole_table = false;
+        }
+        for (members) |member| {
+            const declaration = tree.fullVarDecl(member).?;
+            const pub_index = declaration.visib_token orelse continue;
+            if (!constantExpression(tree, declaration.ast.init_node.unwrap().?)) continue;
+            try exemptions.table_entries.put(context.allocator, pub_index, whole_table);
+        }
+    }
+};
+
+/// Whether a constant's value tells all a comment would: a literal or an
+/// aggregate of literals, which the declaration shows in full, or an alias or
+/// `@import` re-export, documented where its target is declared.
+fn valueDescribesItself(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    return declarationPath(tree, node) or literalValue(tree, node);
+}
+
+/// `name`, `a.b.C`, `@import("m.zig").M` or `@This()`.
+fn declarationPath(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    var current = node;
+    while (true) switch (tree.nodeTag(current)) {
+        .identifier => return true,
+        .field_access => current = tree.nodeData(current).node_and_token[0],
+        .builtin_call_two, .builtin_call_two_comma => {
+            const builtin = tree.tokenSlice(tree.nodeMainToken(current));
+            return std.mem.eql(u8, builtin, "@import") or std.mem.eql(u8, builtin, "@This");
+        },
+        else => return false,
+    };
+}
+
+/// A literal, possibly negated, cast with `@as` or pointed to (`&.{}`), or an
+/// aggregate of them.
+fn literalValue(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    switch (tree.nodeTag(node)) {
+        .number_literal, .char_literal, .string_literal, .multiline_string_literal, .enum_literal, .error_value => return true,
+        .identifier => return identifierIsLiteral(tree.tokenSlice(tree.nodeMainToken(node))),
+        .negation, .bit_not, .address_of => return literalValue(tree, tree.nodeData(node).node),
+        .builtin_call_two, .builtin_call_two_comma => {
+            if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return false;
+            const operand = tree.nodeData(node).opt_node_and_opt_node[1].unwrap() orelse return false;
+            return literalValue(tree, operand);
+        },
+        else => {},
+    }
+    var buffer: [2]std.zig.Ast.Node.Index = undefined;
+    if (tree.fullStructInit(&buffer, node)) |aggregate| {
+        for (aggregate.ast.fields) |field| if (!literalValue(tree, field)) return false;
+        return true;
+    }
+    if (tree.fullArrayInit(&buffer, node)) |aggregate| {
+        for (aggregate.ast.elements) |element| if (!literalValue(tree, element)) return false;
+        return true;
+    }
+    return false;
+}
+
+/// Whether `node` computes a value from literals and other constants with
+/// operators and casts alone, as the entries of C-mirror tables do
+/// (`1 << 4`, `IN | OUT`, `~@as(u32, 0)`).
+fn constantExpression(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
+    switch (tree.nodeTag(node)) {
+        .number_literal,
+        .char_literal,
+        .string_literal,
+        .multiline_string_literal,
+        .enum_literal,
+        .error_value,
+        .identifier,
+        => return true,
+        .field_access, .grouped_expression => return constantExpression(tree, tree.nodeData(node).node_and_token[0]),
+        .negation, .negation_wrap, .bit_not, .bool_not => return constantExpression(tree, tree.nodeData(node).node),
+        .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .shl, .shr, .bit_and, .bit_or, .bit_xor => {
+            const left, const right = tree.nodeData(node).node_and_node;
+            return constantExpression(tree, left) and constantExpression(tree, right);
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            const builtin = tree.tokenSlice(tree.nodeMainToken(node));
+            const casts = [_][]const u8{ "@as", "@intCast", "@bitCast", "@truncate", "@intFromEnum", "@sizeOf" };
+            for (casts) |cast| {
+                if (std.mem.eql(u8, builtin, cast)) break;
+            } else return false;
+            var buffer: [2]std.zig.Ast.Node.Index = undefined;
+            for (tree.builtinCallParams(&buffer, node).?) |argument| if (!constantExpression(tree, argument)) return false;
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// The declarations reachable from the file's root through `pub`
@@ -773,16 +1024,42 @@ const PublicSurface = struct {
     }
 
     /// Whether the `pub` declaration at `pub_index` is on the surface: each
-    /// container around it is exposed by a declaration on the surface.
+    /// container around it is exposed by a declaration on the surface, up to
+    /// a top-level declaration the module roots expose.
     fn contains(surface: *const PublicSurface, pub_index: usize) bool {
         var cursor = pub_index;
         // Aliases can point back into the containers they are declared in,
         // so the walk is bounded rather than trusted to reach the root.
         for (0..64) |_| {
-            const opening = surface.context.scopes.enclosingOpeningBrace(cursor) orelse return true;
+            const opening = surface.context.scopes.enclosingOpeningBrace(cursor) orelse return surface.rootsExpose(cursor);
             cursor = surface.exposer(opening) orelse return false;
         }
         return false;
+    }
+
+    /// Whether the module roots expose the top-level declaration whose `pub`
+    /// keyword, or field name, is at `index`.
+    fn rootsExpose(surface: *const PublicSurface, index: usize) bool {
+        const exposed = switch (surface.context.module_exposure) {
+            .whole => return true,
+            .none => return false,
+            .declarations => |names| names,
+        };
+        const name_index = if (surface.context.tokens[index].tag == .keyword_pub) index + 2 else index;
+        const name = surface.context.tokenText(name_index);
+        for (exposed) |exposed_name| if (std.mem.eql(u8, name, exposed_name)) return true;
+        return false;
+    }
+
+    /// Whether the container holding the `pub` declaration at `pub_index` is
+    /// documented: by the comment of the declaration exposing it, or by the
+    /// file's `//!` comment at the top level.
+    fn documentsTable(surface: *const PublicSurface, pub_index: usize) bool {
+        const tokens = surface.context.tokens;
+        const opening = surface.context.scopes.enclosingOpeningBrace(pub_index) orelse
+            return tokens[0].tag == .container_doc_comment;
+        const exposing = surface.exposer(opening) orelse return false;
+        return exposing > 0 and tokens[exposing - 1].tag == .doc_comment;
     }
 
     /// The `pub` keyword of the declaration, or the name of the field, that
@@ -907,24 +1184,87 @@ fn isBuildEntryPoint(scopes: *const syntax_scope.Index, name_index: usize) bool 
     return false;
 }
 
-fn vagueTypeWord(name: []const u8) ?[]const u8 {
-    // Value/Context/State as a suffix names a role precisely (LookupContext,
-    // CheckpointState); only the bare word says nothing about the domain.
-    const exact_words = [_][]const u8{ "Value", "Context", "State" };
-    for (exact_words) |word| {
-        if (std.mem.eql(u8, name, word)) return word;
-    }
-    const suffix_words = [_][]const u8{ "Data", "Manager", "Utils", "Misc" };
-    for (suffix_words) |word| {
-        if (std.mem.eql(u8, name, word) or std.mem.endsWith(u8, name, word)) return word;
-    }
-    return null;
+fn isVagueTypeName(name: []const u8) bool {
+    // A vague word after a qualifier names a role precisely (CheckpointState,
+    // ImageData, ResourceManager, often the spelling of a specification);
+    // only the bare word says nothing about the domain. `Context` is the
+    // protocol name of `std.hash_map` and `std.sort` contexts.
+    const vague_words = [_][]const u8{ "Value", "State", "Data", "Manager", "Utils", "Misc" };
+    for (vague_words) |word| if (std.mem.eql(u8, name, word)) return true;
+    return false;
 }
 
-fn commentStartsWithName(comment: []const u8, name: []const u8) bool {
-    if (!std.mem.startsWith(u8, comment, name)) return false;
-    if (comment.len == name.len) return true;
-    return std.ascii.isWhitespace(comment[name.len]) or comment[name.len] == ':' or comment[name.len] == '-';
+/// Whether the first sentence of the doc comment starting at `first_doc_index`
+/// says no more than the name: the name, then at most a few words that are
+/// filler or the name's own words (`/// EMCON`, `/// Parser type.`,
+/// `/// renderFrame renders the frame.`). A sentence that goes on to say
+/// anything else (`/// Shaper that uses Harfbuzz.`) is documentation.
+fn commentRestatesName(source: []const u8, tokens: []const std.zig.Token, first_doc_index: usize, name: []const u8) bool {
+    const max_restating_words = 5;
+    var restating_words: usize = 0;
+    var index = first_doc_index;
+    while (index < tokens.len and tokens[index].tag == .doc_comment) : (index += 1) {
+        const raw_line = tokenText(source, tokens[index]);
+        const line = std.mem.trim(u8, raw_line[@min(raw_line.len, 3)..], " \t");
+        // A blank line ends the first paragraph, and with it the sentence.
+        if (line.len == 0) return index != first_doc_index;
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        if (index == first_doc_index) {
+            const first_word = words.next().?;
+            if (!std.mem.startsWith(u8, first_word, name)) return false;
+            const rest = first_word[name.len..];
+            // 'render:' and 'render.' still name the declaration; 'render-based' does not.
+            if (std.mem.trimEnd(u8, rest, ".,:;!?-").len != 0) return false;
+            if (endsSentence(rest)) return true;
+        }
+        while (words.next()) |word| {
+            const bare = std.mem.trim(u8, word, "`'\"()[],.:;!?-");
+            if (bare.len != 0) {
+                if (!isFillerWord(bare) and !isNameWord(bare, name)) return false;
+                restating_words += 1;
+                if (restating_words > max_restating_words) return false;
+            }
+            if (endsSentence(word)) return true;
+        }
+    }
+    return true;
+}
+
+fn endsSentence(word: []const u8) bool {
+    const end = std.mem.trimEnd(u8, word, "`'\")]");
+    return end.len != 0 and (end[end.len - 1] == '.' or end[end.len - 1] == '!' or end[end.len - 1] == '?');
+}
+
+fn isFillerWord(word: []const u8) bool {
+    const filler_words = [_][]const u8{
+        "a",      "an",       "the",   "this",   "that",     "is",       "are",    "of",      "for",   "to",
+        "and",    "or",       "it",    "its",    "returns",  "type",     "struct", "enum",    "union", "function",
+        "method", "constant", "value", "values", "variable", "instance", "object", "wrapper", "field",
+    };
+    for (filler_words) |filler| if (std.ascii.eqlIgnoreCase(word, filler)) return true;
+    return false;
+}
+
+/// Whether `word` is the name or one of its words, possibly inflected:
+/// `renders` and `frame` for `renderFrame`, `parses` for `Parser`.
+fn isNameWord(word: []const u8, name: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(word, name)) return true;
+    const stem = if (word.len > 3 and word[word.len - 1] == 's') word[0 .. word.len - 1] else word;
+    var start: usize = 0;
+    for (name, 0..) |character, index| {
+        const boundary = index + 1 == name.len or name[index + 1] == '_' or
+            (std.ascii.isLower(character) and std.ascii.isUpper(name[index + 1]));
+        if (!boundary) continue;
+        const part = std.mem.trim(u8, name[start .. index + 1], "_");
+        start = index + 1;
+        if (part.len < 3) {
+            if (std.ascii.eqlIgnoreCase(word, part)) return true;
+            continue;
+        }
+        if (std.ascii.startsWithIgnoreCase(part, stem) and stem.len + 1 >= part.len) return true;
+        if (std.ascii.startsWithIgnoreCase(word, part) and word.len <= part.len + 3) return true;
+    }
+    return false;
 }
 
 fn redundantNamespaceSuffix(namespace_name: []const u8, declaration_name: []const u8) ?[]const u8 {
@@ -1079,6 +1419,62 @@ test "error-set types foreign symbols and re-exports keep their names" {
     try std.testing.expectEqual(@as(usize, 0), underscore_count);
 }
 
+test "functions with a foreign calling convention or an @export keep their names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const lib = struct { pub const calling_conv: std.builtin.CallingConvention = .c; };\n" ++
+        "pub fn row_cells_free(cells: u32) callconv(lib.calling_conv) void { _ = cells; }\n" ++
+        "pub fn parse_x11(text: u32) callconv(.c) u32 { return text; }\n" ++
+        "pub fn aligned_c(text: u32) align(4) callconv(.c) u32 { return text; }\n" ++
+        "fn memset_impl() void {}\n" ++
+        "comptime { @export(&memset_impl, .{ .name = \"memset\" }); }\n" ++
+        "fn inline_helper() callconv(.@\"inline\") void {}\n" ++
+        "fn auto_helper() callconv(.auto) void {}\n" ++
+        "fn plain_helper() void {}\n";
+    const configuration = support.only(&.{.non_idiomatic_name}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+    };
+    const expected = [_][]const u8{ "inline_helper", "auto_helper", "plain_helper" };
+    try std.testing.expectEqual(expected.len, reported.items.len);
+    for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
+}
+
+test "underscore prefixes the source does not choose are not privacy markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const private = struct { extern \"c\" fn __errno() *c_int; extern \"c\" fn ___lwp_park60() c_int; };\n" ++
+        "pub const _errno = switch (os) { .windows => private.__errno, else => {} };\n" ++
+        "pub const _lwp_park = private.___lwp_park60;\n" ++
+        "pub const _SC = enum(c_int) { PAGESIZE = 39 };\n" ++
+        "pub const _umtx_time = extern struct { timeout: u64 };\n" ++
+        "fn _start() callconv(.naked) noreturn { unreachable; }\n" ++
+        "inline fn __get_stack_pointer() [*]u8 { return undefined; }\n" ++
+        "fn _carry128(r: u128) u64 { return @truncate(r); }\n" ++
+        "fn _exported() void {}\n" ++
+        "comptime { @export(&_exported, .{ .name = \"exported\" }); }\n" ++
+        "pub fn chain(p: u64) u64 {\n" ++
+        "    const _10 = p *% 2;\n" ++
+        "    const _1011 = _10 +% p;\n" ++
+        "    const _helper = _1011;\n" ++
+        "    _ = __get_stack_pointer();\n" ++
+        "    return _helper +% _carry128(0);\n" ++
+        "}\n";
+    const configuration = support.only(&.{.underscore_private_name}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .underscore_private_name) {
+        try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+    };
+    const expected = [_][]const u8{ "_carry128", "_helper" };
+    try std.testing.expectEqual(expected.len, reported.items.len);
+    for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
+}
+
 test "foreign-binding files preserve literal constants and extern builtin names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1161,6 +1557,38 @@ test "C-style constants, deprecated aliases, digit groups and trailing underscor
         try std.testing.expectEqualStrings("Bad_Type", source[finding.span.start..finding.span.end]);
     };
     try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "names in the casing the project's majority chose follow its convention" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn read_value() void {}\n" ++
+        "pub fn readValue() void {}\n" ++
+        "pub fn Read_Mixed() void {}\n" ++
+        "const Bad_Type = struct { x: u8 };\n";
+    var configuration = support.only(&.{.non_idiomatic_name}, .information);
+    configuration.naming_conventions = .{ .function = .snake_case, .type_name = .title_case };
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try support.expectRules(found, &.{ .non_idiomatic_name, .non_idiomatic_name });
+    try std.testing.expectEqualStrings("declaration 'Read_Mixed' follows neither Zig's camelCase naming convention nor the project's snake_case", found[0].message);
+    try std.testing.expectEqualStrings("declaration 'Bad_Type' does not follow Zig's TitleCase naming convention", found[1].message);
+}
+
+test "an explicit function case outranks the project's majority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn read_value() void {}\n" ++
+        "pub fn readValue() void {}\n" ++
+        "const Bad_Type = struct { x: u8 };\n";
+    var configuration = support.only(&.{.non_idiomatic_name}, .information);
+    configuration.naming_conventions = .{ .function = .snake_case, .type_name = .title_case };
+    configuration.function_case_explicit = true;
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try support.expectRules(found, &.{ .non_idiomatic_name, .non_idiomatic_name });
+    try std.testing.expectEqualStrings("declaration 'read_value' does not follow Zig's camelCase naming convention", found[0].message);
+    try std.testing.expectEqualStrings("declaration 'Bad_Type' does not follow Zig's TitleCase naming convention", found[1].message);
 }
 
 test "namespaces with typed declarations and expressions about types keep value names" {
@@ -1276,12 +1704,12 @@ test "protocol names and members of private containers need no API documentation
         "pub const Tag = union(enum) { a: u8, pub fn tagName() void {} };\n" ++
         "/// Control names.\n" ++
         "pub const CTL = switch (os) {\n" ++
-        "    .linux => struct { pub const KERN = 1; },\n" ++
-        "    else => if (bsd) struct { pub const VM = 2; } else void,\n" ++
+        "    .linux => struct { pub fn KERN() void {} },\n" ++
+        "    else => if (bsd) struct { pub fn VM() void {} } else void,\n" ++
         "};\n" ++
         "/// Signal actions.\n" ++
-        "pub const SA = if (mips) Legacy.SA else struct { pub const ONSTACK = 3; };\n" ++
-        "const Hidden = switch (os) { else => struct { pub const NOT_API = 4; } };\n" ++
+        "pub const SA = if (mips) Legacy.SA else struct { pub fn ONSTACK() void {} };\n" ++
+        "const Hidden = switch (os) { else => struct { pub fn NOT_API() void {} } };\n" ++
         "const Impl = struct { pub fn viaAlias() void {} };\n" ++
         "/// The implementation.\n" ++
         "pub const Api = Impl;\n" ++
@@ -1292,13 +1720,13 @@ test "protocol names and members of private containers need no API documentation
         "const X86 = extern struct { pub fn current() void {} };\n" ++
         "/// The native context.\n" ++
         "pub const Native = switch (arch) { .x86 => X86, else => void };\n" ++
-        "const object_s = opaque { pub const retain = 1; };\n" ++
+        "const object_s = opaque { pub fn retain() void {} };\n" ++
         "/// An object.\n" ++
         "pub const object_t = *object_s;\n" ++
         "/// Compression state.\n" ++
-        "pub const Compress = struct { buffered: struct { pub const empty = 0; } };\n" ++
+        "pub const Compress = struct { buffered: struct { pub fn empty() void {} } };\n" ++
         "/// Permissions.\n" ++
-        "pub const Permissions = Override orelse if (windows) enum(u32) { pub const default_dir = 1; } else u32;\n" ++
+        "pub const Permissions = Override orelse if (windows) enum(u32) { pub fn default_dir() void {} } else u32;\n" ++
         "fn Base(comptime T: type) type { return struct { pub fn based() ?T { return null; } }; }\n" ++
         "/// A wrapper.\n" ++
         "pub fn Wrapper(comptime T: type) type { return Base(T); }\n" ++
@@ -1315,6 +1743,86 @@ test "protocol names and members of private containers need no API documentation
     };
     try std.testing.expectEqual(expected.len, reported.items.len);
     for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
+}
+
+test "self-describing constants and constant tables need no API documentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const bits = @import(\"bits.zig\");\n" ++
+        "pub const max_len = 0x40;\n" ++
+        "pub const negative: i32 = -1;\n" ++
+        "pub const all_bits = @as(u32, 0xffff);\n" ++
+        "pub const name_text = \"probe\";\n" ++
+        "pub const StaticBitSet = bits.StaticBitSet;\n" ++
+        "pub const fd_t = c_int;\n" ++
+        "pub const Thread = @import(\"Thread.zig\");\n" ++
+        "pub const Treap = @import(\"treap.zig\").Treap;\n" ++
+        "pub const empty: Pair = .{ .left = 0, .right = .none };\n" ++
+        "pub const no_lines: []const u8 = &.{};\n" ++
+        "pub const table = [_]u8{ 1, 2, 3 };\n" ++
+        "pub const computed: Pair = .{ .left = std.math.maxInt(u8), .right = .none };\n" ++
+        "pub const Small = Generic(8);\n" ++
+        "pub var counter: u32 = 0;\n" ++
+        "/// Socket options.\n" ++
+        "pub const SO = struct {\n" ++
+        "    pub const DEBUG = 1;\n" ++
+        "    pub const COMBINED = DEBUG | 2;\n" ++
+        "    pub const CALLED = compute(DEBUG);\n" ++
+        "};\n" ++
+        "pub const SC = struct { pub const ARG_MAX = 0; pub const CHILD_MAX = ARG_MAX + 1; pub const SHIFT = 1 << 4; };\n" ++
+        "/// Sizes.\n" ++
+        "pub const SZ = struct { pub const WORD = @sizeOf(usize) * 8; pub const LOW = @truncate(SHIFTED); };\n" ++
+        "pub const S = struct { pub const IFMT = 0o170000; pub const MODE = IFMT & 0o777; pub fn isReg() void {} };\n" ++
+        "const Pair = struct { left: u8, right: enum { none } };\n";
+    const configuration = support.only(&.{.public_declaration_docs}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .public_declaration_docs) {
+        try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+    };
+    // A computed aggregate, a type instantiation, a variable, a call in a
+    // documented table, undocumented namespaces and a namespace with a
+    // function still need comments.
+    const expected = [_][]const u8{ "computed", "Small", "counter", "CALLED", "SC", "S", "MODE", "isReg" };
+    try std.testing.expectEqual(expected.len, reported.items.len);
+    for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
+}
+
+fn runWithExposure(context: RuleRun, exposure: types.ModuleExposure) !void {
+    var exposed = context;
+    exposed.module_exposure = exposure;
+    try run(exposed);
+}
+
+test "only declarations the module roots expose need API documentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "/// The API.\n" ++
+        "pub const Api = struct { pub fn call() void {} };\n" ++
+        "const Impl = struct { pub fn viaAlias() void {} };\n" ++
+        "/// An alias.\n" ++
+        "pub const Alias = Impl;\n" ++
+        "pub const Internal = struct { pub fn helper() void {} };\n" ++
+        "pub fn internalHelper() void {}\n";
+    const configuration = support.only(&.{.public_declaration_docs}, .information);
+    const exposures = [_]struct { types.ModuleExposure, []const []const u8 }{
+        .{ .whole, &.{ "call", "viaAlias", "Internal", "helper", "internalHelper" } },
+        .{ .none, &.{} },
+        .{ .{ .declarations = &.{ "Api", "Alias" } }, &.{ "call", "viaAlias" } },
+    };
+    for (exposures) |case| {
+        const exposure, const expected = case;
+        const found = try support.findingsWith(arena.allocator(), runWithExposure, exposure, source, configuration);
+        var reported: std.ArrayList([]const u8) = .empty;
+        for (found) |finding| if (finding.rule == .public_declaration_docs) {
+            try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+        };
+        try std.testing.expectEqual(expected.len, reported.items.len);
+        for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
+    }
 }
 
 test "main entry points do not require API documentation" {
@@ -1341,24 +1849,43 @@ test "build entry points do not require API documentation" {
     try std.testing.expectEqual(@as(usize, 1), docs_count);
 }
 
-test "doc comment style checks the first line of a multi-line comment" {
+test "doc comment style reports first sentences that only restate the name" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
         "/// Returns the parsed config.\n" ++
         "/// parse errors are returned verbatim.\n" ++
         "pub fn parse() void {}\n" ++
-        "/// render draws the frame.\n" ++
+        "/// renderFrame renders the frame.\n" ++
         "/// Later lines may say anything.\n" ++
-        "pub fn render() void {}\n";
+        "pub fn renderFrame() void {}\n" ++
+        "/// Shaper that uses Harfbuzz.\n" ++
+        "pub const Shaper = struct {};\n" ++
+        "/// Animation state for a single image. Heap-allocated.\n" ++
+        "pub const Animation = struct {};\n" ++
+        "/// EMCON\n" ++
+        "pub const EMCON = 1;\n" ++
+        "/// Parser type.\n" ++
+        "pub const Parser = struct {};\n" ++
+        "/// Mutex is a\n" ++
+        "/// synchronization primitive.\n" ++
+        "pub const Mutex = struct {};\n" ++
+        "/// Index into `nodes`.\n" ++
+        "pub const Index = u32;\n" ++
+        "/// CAN: Controller Area Network\n" ++
+        "pub const CAN = 2;\n" ++
+        "/// Bar.\n" ++
+        "pub const Bar = struct {};\n";
     const configuration = support.only(&.{.doc_comment_style}, .information);
     const found = try support.findings(arena.allocator(), run, source, configuration);
-    var docs_count: usize = 0;
+    var reported: std.ArrayList([]const u8) = .empty;
     for (found) |finding| if (finding.rule == .doc_comment_style) {
-        docs_count += 1;
-        try std.testing.expect(std.mem.find(u8, finding.message, "'render'") != null);
+        const quoted = finding.message[std.mem.findScalar(u8, finding.message, '\'').? + 1 ..];
+        try reported.append(arena.allocator(), quoted[0..std.mem.findScalar(u8, quoted, '\'').?]);
     };
-    try std.testing.expectEqual(@as(usize, 1), docs_count);
+    const expected = [_][]const u8{ "renderFrame", "EMCON", "Parser", "Bar" };
+    try std.testing.expectEqual(expected.len, reported.items.len);
+    for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
 }
 
 test "top-level sentinel arrays do not make a file a type" {
@@ -1378,19 +1905,22 @@ test "build entrypoint keeps its conventional file name" {
     try std.testing.expect((try fileNameFindingForSource(arena.allocator(), source, "build.zig", configuration)) == null);
 }
 
-test "compound Context and State names describe their role" {
+test "only bare vague words are vague type names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
-        "const LookupContext = struct { key: u32 };\n" ++
-        "const CheckpointState = struct { op: u64 };\n" ++
-        "pub const Context = struct { key: u32 };\n";
+        "pub const LookupContext = struct { key: u32 };\n" ++
+        "pub const CheckpointState = struct { op: u64 };\n" ++
+        "pub const ModeData = extern struct { mode: u32 };\n" ++
+        "pub const ResourceManager = struct { count: u32 };\n" ++
+        "pub const Context = struct { pub fn hash(_: Context, key: u32) u64 { return key; } };\n" ++
+        "pub const Data = struct { key: u32 };\n";
     const configuration = support.only(&.{.vague_type_name}, .warning);
     const found = try support.findings(arena.allocator(), run, source, configuration);
     var vague_count: usize = 0;
     for (found) |finding| if (finding.rule == .vague_type_name) {
         vague_count += 1;
-        try std.testing.expect(std.mem.find(u8, finding.message, "'Context'") != null);
+        try std.testing.expect(std.mem.find(u8, finding.message, "'Data'") != null);
     };
     try std.testing.expectEqual(@as(usize, 1), vague_count);
 }

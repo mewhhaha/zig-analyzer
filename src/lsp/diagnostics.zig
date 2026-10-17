@@ -400,6 +400,7 @@ pub const Linter = struct {
         shapes: []const analysis.ResolvedShape,
         dependencies: ?*Dependencies,
     ) ![]analysis.Finding {
+        if (document.excessive_nesting != null) return &.{};
         const origin = try module_sites.File.ofDocument(allocator, document);
         var module_files: module_sites.Cache = .init(allocator);
         defer module_files.deinit();
@@ -426,9 +427,10 @@ pub const Linter = struct {
             ),
         );
         try linter.appendImportedDeprecations(allocator, documents, document, lint_configuration, &document_findings, dependencies);
-        if (try analysis.fileNameFinding(allocator, &document.tree, document.uri, lint_configuration)) |finding| {
+        // A generated file keeps no style findings, as in `analysis.findingsWith`.
+        if (!analysis.hasGeneratedHeader(document.source)) if (try analysis.fileNameFinding(allocator, &document.tree, document.uri, lint_configuration)) |finding| {
             try document_findings.append(allocator, finding);
-        }
+        };
         return try document_findings.toOwnedSlice(allocator);
     }
 
@@ -443,6 +445,16 @@ pub const Linter = struct {
         dependencies: ?*Dependencies,
     ) ![]Diagnostic {
         var layer: std.ArrayList(Diagnostic) = .empty;
+        if (document.excessive_nesting) |span| {
+            try layer.append(arena, .{
+                .range = document.range(span),
+                .severity = .Information,
+                .code = .{ .string = "nesting-limit" },
+                .source = "zig-analyzer",
+                .message = .{ .string = analysis.excessive_nesting_notice },
+            });
+            return try layer.toOwnedSlice(arena);
+        }
         try layer.appendSlice(arena, try syntaxDiagnostics(document, arena));
         const lint_configuration = try linter.configuration(arena, document);
         if (try analysis.suppressionWarning(arena, document.source)) |warning| {
@@ -502,6 +514,14 @@ pub const Publisher = struct {
     transport: *lsp.Transport,
     mutex: std.Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    /// The client pulls diagnostics (`textDocument/diagnostic`) and can be
+    /// asked to pull again, so nothing is pushed: the merged layers wait for
+    /// its next pull. Decided once, from the client's capabilities.
+    pull: bool = false,
+    /// Source of `Entry.result_id`, unique across documents and reopenings.
+    result_count: u64 = 0,
+    /// Source of the ids of `workspace/diagnostic/refresh` requests.
+    refresh_count: i64 = 0,
 
     /// What is currently known about one document. `version` is the newest
     /// version the foreground has published; layers always describe it.
@@ -511,6 +531,10 @@ pub const Publisher = struct {
         compiler: ?Layer = null,
         /// The diagnostics last written, to skip identical republishes.
         published: Layer,
+        /// Pull mode: names `published` for the client; 0 before the first.
+        result_id: u64 = 0,
+        /// Pull mode: the version the client last pulled.
+        pulled_version: ?i32 = null,
 
         fn deinit(state: *Entry) void {
             state.lint.deinit();
@@ -527,7 +551,6 @@ pub const Publisher = struct {
             var arena: std.heap.ArenaAllocator = .init(allocator);
             errdefer arena.deinit();
             // The diagnostics live in `arena`, which `deinit` releases.
-            // zig-analyzer: disable-next-line incomplete-owned-field-cleanup
             return .{ .diagnostics = try copyDiagnostics(arena.allocator(), diagnostics), .arena = arena };
         }
 
@@ -568,6 +591,15 @@ pub const Publisher = struct {
         tracked.lint.deinit();
         tracked.lint = layer;
         try publisher.write(uri, tracked, false);
+    }
+
+    /// Foreground: `version` of `uri` is edited and its lint layer comes
+    /// later. Compiler results for it are kept from now on and older ones
+    /// retired, as `publishLint` of that version would.
+    pub fn expect(publisher: *Publisher, uri: []const u8, version: i32) !void {
+        publisher.mutex.lockUncancelable(publisher.io);
+        defer publisher.mutex.unlock(publisher.io);
+        _ = try publisher.track(uri, version);
     }
 
     /// Compiler backend: the compiler layer of `version` of `uri`, with the
@@ -646,6 +678,7 @@ pub const Publisher = struct {
         if (state.compiler) |compiler_layer| try merged.appendSlice(arena, compiler_layer.diagnostics);
         const count = deduplicateAndSortDiagnostics(merged.items);
         const diagnostics = merged.items[0..count];
+        if (publisher.pull) return publisher.keepForPull(arena, state, diagnostics);
         if (skip_identical and sameDiagnostics(state.published.diagnostics, diagnostics)) return;
         const published = try Layer.copy(publisher.allocator, diagnostics);
         state.published.deinit();
@@ -658,6 +691,47 @@ pub const Publisher = struct {
             .{ .uri = uri, .version = state.version, .diagnostics = diagnostics },
             .{ .emit_null_optional_fields = false },
         );
+    }
+
+    /// Pull mode: keeps `diagnostics` for the client's next pull. The client
+    /// pulls after its own edits; when they change for a version it already
+    /// pulled (a compile finished, a dependency or the configuration changed),
+    /// nothing else would make it ask again, so it is asked to.
+    fn keepForPull(publisher: *Publisher, arena: std.mem.Allocator, state: *Entry, diagnostics: []const Diagnostic) !void {
+        if (state.result_id != 0 and sameDiagnostics(state.published.diagnostics, diagnostics)) return;
+        const published = try Layer.copy(publisher.allocator, diagnostics);
+        state.published.deinit();
+        state.published = published;
+        publisher.result_count += 1;
+        state.result_id = publisher.result_count;
+        if (state.pulled_version != state.version) return;
+        publisher.refresh_count += 1;
+        try publisher.transport.writeRequest(
+            publisher.io,
+            arena,
+            .{ .number = publisher.refresh_count },
+            "workspace/diagnostic/refresh",
+            void,
+            {},
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+
+    pub const Pulled = struct {
+        result_id: u64,
+        diagnostics: []const Diagnostic,
+    };
+
+    /// Pull mode: the merged diagnostics of `version` of `uri`, copied into
+    /// `arena`, recording that the client has them. Null when that version's
+    /// lint layer has not been computed.
+    pub fn pulled(publisher: *Publisher, arena: std.mem.Allocator, uri: []const u8, version: i32) !?Pulled {
+        publisher.mutex.lockUncancelable(publisher.io);
+        defer publisher.mutex.unlock(publisher.io);
+        const known = publisher.entries.getPtr(uri) orelse return null;
+        if (known.version != version or known.result_id == 0) return null;
+        known.pulled_version = version;
+        return .{ .result_id = known.result_id, .diagnostics = try copyDiagnostics(arena, known.published.diagnostics) };
     }
 };
 

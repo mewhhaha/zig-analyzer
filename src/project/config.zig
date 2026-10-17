@@ -222,9 +222,10 @@ fn isWithin(path: []const u8, directory: []const u8) bool {
     return std.Io.Dir.path.isSep(path[directory.len]);
 }
 
-/// Per-path relaxations of a project's configuration for the file at `path`,
-/// relative to the project root: debug printing is legitimate in tests and
-/// build scripts, and the discipline rules hold only production code.
+/// A project's configuration for the file at `path`, relative to the project
+/// root: the built-in relaxations for tests, fixtures and scripts (debug
+/// printing is legitimate in tests and build scripts, and the discipline
+/// rules hold only production code), then the matching `overrides`.
 pub fn configurationForPath(configuration: analysis.Configuration, path: []const u8) analysis.Configuration {
     return analysis.configurationForPath(configuration, path);
 }
@@ -330,4 +331,27 @@ test "a configuration file appearing later is noticed without invalidation" {
     try temporary.dir.writeFile(io, .{ .sub_path = "app/zig-analyzer.json", .data = "{}\n" });
     const after = try store.forDirectory(source_directory);
     try std.testing.expectEqualStrings(root, after.root);
+}
+
+test "the language server applies overrides by the path inside the project" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(io, "tests/unit");
+    try temporary.dir.writeFile(io, .{
+        .sub_path = file_name,
+        .data = "{\"lints\":{\"rules\":{\"redundant-boolean-if\":\"warning\"}},\"overrides\":[{\"paths\":[\"tests/**\"],\"lints\":{\"rules\":{\"redundant-boolean-if\":\"hint\"}}}]}\n",
+    });
+    const root = try temporary.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const test_file = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "tests/unit/walk.zig" });
+    defer std.testing.allocator.free(test_file);
+    var store = Store.init(io, std.testing.allocator);
+    defer store.deinit();
+    const resolved = try store.forFile(test_file);
+    try std.testing.expect(resolved.new_warning == null);
+    try std.testing.expectEqual(analysis.Level.hint, resolved.configuration.level(.redundant_boolean_if));
+    const production = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "src/main.zig" });
+    defer std.testing.allocator.free(production);
+    try std.testing.expectEqual(analysis.Level.warning, (try store.forFile(production)).configuration.level(.redundant_boolean_if));
 }

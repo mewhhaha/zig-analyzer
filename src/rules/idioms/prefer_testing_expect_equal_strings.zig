@@ -3,6 +3,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const topLevelComma = @import("../../syntax/tokens.zig").topLevelComma;
+const dottedCalleeStart = @import("../../syntax/tokens.zig").dottedCalleeStart;
 
 pub const rules = [_]types.Rule{
     .prefer_testing_expect_equal_strings,
@@ -28,7 +29,7 @@ pub fn run(context: RuleRun) !void {
         const argument_comma = topLevelComma(context.tokens, eql_index + 4, eql_end) orelse continue;
         if (argument_comma == eql_index + 4 or argument_comma + 1 == eql_end) continue;
 
-        const expression_start = callExpressionStart(context.tokens, expect_index + 1) orelse expect_index;
+        const expression_start = dottedCalleeStart(context.tokens, expect_index + 1) orelse expect_index;
         const qualification = context.source[context.tokens[expression_start].loc.start..token.loc.start];
         const expected = std.mem.trim(
             u8,
@@ -74,13 +75,6 @@ fn calleeIsTestingQualified(context: RuleRun, expect_index: usize) bool {
     if (expect_index == 0 or context.tokens[expect_index - 1].tag != .period) return true;
     return expect_index >= 2 and context.tokens[expect_index - 2].tag == .identifier and
         context.tokenIs(expect_index - 2, "testing");
-}
-
-fn callExpressionStart(tokens: []const std.zig.Token, opening: usize) ?usize {
-    if (opening == 0 or tokens[opening - 1].tag != .identifier) return null;
-    var start = opening - 1;
-    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
-    return start;
 }
 
 test "byte equality assertions use string-aware failures" {

@@ -1,8 +1,77 @@
-//! Whether a mutation of a container can affect a later use of a view into it.
-//! Shared by the invalidation rules so they agree on what a "use after" is.
+//! Whether a mutation of a container can affect a later use of a view into it,
+//! and whether a statement runs on every path through a block. Shared by the
+//! lifecycle rules so they agree on what a "use after" and a "release before"
+//! are.
 
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
+const Syntax = @import("../context.zig").Syntax;
+const types = @import("../types.zig");
+const syntax_scope = @import("../../syntax/scope.zig");
+const tokens_util = @import("../../syntax/tokens.zig");
+const Token = std.zig.Token;
+
+/// The innermost block that holds both `first` and `second`.
+pub fn commonBlock(scopes: *const syntax_scope.Index, first: usize, second: usize) ?usize {
+    var opening = scopes.enclosingOpeningBrace(first);
+    while (opening) |brace| : (opening = scopes.enclosingOpeningBrace(brace)) {
+        const closing = scopes.matchingToken(brace) orelse return null;
+        if (second > brace and second < closing) return brace;
+    }
+    return null;
+}
+
+/// Whether the statement holding `index` runs whenever control passes through
+/// the block opened at `opening` up to it: no branch, prong, handler, defer or
+/// nested declaration guards it on the way down. Loop bodies are taken to run.
+pub fn runsWithin(tokens: []const Token, scopes: *const syntax_scope.Index, index: usize, opening: usize) bool {
+    var cursor = index;
+    while (true) {
+        if (!statementReaches(tokens, cursor)) return false;
+        const enclosing = scopes.enclosingOpeningBrace(cursor) orelse return false;
+        if (enclosing == opening) return true;
+        if (enclosing < opening) return false;
+        cursor = enclosing;
+    }
+}
+
+/// Whether the part of its statement before `index` always gets there.
+fn statementReaches(tokens: []const Token, index: usize) bool {
+    var start = tokens_util.statementStart(tokens, index);
+    if (start + 1 < index and tokens[start].tag == .identifier and tokens[start + 1].tag == .colon) start += 2;
+    if (start < index and tokens[start].tag == .keyword_inline) start += 1;
+    if (start < index and (tokens[start].tag == .keyword_while or tokens[start].tag == .keyword_for)) return true;
+    return unguarded(tokens, start, index);
+}
+
+/// Whether control at `start` always gets to `index`: nothing between them
+/// branches, handles an error, defers or declares.
+pub fn unguarded(tokens: []const Token, start: usize, index: usize) bool {
+    for (tokens[start..index]) |token| switch (token.tag) {
+        .keyword_if,
+        .keyword_else,
+        .keyword_switch,
+        .equal_angle_bracket_right,
+        .keyword_catch,
+        .keyword_orelse,
+        .keyword_and,
+        .keyword_or,
+        .keyword_while,
+        .keyword_for,
+        .keyword_defer,
+        .keyword_errdefer,
+        .keyword_suspend,
+        .keyword_fn,
+        .keyword_test,
+        .keyword_struct,
+        .keyword_union,
+        .keyword_enum,
+        .keyword_opaque,
+        => return false,
+        else => {},
+    };
+    return true;
+}
 
 /// The `)` closing the call whose method name sits at `method_index`.
 pub fn callEnd(context: RuleRun, method_index: usize) ?usize {
@@ -117,19 +186,27 @@ pub fn harmlessUse(context: RuleRun, use: usize) bool {
         if (!context.tokenIs(after + 1, "ptr")) return false;
         after += 2;
     }
-    if (after < tokens.len and isComparison(tokens[after].tag)) return true;
-    return use > 0 and isComparison(tokens[use - 1].tag);
+    if (after < tokens.len and isEquality(tokens[after].tag)) return true;
+    return use > 0 and isEquality(tokens[use - 1].tag);
 }
 
-fn isComparison(tag: std.zig.Token.Tag) bool {
+fn isEquality(tag: std.zig.Token.Tag) bool {
     return tag == .equal_equal or tag == .bang_equal;
 }
 
 /// The first use of `name` in `[start, end)` that the mutation at `mutation`
 /// can affect; a reassignment or redeclaration of `name` ends the search.
-pub fn firstReachedUse(context: RuleRun, name: []const u8, mutation: usize, start: usize, end: usize) ?usize {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+/// `identifiers` is the file's table, which lists the identifiers spelled `name`.
+pub fn firstReachedUse(
+    context: RuleRun,
+    identifiers: *const syntax_scope.IdentifierTable,
+    name: []const u8,
+    mutation: usize,
+    start: usize,
+    end: usize,
+) ?usize {
+    for (identifiers.within(name, start, end)) |position| {
+        const index: usize = position;
         if (index > start and context.tokens[index - 1].tag == .period) continue;
         if (!mutationReaches(context, mutation, index)) continue;
         if (index > start and (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var)) return null;
@@ -138,4 +215,172 @@ pub fn firstReachedUse(context: RuleRun, name: []const u8, mutation: usize, star
         return index;
     }
     return null;
+}
+
+/// The last mention of `name` in `[start, end)`, or `start` when there is
+/// none: a mutation at or after it ends after every mention, so
+/// `firstReachedUse` finds no use after it.
+pub fn lastMention(identifiers: *const syntax_scope.IdentifierTable, name: []const u8, start: usize, end: usize) usize {
+    const mentions = identifiers.within(name, start, end);
+    return if (mentions.len == 0) start else mentions[mentions.len - 1];
+}
+
+/// A `RuleRun` over `source` whose inputs live in `arena`.
+fn testRun(arena: std.mem.Allocator, source: [:0]const u8) !RuleRun {
+    const tokens = try tokens_util.tokenize(arena, source);
+    const syntax = try arena.create(Syntax);
+    syntax.* = try Syntax.init(arena, source, tokens);
+    const found = try arena.create(std.ArrayList(types.Finding));
+    found.* = .empty;
+    return syntax.ruleRun(arena, types.Configuration.defaults(), found);
+}
+
+/// The `occurrence`-th token spelled `text`.
+fn at(context: RuleRun, text: []const u8, occurrence: usize) usize {
+    var seen: usize = 0;
+    for (0..context.tokens.len) |index| {
+        if (!std.mem.eql(u8, context.tokenText(index), text)) continue;
+        if (seen == occurrence) return index;
+        seen += 1;
+    }
+    unreachable;
+}
+
+test "commonBlock is the innermost block holding both tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(), "fn f() void { { a(); b(); } c(); }");
+    const body = at(context, "{", 0);
+    const inner = at(context, "{", 1);
+    try std.testing.expectEqual(@as(?usize, inner), commonBlock(context.scopes, at(context, "a", 0), at(context, "b", 0)));
+    try std.testing.expectEqual(@as(?usize, body), commonBlock(context.scopes, at(context, "a", 0), at(context, "c", 0)));
+    try std.testing.expectEqual(@as(?usize, null), commonBlock(context.scopes, at(context, "fn", 0), at(context, "a", 0)));
+}
+
+test "runsWithin follows loop bodies but not branches, defers or nested declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(),
+        \\fn f(c: bool) void {
+        \\    a();
+        \\    if (c) { b(); }
+        \\    while (c) { d(); }
+        \\    defer e();
+        \\    const g = struct { fn h() void { i(); } };
+        \\}
+    );
+    const body = at(context, "{", 0);
+    try std.testing.expect(runsWithin(context.tokens, context.scopes, at(context, "a", 0), body));
+    try std.testing.expect(!runsWithin(context.tokens, context.scopes, at(context, "b", 0), body));
+    try std.testing.expect(runsWithin(context.tokens, context.scopes, at(context, "d", 0), body));
+    try std.testing.expect(!runsWithin(context.tokens, context.scopes, at(context, "e", 0), body));
+    try std.testing.expect(!runsWithin(context.tokens, context.scopes, at(context, "i", 0), body));
+}
+
+test "unguarded rejects a range that branches or handles an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(), "fn f() void { a(); b(); c() catch {}; d(); if (x) e(); }");
+    try std.testing.expect(unguarded(context.tokens, at(context, "a", 0), at(context, "b", 0)));
+    try std.testing.expect(!unguarded(context.tokens, at(context, "c", 0), at(context, "d", 0)));
+    try std.testing.expect(!unguarded(context.tokens, at(context, "d", 0), at(context, "e", 0)));
+}
+
+test "callEnd is the parenthesis that closes a call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(), "fn f() void { list.append(g(1), 2); _ = list.items; }");
+    try std.testing.expectEqual(@as(?usize, at(context, ")", 2)), callEnd(context, at(context, "append", 0)));
+    try std.testing.expectEqual(@as(?usize, null), callEnd(context, at(context, "items", 0)));
+}
+
+test "deferKeyword finds the defer of a statement or of the block around it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(), "fn f() !void { defer list.deinit(); errdefer |err| { log(err); } work(); }");
+    try std.testing.expectEqual(@as(?usize, at(context, "defer", 0)), deferKeyword(context, at(context, "deinit", 0)));
+    try std.testing.expectEqual(@as(?usize, at(context, "errdefer", 0)), deferKeyword(context, at(context, "log", 0)));
+    try std.testing.expectEqual(@as(?usize, null), deferKeyword(context, at(context, "work", 0)));
+}
+
+test "mutationReaches stops at a return, a sibling branch or prong, and a deferred mutation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(),
+        \\fn f(list: *List, c: bool, n: u8) void {
+        \\    list.append(0);
+        \\    use(view);
+        \\    if (c) {
+        \\        list.append(1);
+        \\        return;
+        \\    }
+        \\    use(view);
+        \\    if (c) {
+        \\        list.append(2);
+        \\    } else {
+        \\        use(view);
+        \\    }
+        \\    switch (n) {
+        \\        0 => {
+        \\            list.append(3);
+        \\        },
+        \\        else => {
+        \\            use(view);
+        \\        },
+        \\    }
+        \\    defer list.append(4);
+        \\    use(view);
+        \\}
+    );
+    try std.testing.expect(mutationReaches(context, at(context, "append", 0), at(context, "view", 0)));
+    try std.testing.expect(!mutationReaches(context, at(context, "append", 1), at(context, "view", 1)));
+    try std.testing.expect(!mutationReaches(context, at(context, "append", 2), at(context, "view", 2)));
+    try std.testing.expect(mutationReaches(context, at(context, "append", 2), at(context, "view", 4)));
+    try std.testing.expect(!mutationReaches(context, at(context, "append", 3), at(context, "view", 3)));
+    try std.testing.expect(!mutationReaches(context, at(context, "append", 4), at(context, "view", 4)));
+}
+
+test "harmlessUse accepts length reads and pointer comparisons only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(
+        arena.allocator(),
+        "fn f() void { _ = view.len; _ = view.ptr == other; _ = other != view; _ = view == other; _ = view[0]; _ = view.ptr[0]; _ = view.items; }",
+    );
+    for ([_]bool{ true, true, true, true, false, false, false }, 0..) |harmless, occurrence| {
+        try std.testing.expectEqual(harmless, harmlessUse(context, at(context, "view", occurrence)));
+    }
+}
+
+test "firstReachedUse skips harmless and field uses and stops at a reassignment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(),
+        \\fn f(list: *List, other: Other) void {
+        \\    var view = list.items;
+        \\    list.append(1);
+        \\    _ = other.view;
+        \\    _ = view.len;
+        \\    _ = view[0];
+        \\    view = list.items;
+        \\    _ = view[1];
+        \\}
+    );
+    const identifiers = try context.scopes.identifiers();
+    const mutation = at(context, "append", 0);
+    const body_end = context.scopes.matchingToken(at(context, "{", 0)).?;
+    try std.testing.expectEqual(@as(?usize, at(context, "view", 3)), firstReachedUse(context, identifiers, "view", mutation, mutation, body_end));
+    try std.testing.expectEqual(@as(?usize, null), firstReachedUse(context, identifiers, "view", mutation, at(context, "view", 3) + 1, body_end));
+}
+
+test "lastMention is the last mention in the range or its start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const context = try testRun(arena.allocator(), "fn f() void { a(view); b(view); c(); }");
+    const identifiers = try context.scopes.identifiers();
+    const body = at(context, "{", 0);
+    const body_end = context.scopes.matchingToken(body).?;
+    try std.testing.expectEqual(at(context, "view", 1), lastMention(identifiers, "view", body, body_end));
+    try std.testing.expectEqual(at(context, "view", 0), lastMention(identifiers, "view", body, at(context, "b", 0)));
+    try std.testing.expectEqual(body, lastMention(identifiers, "missing", body, body_end));
 }

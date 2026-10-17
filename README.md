@@ -51,9 +51,13 @@ for top-level constants rather than only their initializer text.
 
 ## Language server
 
-zig-analyzer implements diagnostics, completion, hover, references, rename,
-call hierarchy, semantic tokens, inlay hints, code actions, and formatting that
-matches `zig fmt` byte for byte.
+zig-analyzer implements diagnostics (pushed, or pulled by clients that ask),
+completion, hover, references, document highlights, rename with prepare, call
+hierarchy, semantic tokens, inlay hints (including "caller frees" after calls
+whose result the caller owns), folding and selection ranges, links to imported
+and embedded files, code lenses (including "Run test" above each named test),
+code actions, and whole-document or range formatting that matches `zig fmt`
+byte for byte.
 
 Renaming a field, method, enum case, or top-level declaration asks the compiler
 which occurrences denote it: `x.name` through an alias, a pointer, a method
@@ -68,10 +72,13 @@ for each other compile unit it must start (at most 30 s, 16 units).
 
 Configure your editor to run the executable with the `lsp` argument;
 [docs/editors.md](docs/editors.md) has complete Helix and Neovim
-configurations. This repository's own `.helix/languages.toml` is already set
+configurations and describes the features that depend on the editor, such as
+the "Run test" lens. This repository's own `.helix/languages.toml` is already set
 up, so opening `examples/compiler/comptime_pipeline.zig` in Helix reproduces
 the completion above.
 
+Edits are applied at once and requests answer from the latest text; lint
+diagnostics follow once typing pauses, for the last version only.
 Compiler updates run on a debounced background worker, one job per document.
 The server answers from the latest syntax immediately, then publishes
 compiler-enriched diagnostics only if that result still matches the current
@@ -89,6 +96,10 @@ The `check` command lints a project from the command line or CI:
 zig-analyzer check .            # lint the project; exits nonzero on findings
 zig-analyzer check --fix .      # apply only provably safe rewrites
 zig-analyzer check --no-cache . # ignore cached results for unchanged files
+zig-analyzer check --baseline base.json .  # report only findings not in a baseline
+zig-analyzer check --format sarif .        # also json, or github for Actions annotations
+zig-analyzer check --rule discarded-error --fail-on warning .  # one rule; ignore hints
+zig-analyzer explain missing-errdefer      # a rule's documentation; no rule lists them all
 ```
 
 The rules focus on valid Zig that is still wrong — patterns neither the
@@ -112,11 +123,14 @@ compiler nor a syntax-based server reports:
 | Byte-comparing a struct whose layout has padding | `padded-byte-compare` |
 | `operation() catch {};` | `discarded-error` |
 
-There are 198 rules with stable codes (see the [rule index](docs/rules/README.md)), organized into five named profiles,
+Rules have stable codes (the [rule index](docs/rules/README.md) lists them all and gives the count), are organized into five named profiles,
 with quick fixes wherever the rewrite is provable. Project contracts extend
 the built-in analyses with your own import boundaries, resource pairs, and
-must-use functions. Configuration lives in `zig-analyzer.json`, and findings
-can be suppressed with source directives;
+must-use functions. Configuration lives in `zig-analyzer.json`: profiles
+choose the style rules, tier settings set the level of the rules that are on,
+per-path `overrides` adjust them for parts of the project, and tests,
+fixtures, scripts and generated files get built-in relaxations. Findings can
+be suppressed with source directives or recorded in a baseline file;
 [docs/linting.md](docs/linting.md) documents all of it.
 
 The [Zig 0.17.0 audit](docs/zig-0.17.0-lint-audit.md) reviews every existing

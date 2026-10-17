@@ -14,8 +14,9 @@ pub fn run(context: RuleRun) !void {
     for (context.tokens, 0..) |token, cast_index| {
         if (token.tag != .builtin) continue;
         const operand_index = nestedPointerCastOperand(context, cast_index) orelse continue;
-        const slice_name = reinterpretationSlice(context, operand_index, cast_index) orelse continue;
-        if (!bindingIsPlainSlice(context, slice_name, cast_index)) continue;
+        const slice_index = reinterpretationSlice(context, operand_index) orelse continue;
+        if (!bindingIsPlainSlice(context, slice_index) or functionTakesAlignment(context, cast_index)) continue;
+        const slice_name = context.tokenText(slice_index);
         try context.emit(.{
             .rule = .unchecked_slice_reinterpretation,
             .level = level,
@@ -37,45 +38,52 @@ fn nestedPointerCastOperand(context: RuleRun, cast_index: usize) ?usize {
     return if (align_then_pointer or pointer_then_align) cast_index + 4 else null;
 }
 
-fn reinterpretationSlice(context: RuleRun, operand_index: usize, before: usize) ?[]const u8 {
+/// The slice whose `.ptr` the cast operand is, directly (`raw.ptr`) or through
+/// the declaration of the operand (`const shifted = raw.ptr + offset;`).
+fn reinterpretationSlice(context: RuleRun, operand_index: usize) ?usize {
     if (operand_index + 2 < context.tokens.len and context.tokens[operand_index + 1].tag == .period and
-        context.tokenIs(operand_index + 2, "ptr")) return context.tokenText(operand_index);
-    const alias = context.tokenText(operand_index);
-    var index = before;
-    while (index > 2) {
-        index -= 1;
-        if (!context.tokenIs(index, alias) or index + 1 >= before or context.tokens[index + 1].tag != .equal) continue;
-        const declaration_index = index - 1;
-        if (context.tokens[declaration_index].tag != .keyword_const and context.tokens[declaration_index].tag != .keyword_var) continue;
-        const statement_end = context.statementEnd(declaration_index) orelse continue;
-        var source_index = index + 2;
-        while (source_index + 2 < statement_end) : (source_index += 1) {
-            if (context.tokens[source_index].tag == .identifier and context.tokens[source_index + 1].tag == .period and
-                context.tokenIs(source_index + 2, "ptr")) return context.tokenText(source_index);
-        }
+        context.tokenIs(operand_index + 2, "ptr")) return operand_index;
+    const alias = (context.scopes.findBinding(operand_index) orelse return null).token_index;
+    if (alias == 0 or alias + 1 >= context.tokens.len or context.tokens[alias + 1].tag != .equal or
+        (context.tokens[alias - 1].tag != .keyword_const and context.tokens[alias - 1].tag != .keyword_var)) return null;
+    const statement_end = context.statementEnd(alias - 1) orelse return null;
+    var source_index = alias + 2;
+    while (source_index + 2 < statement_end) : (source_index += 1) {
+        if (context.tokens[source_index].tag == .identifier and context.tokens[source_index + 1].tag == .period and
+            context.tokenIs(source_index + 2, "ptr")) return source_index;
     }
     return null;
 }
 
-fn bindingIsPlainSlice(context: RuleRun, name: []const u8, before: usize) bool {
-    var index = before;
-    while (index > 0) {
-        index -= 1;
-        if (!context.tokenIs(index, name) or index + 2 >= before or context.tokens[index + 1].tag != .colon) continue;
-        var type_index = index + 2;
-        var saw_slice = false;
-        var explicit_alignment = false;
-        while (type_index < before) : (type_index += 1) {
-            switch (context.tokens[type_index].tag) {
-                .l_bracket => if (type_index + 1 < before and context.tokens[type_index + 1].tag == .r_bracket) {
-                    saw_slice = true;
-                },
-                .keyword_align => explicit_alignment = true,
-                .comma, .r_paren, .equal, .semicolon, .l_brace => break,
-                else => {},
-            }
+/// Whether the binding the identifier at `use_index` names is declared with
+/// a slice type and no explicit alignment.
+fn bindingIsPlainSlice(context: RuleRun, use_index: usize) bool {
+    const declaration = (context.scopes.findBinding(use_index) orelse return false).token_index;
+    if (declaration + 2 >= context.tokens.len or context.tokens[declaration + 1].tag != .colon) return false;
+    var saw_slice = false;
+    var explicit_alignment = false;
+    for (context.tokens[declaration + 2 ..], declaration + 2..) |token, type_index| {
+        switch (token.tag) {
+            .l_bracket => if (context.tokens[type_index + 1].tag == .r_bracket) {
+                saw_slice = true;
+            },
+            .keyword_align => explicit_alignment = true,
+            .comma, .r_paren, .equal, .semicolon, .l_brace, .eof => break,
+            else => {},
         }
-        return saw_slice and !explicit_alignment;
+    }
+    return saw_slice and !explicit_alignment;
+}
+
+/// Whether the function around the cast takes a `mem.Alignment` parameter,
+/// as allocator implementations do: the caller's alignment travels beside the
+/// plain slice, so the slice type does not describe it.
+fn functionTakesAlignment(context: RuleRun, cast_index: usize) bool {
+    const body = context.scopes.functionBodyContaining(cast_index) orelse return false;
+    const opening = (context.scopes.functionKeyword(body) orelse return false) + 2;
+    const closing = context.matchingToken(opening, .l_paren, .r_paren) orelse return false;
+    for (context.tokens[opening..closing], opening..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, "Alignment")) return true;
     }
     return false;
 }
@@ -119,6 +127,24 @@ test "byte-offset pointer aliases retain the original slice contract" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "the operand's own declaration decides the slice and allocator internals stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn read(buf: []u8) usize { const rc = system.read(buf.ptr, buf.len); return rc; }\n" ++
+        "fn mmap(ptr: ?[*]u8, length: usize) []align(4096) u8 {\n" ++
+        "    const rc = system.mmap(ptr, length);\n" ++
+        "    return @as([*]align(4096) u8, @ptrCast(@alignCast(rc)))[0..length];\n" ++
+        "}\n" ++
+        "fn free(context: *anyopaque, memory: []u8, alignment: mem.Alignment, ra: usize) void {\n" ++
+        "    const node: *usize = @ptrCast(@alignCast(memory.ptr));\n" ++
+        "    _ = .{ context, alignment, ra, node };\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "ptrCast outside alignCast retains the same slice contract" {

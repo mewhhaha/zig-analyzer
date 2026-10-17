@@ -35,7 +35,7 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[while_index + 3].tag != .angle_bracket_right_equal or
                 context.tokens[while_index + 4].tag != .number_literal or
                 !context.tokenIs(while_index + 4, "0") or
-                bindingShadowed(context, index_name, declaration_end + 1, while_index)) continue;
+                context.rangeDeclaresName(index_name, declaration_end + 1, while_index)) continue;
             const update_opening = condition_end + 2;
             if (update_opening >= scope_end or context.tokens[condition_end + 1].tag != .colon or
                 context.tokens[update_opening].tag != .l_paren) continue;
@@ -125,14 +125,6 @@ fn decrementsByOne(context: RuleRun, name: []const u8, start: usize, end: usize)
     while (index + 2 < end) : (index += 1) {
         if (context.tokenIs(index, name) and context.tokens[index + 1].tag == .minus_equal and
             context.tokens[index + 2].tag == .number_literal and context.tokenIs(index + 2, "1")) return true;
-    }
-    return false;
-}
-
-fn bindingShadowed(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if ((token.tag == .keyword_const or token.tag == .keyword_var) and index + 1 < end and
-            context.tokenIs(index + 1, name)) return true;
     }
     return false;
 }

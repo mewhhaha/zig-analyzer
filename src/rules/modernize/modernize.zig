@@ -18,9 +18,11 @@ pub const rules = [_]types.Rule{
 
 pub fn run(context: RuleRun) !void {
     const scopes = context.scopes;
-    try findManagedContainers(context, scopes);
-    try findDeprecatedIo(context, scopes);
-    try findDeprecatedStdlib(context, scopes);
+    const std_roots = try stdRoots(context, scopes);
+    defer context.allocator.free(std_roots);
+    try findManagedContainers(context, std_roots);
+    try findDeprecatedIo(context, std_roots);
+    try findDeprecatedStdlib(context, scopes, std_roots);
     try findDeprecatedBuiltins(context, scopes);
     try findRemovedSyntax(context, scopes);
     try findBuildApi(context, scopes);
@@ -169,6 +171,15 @@ pub const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "Thread.ResetEvent", .advice = "std.Io.Event", .removed = true },
     .{ .path = "Thread.WaitGroup", .advice = "std.Io.Group", .removed = true },
     .{ .path = "Thread.Pool", .advice = "std.Io.Group with Io.async or Io.concurrent", .removed = true },
+    .{ .path = "fs.File.readToEndAlloc", .advice = "file.reader(io, &buffer).interface.allocRemaining(gpa, limit) on a std.Io.File", .removed = true },
+    .{ .path = "Io.File.readToEndAlloc", .advice = "file.reader(io, &buffer).interface.allocRemaining(gpa, limit)", .removed = true },
+    .{ .path = "fs.Dir.atomicFile", .advice = "std.Io.Dir.createFileAtomic", .removed = true },
+    .{ .path = "Io.Dir.atomicFile", .advice = "std.Io.Dir.createFileAtomic", .removed = true },
+    .{ .path = "fs.selfExePath", .advice = "std.process.executablePath with an Io instance", .removed = true },
+    .{ .path = "fs.selfExePathAlloc", .advice = "std.process.executablePathAlloc with an Io instance", .removed = true },
+    .{ .path = "fs.selfExeDirPath", .advice = "std.process.executableDirPath with an Io instance", .removed = true },
+    .{ .path = "fs.selfExeDirPathAlloc", .advice = "std.process.executableDirPathAlloc with an Io instance", .removed = true },
+    .{ .path = "fs.openSelfExe", .advice = "std.process.openExecutable with an Io instance", .removed = true },
     .{ .path = "fs.cwd", .advice = "std.Io.Dir.cwd()", .removed = true },
     .{ .path = "fs.File", .advice = "std.Io.File, whose operations take an Io instance", .removed = true },
     .{ .path = "fs.Dir", .advice = "std.Io.Dir, whose operations take an Io instance", .removed = true },
@@ -188,6 +199,31 @@ pub const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "posix.getenv", .advice = "std.process.Environ.getPosix, or the environ_map field of main's std.process.Init parameter", .removed = true },
     .{ .path = "fmt.format", .advice = "std.Io.Writer.print on the destination writer", .removed = true },
     .{ .path = "fmt.FormatOptions", .advice = "std.fmt.Options", .removed = true },
+    .{ .path = "fmt.Formatter", .advice = "std.fmt.Alt, whose format function takes the data and a *std.Io.Writer", .removed = true },
+    .{ .path = "fmt.fmtSliceHexLower", .advice = "the {x} format specifier on the byte slice", .removed = true },
+    .{ .path = "fmt.fmtSliceHexUpper", .advice = "the {X} format specifier on the byte slice", .removed = true },
+    .{ .path = "fmt.fmtSliceEscapeLower", .advice = "std.ascii.hexEscape(bytes, .lower) formatted with {f}", .removed = true },
+    .{ .path = "fmt.fmtSliceEscapeUpper", .advice = "std.ascii.hexEscape(bytes, .upper) formatted with {f}", .removed = true },
+    .{ .path = "fmt.fmtIntSizeDec", .advice = "the {B} format specifier on the integer", .removed = true },
+    .{ .path = "fmt.fmtIntSizeBin", .advice = "the {Bi} format specifier on the integer", .removed = true },
+    .{ .path = "fmt.fmtDuration", .advice = "std.Io.Duration.fromNanoseconds(ns) formatted with {f}", .removed = true },
+    .{ .path = "fmt.fmtDurationSigned", .advice = "std.Io.Duration.fromNanoseconds(ns) formatted with {f}", .removed = true },
+    .{ .path = "zig.fmtEscapes", .advice = "std.zig.fmtString, or std.zig.fmtChar for one character", .removed = true },
+    .{ .path = "io.null_writer", .advice = "std.Io.Writer.Discarding", .removed = true },
+    .{ .path = "Io.null_writer", .advice = "std.Io.Writer.Discarding", .removed = true },
+    .{ .path = "io.CountingWriter", .advice = "std.Io.Writer.Discarding, whose fullCount() is the number of bytes written", .removed = true },
+    .{ .path = "io.countingWriter", .advice = "std.Io.Writer.Discarding, whose fullCount() is the number of bytes written", .removed = true },
+    .{ .path = "leb.readUleb128", .advice = "std.Io.Reader.takeLeb128 with an unsigned integer type", .removed = true },
+    .{ .path = "leb.readIleb128", .advice = "std.Io.Reader.takeLeb128 with a signed integer type", .removed = true },
+    .{ .path = "leb.writeUleb128", .advice = "std.Io.Writer.writeUleb128", .removed = true },
+    .{ .path = "leb.writeIleb128", .advice = "std.Io.Writer.writeSleb128", .removed = true },
+    .{ .path = "ArrayHashMap", .advice = "std.array_hash_map.Custom and pass the allocator to allocating calls", .removed = true },
+    .{ .path = "AutoArrayHashMap", .advice = "std.array_hash_map.Auto and pass the allocator to allocating calls", .removed = true },
+    .{ .path = "StringArrayHashMap", .advice = "std.array_hash_map.String and pass the allocator to allocating calls", .removed = true },
+    .{ .path = "process.Child.init", .advice = "std.process.spawn with an Io instance and spawn options", .removed = true },
+    .{ .path = "process.Child.run", .advice = "std.process.run with an Io instance", .removed = true },
+    .{ .path = "process.execv", .advice = "std.process.replace with an Io instance", .removed = true },
+    .{ .path = "process.execve", .advice = "std.process.replace with an Io instance", .removed = true },
     .{ .path = "heap.memory_pool.Managed", .advice = "std.heap.MemoryPool and pass the allocator to allocating calls", .removed = true },
     .{ .path = "zig.system.NativeTargetInfo", .advice = "std.zig.system.resolveTargetQuery", .removed = true },
     .{ .path = "lang.Type.StructField", .advice = "std.lang.Type.Struct and its field_names, field_types and field_attrs arrays", .removed = true },
@@ -202,12 +238,42 @@ pub const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "math.fabs", .advice = "@abs", .removed = true },
 };
 
-fn findDeprecatedStdlib(context: RuleRun, scopes: *const syntax_scope.Index) !void {
+/// The positions in `stdlib_replacements` of the entries under each first path
+/// segment, in table order: a `std.` member is only matched against its own
+/// namespace's entries.
+const stdlib_replacements_by_namespace = namespaces: {
+    @setEvalBranchQuota(100_000);
+    var namespaces: []const []const u8 = &.{};
+    for (stdlib_replacements) |entry| {
+        const namespace = entry.path[0 .. std.mem.findScalar(u8, entry.path, '.') orelse entry.path.len];
+        for (namespaces) |known| {
+            if (std.mem.eql(u8, known, namespace)) break;
+        } else namespaces = namespaces ++ .{namespace};
+    }
+    var groups: [namespaces.len]struct { []const u8, []const u16 } = undefined;
+    for (namespaces, &groups) |namespace, *group| {
+        var positions: []const u16 = &.{};
+        for (stdlib_replacements, 0..) |entry, position| {
+            if (std.mem.startsWith(u8, entry.path, namespace) and
+                (entry.path.len == namespace.len or entry.path[namespace.len] == '.')) positions = positions ++ .{position};
+        }
+        group.* = .{ namespace, positions };
+    }
+    const frozen = groups;
+    break :namespaces std.StaticStringMap([]const u16).initComptime(&frozen);
+};
+
+fn findDeprecatedStdlib(context: RuleRun, scopes: *const syntax_scope.Index, std_roots: []const u32) !void {
     const level = context.level(.modernize_deprecated_stdlib);
     if (level == .off) return;
-    for (context.tokens, 0..) |token, index| {
-        if (!isStdRoot(context, scopes, index)) continue;
-        for (&stdlib_replacements) |entry| {
+    for (std_roots) |root| {
+        const index: usize = root;
+        const token = context.tokens[index];
+        if (index + 2 >= context.tokens.len or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 2].tag != .identifier) continue;
+        const positions = stdlib_replacements_by_namespace.get(context.tokenText(index + 2)) orelse continue;
+        for (positions) |position| {
+            const entry = &stdlib_replacements[position];
             const path_end = matchedStdPathEnd(context, index, entry.path) orelse continue;
             var fixes: []const types.Fix = &.{};
             if (entry.drop_in) {
@@ -234,7 +300,6 @@ fn findDeprecatedStdlib(context: RuleRun, scopes: *const syntax_scope.Index) !vo
             break;
         }
     }
-    try findLegacyReflection(context, scopes, level);
     try findLegacyAllocatorDupe(context, scopes, level);
     try findRuntimeSafety(context, scopes, level);
 }
@@ -250,28 +315,6 @@ fn findRuntimeSafety(context: RuleRun, scopes: *const syntax_scope.Index, level:
             .level = level,
             .span = .{ .start = token.loc.start, .end = context.tokens[end].loc.end },
             .message = "std.debug.runtime_safety is deprecated; use @import(\"builtin\").mode.runtimeSafety() to query the caller's module rather than std's module",
-        });
-    }
-}
-
-fn findLegacyReflection(context: RuleRun, scopes: *const syntax_scope.Index, level: types.Level) !void {
-    for (context.tokens, 0..) |token, index| {
-        if (token.tag != .builtin or !context.tokenIs(index, "@typeInfo") or
-            index + 1 >= context.tokens.len or context.tokens[index + 1].tag != .l_paren) continue;
-        const closing = scopes.matchingToken(index + 1) orelse continue;
-        if (closing + 4 >= context.tokens.len or context.tokens[closing + 1].tag != .period or
-            context.tokens[closing + 3].tag != .period or !context.tokenIs(closing + 4, "fields")) continue;
-        const is_enum = context.tokenIs(closing + 2, "@\"enum\"");
-        if (!is_enum and !context.tokenIs(closing + 2, "@\"struct\"") and
-            !context.tokenIs(closing + 2, "@\"union\"")) continue;
-        try context.emit(.{
-            .rule = .modernize_deprecated_stdlib,
-            .level = level,
-            .span = .{ .start = token.loc.start, .end = context.tokens[closing + 4].loc.end },
-            .message = if (is_enum)
-                "@typeInfo enum fields changed in Zig 0.17; iterate field_names and field_values together instead of fields"
-            else
-                "@typeInfo struct and union fields changed in Zig 0.17; iterate field_names, field_types, and related arrays together instead of fields",
         });
     }
 }
@@ -318,13 +361,16 @@ fn matchedStdPathEnd(context: RuleRun, std_index: usize, path: []const u8) ?usiz
     return cursor;
 }
 
-fn findManagedContainers(context: RuleRun, scopes: *const syntax_scope.Index) !void {
+/// The allocator-storing containers `modernize-managed-container` reports.
+pub const managed_container_paths = [_][]const u8{ "array_list.Managed", "array_list.AlignedManaged", "bit_set.DynamicManaged" };
+
+fn findManagedContainers(context: RuleRun, std_roots: []const u32) !void {
     const level = context.level(.modernize_managed_container);
     if (level == .off) return;
-    for (context.tokens, 0..) |token, index| {
-        if (!isStdRoot(context, scopes, index)) continue;
-        const paths = [_][]const u8{ "array_list.Managed", "array_list.AlignedManaged", "bit_set.DynamicManaged" };
-        for (paths) |path| {
+    for (std_roots) |root| {
+        const index: usize = root;
+        const token = context.tokens[index];
+        for (managed_container_paths) |path| {
             const end = matchedStdPathEnd(context, index, path) orelse continue;
             try context.emit(.{
                 .rule = .modernize_managed_container,
@@ -336,7 +382,7 @@ fn findManagedContainers(context: RuleRun, scopes: *const syntax_scope.Index) !v
     }
 }
 
-fn findDeprecatedIo(context: RuleRun, scopes: *const syntax_scope.Index) !void {
+fn findDeprecatedIo(context: RuleRun, std_roots: []const u32) !void {
     const level = context.level(.modernize_deprecated_io);
     if (level == .off) return;
     const adapters = [_]struct { old: []const u8, replacement: []const u8 }{
@@ -348,8 +394,9 @@ fn findDeprecatedIo(context: RuleRun, scopes: *const syntax_scope.Index) !void {
         .{ .old = "bufferedWriter", .replacement = "std.Io.Writer.Allocating or a caller-owned buffer" },
         .{ .old = "bufferedReader", .replacement = "std.Io.Reader with caller-owned buffering" },
     };
-    for (context.tokens, 0..) |token, index| {
-        if (!isStdRoot(context, scopes, index)) continue;
+    for (std_roots) |root| {
+        const index: usize = root;
+        const token = context.tokens[index];
         if (index + 4 >= context.tokens.len or context.tokens[index + 1].tag != .period or
             (!context.tokenIs(index + 2, "io") and !context.tokenIs(index + 2, "Io")) or
             context.tokens[index + 3].tag != .period) continue;
@@ -363,6 +410,19 @@ fn findDeprecatedIo(context: RuleRun, scopes: *const syntax_scope.Index) !void {
             });
         }
     }
+}
+
+/// Every token that is `std` naming the standard-library import, found once
+/// for the passes that match paths from it; empty when they are all off.
+fn stdRoots(context: RuleRun, scopes: *const syntax_scope.Index) ![]const u32 {
+    if (context.level(.modernize_managed_container) == .off and context.level(.modernize_deprecated_io) == .off and
+        context.level(.modernize_deprecated_stdlib) == .off) return &.{};
+    var roots: std.ArrayList(u32) = .empty;
+    errdefer roots.deinit(context.allocator);
+    for (0..context.tokens.len) |index| {
+        if (isStdRoot(context, scopes, index)) try roots.append(context.allocator, @intCast(index));
+    }
+    return try roots.toOwnedSlice(context.allocator);
 }
 
 fn isStdRoot(context: RuleRun, scopes: *const syntax_scope.Index, index: usize) bool {
@@ -476,6 +536,11 @@ fn findRemovedSyntax(context: RuleRun, scopes: *const syntax_scope.Index) !void 
         repeat: {
             end = context.tokens[index + 1].loc.end;
             break :repeat "array multiplication (**) was removed in Zig 0.17; use typed @splat for single-element repetition or an explicit initializer or loop for larger patterns";
+        } else if (removedKeyword(context, index)) |keyword| switch (keyword) {
+            .usingnamespace => "usingnamespace was removed in Zig 0.15; re-export each declaration that is needed (pub const name = Namespace.name;) or reach them through a named constant",
+            .async => "async calls were removed from the language; start the call with io.async(function, .{ args }) and finish it with await(io) on the returned std.Io.Future",
+            .await => "await on async frames was removed from the language; call await(io) on the std.Io.Future that io.async returns",
+            .suspend_resume => "suspend and resume belong to async functions, which the Zig 0.17 compiler rejects; restructure the code around std.Io's io.async and io.concurrent",
         } else continue;
         try context.emit(.{
             .rule = .modernize_removed_syntax,
@@ -485,6 +550,33 @@ fn findRemovedSyntax(context: RuleRun, scopes: *const syntax_scope.Index) !void 
             .fixes = fixes,
         });
     }
+}
+
+const RemovedKeyword = enum { usingnamespace, async, await, suspend_resume };
+
+/// The removed keyword the token at `index` is used as. `usingnamespace`,
+/// `async` and `await` are ordinary identifiers in Zig 0.17, so they count only
+/// where the old syntax put them: `usingnamespace` opening a declaration, and
+/// `async`/`await` directly before an operand, not as a member such as
+/// `io.async(...)` or `future.await(io)`. `nosuspend` still compiles and is
+/// not reported.
+fn removedKeyword(context: RuleRun, index: usize) ?RemovedKeyword {
+    const tokens = context.tokens;
+    const token = tokens[index];
+    if (token.tag == .keyword_suspend or token.tag == .keyword_resume) return .suspend_resume;
+    if (token.tag != .identifier or index + 1 >= tokens.len or (index > 0 and tokens[index - 1].tag == .period)) return null;
+    const next = tokens[index + 1].tag;
+    if (context.tokenIs(index, "usingnamespace")) {
+        const declaration_start = index == 0 or switch (tokens[index - 1].tag) {
+            .l_brace, .r_brace, .semicolon, .comma, .keyword_pub, .doc_comment, .container_doc_comment => true,
+            else => false,
+        };
+        return if (declaration_start and (next == .identifier or next == .builtin or next == .keyword_struct)) .usingnamespace else null;
+    }
+    if (next != .identifier and next != .builtin) return null;
+    if (context.tokenIs(index, "async")) return .async;
+    if (context.tokenIs(index, "await")) return .await;
+    return null;
 }
 
 /// Whether a token of this tag can directly precede an expression, which
@@ -577,18 +669,18 @@ const RunArgumentReplacement = struct {
     plain: bool = true,
 };
 
-// The plain wrappers pass their argument and .{} straight through in Zig 0.17.
-// Prefix/decorated wrappers reorder arguments; those migrations need review.
+// The wrappers Zig 0.17 marks `Deprecated`. The plain ones pass their argument
+// and .{} straight through; prefix/decorated wrappers reorder arguments, so
+// those migrations need review. `addFileArg` and `addPrefixedFileArg` are
+// current convenience wrappers ("See `addFileArg2`") and are not listed.
 const run_argument_replacements = [_]RunArgumentReplacement{
     .{ .old = "addArtifactArg", .new = "addArtifactArg2" },
-    .{ .old = "addFileArg", .new = "addFileArg2" },
     .{ .old = "addOutputFileArg", .new = "addOutputFileArg2" },
     .{ .old = "addFileContentArg", .new = "addFileContentArg2" },
     .{ .old = "addOutputDirectoryArg", .new = "addOutputDirectoryArg2" },
     .{ .old = "addDirectoryArg", .new = "addDirectoryArg2" },
     .{ .old = "addDepFileOutputArg", .new = "addDepFileOutputArg2" },
     .{ .old = "addPrefixedArtifactArg", .new = "addArtifactArg2", .plain = false },
-    .{ .old = "addPrefixedFileArg", .new = "addFileArg2", .plain = false },
     .{ .old = "addPrefixedOutputFileArg", .new = "addOutputFileArg2", .plain = false },
     .{ .old = "addPrefixedFileContentArg", .new = "addFileContentArg2", .plain = false },
     .{ .old = "addPrefixedOutputDirectoryArg", .new = "addOutputDirectoryArg2", .plain = false },
@@ -631,9 +723,9 @@ fn emitRunArgument(context: RuleRun, scopes: *const syntax_scope.Index, level: t
         .level = level,
         .span = .{ .start = context.tokens[receiver].loc.start, .end = context.tokens[member].loc.end },
         .message = if (entry.plain)
-            try context.allocator.print("std.Build.Step.Run.{s} is a legacy argument wrapper; use {s} with .{{}} options", .{ entry.old, entry.new })
+            try context.allocator.print("std.Build.Step.Run.{s} is deprecated; use {s} with .{{}} options", .{ entry.old, entry.new })
         else
-            try context.allocator.print("std.Build.Step.Run.{s} is a legacy argument wrapper; use {s} with prefix/suffix options and review argument evaluation order", .{ entry.old, entry.new }),
+            try context.allocator.print("std.Build.Step.Run.{s} is deprecated; use {s} with prefix/suffix options and review argument evaluation order", .{ entry.old, entry.new }),
         .fixes = fixes,
     });
 }
@@ -960,6 +1052,30 @@ fn leadingPath(comptime advice: []const u8) []const u8 {
     return advice;
 }
 
+test "modernize names the replacements of removed formatting, process and file helpers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const hex = std.fmt.fmtSliceHexLower(bytes);\n" ++
+        "const size = std.fmt.fmtIntSizeBin(count);\n" ++
+        "const result = std.process.Child.run(.{ .allocator = gpa, .argv = argv });\n" ++
+        "const read = std.fs.File.readToEndAlloc;\n" ++
+        "const Map = std.AutoArrayHashMap(u32, u32);\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    const expected = [_][]const u8{
+        "std.fmt.fmtSliceHexLower was removed from the standard library; use the {x} format specifier on the byte slice",
+        "std.fmt.fmtIntSizeBin was removed from the standard library; use the {Bi} format specifier on the integer",
+        "std.process.Child.run was removed from the standard library; use std.process.run with an Io instance",
+        "std.fs.File.readToEndAlloc was removed from the standard library; use file.reader(io, &buffer).interface.allocRemaining(gpa, limit) on a std.Io.File",
+        "std.AutoArrayHashMap was removed from the standard library; use std.array_hash_map.Auto and pass the allocator to allocating calls",
+    };
+    try std.testing.expectEqual(expected.len, findings.len);
+    for (expected, findings) |message, finding| {
+        try std.testing.expectEqualStrings(message, finding.message);
+        try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+    }
+}
+
 test "modernize 0.17 distinguishes removed aliases and shape-changing replacements" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -997,26 +1113,20 @@ test "modernize path allocator renames combine namespace migration into one fix"
     try std.testing.expectEqualStrings("Io.Dir.path.resolveAllocPosix", findings[2].fixes[0].edits[0].replacement);
 }
 
-test "modernize 0.17 stdlib migration includes reflection and typed allocator dupeZ" {
+test "modernize 0.17 stdlib migration includes typed allocator dupeZ" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
         "const std = @import(\"std\");\n" ++
-        "fn copy(gpa: std.mem.Allocator) void { _ = gpa.dupeZ(u8, text); }\n" ++
-        "const fields = @typeInfo(Item).@\"struct\".fields;\n" ++
-        "const union_fields = @typeInfo(Item).@\"union\".fields;\n" ++
-        "const enum_fields = @typeInfo(Item).@\"enum\".fields;\n";
+        "fn copy(gpa: std.mem.Allocator) void { _ = gpa.dupeZ(u8, text); }\n";
     const findings = try findingsFor(arena.allocator(), source);
-    try std.testing.expectEqual(@as(usize, 4), findings.len);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
     for (findings) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
     const current: [:0]const u8 =
         "const std = @import(\"std\");\n" ++
         "fn copy(gpa: std.mem.Allocator) void { _ = gpa.dupeSentinel(u8, text, 0); }\n" ++
         "fn custom(gpa: Custom) void { _ = gpa.dupeZ(u8, text); }\n" ++
-        "fn nested(gpa: std.mem.Allocator) void { { const gpa = Custom{}; _ = gpa.dupeZ(u8, text); } }\n" ++
-        "const fields = @typeInfo(Item).@\"struct\".field_names;\n" ++
-        "const pointers = @typeInfo(Ptr).pointer.fields;\n" ++
-        "const custom_fields = item.@\"struct\".fields;\n";
+        "fn nested(gpa: std.mem.Allocator) void { { const gpa = Custom{}; _ = gpa.dupeZ(u8, text); } }\n";
     try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), current)).len);
 }
 
@@ -1099,6 +1209,24 @@ test "modernize removed syntax reports migration even for unparseable input" {
     try std.testing.expectEqualStrings("", findings[2].fixes[0].edits[0].replacement);
     try std.testing.expectEqualStrings("errdefer |err|", source[findings[3].span.start..findings[3].span.end]);
     try std.testing.expectEqual(@as(usize, 0), findings[4].fixes.len);
+}
+
+test "modernize removed syntax reports the removed async keywords and usingnamespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mixin = struct { pub usingnamespace @import(\"other.zig\"); usingnamespace Helpers; };\n" ++
+        "fn f() void { var frame = async g(); _ = await frame; suspend {} resume frame; }\n" ++
+        "fn current(io: Io) void { var future = io.async(g, .{}); _ = future.await(io); _ = nosuspend g(); }\n" ++
+        "fn named(async: bool, await: u8) void { _ = .{ async, await }; _ = usingnamespace; }\n";
+    const findings = try findingsForRule(arena.allocator(), source, .modernize_removed_syntax);
+    const expected = [_][]const u8{ "usingnamespace", "usingnamespace", "async", "await", "suspend", "resume" };
+    try std.testing.expectEqual(expected.len, findings.len);
+    for (expected, findings) |spelling, finding| {
+        try std.testing.expectEqualStrings(spelling, source[finding.span.start..finding.span.end]);
+        try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+    }
+    try std.testing.expect(std.mem.containsAtLeast(u8, findings[2].message, 1, "io.async"));
 }
 
 test "modernize removed syntax ignores void return types before function bodies" {
@@ -1196,14 +1324,12 @@ test "modernize Run argument wrappers offer fixes only without argument reorderi
         \\const library = @import("std");
         \\fn configure(run: *library.Build.Step.Run, artifact: *library.Build.Step.Compile, path: library.Build.LazyPath) void {
         \\    run.addArtifactArg(artifact);
-        \\    run.addFileArg(path);
         \\    _ = run.addOutputFileArg("out");
         \\    run.addFileContentArg(path);
         \\    _ = run.addOutputDirectoryArg("dir");
         \\    run.addDirectoryArg(path);
         \\    _ = run.addDepFileOutputArg("deps");
         \\    run.addPrefixedArtifactArg("--artifact=", artifact);
-        \\    run.addPrefixedFileArg("--file=", path);
         \\    _ = run.addPrefixedOutputFileArg("--out=", "out");
         \\    run.addPrefixedFileContentArg("--content=", path);
         \\    _ = run.addPrefixedOutputDirectoryArg("--dir=", "dir");
@@ -1212,6 +1338,8 @@ test "modernize Run argument wrappers offer fixes only without argument reorderi
         \\    run.addDecoratedDirectoryArg("--dir=", path, "/tail");
         \\    run.addFileArg2(path, .{});
         \\    run.addArg("plain");
+        \\    run.addFileArg(path);
+        \\    run.addPrefixedFileArg("--file=", path);
         \\}
     ;
     const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
@@ -1234,7 +1362,7 @@ test "modernize Run argument fixes preserve expressions comments and trailing co
     const source: [:0]const u8 =
         \\const std = @import("std");
         \\fn configure(run: *std.Build.Step.Run) void {
-        \\    run.addFileArg(nextPath(.{ .a = 1, .b = 2 }) // keep argument comment
+        \\    run.addFileContentArg(nextPath(.{ .a = 1, .b = 2 }) // keep argument comment
         \\    );
         \\    run.addDirectoryArg(
         \\        paths[index(1, 2)], // keep trailing comma comment
@@ -1247,7 +1375,7 @@ test "modernize Run argument fixes preserve expressions comments and trailing co
     const expected =
         \\const std = @import("std");
         \\fn configure(run: *std.Build.Step.Run) void {
-        \\    run.addFileArg2(nextPath(.{ .a = 1, .b = 2 }), .{} // keep argument comment
+        \\    run.addFileContentArg2(nextPath(.{ .a = 1, .b = 2 }), .{} // keep argument comment
         \\    );
         \\    run.addDirectoryArg2(
         \\        paths[index(1, 2)], .{}, // keep trailing comma comment
@@ -1276,20 +1404,20 @@ test "modernize Build receivers prove immutable namespace aliases and Run factor
         \\const Run = Step.Run;
         \\const OtherRun = @import("std").Build.Step.Run;
         \\fn configure(b: *Build, run: *const Run, direct: *@import("std").Build.Step.Run, other: *OtherRun) void {
-        \\    run.addFileArg(path);
-        \\    direct.addFileArg(path);
-        \\    other.addFileArg(path);
+        \\    run.addDirectoryArg(path);
+        \\    direct.addDirectoryArg(path);
+        \\    other.addDirectoryArg(path);
         \\    const command = b.addSystemCommand(&.{"tool"});
         \\    const alias = command;
-        \\    alias.addFileArg(path);
+        \\    alias.addDirectoryArg(path);
         \\    const artifact = b.addRunArtifact(exe);
-        \\    artifact.addFileArg(path);
+        \\    artifact.addDirectoryArg(path);
         \\    const file = b.addRunFile(path);
-        \\    file.addFileArg(path);
+        \\    file.addDirectoryArg(path);
         \\    const created = Run.create(b, "run");
-        \\    created.addFileArg(path);
+        \\    created.addDirectoryArg(path);
         \\    const directly_created = @import("std").Build.Step.Run.create(b, "run");
-        \\    directly_created.addFileArg(path);
+        \\    directly_created.addDirectoryArg(path);
         \\}
     ;
     const findings = try findingsForRule(arena.allocator(), source, .modernize_build_api);
@@ -1304,25 +1432,25 @@ test "modernize Run arguments reject custom mutable shadowed and incomplete proo
         \\const std = @import("std");
         \\const Run = std.Build.Step.Run;
         \\fn custom(run: *Custom, std: Custom, fake: *std.Build.Step.Run) void {
-        \\    run.addFileArg(path); fake.addFileArg(path);
+        \\    run.addDirectoryArg(path); fake.addDirectoryArg(path);
         \\}
         \\fn configure(b: *std.Build) void {
-        \\    const unknown = b.customFactory(.{}); unknown.addFileArg(path);
-        \\    const selected = b.addSystemCommand(&.{"tool"}).custom; selected.addFileArg(path);
-        \\    var mutable = b.addSystemCommand(&.{"tool"}); mutable.addFileArg(path);
-        \\    { const Run = Custom; const fake = Run.create(b, "run"); fake.addFileArg(path); }
-        \\    { var Namespace = @import("std"); const fake: *Namespace.Build.Step.Run = undefined; fake.addFileArg(path); }
-        \\    { var Namespace = Run; const fake: *Namespace = undefined; fake.addFileArg(path); }
-        \\    wrapper.run.addFileArg(path);
+        \\    const unknown = b.customFactory(.{}); unknown.addDirectoryArg(path);
+        \\    const selected = b.addSystemCommand(&.{"tool"}).custom; selected.addDirectoryArg(path);
+        \\    var mutable = b.addSystemCommand(&.{"tool"}); mutable.addDirectoryArg(path);
+        \\    { const Run = Custom; const fake = Run.create(b, "run"); fake.addDirectoryArg(path); }
+        \\    { var Namespace = @import("std"); const fake: *Namespace.Build.Step.Run = undefined; fake.addDirectoryArg(path); }
+        \\    { var Namespace = Run; const fake: *Namespace = undefined; fake.addDirectoryArg(path); }
+        \\    wrapper.run.addDirectoryArg(path);
         \\}
     ;
     try std.testing.expectEqual(@as(usize, 0), (try findingsForRule(arena.allocator(), source, .modernize_build_api)).len);
     const malformed: [:0]const u8 =
         \\const std = @import("std");
         \\fn configure(run: *std.Build.Step.Run) void {
-        \\    run.addFileArg();
-        \\    run.addFileArg(path, extra);
-        \\    run.addFileArg(,);
+        \\    run.addDirectoryArg();
+        \\    run.addDirectoryArg(path, extra);
+        \\    run.addDirectoryArg(,);
         \\}
     ;
     const findings = try findingsForRule(arena.allocator(), malformed, .modernize_build_api);
@@ -1405,7 +1533,7 @@ test "modernize additional Build and runtime safety migrations honor suppression
         \\const std = @import("std");
         \\fn configure(b: *std.Build, run_step: *std.Build.Step.Run) void {
         \\    // zig-analyzer: disable-next-line modernize-build-api
-        \\    run_step.addFileArg(path);
+        \\    run_step.addDirectoryArg(path);
         \\    // zig-analyzer: disable-next-line modernize-build-api
         \\    _ = b.lazyDependency("package", .{});
         \\    // zig-analyzer: disable-next-line modernize-build-api

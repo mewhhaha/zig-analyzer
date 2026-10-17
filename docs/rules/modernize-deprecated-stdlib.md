@@ -15,8 +15,10 @@ makes the release migration mechanical.
 
 ## When it fires
 
-Also recognizes removed reflection `fields` access and `dupeZ` on a binding
-explicitly typed `std.mem.Allocator`.
+Also recognizes `dupeZ` on a binding explicitly typed `std.mem.Allocator`.
+Removed `@typeInfo` payload members such as `@typeInfo(T).@"struct".fields`
+are compile errors, so [`unresolved-member`](unresolved-member.md) reports
+them.
 
 General replacements match literal `std.…` paths. Runtime-safety and target
 checks also follow proven immutable namespace/type aliases and explicit receiver
@@ -24,9 +26,14 @@ types. Declared objects, mutable type aliases, and parameters that shadow
 standard imports are skipped. Signature-identical renames carry a fix and
 participate in fix-all; shape-changing migrations only name the replacement.
 
-Coverage includes formatting moving to `std.mem` and allocator methods, bit-set
-renames, `std.builtin` becoming `std.lang`, optimization-mode names, removed
-managed memory pools, and reflection moving to parallel field arrays. The
+Coverage includes formatting moving to `std.mem` and allocator methods, the
+removed formatting helpers (`std.fmt.Formatter`, `fmtSliceHexLower`,
+`fmtIntSizeDec`, `fmtDuration`, `std.zig.fmtEscapes`) giving way to `std.fmt.Alt`
+and format specifiers, executable-path, LEB128, atomic-file, managed array hash
+map and child-process helpers moving to `std.process`, `std.Io` and
+`std.array_hash_map`, bit-set renames, `std.builtin` becoming `std.lang`, optimization-mode names, removed
+managed memory pools, and `std.meta` reflection helpers moving to `@typeInfo`'s
+parallel field arrays. The
 replacements are checked against the pinned standard library.
 
 `std.debug.runtime_safety` describes the standard library's optimization mode;

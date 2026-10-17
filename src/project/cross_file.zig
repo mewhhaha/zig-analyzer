@@ -70,8 +70,11 @@ pub fn run(input: Input) !Results {
     var shared_arena: std.heap.ArenaAllocator = .init(input.allocator);
     defer shared_arena.deinit();
     const arena = shared_arena.allocator();
-    const check_imports = imported_deprecations.enabled(input.configuration);
-    const check_members = input.configuration.level(.unresolved_member) != .off;
+    // An override may turn a pass on for some paths only; each file is then
+    // checked under its own configuration.
+    const project_configuration = project_rules.projectConfiguration(input.configuration, input.files);
+    const check_imports = imported_deprecations.enabled(project_configuration);
+    const check_members = project_configuration.level(.unresolved_member) != .off;
     if (!check_imports and !check_members or input.files.len == 0) return results;
 
     const absolute_paths = try arena.alloc([]const u8, input.files.len);
@@ -286,6 +289,7 @@ const Worker = struct {
             }
         }
 
+        const file_configuration = project_config.configurationForPath(input.configuration, source_file.config_path orelse source_file.path);
         var dependencies: std.array_hash_map.String(check_cache.DependencyKind) = .empty;
         var imports: []const Record = &.{};
         var members: []const Record = &.{};
@@ -299,7 +303,7 @@ const Worker = struct {
                 .source = source_file.source,
                 .tokens = source_file.tokens.?,
                 .scopes = try shared.scopesAt(position),
-            }, input.configuration, &found);
+            }, file_configuration, &found);
             imported_findings = found.items;
             imports = try records(temporary, found.items);
             for (try imported.dependencyPaths(temporary)) |path| try dependencies.put(temporary, path, .file);
@@ -316,7 +320,7 @@ const Worker = struct {
                 temporary,
                 source_file.source,
                 source_file.tokens.?,
-                project_config.configurationForPath(input.configuration, source_file.path),
+                file_configuration,
                 modules,
             );
             var kept: usize = 0;
@@ -394,12 +398,69 @@ fn records(allocator: std.mem.Allocator, found: []const analysis.Finding) ![]con
         .start = finding.span.start,
         .end = finding.span.end,
         .message = finding.message,
+        .related = if (finding.related.len == 0) null else finding.related,
+        .fix = check_cache.fixOf(finding.fixes),
     };
     return stored;
 }
 
 fn duplicate(arena: std.mem.Allocator, found: []const Record) ![]const Record {
     const copy = try arena.dupe(Record, found);
-    for (copy) |*record| record.message = try arena.dupe(u8, record.message);
+    for (copy) |*record| {
+        record.message = try arena.dupe(u8, record.message);
+        const related = record.related orelse continue;
+        const kept = try arena.dupe(analysis.RelatedSpan, related);
+        for (kept) |*span| span.message = try arena.dupe(u8, span.message);
+        record.related = kept;
+    }
     return copy;
+}
+
+test "an override turns the deprecation pass on for the paths it names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var configuration = try analysis.parseConfiguration(arena,
+        \\{"lints":{"rules":{"deprecated-declaration":"off","removed-std-api":"off"}},
+        \\ "overrides":[{"paths":["legacy"],"lints":{"rules":{"deprecated-declaration":"warning"}}}]}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    const sources = [_][:0]const u8{
+        "/// Deprecated; use current\npub fn old() void {}\n",
+        "const api = @import(\"../api.zig\");\npub fn run() void {\n    api.old();\n}\n",
+        "const api = @import(\"../api.zig\");\npub fn run() void {\n    api.old();\n}\n",
+    };
+    const paths = [_][]const u8{ "api.zig", "legacy/main.zig", "src/main.zig" };
+    var files: [sources.len]project_rules.SourceFile = undefined;
+    for (&files, sources, paths) |*file, source, path| file.* = .{
+        .path = path,
+        .source = source,
+        .tokens = try @import("../syntax/tokens.zig").tokenize(arena, source),
+    };
+    var results = try run(.{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .root_path = "/project",
+        .files = &files,
+        .configuration = configuration,
+        .cache = .{},
+    });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(?anyerror, null), results.failure);
+    try std.testing.expectEqual(@as(usize, 0), results.files[0].imports.len);
+    try std.testing.expectEqual(@as(usize, 1), results.files[1].imports.len);
+    try std.testing.expectEqual(analysis.Rule.deprecated_declaration, results.files[1].imports[0].rule);
+    try std.testing.expectEqual(@as(usize, 0), results.files[2].imports.len);
+    // Without the override the pass has nothing to do.
+    configuration.overrides = &.{};
+    var off = try run(.{
+        .io = std.testing.io,
+        .allocator = std.testing.allocator,
+        .root_path = "/project",
+        .files = &files,
+        .configuration = configuration,
+        .cache = .{},
+    });
+    defer off.deinit();
+    for (off.files) |result| try std.testing.expectEqual(@as(usize, 0), result.imports.len);
 }

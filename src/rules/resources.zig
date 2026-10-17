@@ -58,6 +58,8 @@ pub const managed_types = [_][]const u8{
     "StringHashMap",
     "ArenaAllocator",
     "GeneralPurposeAllocator",
+    // `std.Io.Writer.Allocating`, which owns the bytes written to it.
+    "Allocating",
 };
 
 /// Calls that return a raw OS handle which must be closed.
@@ -198,6 +200,38 @@ pub fn buildGraphAllocator(
     return false;
 }
 
+/// Whether the allocator argument starting at `first` comes from an arena or a
+/// `FixedBufferAllocator` instance, which give back their memory all at once:
+/// `fba.allocator()`, or a `const` alias of it.
+pub fn allocatorFreesWholesale(context: RuleRun, first: usize) bool {
+    const tokens = context.tokens;
+    var instance = first;
+    if (!allocatorCall(context, first)) {
+        if (tokens[first + 1].tag != .r_paren and tokens[first + 1].tag != .comma) return false;
+        const alias = context.scopes.findBinding(first) orelse return false;
+        const declaration = alias.token_index;
+        if (declaration == 0 or tokens[declaration - 1].tag != .keyword_const or tokens[declaration + 1].tag != .equal or
+            !allocatorCall(context, declaration + 2) or tokens[declaration + 7].tag != .semicolon) return false;
+        instance = declaration + 2;
+    }
+    const binding = context.scopes.findBinding(instance) orelse return false;
+    // The instance's type or initializer, up to the first argument or the end
+    // of its declaration or parameter.
+    for (tokens[binding.token_index + 1 ..], binding.token_index + 1..) |token, index| switch (token.tag) {
+        .semicolon, .comma, .r_paren, .l_brace, .r_brace, .eof => return false,
+        .identifier => if (context.tokenIs(index, "FixedBufferAllocator") or context.tokenIs(index, "ArenaAllocator")) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// `instance.allocator()` starting at `index`.
+fn allocatorCall(context: RuleRun, index: usize) bool {
+    const tokens = context.tokens;
+    return index + 4 < tokens.len and tokens[index].tag == .identifier and tokens[index + 1].tag == .period and
+        context.tokenIs(index + 2, "allocator") and tokens[index + 3].tag == .l_paren and tokens[index + 4].tag == .r_paren;
+}
+
 /// The dotted path a `const name = a.b;` declaration at `binding_index` aliases.
 fn aliasedPath(source: []const u8, tokens: []const std.zig.Token, binding_index: usize) ?[]const u8 {
     if (binding_index + 2 >= tokens.len or tokens[binding_index + 1].tag != .equal) return null;
@@ -306,10 +340,24 @@ fn namesAny(source: []const u8, tokens: []const std.zig.Token, start: usize, end
 
 /// The first resource acquired by a call inside `tokens[start..end]`.
 pub fn acquiredIn(context: RuleRun, start: usize, end: usize) ?Pair {
+    // The hints `acquires` looks for in `[start, call)`, extended as the
+    // calls advance so that a long initializer is read once.
+    var hinted_until = start;
+    var names_thread = false;
+    var names_managed = false;
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .identifier or index + 1 >= end or context.tokens[index + 1].tag != .l_paren) continue;
         const pair = lookup(context.configuration, context.tokenText(index), callReceiver(context.source, context.tokens, index)) orelse continue;
-        if (acquires(pair, context.source, context.tokens, start, index)) return pair;
+        while (hinted_until < index) : (hinted_until += 1) {
+            names_thread = names_thread or namesAny(context.source, context.tokens, hinted_until, hinted_until + 1, &.{"Thread"});
+            names_managed = names_managed or namesAny(context.source, context.tokens, hinted_until, hinted_until + 1, &managed_types);
+        }
+        const acquired = switch (pair.kind) {
+            .thread => names_thread,
+            .managed => names_managed,
+            .io_handle, .contract => true,
+        };
+        if (acquired) return pair;
     }
     return null;
 }

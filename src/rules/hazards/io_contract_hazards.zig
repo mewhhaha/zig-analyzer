@@ -2,6 +2,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const findTag = @import("../../syntax/tokens.zig").findTag;
 
 pub const rules = [_]types.Rule{
     .silent_buffer_truncation,
@@ -19,6 +20,7 @@ pub fn run(context: RuleRun) !void {
         const amount = minimumBinding(context, source_name, function.body_start + 1, function.body_end) orelse continue;
         const copy_index = truncatingCopy(context, source_name, amount.name, amount.declaration_end + 1, function.body_end) orelse continue;
         if (hasExplicitCapacityFailure(context, source_name, function.body_start + 1, amount.declaration_end)) continue;
+        if (slicedFromOffset(context, source_name, function.body_start + 1, function.body_end)) continue;
         if (writesTerminatorAtAmount(context, amount.name, copy_index + 1, function.body_end) and
             minimumReservesTerminator(context, source_name, amount.minimum_index, amount.declaration_end)) continue;
         try context.emit(.{
@@ -31,6 +33,23 @@ pub fn run(context: RuleRun) !void {
             ),
         });
     }
+}
+
+/// Whether the function slices the source from a running offset (`b[i..]`,
+/// `out[offset..][0..n]`): it processes the input in chunks, so the bounded
+/// copy is one chunk and the remainder is consumed elsewhere.
+fn slicedFromOffset(context: RuleRun, source_name: []const u8, start: usize, end: usize) bool {
+    var index = start;
+    while (index + 3 < end) : (index += 1) {
+        if (context.tokens[index].tag != .identifier or !context.tokenIs(index, source_name) or
+            context.tokens[index + 1].tag != .l_bracket or context.tokens[index - 1].tag == .period) continue;
+        const closing = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
+        const range = findTag(context.tokens, index + 2, closing, .ellipsis2) orelse continue;
+        const literal_zero = range == index + 3 and context.tokens[index + 2].tag == .number_literal and
+            context.tokenIs(index + 2, "0");
+        if (range > index + 2 and !literal_zero) return true;
+    }
+    return false;
 }
 
 fn writesTerminatorAtAmount(context: RuleRun, amount_name: []const u8, start: usize, end: usize) bool {
@@ -163,6 +182,21 @@ test "fixed-buffer writes cannot silently truncate input" {
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(types.Rule.silent_buffer_truncation, findings[0].rule);
+}
+
+test "chunked streaming copies that consume the remainder stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn update(self: *Mac, b: []const u8) void { " ++
+        "const partial = @min(b.len, block_length - self.off); " ++
+        "@memcpy(self.buf[self.off..][0..partial], b[0..partial]); self.off += partial; " ++
+        "if (self.off < block_length) return; var i = partial; " ++
+        "while (i + block_length <= b.len) : (i += block_length) self.absorb(b[i..][0..block_length]); }\n" ++
+        "fn squeeze(self: *Xof, out: []u8) void { var i: usize = 0; while (i < out.len) { " ++
+        "const n = @min(8, out.len - i); @memcpy(out[i..][0..n], self.block[0..n]); i += n; } }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "returning the written byte count makes truncation visible" {

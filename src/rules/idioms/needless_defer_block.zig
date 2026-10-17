@@ -3,6 +3,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const containsComment = @import("../../syntax/tokens.zig").containsComment;
+const dedentContinuationLines = @import("../../syntax/tokens.zig").dedentContinuationLines;
 
 pub const rules = [_]types.Rule{
     .needless_defer_block,
@@ -23,11 +24,13 @@ pub fn run(context: RuleRun) !void {
 
         const block_source = context.source[context.tokens[opening_index].loc.end..context.tokens[closing_index].loc.start];
         if (containsComment(block_source)) continue;
-        const statement = std.mem.trim(u8, block_source, " \t\r\n");
+        // The statement leaves the block, so its continuation lines move out
+        // one indentation level.
+        const statement = try dedentContinuationLines(context.allocator, std.mem.trim(u8, block_source, " \t\r\n"));
         const replacement = if (context.tokens[defer_index].loc.end == context.tokens[opening_index].loc.start)
             try context.allocator.print(" {s}", .{statement})
         else
-            try context.allocator.dupe(u8, statement);
+            statement;
         const fixes = try context.singleFix(.{
             .title = if (token.tag == .keyword_defer) "Remove the single-statement defer block" else "Remove the single-statement errdefer block",
             .span = .{ .start = context.tokens[opening_index].loc.start, .end = context.tokens[closing_index].loc.end },
@@ -74,6 +77,23 @@ test "unspaced defer block prepends space in replacement" {
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqualStrings(" file.close();", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "a statement spanning lines moves out with the block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn reset(list: *List, end: usize) void {\n" ++
+        "    defer {\n" ++
+        "        list.* = .{\n" ++
+        "            .len = end,\n" ++
+        "        };\n" ++
+        "    }\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("list.* = .{\n        .len = end,\n    };", findings[0].fixes[0].edits[0].replacement);
 }
 
 test "multi-statement commented and declaration defer blocks stay unchanged" {

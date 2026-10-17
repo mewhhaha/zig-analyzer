@@ -100,7 +100,7 @@ fn selectedPackageImport(
         if (token.tag != .builtin or !tokenIs(source, token, "@import") or index + 2 >= tokens.len or
             tokens[index + 1].tag != .l_paren or tokens[index + 2].tag != .string_literal or
             !action_context.spansOverlap(selection, tokens[index + 2].loc)) continue;
-        const name = stringValue(source[tokens[index + 2].loc.start..tokens[index + 2].loc.end]) orelse continue;
+        const name = action_context.stringValue(source[tokens[index + 2].loc.start..tokens[index + 2].loc.end]) orelse continue;
         if (std.mem.eql(u8, name, "std") or std.mem.eql(u8, name, "root") or std.mem.eql(u8, name, "builtin") or
             std.mem.endsWith(u8, name, ".zig") or std.mem.findScalar(u8, name, '/') != null) return null;
         return name;
@@ -167,13 +167,6 @@ fn firstRootModuleReceiver(
             tokenIs(source, tokens[index + 2], "root_module")) return source[token.loc.start..token.loc.end];
     }
     return null;
-}
-
-fn stringValue(literal: []const u8) ?[]const u8 {
-    if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
-    const value = literal[1 .. literal.len - 1];
-    if (std.mem.findScalar(u8, value, '\\') != null) return null;
-    return value;
 }
 
 test "build import quick fixes release partial results on allocation failure" {

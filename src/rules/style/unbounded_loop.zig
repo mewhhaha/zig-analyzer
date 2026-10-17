@@ -21,6 +21,7 @@ pub fn run(context: RuleRun) !void {
         const body_open = context.whileBodyOpening(condition_end) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (std.mem.findAny(u8, condition, "<>") != null or
+            conditionRepeatsStep(context, while_index + 2, condition_end, body_open, body_end) or
             conditionDrainsLength(context, while_index + 2, condition_end) or
             conditionAwaitsEnd(context, while_index + 2, condition_end) or
             conditionStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
@@ -31,7 +32,7 @@ pub fn run(context: RuleRun) !void {
             bodyHasBoundAssertion(context, while_index + 2, condition_end, body_open + 1, body_end) or
             bodyHasExhaustionPredicate(context, body_open + 1, body_end) or
             bodyDrainsCollection(context, body_open + 1, body_end) or
-            bodyRetriesInterruptedCall(context, body_open + 1, body_end)) continue;
+            bodyRetriesSystemCall(context, while_index, body_open, body_end)) continue;
         if (eventLoopHasBlockingDispatch(context, body_open + 1, body_end)) continue;
         if (bodyHasCounterGuard(context, body_open + 1, body_end) or
             bodyHasDerivedCounterGuard(context, body_open + 1, body_end)) continue;
@@ -164,15 +165,277 @@ fn bodyHasExhaustionPredicate(context: RuleRun, start: usize, end: usize) bool {
         bodyCalls(context, start, end, "streamDelimiterEnding");
 }
 
-fn bodyRetriesInterruptedCall(context: RuleRun, start: usize, end: usize) bool {
-    if (!bodyCalls(context, start, end, "errno")) return false;
-    var saw_interrupted = false;
-    var saw_retry = false;
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, "INTR")) saw_interrupted = true;
-        if (token.tag == .keyword_continue) saw_retry = true;
+/// `while (try ops[0].toLea(cg)) {}` repeats a fallible step that reports
+/// whether it changed anything, so the step itself is the progress.
+fn conditionRepeatsStep(context: RuleRun, condition_start: usize, condition_end: usize, body_open: usize, body_end: usize) bool {
+    if (body_open != condition_end + 1 or body_end != body_open + 1) return false;
+    var cursor = condition_start;
+    while (cursor < condition_end) {
+        if (context.tokens[cursor].tag != .keyword_try) return false;
+        cursor += 1;
+        // The called path, `ops[0].toLea`, then its arguments.
+        var called = false;
+        while (cursor < condition_end) : (cursor += 1) switch (context.tokens[cursor].tag) {
+            .identifier, .period => called = false,
+            .l_bracket, .l_paren => |tag| {
+                cursor = context.scopes.matchingToken(cursor) orelse return false;
+                called = tag == .l_paren;
+            },
+            else => break,
+        };
+        if (!called) return false;
+        if (cursor == condition_end) return true;
+        if (context.tokens[cursor].tag != .keyword_or) return false;
+        cursor += 1;
     }
-    return saw_interrupted and saw_retry;
+    return false;
+}
+
+/// How deep `branchExits` follows nested blocks, `if`s and `switch`es.
+const exit_depth = 4;
+
+/// A system call retried while it reports an interruption: every `continue`
+/// of the loop retries (see `retryContinue`), at least one path retries, and
+/// the body leaves the loop on every other path, because one of its
+/// statements returns or breaks, or is a `switch` or `if`-`else` whose
+/// branches all do except the prongs that retry, as
+/// `while (true) switch (errno(rc)) { .SUCCESS => return, .INTR => {}, else => return error.Unexpected }`
+/// and `while (true) { const rc = waitpid(pid); if (errno(rc) == .INTR) continue; break rc; }` do.
+fn bodyRetriesSystemCall(context: RuleRun, while_index: usize, body_open: usize, body_end: usize) bool {
+    var leaves = false;
+    var retries = false;
+    var previous: std.zig.Token.Tag = .l_brace;
+    var cursor = body_open + 1;
+    while (cursor < body_end) : (cursor += 1) {
+        const tag = context.tokens[cursor].tag;
+        if (startsStatement(previous)) switch (tag) {
+            .keyword_return, .keyword_break, .keyword_unreachable => leaves = true,
+            .keyword_switch => if (switchExits(context, cursor, exit_depth, &retries)) {
+                leaves = true;
+            },
+            .keyword_if => if (ifExits(context, cursor, body_end, exit_depth, &retries)) {
+                leaves = true;
+            },
+            else => {},
+        };
+        switch (tag) {
+            .l_brace, .l_paren, .l_bracket => cursor = context.scopes.matchingToken(cursor) orelse return false,
+            else => {},
+        }
+        previous = context.tokens[cursor].tag;
+    }
+    if (!leaves) return false;
+    const label: ?[]const u8 = if (while_index >= 2 and context.tokens[while_index - 1].tag == .colon and
+        context.tokens[while_index - 2].tag == .identifier) context.tokenText(while_index - 2) else null;
+    for (context.tokens[body_open + 1 .. body_end], body_open + 1..) |token, index| {
+        if (token.tag != .keyword_continue) continue;
+        if (index + 2 < body_end and context.tokens[index + 1].tag == .colon) {
+            // A labeled `continue` repeats this loop only when it names it.
+            const own = if (label) |name| context.tokenIs(index + 2, name) else false;
+            if (!own) continue;
+        } else if (insideInnerLoop(context, index, body_open)) continue;
+        if (!retryContinue(context, index, body_open)) return false;
+        retries = true;
+    }
+    return retries;
+}
+
+fn startsStatement(previous: std.zig.Token.Tag) bool {
+    return previous == .l_brace or previous == .semicolon or previous == .r_brace;
+}
+
+/// A prong for `.INTR` or `.AGAIN`, or one that checks for cancellation
+/// before trying again.
+fn retryProng(context: RuleRun, prong: Prongs.Prong) bool {
+    return namesRetryCode(context, prong.start, prong.arrow) or bodyCalls(context, prong.arrow + 1, prong.end, "checkCancel");
+}
+
+fn namesRetryCode(context: RuleRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or index == start or context.tokens[index - 1].tag != .period) continue;
+        if (context.tokenIs(index, "INTR") or context.tokenIs(index, "AGAIN")) return true;
+    }
+    return false;
+}
+
+/// Whether the `continue` at `index` retries an interrupted call: it lies in
+/// the body of a retrying prong (`.INTR => continue`) or of an `if` testing
+/// for `.INTR` or `.AGAIN`.
+fn retryContinue(context: RuleRun, index: usize, body_open: usize) bool {
+    switch (context.tokens[index - 1].tag) {
+        .equal_angle_bracket_right, .r_paren => if (retryBranch(context, index)) return true,
+        else => {},
+    }
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (opening <= body_open) return false;
+        if (retryBranch(context, opening)) return true;
+    }
+    return false;
+}
+
+/// Whether the branch starting at `branch` is the body of a retrying prong
+/// or of an `if` testing for `.INTR` or `.AGAIN`.
+fn retryBranch(context: RuleRun, branch: usize) bool {
+    const tokens = context.tokens;
+    const before = branch - 1;
+    switch (tokens[before].tag) {
+        .equal_angle_bracket_right => {
+            const switch_open = context.enclosingOpeningBrace(before) orelse return false;
+            if (switch_open < 2 or tokens[switch_open - 1].tag != .r_paren) return false;
+            const operand_open = context.scopes.matchingToken(switch_open - 1) orelse return false;
+            if (operand_open == 0 or tokens[operand_open - 1].tag != .keyword_switch) return false;
+            var prongs = Prongs.init(context, operand_open - 1) orelse return false;
+            while (prongs.next()) |prong| {
+                if (prong.arrow == before) return retryProng(context, prong);
+            }
+            return false;
+        },
+        .r_paren => {
+            const condition_open = context.scopes.matchingToken(before) orelse return false;
+            if (condition_open == 0 or tokens[condition_open - 1].tag != .keyword_if) return false;
+            return namesRetryCode(context, condition_open + 1, before);
+        },
+        else => return false,
+    }
+}
+
+/// The prongs of a `switch`, each as its items, `=>` and the end of its body
+/// (the separating `,` or the closing brace).
+const Prongs = struct {
+    context: RuleRun,
+    cursor: usize,
+    close: usize,
+    /// Set when a prong has no `=>`, as in code that does not parse.
+    malformed: bool = false,
+
+    const Prong = struct { start: usize, arrow: usize, end: usize };
+
+    fn init(context: RuleRun, switch_index: usize) ?Prongs {
+        const tokens = context.tokens;
+        if (switch_index + 1 >= tokens.len or tokens[switch_index + 1].tag != .l_paren) return null;
+        const operand_end = context.scopes.matchingToken(switch_index + 1) orelse return null;
+        if (operand_end + 1 >= tokens.len or tokens[operand_end + 1].tag != .l_brace) return null;
+        const close = context.scopes.matchingToken(operand_end + 1) orelse return null;
+        return .{ .context = context, .cursor = operand_end + 2, .close = close };
+    }
+
+    fn next(prongs: *Prongs) ?Prong {
+        if (prongs.cursor >= prongs.close) return null;
+        const start = prongs.cursor;
+        const arrow = topLevelTag(prongs.context, start, prongs.close, .equal_angle_bracket_right) orelse {
+            prongs.malformed = true;
+            prongs.cursor = prongs.close;
+            return null;
+        };
+        const end = topLevelTag(prongs.context, arrow + 1, prongs.close, .comma) orelse prongs.close;
+        prongs.cursor = end + 1;
+        return .{ .start = start, .arrow = arrow, .end = end };
+    }
+};
+
+/// The first `tag` token in `[start, end)` outside nested brackets, stopping
+/// at a `;`.
+fn topLevelTag(context: RuleRun, start: usize, end: usize, tag: std.zig.Token.Tag) ?usize {
+    var cursor = start;
+    while (cursor < end) : (cursor += 1) {
+        const current = context.tokens[cursor].tag;
+        if (current == tag) return cursor;
+        switch (current) {
+            .l_brace, .l_paren, .l_bracket => cursor = context.scopes.matchingToken(cursor) orelse return null,
+            .semicolon => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Whether the branch in `[start, end)` always leaves the loop: it returns,
+/// breaks, is unreachable, panics, or is a block, `if`-`else` or `switch`
+/// whose every path does. With `retries`, a `switch` prong that retries an
+/// interrupted call (see `retryProng`) is accepted too and sets it. `depth`
+/// bounds how far nested branches are followed.
+fn branchExits(context: RuleRun, start: usize, end: usize, depth: u8, retries: ?*bool) bool {
+    var cursor = start;
+    if (cursor < end and context.tokens[cursor].tag == .pipe) {
+        cursor = (nextTagBefore(context.tokens, cursor + 1, .pipe, .semicolon) orelse return false) + 1;
+    }
+    if (cursor >= end) return false;
+    return switch (context.tokens[cursor].tag) {
+        .keyword_return, .keyword_break, .keyword_unreachable => true,
+        .builtin => context.tokenIs(cursor, "@panic") or context.tokenIs(cursor, "@trap"),
+        .keyword_switch => depth > 0 and switchExits(context, cursor, depth - 1, retries),
+        .keyword_if => depth > 0 and ifExits(context, cursor, end, depth - 1, retries),
+        .l_brace => depth > 0 and blockExits(context, cursor, depth - 1, retries),
+        else => false,
+    };
+}
+
+/// Whether every prong of the `switch` at `switch_index` leaves the loop or,
+/// with `retries`, retries. The other prongs must leave it for good.
+fn switchExits(context: RuleRun, switch_index: usize, depth: u8, retries: ?*bool) bool {
+    var prongs = Prongs.init(context, switch_index) orelse return false;
+    var retrying = false;
+    while (prongs.next()) |prong| {
+        if (retries != null and retryProng(context, prong)) {
+            retrying = true;
+        } else if (!branchExits(context, prong.arrow + 1, prong.end, depth, null)) return false;
+    }
+    if (prongs.malformed) return false;
+    if (retrying) retries.?.* = true;
+    return true;
+}
+
+/// Whether both branches of the `if` at `if_index`, which ends before `end`,
+/// leave the loop.
+fn ifExits(context: RuleRun, if_index: usize, end: usize, depth: u8, retries: ?*bool) bool {
+    const tokens = context.tokens;
+    if (if_index + 1 >= end or tokens[if_index + 1].tag != .l_paren) return false;
+    var then_start = (context.scopes.matchingToken(if_index + 1) orelse return false) + 1;
+    if (then_start < end and tokens[then_start].tag == .pipe) {
+        then_start = (nextTagBefore(tokens, then_start + 1, .pipe, .semicolon) orelse return false) + 1;
+    }
+    if (then_start >= end) return false;
+    const else_index = if (tokens[then_start].tag == .l_brace)
+        (context.scopes.matchingToken(then_start) orelse return false) + 1
+    else
+        topLevelTag(context, then_start, end, .keyword_else) orelse return false;
+    if (else_index >= end or tokens[else_index].tag != .keyword_else) return false;
+    return branchExits(context, then_start, else_index, depth, retries) and
+        branchExits(context, else_index + 1, end, depth, retries);
+}
+
+/// Whether a statement of the block at `open` always leaves the loop.
+fn blockExits(context: RuleRun, open: usize, depth: u8, retries: ?*bool) bool {
+    const close = context.scopes.matchingToken(open) orelse return false;
+    var previous: std.zig.Token.Tag = .l_brace;
+    var cursor = open + 1;
+    while (cursor < close) : (cursor += 1) {
+        const tag = context.tokens[cursor].tag;
+        if (startsStatement(previous)) switch (tag) {
+            .keyword_return, .keyword_break, .keyword_unreachable => return true,
+            .keyword_switch => if (switchExits(context, cursor, depth, retries)) return true,
+            .keyword_if => if (ifExits(context, cursor, close, depth, retries)) return true,
+            .builtin => if (context.tokenIs(cursor, "@panic") or context.tokenIs(cursor, "@trap")) return true,
+            else => {},
+        };
+        switch (tag) {
+            .l_brace, .l_paren, .l_bracket => cursor = context.scopes.matchingToken(cursor) orelse return false,
+            else => {},
+        }
+        previous = context.tokens[cursor].tag;
+    }
+    return false;
+}
+
+/// Whether the body of a loop nested in the body at `body_open` encloses `index`.
+fn insideInnerLoop(context: RuleRun, index: usize, body_open: usize) bool {
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (opening <= body_open) return false;
+        if (context.loopKeyword(opening) != null) return true;
+    }
+    return false;
 }
 
 fn callConditionHasUpdate(
@@ -576,4 +839,175 @@ test "length drains, end-of-input scans and helpers only tests call state termin
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
     try support.expectRules(found, &.{.unbounded_loop});
     try std.testing.expect(found[0].span.start > std.mem.find(u8, source, "fn spin").?);
+}
+
+test "system call retries repeat only while the call is interrupted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn mkdir(dir: Dir, path: [*:0]const u8, syscall: *Syscall) !void {
+        \\    while (true) {
+        \\        switch (c.errno(c.mkdirat(dir.handle, path, 0o755))) {
+        \\            .SUCCESS => return,
+        \\            .INTR => {},
+        \\            .ACCES => return error.AccessDenied,
+        \\            else => |err| return unexpectedErrno(err),
+        \\        }
+        \\    }
+        \\    while (true) {
+        \\        try syscall.checkCancel();
+        \\        switch (wasi.path_create_directory(dir.handle, path)) {
+        \\            .SUCCESS => {
+        \\                syscall.finish();
+        \\                return;
+        \\            },
+        \\            .INTR => continue,
+        \\            else => |e| {
+        \\                syscall.finish();
+        \\                switch (e) {
+        \\                    .ACCES => return error.AccessDenied,
+        \\                    else => |err| return unexpectedErrno(err),
+        \\                }
+        \\            },
+        \\        }
+        \\    }
+        \\    while (true) {
+        \\        switch (windows.ntdll.NtFlushBuffersFile(dir.handle)) {
+        \\            .SUCCESS => break syscall.finish(),
+        \\            .CANCELLED => {
+        \\                try syscall.checkCancel();
+        \\                continue;
+        \\            },
+        \\            .INVALID_HANDLE => unreachable,
+        \\            else => |status| return syscall.unexpectedNtstatus(status),
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "a retry switch does not bound a loop another path repeats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn serve(fd: i32, buffer: []u8) !void {
+        \\    while (true) {
+        \\        switch (c.errno(c.read(fd, buffer.ptr, buffer.len))) {
+        \\            .SUCCESS => {},
+        \\            .INTR => {},
+        \\            else => return error.Unexpected,
+        \\        }
+        \\        consume(buffer);
+        \\    }
+        \\    while (true) {
+        \\        if (pending()) continue;
+        \\        switch (c.errno(c.read(fd, buffer.ptr, buffer.len))) {
+        \\            .SUCCESS => return,
+        \\            .AGAIN => {},
+        \\            else => return error.Unexpected,
+        \\        }
+        \\    }
+        \\    while (true) {
+        \\        switch (c.errno(c.read(fd, buffer.ptr, buffer.len))) {
+        \\            .SUCCESS => {
+        \\                if (buffer[0] == 0) continue;
+        \\                return;
+        \\            },
+        \\            .INTR => {},
+        \\            else => return error.Unexpected,
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+}
+
+test "an empty loop repeating a fallible step makes progress through the step" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn lower(ops: []Temp, cg: *CodeGen, lock: *Lock) !void {
+        \\    while (try ops[0].toLea(cg)) {}
+        \\    while (try ops[0].toBase(false, cg) or
+        \\        try ops[1].toRegClass(true, .general_purpose, cg))
+        \\    {}
+        \\    while (lock.isHeld()) {}
+        \\    while (try lock.poll()) {
+        \\        lock.spin();
+        \\    }
+        \\}
+        \\
+    ;
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+}
+
+test "retries returned from a switch or guarded by an interruption test" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn open(op: *Op, pid: i32, syscall: *Syscall) !i32 {
+        \\    while (true) {
+        \\        const rc = posix.system.openat(op.dir_fd, op.file_path, op.flags, op.mode);
+        \\        return switch (posix.errno(rc)) {
+        \\            .SUCCESS => @intCast(rc),
+        \\            .INTR => continue,
+        \\            else => error.Unexpected,
+        \\        };
+        \\    }
+        \\    const result = while (true) {
+        \\        const rc = posix.system.waitpid(pid, null, 0);
+        \\        if (posix.errno(rc) == .INTR) continue;
+        \\        break rc;
+        \\    };
+        \\    while (true) {
+        \\        switch (posix.errno(posix.system.open("/dev/null", .{}, 0))) {
+        \\            .SUCCESS => {
+        \\                if (op.shared) {
+        \\                    return op.fd;
+        \\                } else {
+        \\                    return result;
+        \\                }
+        \\            },
+        \\            .INTR => {
+        \\                try syscall.checkCancel();
+        \\                continue;
+        \\            },
+        \\            else => |err| return unexpectedErrno(err),
+        \\        }
+        \\    }
+        \\    while (true) {
+        \\        if (std.c.realpath(op.file_path, &op.buffer)) |resolved| {
+        \\            break syscall.finish();
+        \\        } else switch (@as(std.c.E, @fromBackingInt(std.c._errno().*))) {
+        \\            .INTR => {
+        \\                try syscall.checkCancel();
+        \\                continue;
+        \\            },
+        \\            else => |err| return unexpectedErrno(err),
+        \\        }
+        \\    }
+        \\    while (true) {
+        \\        switch (linux.errno(linux.flock(op.fd, LOCK.NB))) {
+        \\            .SUCCESS => return,
+        \\            .AGAIN => {
+        \\                try wait(op);
+        \\                switch (op.blocking) {
+        \\                    .blocking => continue,
+        \\                    .nonblocking => return error.WouldBlock,
+        \\                }
+        \\            },
+        \\            else => |err| return unexpectedErrno(err),
+        \\        }
+        \\    }
+        \\}
+        \\
+    ;
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }

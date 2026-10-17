@@ -5,6 +5,7 @@ const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const lineEnd = @import("../../syntax/tokens.zig").lineEnd;
+const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
 const attachedCommentStart = @import("../../syntax/tokens.zig").attachedCommentStart;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
@@ -49,10 +50,12 @@ fn findImportIssues(context: RuleRun) !void {
         const alias = tokenText(source, tokens[index + 1]);
         const raw_path = tokenText(source, tokens[index + 5]);
         const path = raw_path[1 .. raw_path.len - 1];
-        const declaration_span = std.zig.Token.Loc{ .start = lineStart(source, token.loc.start), .end = lineEnd(source, tokens[index + 7].loc.end) };
+        const line_start = lineStart(source, token.loc.start);
+        const documented = attachedCommentStart(source, line_start) != line_start;
+        const declaration_span = removedLinesSpan(source, token.loc.start, tokens[index + 7].loc.end);
         if (duplicate_level != .off) {
             if (seen_paths.get(path)) |first| {
-                const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start)
+                const fixes: []const Fix = if (!documented)
                     try duplicateRemoval(context, first + 1, index + 1, declaration_span)
                 else
                     &.{};
@@ -69,7 +72,7 @@ fn findImportIssues(context: RuleRun) !void {
             } else try seen_paths.put(context.allocator, path, index);
         }
         if (unused_level != .off and identifierUseCount(source, tokens, alias) == 1) {
-            const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start) fixes: {
+            const fixes: []const Fix = if (!documented) fixes: {
                 const allocated = try Fix.single(context.allocator, .{
                     .title = "Remove unused import",
                     .span = declaration_span,
@@ -218,20 +221,51 @@ fn importsAreContiguous(source: []const u8, imports: []const Import) bool {
     return true;
 }
 
+/// The orders a block may already follow: `std`, `builtin` and `root` lead,
+/// in that conventional order or by path, and paths compare with or without
+/// case. The fix writes the first.
+const ImportOrder = struct { conventional_first: bool, ignore_case: bool };
+const accepted_orders = [_]ImportOrder{
+    .{ .conventional_first = true, .ignore_case = true },
+    .{ .conventional_first = true, .ignore_case = false },
+    .{ .conventional_first = false, .ignore_case = true },
+    .{ .conventional_first = false, .ignore_case = false },
+};
+
 fn importsAreSorted(imports: []const Import) bool {
-    for (imports[1..], 1..) |current, index| {
-        if (importLessThan(current, imports[index - 1])) return false;
+    order: for (accepted_orders) |order| {
+        for (imports[1..], 1..) |current, index| {
+            if (importLessThan(order, current, imports[index - 1])) continue :order;
+        }
+        return true;
     }
-    return true;
+    return false;
 }
 
-fn importLessThan(left: Import, right: Import) bool {
+fn importLessThan(order: ImportOrder, left: Import, right: Import) bool {
     const left_group = importGroup(left.path);
     const right_group = importGroup(right.path);
     if (left_group != right_group) return left_group < right_group;
+    if (left_group == 0 and order.conventional_first) {
+        const left_rank = conventionalRank(left.path);
+        const right_rank = conventionalRank(right.path);
+        if (left_rank != right_rank) return left_rank < right_rank;
+    }
+    if (order.ignore_case) switch (std.ascii.orderIgnoreCase(left.path, right.path)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    };
     const path_order = std.mem.order(u8, left.path, right.path);
     if (path_order != .eq) return path_order == .lt;
     return std.mem.lessThan(u8, left.alias, right.alias);
+}
+
+/// `std`, then `builtin`, then `root`.
+fn conventionalRank(path: []const u8) u2 {
+    if (std.mem.eql(u8, path, "std")) return 0;
+    if (std.mem.eql(u8, path, "builtin")) return 1;
+    return 2;
 }
 
 fn importGroup(path: []const u8) u2 {
@@ -242,9 +276,9 @@ fn importGroup(path: []const u8) u2 {
 
 fn sortedImportText(allocator: std.mem.Allocator, source: []const u8, imports: []const Import) ![]const u8 {
     const sorted = try allocator.dupe(Import, imports);
-    std.mem.sort(Import, sorted, {}, struct {
-        fn lessThan(_: void, left: Import, right: Import) bool {
-            return importLessThan(left, right);
+    std.mem.sort(Import, sorted, accepted_orders[0], struct {
+        fn lessThan(order: ImportOrder, left: Import, right: Import) bool {
+            return importLessThan(order, left, right);
         }
     }.lessThan);
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -326,4 +360,47 @@ test "organize imports leaves container doc comments in place" {
         try std.testing.expect(std.mem.find(u8, finding.fixes[0].edits[0].replacement, "//!") == null);
     };
     try std.testing.expectEqual(@as(usize, 1), import_count);
+}
+
+test "std leads builtin and paths compare with or without case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = support.only(&.{.unsorted_imports}, .warning);
+    const sorted = [_][:0]const u8{
+        "const std = @import(\"std\");\nconst builtin = @import(\"builtin\");\nconst common = @import(\"common.zig\");\nconst FloatStream = @import(\"FloatStream.zig\");\n",
+        "const builtin = @import(\"builtin\");\nconst std = @import(\"std\");\nconst Foo = @import(\"Foo.zig\");\nconst bar = @import(\"bar.zig\");\n",
+    };
+    for (sorted) |source| try std.testing.expectEqual(@as(usize, 0), (try support.findings(arena.allocator(), run, source, configuration)).len);
+    const source: [:0]const u8 =
+        "const Zeta = @import(\"Zeta.zig\");\n" ++
+        "const builtin = @import(\"builtin\");\n" ++
+        "const alpha = @import(\"alpha.zig\");\n" ++
+        "const std = @import(\"std\");\n";
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings(
+        "const std = @import(\"std\");\n" ++
+            "const builtin = @import(\"builtin\");\n" ++
+            "\n" ++
+            "const alpha = @import(\"alpha.zig\");\n" ++
+            "const Zeta = @import(\"Zeta.zig\");\n",
+        found[0].fixes[0].edits[0].replacement,
+    );
+}
+
+test "removing an unused import leaves no blank line the formatter would delete" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct { source: [:0]const u8, expected: []const u8 }{
+        .{ .source = "const unused = @import(\"unused\");\n\nconst std = @import(\"std\");\npub const a = std.math;\n", .expected = "const std = @import(\"std\");\npub const a = std.math;\n" },
+        .{ .source = "pub const a = 1;\n\nconst unused = @import(\"unused\");\n\npub const b = 2;\n", .expected = "pub const a = 1;\n\npub const b = 2;\n" },
+        .{ .source = "pub const a = 1;\n\nconst unused = @import(\"unused\");\n", .expected = "pub const a = 1;\n" },
+    };
+    for (cases) |case| {
+        const found = try support.findings(arena.allocator(), run, case.source, support.only(&.{.unused_import}, .warning));
+        try std.testing.expectEqual(@as(usize, 1), found.len);
+        const edit = found[0].fixes[0].edits[0];
+        const fixed = try std.mem.concat(arena.allocator(), u8, &.{ case.source[0..edit.span.start], edit.replacement, case.source[edit.span.end..] });
+        try std.testing.expectEqualStrings(case.expected, fixed);
+    }
 }

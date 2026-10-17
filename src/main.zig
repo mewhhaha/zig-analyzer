@@ -11,10 +11,38 @@ const usage =
     \\
     \\Usage:
     \\  zig-analyzer lsp
-    \\  zig-analyzer check [--fix] [--no-cache] [path]
+    \\  zig-analyzer check [--fix] [--no-cache] [--strict-config]
+    \\                     [--baseline <file>] [--write-baseline <file>]
+    \\                     [--format <format>] [--rule <code>]... [--fail-on <level>]
+    \\                     [path]
+    \\  zig-analyzer explain [rule]
     \\  zig-analyzer doctor
     \\  zig-analyzer backend bootstrap
     \\  zig-analyzer version
+    \\
+;
+
+const check_usage =
+    \\Usage: zig-analyzer check [options] [path]
+    \\
+    \\Lints the Zig files under path, the current directory by default, or the
+    \\one file path names.
+    \\
+    \\Options:
+    \\  --fix                    apply the provably safe fixes before reporting
+    \\  --no-cache               reanalyze files whose findings are cached
+    \\  --strict-config          stop with status 2 on a configuration error
+    \\  --baseline <file>        leave out the findings recorded in file
+    \\  --write-baseline <file>  record every finding in file instead of reporting it
+    \\  --format <format>        text (the default), json, sarif or github
+    \\  --rule <code>[,<code>]   report, count and fix only these rules; repeatable
+    \\  --fail-on <level>        exit with status 1 only for a finding at level or
+    \\                           above: hint (the default, any finding),
+    \\                           information, warning, error, or never
+    \\  -h, --help               print this help
+    \\
+    \\Exit status: 0 when no finding reaches the --fail-on level, 1 when one
+    \\does, 2 for a usage, I/O or --strict-config error.
     \\
 ;
 
@@ -52,40 +80,30 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return try runDoctor(io, allocator);
     }
     if (std.mem.eql(u8, command, "check")) {
-        var fix = false;
-        var cache = true;
-        var path: ?[]const u8 = null;
-        while (arguments.next()) |argument| {
-            if (std.mem.eql(u8, argument, "--fix")) {
-                fix = true;
-                continue;
-            }
-            if (std.mem.eql(u8, argument, "--no-cache")) {
-                cache = false;
-                continue;
-            }
-            if (std.mem.eql(u8, argument, "--help") or std.mem.eql(u8, argument, "-h")) {
-                try std.Io.File.stdout().writeStreamingAll(io, usage);
+        var buffer: [256]u8 = undefined;
+        var file_writer = std.Io.File.stderr().writer(io, &buffer);
+        const parsed = try zig_analyzer.project.check.parseArguments(&arguments, &file_writer.interface);
+        try file_writer.interface.flush();
+        switch (parsed) {
+            .run => |options| return try zig_analyzer.project.check.run(io, allocator, options),
+            .help => {
+                try std.Io.File.stdout().writeStreamingAll(io, check_usage);
                 return 0;
-            }
-            if (argument.len > 0 and argument[0] == '-') {
-                var buffer: [256]u8 = undefined;
-                var file_writer = std.Io.File.stderr().writer(io, &buffer);
-                try file_writer.interface.print("zig-analyzer check: unknown option '{s}'\n", .{argument});
-                try file_writer.interface.flush();
-                return 2;
-            }
-            if (path != null) {
-                try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer check accepts one path\n");
-                return 2;
-            }
-            path = argument;
+            },
+            .invalid => return 2,
         }
-        return try zig_analyzer.project.check.run(io, allocator, .{
-            .path = path orelse ".",
-            .fix = fix,
-            .cache = cache,
-        });
+    }
+    if (std.mem.eql(u8, command, "explain")) {
+        const rule = arguments.next();
+        if (rule) |code| if (std.mem.eql(u8, code, "--help") or std.mem.eql(u8, code, "-h")) {
+            try std.Io.File.stdout().writeStreamingAll(io, usage);
+            return 0;
+        };
+        if (arguments.next() != null) {
+            try std.Io.File.stderr().writeStreamingAll(io, "zig-analyzer explain accepts one rule\n");
+            return 2;
+        }
+        return try zig_analyzer.project.explain.run(io, allocator, rule);
     }
     if (std.mem.eql(u8, command, "backend")) {
         const backend_command = arguments.next() orelse {

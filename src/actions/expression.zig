@@ -1,13 +1,19 @@
 const std = @import("std");
+
+const analysis = @import("../analysis.zig");
+const tokens_util = @import("../syntax/tokens.zig");
+const syntax_types = @import("../syntax/types.zig");
 const action_context = @import("context.zig");
 
 const ActionRun = action_context.ActionRun;
+const Ast = std.zig.Ast;
 
 pub fn run(context: ActionRun) !void {
     try addErrorAndOptionalActions(context);
     try addPointerCastAction(context);
     try addSplitCompoundAssertion(context);
     try addOrelseUnreachableUnwrap(context);
+    try addArithmeticVariants(context);
 }
 
 const ReturnKind = struct {
@@ -492,6 +498,497 @@ fn declaredType(context: ActionRun, name: []const u8, before: usize) ?[]const u8
     return null;
 }
 
+/// The overflow-aware spellings of one arithmetic operator.
+const ArithmeticOperator = struct {
+    wrapping: ?[]const u8 = null,
+    saturating: []const u8,
+    checked: ?CheckedBuiltin = null,
+    compound: bool = false,
+};
+
+const CheckedBuiltin = struct {
+    builtin: []const u8,
+    /// The base name of the tuple the checked rewrite binds.
+    result: []const u8,
+};
+
+fn arithmeticOperator(tag: Ast.Node.Tag) ?ArithmeticOperator {
+    const add: CheckedBuiltin = .{ .builtin = "@addWithOverflow", .result = "sum" };
+    const sub: CheckedBuiltin = .{ .builtin = "@subWithOverflow", .result = "difference" };
+    const mul: CheckedBuiltin = .{ .builtin = "@mulWithOverflow", .result = "product" };
+    return switch (tag) {
+        .add => .{ .wrapping = "+%", .saturating = "+|", .checked = add },
+        .sub => .{ .wrapping = "-%", .saturating = "-|", .checked = sub },
+        .mul => .{ .wrapping = "*%", .saturating = "*|", .checked = mul },
+        .shl => .{ .saturating = "<<|" },
+        .assign_add => .{ .wrapping = "+%=", .saturating = "+|=", .checked = add, .compound = true },
+        .assign_sub => .{ .wrapping = "-%=", .saturating = "-|=", .checked = sub, .compound = true },
+        .assign_mul => .{ .wrapping = "*%=", .saturating = "*|=", .checked = mul, .compound = true },
+        .assign_shl => .{ .saturating = "<<|=", .compound = true },
+        else => null,
+    };
+}
+
+/// Spells a selected `+`, `-` or `*` (or its compound assignment) with
+/// wrapping, saturating or overflow-checked arithmetic, and `<<` with a
+/// saturating shift. The left operand must be proven a fixed-width integer:
+/// `+%` and `+|` reject floats and pointer arithmetic, and `@addWithOverflow`
+/// rejects `comptime_int`, so an unproven operand could stop compiling.
+fn addArithmeticVariants(context: ActionRun) !void {
+    const operator_index = selectedArithmeticOperator(context) orelse return;
+    var tree = try Ast.parse(context.allocator, context.source, .{ .mode = .zig });
+    defer tree.deinit(context.allocator);
+    const node = arithmeticNodeAt(&tree, operator_index) orelse return;
+    const operator = arithmeticOperator(tree.nodeTag(node)).?;
+    const body = enclosingBody(context, &tree, operator_index) orelse return;
+    const scope: TypeScope = .{ .context = context, .tree = &tree, .body = body };
+    const left, const right = tree.nodeData(node).node_and_node;
+    const left_proven = scope.integer(left);
+    // `1 << n` only compiles with a comptime shift, so the literal form is for the other operators.
+    const literal_left = tree.nodeTag(node) != .shl and integerLiteral(&tree, left) and scope.integer(right);
+    if (!left_proven and !literal_left) return;
+    const operator_span = context.tokens[operator_index].loc;
+    if (operator.wrapping) |wrapping| try context.oneEdit(
+        try context.allocator.print("Use wrapping arithmetic '{s}'", .{wrapping}),
+        .refactor_rewrite,
+        operator_span,
+        wrapping,
+        .{},
+    );
+    try context.oneEdit(
+        try context.allocator.print("Use saturating arithmetic '{s}'", .{operator.saturating}),
+        .refactor_rewrite,
+        operator_span,
+        operator.saturating,
+        .{},
+    );
+    const checked = operator.checked orelse return;
+    if (!body.accepts_overflow) return;
+    const edits = try checkedArithmeticEdits(scope, node, operator.compound, checked) orelse return;
+    try context.add(
+        try context.allocator.print("Use checked arithmetic '{s}'", .{checked.builtin}),
+        .refactor_rewrite,
+        edits,
+        .{},
+    );
+}
+
+fn selectedArithmeticOperator(context: ActionRun) ?usize {
+    for (context.tokens, 0..) |token, index| {
+        if (token.loc.start > context.selection.end) return null;
+        switch (token.tag) {
+            .plus,
+            .minus,
+            .asterisk,
+            .angle_bracket_angle_bracket_left,
+            .plus_equal,
+            .minus_equal,
+            .asterisk_equal,
+            .angle_bracket_angle_bracket_left_equal,
+            => if (context.selected(token.loc)) return index,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn arithmeticNodeAt(tree: *const Ast, operator_index: usize) ?Ast.Node.Index {
+    for (1..tree.nodes.len) |raw_node| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        if (tree.nodeMainToken(node) == operator_index and arithmeticOperator(tree.nodeTag(node)) != null) return node;
+    }
+    return null;
+}
+
+/// The innermost function or test body around a token: the parameter list's
+/// parentheses (none for a test), the body's braces, and whether the body may
+/// `return error.Overflow`.
+const Body = struct {
+    parameters: ?[2]usize,
+    start: usize,
+    end: usize,
+    accepts_overflow: bool,
+};
+
+fn enclosingBody(context: ActionRun, tree: *const Ast, index: usize) ?Body {
+    var innermost: ?Body = null;
+    for (1..tree.nodes.len) |raw_node| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        const body_node = switch (tree.nodeTag(node)) {
+            .fn_decl => tree.nodeData(node).node_and_node[1],
+            .test_decl => tree.nodeData(node).opt_token_and_node[1],
+            else => continue,
+        };
+        const start = tree.firstToken(body_node);
+        const end = tree.lastToken(body_node);
+        if (index <= start or index >= end) continue;
+        if (innermost) |current| if (current.start > start) continue;
+        if (tree.nodeTag(node) == .test_decl) {
+            // A test returns `anyerror!void`.
+            innermost = .{ .parameters = null, .start = start, .end = end, .accepts_overflow = true };
+            continue;
+        }
+        var buffer: [1]Ast.Node.Index = undefined;
+        const prototype = tree.fullFnProto(&buffer, tree.nodeData(node).node_and_node[0]) orelse continue;
+        const parameters_end = context.matchingToken(prototype.lparen, .l_paren, .r_paren) orelse continue;
+        innermost = .{
+            .parameters = .{ prototype.lparen, parameters_end },
+            .start = start,
+            .end = end,
+            .accepts_overflow = returnsOverflow(tree, prototype),
+        };
+    }
+    return innermost;
+}
+
+/// Whether the function's error set admits `error.Overflow`: an inferred set
+/// (`!T`), `anyerror`, or an explicit `error{...}` naming `Overflow`.
+fn returnsOverflow(tree: *const Ast, prototype: Ast.full.FnProto) bool {
+    const return_type = prototype.ast.return_type.unwrap() orelse return false;
+    if (tree.tokenTag(tree.firstToken(return_type) - 1) == .bang) return true;
+    if (tree.nodeTag(return_type) != .error_union) return false;
+    const error_set = tree.nodeData(return_type).node_and_node[0];
+    switch (tree.nodeTag(error_set)) {
+        .identifier => return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(error_set)), "anyerror"),
+        .error_set_decl => {
+            const opening, const closing = tree.nodeData(error_set).token_and_token;
+            for (opening + 1..closing) |token| {
+                if (tree.tokenTag(@intCast(token)) == .identifier and
+                    std.mem.eql(u8, tree.tokenSlice(@intCast(token)), "Overflow")) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn integerLiteral(tree: *const Ast, node: Ast.Node.Index) bool {
+    return switch (tree.nodeTag(node)) {
+        .char_literal => true,
+        .number_literal => switch (std.zig.parseNumberLiteral(tree.tokenSlice(tree.nodeMainToken(node)))) {
+            .int, .big_int => true,
+            .float, .failure => false,
+        },
+        else => false,
+    };
+}
+
+/// What the one declaration of a name says about its type.
+const Declaration = union(enum) {
+    /// The annotation's tokens, `[start, end)`.
+    annotated: [2]usize,
+    /// A `for` capture of a range input, which is a `usize`.
+    range_index,
+    /// A binding initialized with a string literal.
+    string_literal,
+    unknown,
+};
+
+/// Syntax-only type facts for the operands of one expression inside `body`.
+const TypeScope = struct {
+    context: ActionRun,
+    tree: *const Ast,
+    body: Body,
+
+    /// Whether `node` is proven to have a fixed-width integer type: a name
+    /// annotated with one, a range index, `.len` of a sequence, `@as(T, x)`, or
+    /// arithmetic whose left operand (or right, beside a literal) is one.
+    fn integer(scope: TypeScope, node: Ast.Node.Index) bool {
+        const tree = scope.tree;
+        switch (tree.nodeTag(node)) {
+            .identifier => return switch (scope.declaration(tree.nodeMainToken(node)) orelse return false) {
+                .annotated => |range| range[1] == range[0] + 1 and
+                    syntax_types.isIntegerTypeName(scope.context.tokenText(range[0])),
+                .range_index => true,
+                .string_literal, .unknown => false,
+            },
+            .field_access => {
+                const object, const field = tree.nodeData(node).node_and_token;
+                if (tree.nodeTag(object) != .identifier) return false;
+                const object_declaration = scope.declaration(tree.nodeMainToken(object)) orelse return false;
+                if (std.mem.eql(u8, tree.tokenSlice(field), "len")) switch (object_declaration) {
+                    .annotated => |range| if (scope.sequenceType(range)) return true,
+                    .string_literal => return true,
+                    .range_index, .unknown => {},
+                };
+                return switch (object_declaration) {
+                    .annotated => |range| scope.integerField(range, tree.tokenSlice(field)),
+                    .range_index, .string_literal, .unknown => false,
+                };
+            },
+            .grouped_expression => return scope.integer(tree.nodeData(node).node_and_token[0]),
+            .builtin_call_two, .builtin_call_two_comma => {
+                if (!std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "@as")) return false;
+                const type_node = tree.nodeData(node).opt_node_and_opt_node[0].unwrap() orelse return false;
+                return tree.nodeTag(type_node) == .identifier and
+                    syntax_types.isIntegerTypeName(tree.tokenSlice(tree.nodeMainToken(type_node)));
+            },
+            .add, .sub, .mul, .div, .mod, .add_wrap, .sub_wrap, .mul_wrap, .add_sat, .sub_sat, .mul_sat, .bit_and, .bit_or, .bit_xor => {
+                const left, const right = tree.nodeData(node).node_and_node;
+                return scope.integer(left) or (integerLiteral(tree, left) and scope.integer(right));
+            },
+            .shl, .shl_sat, .shr => return scope.integer(tree.nodeData(node).node_and_node[0]),
+            else => return false,
+        }
+    }
+
+    /// Whether a receiver annotated `range` (`*Self`, `T`, `*const @This()`) is
+    /// the struct around the body and its field `name` is annotated with a
+    /// fixed-width integer type.
+    fn integerField(scope: TypeScope, range: [2]usize, name: []const u8) bool {
+        const context = scope.context;
+        const tree = scope.tree;
+        var type_start = range[0];
+        while (type_start < range[1] and
+            (context.tokens[type_start].tag == .asterisk or context.tokens[type_start].tag == .keyword_const)) type_start += 1;
+        const container = action_context.enclosingStruct(tree, scope.body.start) orelse return false;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const members = tree.fullContainerDecl(&buffer, container).?.ast.members;
+        const this_type = type_start + 3 == range[1] and context.tokenIs(type_start, "@This") and
+            context.tokens[type_start + 1].tag == .l_paren and context.tokens[type_start + 2].tag == .r_paren;
+        if (!this_type) {
+            if (type_start + 1 != range[1] or context.tokens[type_start].tag != .identifier) return false;
+            if (!action_context.namesStruct(context, tree, container, context.tokenText(type_start))) return false;
+        }
+        for (members) |member| {
+            const field = tree.fullContainerField(member) orelse continue;
+            if (!std.mem.eql(u8, tree.tokenSlice(field.ast.main_token), name)) continue;
+            const type_node = field.ast.type_expr.unwrap() orelse return false;
+            return tree.nodeTag(type_node) == .identifier and
+                syntax_types.isIntegerTypeName(tree.tokenSlice(tree.nodeMainToken(type_node)));
+        }
+        return false;
+    }
+
+    /// A slice, an array, or a pointer to an array: types whose `.len` is a `usize`.
+    fn sequenceType(scope: TypeScope, range: [2]usize) bool {
+        const tokens = scope.context.tokens;
+        var index = range[0];
+        if (tokens[index].tag == .asterisk) {
+            index += 1;
+            if (index < range[1] and tokens[index].tag == .keyword_const) index += 1;
+            // `*[]T` has no `.len` of its own, so only `*[N]T` counts.
+            if (index + 1 >= range[1] or tokens[index].tag != .l_bracket or tokens[index + 1].tag == .r_bracket) return false;
+        }
+        return index + 1 < range[1] and tokens[index].tag == .l_bracket and tokens[index + 1].tag != .asterisk;
+    }
+
+    /// The only declaration of the name at `use` visible from the body: a
+    /// parameter, a local, or a capture of the function; else an annotated
+    /// top-level declaration. Two declarations of the name in the function
+    /// (in sibling scopes) are ambiguous and prove nothing.
+    fn declaration(scope: TypeScope, use: Ast.TokenIndex) ?Declaration {
+        const context = scope.context;
+        const name = scope.tree.tokenSlice(use);
+        var found: ?Declaration = null;
+        var count: usize = 0;
+        if (scope.body.parameters) |parameters| {
+            var depth: usize = 0;
+            for (context.tokens[parameters[0] + 1 .. parameters[1]], parameters[0] + 1..) |token, index| switch (token.tag) {
+                .l_paren, .l_bracket, .l_brace => depth += 1,
+                .r_paren, .r_bracket, .r_brace => depth -|= 1,
+                .identifier => if (depth == 0 and context.tokens[index + 1].tag == .colon and context.tokenIs(index, name)) {
+                    count += 1;
+                    found = .{ .annotated = .{ index + 2, topLevelEnd(context, index + 2, parameters[1], &.{.comma}) } };
+                },
+                else => {},
+            };
+        }
+        for (context.tokens[scope.body.start + 1 .. scope.body.end], scope.body.start + 1..) |token, index| {
+            if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+            switch (context.tokens[index - 1].tag) {
+                .keyword_const, .keyword_var => {
+                    count += 1;
+                    found = localDeclaration(context, index, scope.body.end);
+                },
+                .pipe, .comma, .asterisk => if (captureDeclaration(context, index)) |capture| {
+                    count += 1;
+                    found = capture;
+                },
+                else => {},
+            }
+        }
+        if (count == 1) return found;
+        if (count != 0) return null;
+        for (scope.tree.rootDecls()) |root| {
+            const variable = scope.tree.fullVarDecl(root) orelse continue;
+            if (!context.tokenIs(variable.ast.mut_token + 1, name)) continue;
+            const type_node = variable.ast.type_node.unwrap() orelse return .unknown;
+            return .{ .annotated = .{ scope.tree.firstToken(type_node), scope.tree.lastToken(type_node) + 1 } };
+        }
+        return null;
+    }
+};
+
+/// The first token in `[start, end)` at bracket depth zero whose tag is one of
+/// `stops`, or `end`.
+fn topLevelEnd(context: ActionRun, start: usize, end: usize, stops: []const std.zig.Token.Tag) usize {
+    var depth: usize = 0;
+    for (context.tokens[start..end], start..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        else => if (depth == 0 and std.mem.findScalar(std.zig.Token.Tag, stops, token.tag) != null) return index,
+    };
+    return end;
+}
+
+fn localDeclaration(context: ActionRun, name_index: usize, end: usize) Declaration {
+    if (context.tokens[name_index + 1].tag == .colon) {
+        return .{ .annotated = .{ name_index + 2, topLevelEnd(context, name_index + 2, end, &.{ .equal, .semicolon }) } };
+    }
+    if (context.tokens[name_index + 1].tag == .equal and context.tokens[name_index + 2].tag == .string_literal and
+        context.tokens[name_index + 3].tag == .semicolon) return .string_literal;
+    return .unknown;
+}
+
+/// The declaration a name inside `|...|` makes: a range index when it captures
+/// a `for` input that is a range, else an untyped capture. Null when the pipes
+/// are not a capture list.
+fn captureDeclaration(context: ActionRun, name_index: usize) ?Declaration {
+    var position: usize = 0;
+    var cursor = name_index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .pipe => break,
+            .comma => position += 1,
+            .identifier, .asterisk => {},
+            else => return null,
+        }
+    }
+    if (cursor == 0 or context.tokens[cursor].tag != .pipe) return null;
+    switch (context.tokens[cursor - 1].tag) {
+        .r_paren => {},
+        .keyword_else, .keyword_catch, .equal_angle_bracket_right => return .unknown,
+        else => return null,
+    }
+    const opening = tokens_util.matchingOpeningToken(context.tokens, cursor - 1, .l_paren, .r_paren) orelse return .unknown;
+    if (opening == 0 or context.tokens[opening - 1].tag != .keyword_for) return .unknown;
+    var input_start = opening + 1;
+    for (0..position) |_| {
+        input_start = topLevelEnd(context, input_start, cursor - 1, &.{.comma}) + 1;
+        if (input_start >= cursor - 1) return .unknown;
+    }
+    const input_end = topLevelEnd(context, input_start, cursor - 1, &.{.comma});
+    for (context.tokens[input_start..input_end]) |token| if (token.tag == .ellipsis2) return .range_index;
+    return .unknown;
+}
+
+/// The edits that bind `@addWithOverflow(a, b)` before the statement holding
+/// `a + b` and return `error.Overflow` when it overflowed. Only a whole
+/// statement value is hoisted (`const x = a + b;`, `return a + b;`, `x = a + b;`,
+/// `x += b;`), so nothing else in the statement changes evaluation order, and
+/// only directly inside a block outside `defer` and `comptime`, where a
+/// statement can be inserted and `return` is allowed.
+fn checkedArithmeticEdits(
+    scope: TypeScope,
+    node: Ast.Node.Index,
+    compound: bool,
+    checked: CheckedBuiltin,
+) !?[]const analysis.Edit {
+    const context = scope.context;
+    const tree = scope.tree;
+    const statement = if (compound) node else valueStatement(tree, node) orelse return null;
+    if (!directBlockStatement(tree, statement)) return null;
+    const left, const right = tree.nodeData(node).node_and_node;
+    if (compound or tree.nodeTag(statement) == .assign) {
+        if (!pureLocation(context, tree, tree.nodeData(statement).node_and_node[0])) return null;
+    }
+    const first = tree.firstToken(statement);
+    const statement_start = context.tokens[first].loc.start;
+    if (std.mem.trim(u8, context.source[tokens_util.lineStart(context.source, statement_start)..statement_start], " \t").len != 0) return null;
+    const left_text = nodeSource(context, tree, left);
+    const right_text = nodeSource(context, tree, right);
+    for ([_][]const u8{ left_text, right_text }) |operand| {
+        if (std.mem.findScalar(u8, operand, '\n') != null or tokens_util.containsComment(operand)) return null;
+    }
+    var name: []const u8 = checked.result;
+    var suffix: usize = 2;
+    while (identifierExists(context, name)) : (suffix += 1) {
+        name = try context.allocator.print("{s}{d}", .{ checked.result, suffix });
+    }
+    const indentation = context.lineIndentation(statement_start);
+    const check_format = "const {s} = {s}({s}, {s});\n{s}if ({s}[1] != 0) return error.Overflow;\n{s}";
+    const check_arguments = .{ name, checked.builtin, left_text, right_text, indentation, name, indentation };
+    if (compound) {
+        const edits = try context.allocator.alloc(analysis.Edit, 1);
+        errdefer context.allocator.free(edits);
+        edits[0] = .{
+            .span = .{ .start = statement_start, .end = nodeSpan(context, tree, statement).end },
+            .replacement = try context.allocator.print(check_format ++ "{s} = {s}[0]", check_arguments ++ .{ left_text, name }),
+        };
+        return edits;
+    }
+    const edits = try context.allocator.alloc(analysis.Edit, 2);
+    errdefer context.allocator.free(edits);
+    edits[0] = .{
+        .span = .{ .start = statement_start, .end = statement_start },
+        .replacement = try context.allocator.print(check_format, check_arguments),
+    };
+    edits[1] = .{ .span = nodeSpan(context, tree, node), .replacement = try context.allocator.print("{s}[0]", .{name}) };
+    return edits;
+}
+
+/// The statement whose whole value is `node`: a local's initializer, a
+/// returned operand, or the right side of a plain assignment.
+fn valueStatement(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    for (1..tree.nodes.len) |raw_node| {
+        const candidate: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        switch (tree.nodeTag(candidate)) {
+            .simple_var_decl, .local_var_decl, .aligned_var_decl => {
+                if (tree.fullVarDecl(candidate).?.ast.init_node.unwrap() == node) return candidate;
+            },
+            .@"return" => if (tree.nodeData(candidate).opt_node.unwrap() == node) return candidate,
+            .assign => if (tree.nodeData(candidate).node_and_node[1] == node) return candidate,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn directBlockStatement(tree: *const Ast, statement: Ast.Node.Index) bool {
+    const first = tree.firstToken(statement);
+    var in_block = false;
+    for (1..tree.nodes.len) |raw_node| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        switch (tree.nodeTag(node)) {
+            .block_two, .block_two_semicolon, .block, .block_semicolon => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const statements = tree.blockStatements(&buffer, node) orelse continue;
+                if (std.mem.findScalar(Ast.Node.Index, statements, statement) != null) in_block = true;
+            },
+            // `return` is not allowed in a deferred expression or a comptime block.
+            .@"defer", .@"errdefer", .@"comptime" => {
+                if (tree.firstToken(node) < first and first <= tree.lastToken(node)) return false;
+            },
+            else => {},
+        }
+    }
+    return in_block;
+}
+
+/// Whether evaluating the assignment target twice is harmless: a path of
+/// names, fields, dereferences and literal or name indexes, with no call.
+fn pureLocation(context: ActionRun, tree: *const Ast, node: Ast.Node.Index) bool {
+    for (context.tokens[tree.firstToken(node) .. tree.lastToken(node) + 1]) |token| switch (token.tag) {
+        .identifier, .period, .period_asterisk, .question_mark, .l_bracket, .r_bracket, .number_literal => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn nodeSpan(context: ActionRun, tree: *const Ast, node: Ast.Node.Index) std.zig.Token.Loc {
+    return .{
+        .start = context.tokens[tree.firstToken(node)].loc.start,
+        .end = context.tokens[tree.lastToken(node)].loc.end,
+    };
+}
+
+fn nodeSource(context: ActionRun, tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    const span = nodeSpan(context, tree, node);
+    return context.source[span.start..span.end];
+}
+
 test "fallible and optional expressions get Zig recovery actions" {
     const registry = @import("registry.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -666,4 +1163,158 @@ test "orelse unreachable with a comment or a larger operand is not rewritten" {
     const operand_start = std.mem.find(u8, operand_source, "unreachable") orelse unreachable;
     const operand = try registry.actions(arena.allocator(), operand_source, .{ .start = operand_start, .end = operand_start + 11 }, &.{});
     try std.testing.expectEqual(@as(usize, 0), operand.len);
+}
+
+/// The actions offered with the cursor on the first `operator` after `after`.
+fn actionsAtOperator(allocator: std.mem.Allocator, source: [:0]const u8, after: []const u8, operator: []const u8) ![]const action_context.Candidate {
+    const registry = @import("registry.zig");
+    const start = std.mem.findPos(u8, source, std.mem.find(u8, source, after).?, operator).?;
+    return registry.actions(allocator, source, .{ .start = start, .end = start }, &.{});
+}
+
+fn applied(allocator: std.mem.Allocator, source: [:0]const u8, edits: []const analysis.Edit) ![]const u8 {
+    return @import("../syntax/text_edits.zig").apply(allocator, source, edits);
+}
+
+test "integer arithmetic offers wrapping, saturating and checked spellings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn total(a: u32, b: u32) !u32 {
+        \\    return a + b;
+        \\}
+    ;
+    const actions = try actionsAtOperator(arena.allocator(), source, "return", "+");
+    try std.testing.expectEqual(@as(usize, 3), actions.len);
+    try std.testing.expectEqualStrings("Use wrapping arithmetic '+%'", actions[0].title);
+    try std.testing.expectEqualStrings("+%", actions[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("+|", actions[1].edits[0].replacement);
+    try std.testing.expectEqualStrings("Use checked arithmetic '@addWithOverflow'", actions[2].title);
+    try std.testing.expectEqualStrings(
+        \\fn total(a: u32, b: u32) !u32 {
+        \\    const sum = @addWithOverflow(a, b);
+        \\    if (sum[1] != 0) return error.Overflow;
+        \\    return sum[0];
+        \\}
+    , try applied(arena.allocator(), source, actions[2].edits));
+}
+
+test "compound assignments rewrite the target once more for the checked form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn scale(values: []const u16, factor: u16) !u16 {
+        \\    var product: u16 = 1;
+        \\    for (values) |value| {
+        \\        product *= value * factor;
+        \\    }
+        \\    return product;
+        \\}
+    ;
+    const actions = try actionsAtOperator(arena.allocator(), source, "product *=", "*=");
+    try std.testing.expectEqual(@as(usize, 3), actions.len);
+    try std.testing.expectEqualStrings("*%=", actions[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("*|=", actions[1].edits[0].replacement);
+    try std.testing.expectEqualStrings(
+        \\fn scale(values: []const u16, factor: u16) !u16 {
+        \\    var product: u16 = 1;
+        \\    for (values) |value| {
+        \\        const product2 = @mulWithOverflow(product, value * factor);
+        \\        if (product2[1] != 0) return error.Overflow;
+        \\        product = product2[0];
+        \\    }
+        \\    return product;
+        \\}
+    , try applied(arena.allocator(), source, actions[2].edits));
+}
+
+test "shifts only offer the saturating shift" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "fn widen(bits: u32, shift: u5) !u32 { return bits << shift; }";
+    const actions = try actionsAtOperator(arena.allocator(), source, "bits <<", "<<");
+    try std.testing.expectEqual(@as(usize, 1), actions.len);
+    try std.testing.expectEqualStrings("<<|", actions[0].edits[0].replacement);
+}
+
+test "checked arithmetic needs an error return and a whole-statement value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const infallible = try actionsAtOperator(allocator, "fn f(a: u8) u8 {\n    return a + 1;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), infallible.len);
+    const closed_set = try actionsAtOperator(allocator, "fn f(a: u8) error{Empty}!u8 {\n    return a + 1;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), closed_set.len);
+    const listed = try actionsAtOperator(allocator, "fn f(a: u8) error{Overflow}!u8 {\n    return a + 1;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+    const any = try actionsAtOperator(allocator, "fn f(a: u8) anyerror!u8 {\n    return a + 1;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 3), any.len);
+    const embedded = try actionsAtOperator(allocator, "fn f(a: u8, b: u8) !bool {\n    return a + 1 > b;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), embedded.len);
+    const deferred = try actionsAtOperator(allocator, "fn f(a: u8) !void {\n    defer {\n        const b = a + 1;\n        _ = b;\n    }\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), deferred.len);
+    const unbraced = try actionsAtOperator(allocator, "fn f(a: u8, c: bool) !u8 {\n    if (c) return a + 1;\n    return a;\n}", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), unbraced.len);
+    const shared_line = try actionsAtOperator(allocator, "fn f(a: u8) !u8 { return a + 1; }", "a +", "+");
+    try std.testing.expectEqual(@as(usize, 2), shared_line.len);
+    const call_target = try actionsAtOperator(allocator, "fn f(a: []u8, i: usize) !void {\n    a[slot(i)] += 1;\n}", "+=", "+=");
+    try std.testing.expectEqual(@as(usize, 0), call_target.len);
+    const in_test = try actionsAtOperator(allocator, "test \"x\" {\n    const a: u8 = 1;\n    const b = a - 1;\n    _ = b;\n}", "a -", "-");
+    try std.testing.expectEqual(@as(usize, 3), in_test.len);
+    try std.testing.expectEqualStrings(
+        "test \"x\" {\n    const a: u8 = 1;\n    const difference = @subWithOverflow(a, 1);\n" ++
+            "    if (difference[1] != 0) return error.Overflow;\n    const b = difference[0];\n    _ = b;\n}",
+        try applied(allocator, "test \"x\" {\n    const a: u8 = 1;\n    const b = a - 1;\n    _ = b;\n}", in_test[2].edits),
+    );
+}
+
+test "arithmetic rewrites need a proven fixed-width integer operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { source: [:0]const u8, anchor: []const u8 }{
+        .{ .source = "fn f(a: f32, b: f32) f32 { return a + b; }", .anchor = "a +" },
+        .{ .source = "fn f(p: [*]u8, n: usize) [*]u8 { return p + n; }", .anchor = "p +" },
+        .{ .source = "fn f(a: anytype) @TypeOf(a) { return a + 1; }", .anchor = "a +" },
+        .{ .source = "fn f() u8 { return 1 + 2; }", .anchor = "1 +" },
+        .{ .source = "fn f(x: u32) u32 { return 1 << x; }", .anchor = "1 <<" },
+        .{ .source = "fn g(m: f32) f32 { const n: f32 = m; return n + 1; } fn f(n: usize) usize { return n; }", .anchor = "n +" },
+        .{ .source = "fn f(x: u8) void { if (x > 0) { const y: u8 = 1; _ = y; } else { const y: f32 = 1; _ = y + 1; } }", .anchor = "y +" },
+        .{ .source = "fn f(o: ?u8) u8 { if (o) |y| return y + 1; return 0; } const y: u8 = 0;", .anchor = "y +" },
+        .{ .source = "fn f(xs: []const f32) f32 { for (xs) |x| return x * 2; return 0; }", .anchor = "x *" },
+    };
+    for (cases) |case| {
+        const actions = try actionsAtOperator(allocator, case.source, case.anchor, case.anchor[case.anchor.len - 1 ..]);
+        errdefer std.debug.print("offered for: {s}\n", .{case.source});
+        try std.testing.expectEqual(@as(usize, 0), actions.len);
+    }
+}
+
+test "lengths, range indexes, casts and integer fields are proven integers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const last = try actionsAtOperator(allocator, "fn f(items: []const u8) usize { return items.len - 1; }", "len", "-");
+    try std.testing.expectEqualStrings("-%", last[0].edits[0].replacement);
+    const index = try actionsAtOperator(allocator, "fn f(items: []const u8) void { for (items, 0..) |_, i| { _ = i + 1; } }", "i +", "+");
+    try std.testing.expectEqual(@as(usize, 2), index.len);
+    const cast = try actionsAtOperator(allocator, "fn f(x: anytype) u16 { return @as(u16, x) * 3; }", "@as", "*");
+    try std.testing.expectEqual(@as(usize, 2), cast.len);
+    const literal = try actionsAtOperator(allocator, "fn f(x: i64) i64 { return 1 - x; }", "1 -", "-");
+    try std.testing.expectEqual(@as(usize, 2), literal.len);
+    const field = try actionsAtOperator(
+        allocator,
+        "const Counter = struct { count: u32, const Self = @This(); fn bump(self: *Self) void { self.count += 1; } };",
+        "self.count",
+        "+=",
+    );
+    try std.testing.expectEqual(@as(usize, 2), field.len);
+    try std.testing.expectEqualStrings("+%=", field[0].edits[0].replacement);
+    const foreign = try actionsAtOperator(
+        allocator,
+        "const Counter = struct { count: u32, fn bump(other: *Other) void { other.count += 1; } }; const Other = struct { count: f32 };",
+        "other.count",
+        "+=",
+    );
+    try std.testing.expectEqual(@as(usize, 0), foreign.len);
 }

@@ -103,7 +103,7 @@ test "LSP offers line and file suppression quickfixes for a finding" {
     try std.testing.expect(std.mem.find(u8, response, "Suppress 'never-mutated-var' in this file") != null);
     try std.testing.expect(std.mem.find(u8, response, "    // zig-analyzer: disable-next-line never-mutated-var\\n") != null);
     try std.testing.expect(std.mem.find(u8, response, "// zig-analyzer: disable-file never-mutated-var\\n") != null);
-    try std.testing.expect(std.mem.count(u8, response, "Suppress 'never-mutated-var' on this line") == 1);
+    try std.testing.expectEqual(1, std.mem.count(u8, response, "Suppress 'never-mutated-var' on this line"));
 }
 
 test "LSP returns Zig error recovery actions" {
@@ -275,4 +275,115 @@ test "LSP code action offers rule-wide fix-all for deterministic rule" {
         }
     }
     try std.testing.expect(found_rule_fix_all);
+}
+
+test "LSP fix-all repeats passes until nothing more is fixable" {
+    var transport = TestTransport.init(&.{});
+    defer transport.deinit();
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport, .syntax_only);
+    defer server.deinit();
+
+    // The repository configuration enables the migration to `find` and the
+    // scalar search, which rewrite the same call one pass after the other.
+    const uri = try checkoutUri(std.testing.allocator, "examples/fix_all_passes.zig");
+    defer std.testing.allocator.free(uri);
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "pub fn open(output: []const u8) usize {\n" ++
+        "    return \"é😀\".len + std.mem.indexOf(u8, output, \"(\").?;\n" ++
+        "}\n";
+    try server.documents.open(uri, 1, source);
+    const document = server.documents.getConst(uri).?;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const only = [_]lsp.types.CodeAction.Kind{.@"source.fixAll"};
+    const result = (try server.@"textDocument/codeAction"(arena, .{
+        .textDocument = .{ .uri = uri },
+        .range = document.range(.{ .start = 0, .end = source.len }),
+        .context = .{ .diagnostics = &.{}, .only = &only },
+    })).?;
+
+    var fixed: ?[]const u8 = null;
+    for (result) |action_result| {
+        const action = switch (action_result) {
+            .code_action => |code_action| code_action,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, action.title, "Fix all safe zig-analyzer findings")) continue;
+        // Apply the UTF-16 ranges to the source, last first.
+        const edits = action.edit.?.changes.?.map.get(uri).?;
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(arena, source);
+        var index = edits.len;
+        while (index > 0) {
+            index -= 1;
+            const start = document.byteOffset(edits[index].range.start);
+            const end = document.byteOffset(edits[index].range.end);
+            if (index > 0) try std.testing.expect(document.byteOffset(edits[index - 1].range.end) < start);
+            try text.replaceRange(arena, start, end - start, edits[index].newText);
+        }
+        fixed = text.items;
+    }
+    try std.testing.expectEqualStrings(
+        "const std = @import(\"std\");\n" ++
+            "pub fn open(output: []const u8) usize {\n" ++
+            "    return \"é😀\".len + std.mem.findScalar(u8, output, '(').?;\n" ++
+            "}\n",
+        fixed.?,
+    );
+}
+
+test "LSP lists a native action once when a diagnostic fix makes the same edit" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "zig-analyzer.json",
+        .data = "{\"lints\":{\"rules\":{\"missing-deinit-poison\":\"warning\"}}}\n",
+    });
+    const root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    var transport = TestTransport.init(&.{});
+    defer transport.deinit();
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport, .syntax_only);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const Buffer = struct {\n" ++
+        "    bytes: []u8,\n" ++
+        "    fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {\n" ++
+        "        allocator.free(self.bytes);\n" ++
+        "    }\n" ++
+        "};\n";
+    const name = std.mem.find(u8, source, "deinit").?;
+    // With the rule on, its quick fix stands in for the native action; with
+    // it off, the native action remains.
+    for ([_][]const u8{ try uri_module.fromPath(arena, try std.Io.Dir.path.join(arena, &.{ root, "buffer.zig" })), "file:///buffer.zig" }, [_]bool{ true, false }) |uri, rule_on| {
+        try server.documents.open(uri, 1, source);
+        const document = server.documents.getConst(uri).?;
+        const result = (try server.@"textDocument/codeAction"(arena, .{
+            .textDocument = .{ .uri = uri },
+            .range = document.range(.{ .start = name, .end = name + "deinit".len }),
+            .context = .{ .diagnostics = &.{} },
+        })).?;
+        var poison_actions: usize = 0;
+        for (result) |action_result| {
+            const action = switch (action_result) {
+                .code_action => |code_action| code_action,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, action.title, "Poison after deinit")) continue;
+            poison_actions += 1;
+            const expected: lsp.types.CodeAction.Kind = if (rule_on) .quickfix else .@"refactor.rewrite";
+            try std.testing.expect(lsp.types.CodeAction.Kind.eql(expected, action.kind.?));
+        }
+        try std.testing.expectEqual(@as(usize, 1), poison_actions);
+    }
 }

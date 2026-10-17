@@ -14,8 +14,13 @@ clearly documented invariant.
 ## When it fires
 
 The strict profile is useful at trust boundaries; proven internal invariants may
-instead use an assertion with an explanation. Outside tests, every `x orelse
-unreachable` fires unless an assertion that `x` is non-null precedes it. A quick
+instead use an assertion with an explanation. Outside tests and the private
+functions only tests reach, every `x orelse unreachable` fires unless an
+assertion that `x` is non-null precedes it, a comment on the same line or on a
+comment line above the statement explains it, it is evaluated at compile time
+(a container-level initializer, a `comptime` expression or block), or the
+subject is a call whose arguments are all compile-time-known (literals, enum
+literals, primitive types, container-level constants). A quick
 fix spells the unwrap `x.?`, parenthesizing a subject that is not already a
 suffix expression (`(try f()).?`); it is not offered under `&`, where `&x.?`
 would point into `x` instead of at a copy of its payload.

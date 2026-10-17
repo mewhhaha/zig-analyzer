@@ -3,15 +3,18 @@
 //! the file writer's `end`), so a writer that goes out of scope first loses
 //! them.
 //!
-//! A writer is handled once it is flushed or ended anywhere in its scope,
-//! returned, stored, or passed to a callee that flushes or keeps it. Callees
-//! in the same file are read directly; project analysis re-runs the rule with
+//! A writer is handled once it is returned, stored, flushed in a `defer`, or
+//! passed to a callee that flushes or keeps it, and otherwise needs a flush
+//! after every write on every path: one inside a branch, or after an early
+//! `return`, leaves the bytes behind on the paths that skip it. Callees in the
+//! same file are read directly; project analysis re-runs the rule with
 //! summaries to read callees in other files. A callee neither pass can read
 //! keeps the writer quiet.
 
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const resources = @import("../resources.zig");
+const reach = @import("reach.zig");
 const summaries = @import("../summaries.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -48,6 +51,8 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index) !void {
     if (level == .off) return;
     var analysis: Analysis = .{ .context = context, .summary_index = summary_index };
     defer analysis.effects.deinit(context.allocator);
+    var timeline: Timeline = .{};
+    defer timeline.deinit(context.allocator);
     const tokens = context.tokens;
     for (tokens, 0..) |token, method| {
         if (token.tag != .identifier or method < 2 or tokens[method - 1].tag != .period or
@@ -58,19 +63,282 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index) !void {
         const scope_end = context.enclosingScopeEnd(declaration.name) orelse continue;
         var names: Names = .{};
         _ = names.add(.{ .text = context.tokenText(declaration.name), .declaration = declaration.name });
-        var facts: Facts = .{};
+        timeline.writes.clearRetainingCapacity();
+        timeline.flushes.clearRetainingCapacity();
+        var facts: Facts = .{ .timeline = &timeline };
         try analysis.scan(analysis.localFile(), &names, declaration.end, scope_end, 0, &facts);
         if (!facts.wrote or facts.flushed or facts.unknown) continue;
         if (summary_index != null and !facts.crossed_files) continue;
-        try context.emit(.{
-            .rule = .unflushed_writer,
-            .level = level,
-            .span = tokens[declaration.name].loc,
-            .message = try context.allocator.print(
-                "buffered writer '{s}' is written but never flushed; the bytes left in its buffer are lost when it goes out of scope",
-                .{context.tokenText(declaration.name)},
-            ),
-        });
+        const name = context.tokenText(declaration.name);
+        if (timeline.flushes.items.len == 0) {
+            try context.emit(.{
+                .rule = .unflushed_writer,
+                .level = level,
+                .span = tokens[declaration.name].loc,
+                .message = try context.allocator.print(
+                    "buffered writer '{s}' is written but never flushed; the bytes left in its buffer are lost when it goes out of scope",
+                    .{name},
+                ),
+            });
+        } else if (timeline.uncoveredReturn(context, declaration.name, scope_end)) |exit| {
+            try context.emit(.{
+                .rule = .unflushed_writer,
+                .level = level,
+                .span = tokens[exit].loc,
+                .message = try context.allocator.print(
+                    "this 'return' leaves bytes written to buffered writer '{s}' unflushed; flush before returning or in a defer",
+                    .{name},
+                ),
+            });
+        } else if (timeline.uncoveredWrite(context)) |write| {
+            const related = try context.allocator.alloc(types.RelatedSpan, 1);
+            related[0] = .{ .span = tokens[write].loc, .message = "a path from this write reaches the end of the scope without a flush" };
+            try context.emit(.{
+                .rule = .unflushed_writer,
+                .level = level,
+                .span = tokens[declaration.name].loc,
+                .related = related,
+                .message = try context.allocator.print(
+                    "buffered writer '{s}' is flushed only on some paths; the bytes left in its buffer are lost on the others",
+                    .{name},
+                ),
+            });
+        }
+    }
+}
+
+/// Where the analyzed function writes to the writer and flushes it outside a
+/// `defer`, in token order, for the path checks.
+const Timeline = struct {
+    writes: std.ArrayList(u32) = .empty,
+    flushes: std.ArrayList(u32) = .empty,
+
+    fn deinit(timeline: *Timeline, allocator: std.mem.Allocator) void {
+        timeline.writes.deinit(allocator);
+        timeline.flushes.deinit(allocator);
+    }
+
+    /// The first non-error `return` of the writer's function that a write
+    /// reaches with no flush between them on every path.
+    fn uncoveredReturn(timeline: *const Timeline, context: RuleRun, name: usize, scope_end: usize) ?usize {
+        const tokens = context.tokens;
+        const writes = timeline.writes.items;
+        const function_body = context.scopes.enclosingFunctionBody(name) orelse return null;
+        for (writes[0] + 1..scope_end) |exit| {
+            if (tokens[exit].tag != .keyword_return or context.scopes.enclosingFunctionBody(exit) != function_body or
+                errorExit(context, exit, function_body)) continue;
+            // The last write that can run before this return.
+            var position = std.sort.lowerBound(u32, writes, exit, orderPosition);
+            const write = while (position > 0) {
+                position -= 1;
+                if (reach.mutationReaches(context, writes[position], exit)) break writes[position];
+            } else continue;
+            // `return stdout.flush();` flushes on its way out.
+            const exit_end = context.statementEnd(exit) orelse continue;
+            if (!timeline.flushedOnEveryPath(context, write, exit_end, exit)) return exit;
+        }
+        return null;
+    }
+
+    /// The first write some path from which leaves the scope with no flush.
+    fn uncoveredWrite(timeline: *const Timeline, context: RuleRun) ?usize {
+        for (timeline.writes.items) |write| {
+            if (!timeline.flushedOnEveryPath(context, write, context.tokens.len, write)) return write;
+        }
+        return null;
+    }
+
+    /// Whether a flush in `(after, before)` runs on every path through the
+    /// innermost block that holds both it and `point`.
+    fn flushedOnEveryPath(timeline: *const Timeline, context: RuleRun, after: usize, before: usize, point: usize) bool {
+        var tried: Tried = .{};
+        var position = std.sort.upperBound(u32, timeline.flushes.items, after, orderPosition);
+        while (position < timeline.flushes.items.len) : (position += 1) {
+            const flush = timeline.flushes.items[position];
+            if (flush >= before) break;
+            const block = reach.commonBlock(context.scopes, flush, point) orelse continue;
+            if (timeline.flushCovers(context, after, before, flush, block, &tried)) return true;
+        }
+        return false;
+    }
+
+    /// The branching statement `flushCovers` judged last, so the other
+    /// flushes in it do not judge it again.
+    const Tried = struct {
+        keyword: usize = std.math.maxInt(usize),
+        block: usize = std.math.maxInt(usize),
+    };
+
+    /// Whether the flush at `flush` runs on every path through the block
+    /// opened at `block`, or the `if`/`else` chain or `switch` holding it does
+    /// and flushes in every branch.
+    fn flushCovers(timeline: *const Timeline, context: RuleRun, after: usize, before: usize, flush: usize, block: usize, tried: *Tried) bool {
+        if (reach.runsWithin(context.tokens, context.scopes, flush, block)) return true;
+        const keyword = branchingStatement(context, flush, block) orelse return false;
+        if (tried.keyword == keyword and tried.block == block) return false;
+        tried.* = .{ .keyword = keyword, .block = block };
+        return timeline.everyBranchFlushes(context, after, before, keyword);
+    }
+
+    /// Whether a flush in `(after, before)` runs on every path through the
+    /// block opened at `block`.
+    fn blockFlushes(timeline: *const Timeline, context: RuleRun, after: usize, before: usize, block: usize) bool {
+        const closing = context.scopes.matchingToken(block) orelse return false;
+        var tried: Tried = .{};
+        var position = std.sort.upperBound(u32, timeline.flushes.items, @max(after, block), orderPosition);
+        while (position < timeline.flushes.items.len) : (position += 1) {
+            const flush = timeline.flushes.items[position];
+            if (flush >= @min(before, closing)) break;
+            if (timeline.flushCovers(context, after, before, flush, block, &tried)) return true;
+        }
+        return false;
+    }
+
+    /// Whether every branch of the `if` chain, which must end in a plain
+    /// `else`, or of the `switch` at `keyword` flushes on every path.
+    fn everyBranchFlushes(timeline: *const Timeline, context: RuleRun, after: usize, before: usize, keyword: usize) bool {
+        const tokens = context.tokens;
+        if (tokens[keyword + 1].tag != .l_paren) return false;
+        const condition_end = context.scopes.matchingToken(keyword + 1) orelse return false;
+        if (tokens[keyword].tag == .keyword_switch) {
+            const body = condition_end + 1;
+            if (tokens[body].tag != .l_brace) return false;
+            const body_end = context.scopes.matchingToken(body) orelse return false;
+            var prong = body + 1;
+            while (prong < body_end) {
+                var arrow = prong;
+                while (arrow < body_end and tokens[arrow].tag != .equal_angle_bracket_right) : (arrow += 1) {
+                    if (context.scopes.matchingToken(arrow)) |closing| if (closing > arrow) {
+                        arrow = closing;
+                    };
+                }
+                if (arrow == body_end) return false;
+                const start = skipCapture(tokens, arrow + 1);
+                const end = branchEnd(context, start) orelse return false;
+                if (!timeline.branchFlushes(context, after, before, start, end)) return false;
+                prong = if (tokens[end].tag == .comma) end + 1 else end;
+            }
+            return true;
+        }
+        var condition_close = condition_end;
+        while (true) {
+            const start = skipCapture(tokens, condition_close + 1);
+            const end = branchEnd(context, start) orelse return false;
+            if (!timeline.branchFlushes(context, after, before, start, end)) return false;
+            if (tokens[end].tag != .keyword_else) return false;
+            const next = skipCapture(tokens, end + 1);
+            if (tokens[next].tag != .keyword_if) {
+                const last_end = branchEnd(context, next) orelse return false;
+                return timeline.branchFlushes(context, after, before, next, last_end);
+            }
+            if (tokens[next + 1].tag != .l_paren) return false;
+            condition_close = context.scopes.matchingToken(next + 1) orelse return false;
+        }
+    }
+
+    /// Whether the branch `[start, end)` flushes on every path: a block
+    /// that does, an expression whose flush nothing before it guards, or
+    /// one that never finishes (`else => unreachable`).
+    fn branchFlushes(timeline: *const Timeline, context: RuleRun, after: usize, before: usize, start: usize, end: usize) bool {
+        const tokens = context.tokens;
+        if (tokens[start].tag == .l_brace) return timeline.blockFlushes(context, after, before, start);
+        if (tokens[start].tag == .keyword_unreachable or tokens[start].tag == .builtin and
+            (context.tokenIs(start, "@panic") or context.tokenIs(start, "@trap"))) return true;
+        var position = std.sort.upperBound(u32, timeline.flushes.items, @max(after, start -| 1), orderPosition);
+        while (position < timeline.flushes.items.len) : (position += 1) {
+            const flush = timeline.flushes.items[position];
+            if (flush >= @min(before, end)) break;
+            if (reach.unguarded(tokens, start, flush)) return true;
+        }
+        return false;
+    }
+
+    fn orderPosition(target: usize, position: u32) std.math.Order {
+        return std.math.order(target, position);
+    }
+};
+
+/// The `if` or `switch` keyword of the outermost `if`/`else` chain or
+/// `switch` holding `flush` in the block opened at `block`, when that
+/// statement runs whenever the block does.
+fn branchingStatement(context: RuleRun, flush: usize, block: usize) ?usize {
+    const tokens = context.tokens;
+    var outermost: ?usize = null;
+    var cursor = flush;
+    while (true) {
+        const head = statementHead(tokens, cursor);
+        if (tokens[head].tag == .keyword_if or tokens[head].tag == .keyword_else) outermost = chainHead(context, head) orelse return null;
+        const enclosing = context.scopes.enclosingOpeningBrace(cursor) orelse return null;
+        if (enclosing == block) break;
+        if (enclosing < block) return null;
+        // A prong of `switch (x) {`.
+        if (tokens[enclosing - 1].tag == .r_paren) if (context.scopes.matchingToken(enclosing - 1)) |condition| {
+            if (condition > 0 and tokens[condition - 1].tag == .keyword_switch) outermost = condition - 1;
+        };
+        cursor = enclosing;
+    }
+    const keyword = outermost orelse return null;
+    return if (reach.runsWithin(tokens, context.scopes, keyword, block)) keyword else null;
+}
+
+/// The first token of the statement holding `index`, past a label.
+fn statementHead(tokens: []const Token, index: usize) usize {
+    const start = tokens_util.statementStart(tokens, index);
+    return if (start + 1 < index and tokens[start].tag == .identifier and tokens[start + 1].tag == .colon) start + 2 else start;
+}
+
+/// The `if` opening the chain whose `else` branch starts at `head`, or
+/// `head` itself when it is an `if`; null for a loop's `else`.
+fn chainHead(context: RuleRun, head: usize) ?usize {
+    var cursor = head;
+    while (context.tokens[cursor].tag == .keyword_else) {
+        if (cursor == 0 or context.tokens[cursor - 1].tag != .r_brace) return null;
+        const opening = context.scopes.matchingToken(cursor - 1) orelse return null;
+        cursor = statementHead(context.tokens, opening);
+    }
+    return if (context.tokens[cursor].tag == .keyword_if) cursor else null;
+}
+
+/// The token after a `|capture|` at `index`, or `index`.
+fn skipCapture(tokens: []const Token, index: usize) usize {
+    if (tokens[index].tag != .pipe) return index;
+    var cursor = index + 1;
+    while (cursor < tokens.len and tokens[cursor].tag != .pipe) : (cursor += 1) {}
+    return @min(cursor + 1, tokens.len - 1);
+}
+
+/// Just past the branch starting at `start`: its block, or its expression up
+/// to the `else`, `,` or `;` after it. Null for an expression that branches
+/// again, whose `else` this would misread.
+fn branchEnd(context: RuleRun, start: usize) ?usize {
+    const tokens = context.tokens;
+    if (tokens[start].tag == .l_brace) return (context.scopes.matchingToken(start) orelse return null) + 1;
+    var cursor = start;
+    while (cursor < tokens.len) : (cursor += 1) switch (tokens[cursor].tag) {
+        .keyword_else, .comma, .semicolon, .r_paren, .r_bracket, .r_brace, .eof => return cursor,
+        .l_paren, .l_bracket, .l_brace => cursor = context.scopes.matchingToken(cursor) orelse return null,
+        .keyword_if, .keyword_switch, .keyword_while, .keyword_for => return null,
+        else => {},
+    };
+    return null;
+}
+
+/// Whether the `return` at `exit` leaves with an error: `return error.X`, or
+/// a return inside a `catch` or `else |err|` handler.
+fn errorExit(context: RuleRun, exit: usize, function_body: usize) bool {
+    const tokens = context.tokens;
+    if (tokens[exit + 1].tag == .keyword_error) return true;
+    var cursor = exit;
+    while (true) {
+        const start = tokens_util.statementStart(tokens, cursor);
+        for (tokens[start..cursor], start..) |token, index| switch (token.tag) {
+            .keyword_catch => return true,
+            .keyword_else => if (tokens[index + 1].tag == .pipe) return true,
+            else => {},
+        };
+        const opening = context.enclosingOpeningBrace(cursor) orelse return false;
+        if (opening <= function_body) return false;
+        cursor = opening;
     }
 }
 
@@ -190,11 +458,14 @@ const Names = struct {
 /// What a scan learned about the writer.
 const Facts = struct {
     wrote: bool = false,
+    /// Flushed in a `defer`, kept, or flushed by a callee: quiet on every path.
     flushed: bool = false,
     /// Handed to a callee the scan could not read.
     unknown: bool = false,
     /// A callee in another file took part in the verdict.
     crossed_files: bool = false,
+    /// Where the writer's own function writes and flushes; null in callees.
+    timeline: ?*Timeline = null,
 
     fn effect(facts: Facts) Effect {
         if (facts.flushed) return .flush;
@@ -299,8 +570,19 @@ const Analysis = struct {
                 !analysis.matches(file, names, index)) continue;
             switch (classify(file, index, end)) {
                 .ignored => {},
-                .write => facts.wrote = true,
-                .flush, .escape => {
+                .write => {
+                    facts.wrote = true;
+                    if (facts.timeline) |timeline| try timeline.writes.append(analysis.context.allocator, @intCast(index));
+                },
+                .flush => {
+                    if (facts.timeline) |timeline| if (reach.deferKeyword(analysis.context, index) == null) {
+                        try timeline.flushes.append(analysis.context.allocator, @intCast(index));
+                        continue;
+                    };
+                    facts.flushed = true;
+                    return;
+                },
+                .escape => {
                     facts.flushed = true;
                     return;
                 },
@@ -313,7 +595,10 @@ const Analysis = struct {
                     facts.crossed_files = facts.crossed_files or callee.crossed_files;
                     switch (callee.effect) {
                         .none => {},
-                        .write => facts.wrote = true,
+                        .write => {
+                            facts.wrote = true;
+                            if (facts.timeline) |timeline| try timeline.writes.append(analysis.context.allocator, @intCast(index));
+                        },
                         .flush => {
                             facts.flushed = true;
                             return;
@@ -681,6 +966,183 @@ test "shadowed names belong to their own declaration" {
     ;
     const found = try findingsFor(arena.allocator(), source);
     try support.expectSpans(source, found, &.{"w"});
+}
+
+test "an early return or a flush on only some paths reports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn early(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var early_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    const out = &early_writer.interface;
+        \\    try out.print("hi\n", .{});
+        \\    if (flag) return;
+        \\    try out.flush();
+        \\}
+        \\fn branch(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var branch_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try branch_writer.interface.print("hi\n", .{});
+        \\    if (flag) try branch_writer.interface.flush();
+        \\}
+        \\fn tail(io: std.Io) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var tail_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try tail_writer.interface.writeAll("a");
+        \\    try tail_writer.interface.flush();
+        \\    try tail_writer.interface.writeAll("b");
+        \\}
+    ;
+    const found = try findingsFor(arena.allocator(), source);
+    try support.expectSpans(source, found, &.{ "return", "branch_writer", "tail_writer" });
+    try std.testing.expectEqual(@as(usize, 1), found[1].related.len);
+}
+
+test "flushes that every path runs stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn usage(io: std.Io, help: bool) !u8 {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var stdout_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    const stdout = &stdout_writer.interface;
+        \\    if (help) {
+        \\        try stdout.writeAll("usage\n");
+        \\        try stdout.flush();
+        \\        return 0;
+        \\    }
+        \\    for (0..3) |index| {
+        \\        try stdout.print("{d}\n", .{index});
+        \\        if (index == 1) try stdout.flush();
+        \\    }
+        \\    {
+        \\        try stdout.writeAll("done\n");
+        \\    }
+        \\    const parsed = std.fmt.parseInt(u8, "1", 10) catch return error.Invalid;
+        \\    try stdout.flush();
+        \\    return parsed;
+        \\}
+        \\fn returned(io: std.Io) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var file_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try file_writer.interface.writeAll("x");
+        \\    return file_writer.interface.flush();
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), source)).len);
+}
+
+test "an if with an else or a switch that flushes in every branch covers the writes before it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const clean: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Mode = enum { a, b, c };
+        \\fn braced(io: std.Io, flag: bool, value: anyerror!u8) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var braced_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try braced_writer.interface.writeAll("a");
+        \\    if (flag) {
+        \\        try braced_writer.interface.writeAll("b");
+        \\        try braced_writer.interface.flush();
+        \\    } else if (value) |byte| {
+        \\        _ = byte;
+        \\        try braced_writer.interface.flush();
+        \\    } else |err| {
+        \\        _ = err;
+        \\        try braced_writer.interface.flush();
+        \\    }
+        \\}
+        \\fn unbraced(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var unbraced_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try unbraced_writer.interface.writeAll("a");
+        \\    if (flag) try unbraced_writer.interface.flush() else try unbraced_writer.interface.flush();
+        \\}
+        \\fn switched(io: std.Io, mode: Mode, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var switched_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try switched_writer.interface.writeAll("a");
+        \\    switch (mode) {
+        \\        .a => try switched_writer.interface.flush(),
+        \\        .b => |tag| {
+        \\            _ = tag;
+        \\            if (flag) {
+        \\                try switched_writer.interface.flush();
+        \\            } else {
+        \\                try switched_writer.interface.flush();
+        \\            }
+        \\        },
+        \\        else => unreachable,
+        \\    }
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), clean)).len);
+    const partial: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Mode = enum { a, b, c };
+        \\fn noElse(io: std.Io, flag: bool, other: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var else_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try else_writer.interface.writeAll("a");
+        \\    if (flag) {
+        \\        try else_writer.interface.flush();
+        \\    } else if (other) {
+        \\        try else_writer.interface.flush();
+        \\    }
+        \\}
+        \\fn prong(io: std.Io, mode: Mode) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var prong_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try prong_writer.interface.writeAll("a");
+        \\    switch (mode) {
+        \\        .a, .c => try prong_writer.interface.flush(),
+        \\        .b => {},
+        \\    }
+        \\}
+        \\fn nested(io: std.Io, flag: bool, other: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var nested_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try nested_writer.interface.writeAll("a");
+        \\    if (other) {
+        \\        if (flag) try nested_writer.interface.flush() else try nested_writer.interface.flush();
+        \\    }
+        \\}
+        \\fn guarded(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var guarded_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try guarded_writer.interface.writeAll("a");
+        \\    if (flag) try guarded_writer.interface.flush() else other(flag) catch try guarded_writer.interface.flush();
+        \\}
+        \\fn later(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var later_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    if (flag) {
+        \\        try later_writer.interface.flush();
+        \\        try later_writer.interface.writeAll("a");
+        \\    } else {
+        \\        try later_writer.interface.flush();
+        \\    }
+        \\}
+        \\fn returned(io: std.Io, flag: bool) !void {
+        \\    var buffer: [64]u8 = undefined;
+        \\    var returned_writer = std.Io.File.stdout().writer(io, &buffer);
+        \\    try returned_writer.interface.writeAll("a");
+        \\    if (flag) {
+        \\        try returned_writer.interface.flush();
+        \\    } else {
+        \\        return;
+        \\    }
+        \\}
+        \\fn other(flag: bool) !void {
+        \\    if (flag) return error.Failed;
+        \\}
+    ;
+    const found = try findingsFor(arena.allocator(), partial);
+    try support.expectSpans(partial, found, &.{ "else_writer", "prong_writer", "nested_writer", "guarded_writer", "later_writer", "return" });
 }
 
 test "summaries read a callee in another file" {

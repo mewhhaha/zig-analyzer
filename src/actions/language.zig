@@ -653,7 +653,7 @@ fn addReflectedDeclaration(context: ActionRun) !void {
             context.tokens[builtin_index + 2].tag != .identifier or context.tokens[builtin_index + 3].tag != .comma or
             context.tokens[builtin_index + 4].tag != .string_literal or !context.selected(context.tokens[builtin_index + 4].loc)) continue;
         const type_name = context.tokenText(builtin_index + 2);
-        const member_name = stringValue(context.tokenText(builtin_index + 4)) orelse continue;
+        const member_name = action_context.stringValue(context.tokenText(builtin_index + 4)) orelse continue;
         if (context.shapeNamed(type_name)) |shape| {
             if (shape.kind != .structure) continue;
             if (shapeContains(shape, member_name)) continue;
@@ -682,13 +682,6 @@ fn localPlainStructEnd(context: ActionRun, name: []const u8) ?usize {
         return context.matchingToken(index + 4, .l_brace, .r_brace);
     }
     return null;
-}
-
-fn stringValue(literal: []const u8) ?[]const u8 {
-    if (literal.len < 2 or literal[0] != '"' or literal[literal.len - 1] != '"') return null;
-    const value = literal[1 .. literal.len - 1];
-    if (std.mem.findScalar(u8, value, '\\') != null) return null;
-    return value;
 }
 
 test "mutable captures format strings and reflected declarations have actions" {

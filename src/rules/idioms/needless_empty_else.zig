@@ -39,42 +39,8 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
-fn matchingOpeningBrace(tokens: []const std.zig.Token, closing_index: usize) ?usize {
-    var depth: usize = 0;
-    var cursor = closing_index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => depth += 1,
-            .l_brace => {
-                if (depth == 0) return cursor;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn matchingOpeningParen(tokens: []const std.zig.Token, closing_index: usize) ?usize {
-    var depth: usize = 0;
-    var cursor = closing_index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_paren => depth += 1,
-            .l_paren => {
-                if (depth == 0) return cursor;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn isIfInExpressionPosition(context: RuleRun, else_index: usize) bool {
-    var branch_open = matchingOpeningBrace(context.tokens, else_index - 1) orelse return false;
+    var branch_open = context.scopes.matchingToken(else_index - 1) orelse return false;
     var if_idx: ?usize = null;
 
     while (true) {
@@ -87,13 +53,13 @@ fn isIfInExpressionPosition(context: RuleRun, else_index: usize) bool {
             cursor -= 1;
         }
         if (cursor == 0 or context.tokens[cursor - 1].tag != .r_paren) return false;
-        const open_paren = matchingOpeningParen(context.tokens, cursor - 1) orelse return false;
+        const open_paren = context.scopes.matchingToken(cursor - 1) orelse return false;
         if (open_paren == 0 or context.tokens[open_paren - 1].tag != .keyword_if) return false;
         const current_if = open_paren - 1;
         if (current_if > 0 and context.tokens[current_if - 1].tag == .keyword_else) {
             const prev_else = current_if - 1;
             if (prev_else > 0 and context.tokens[prev_else - 1].tag == .r_brace) {
-                branch_open = matchingOpeningBrace(context.tokens, prev_else - 1) orelse return false;
+                branch_open = context.scopes.matchingToken(prev_else - 1) orelse return false;
                 continue;
             }
         }

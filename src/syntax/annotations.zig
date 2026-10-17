@@ -52,7 +52,7 @@ pub fn tokenClass(document: *const Document, token: std.zig.Token) ?TokenClass {
 }
 
 pub fn tokenModifiers(document: *const Document, token: std.zig.Token) u32 {
-    var modifiers: u32 = if (isDeclarationSpan(document, token.loc)) Modifier.declaration else 0;
+    var modifiers: u32 = if (document.declaresSpan(token.loc)) Modifier.declaration else 0;
     if (token.tag != .identifier) return modifiers;
     const declaration = document.declarationNamed(document.source[token.loc.start..token.loc.end]) orelse return modifiers;
     if (!std.meta.eql(declaration.span, token.loc) or declaration.kind != .constant) return modifiers;
@@ -69,42 +69,51 @@ pub fn tokenModifiers(document: *const Document, token: std.zig.Token) u32 {
     return modifiers;
 }
 
-fn isDeclarationSpan(document: *const Document, span: std.zig.Token.Loc) bool {
-    for (document.declarations) |declaration| {
-        if (std.meta.eql(declaration.span, span)) return true;
-    }
-    return false;
-}
-
-/// Every hint for `document`, in source-kind order: literal types, implicit
-/// enum values, then comptime parameter names at call sites.
-pub fn hints(allocator: std.mem.Allocator, document: *const Document) ![]const Hint {
+/// The hints drawn within `window` (both ends inclusive), in source-kind
+/// order: literal types, implicit enum values, then comptime parameter names
+/// at call sites.
+pub fn hints(allocator: std.mem.Allocator, document: *const Document, window: std.zig.Token.Loc) ![]const Hint {
     var found: std.ArrayList(Hint) = .empty;
     errdefer found.deinit(allocator);
-    try literalTypeHints(allocator, document, &found);
-    try enumValueHints(allocator, document, &found);
-    try comptimeParameterHints(allocator, document, &found);
+    try literalTypeHints(allocator, document, window, &found);
+    try enumValueHints(allocator, document, window, &found);
+    try comptimeParameterHints(allocator, document, window, &found);
     return try found.toOwnedSlice(allocator);
 }
 
-fn literalTypeHints(allocator: std.mem.Allocator, document: *const Document, found: *std.ArrayList(Hint)) !void {
-    var tokenizer = std.zig.Tokenizer.init(document.source);
+fn inWindow(window: std.zig.Token.Loc, offset: usize) bool {
+    return window.start <= offset and offset <= window.end;
+}
+
+fn literalTypeHints(allocator: std.mem.Allocator, document: *const Document, window: std.zig.Token.Loc, found: *std.ArrayList(Hint)) !void {
+    const tokens = document.tokens;
+    var cursor: usize = 0;
+    // Consumes tokens the way a tokenizer would, past the trailing `.eof`.
+    const next = struct {
+        fn next(all: []const std.zig.Token, position: *usize) std.zig.Token {
+            const token = all[@min(position.*, all.len - 1)];
+            position.* += 1;
+            return token;
+        }
+    }.next;
     while (true) {
-        const declaration_token = tokenizer.next();
-        if (declaration_token.tag == .eof) break;
+        const declaration_token = next(tokens, &cursor);
+        if (declaration_token.tag == .eof or declaration_token.loc.start > window.end) break;
         if (declaration_token.tag != .keyword_const and declaration_token.tag != .keyword_var) continue;
-        const name_token = tokenizer.next();
+        const name_token = next(tokens, &cursor);
         if (name_token.tag != .identifier) continue;
-        if (tokenizer.next().tag != .equal) continue;
-        const value_token = tokenizer.next();
+        if (next(tokens, &cursor).tag != .equal) continue;
+        const value_token = next(tokens, &cursor);
+        if (!inWindow(window, name_token.loc.end)) continue;
         const label = inferredTypeLabel(document.source[value_token.loc.start..value_token.loc.end], value_token.tag) orelse continue;
         try found.append(allocator, .{ .offset = name_token.loc.end, .label = label, .kind = .type });
     }
 }
 
-fn enumValueHints(allocator: std.mem.Allocator, document: *const Document, found: *std.ArrayList(Hint)) !void {
+fn enumValueHints(allocator: std.mem.Allocator, document: *const Document, window: std.zig.Token.Loc, found: *std.ArrayList(Hint)) !void {
     const tokens = document.tokens;
     for (tokens, 0..) |token, enum_index| {
+        if (token.loc.start > window.end) break;
         if (token.tag != .keyword_enum) continue;
         var opening = enum_index + 1;
         if (opening < tokens.len and tokens[opening].tag == .l_paren) {
@@ -112,6 +121,7 @@ fn enumValueHints(allocator: std.mem.Allocator, document: *const Document, found
         }
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
         const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse continue;
+        if (tokens[closing].loc.start < window.start) continue;
         var next_value: i128 = 0;
         var value_known = true;
         var cursor = opening + 1;
@@ -133,7 +143,7 @@ fn enumValueHints(allocator: std.mem.Allocator, document: *const Document, found
                 continue;
             }
             if (!value_known) continue;
-            try found.append(allocator, .{
+            if (inWindow(window, tokens[cursor].loc.end)) try found.append(allocator, .{
                 .offset = tokens[cursor].loc.end,
                 .label = try allocator.print(" = {d}", .{next_value}),
                 .kind = .type,
@@ -143,8 +153,16 @@ fn enumValueHints(allocator: std.mem.Allocator, document: *const Document, found
     }
 }
 
-fn comptimeParameterHints(allocator: std.mem.Allocator, document: *const Document, found: *std.ArrayList(Hint)) !void {
+fn comptimeParameterHints(allocator: std.mem.Allocator, document: *const Document, window: std.zig.Token.Loc, found: *std.ArrayList(Hint)) !void {
     const tokens = document.tokens;
+    // The call sites of every name, found once rather than per parameter.
+    var calls: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    defer {
+        var lists = calls.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        calls.deinit(allocator);
+    }
+    var calls_collected = false;
     for (tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= tokens.len or tokens[fn_index + 1].tag != .identifier or
             tokens[fn_index + 2].tag != .l_paren) continue;
@@ -164,11 +182,14 @@ fn comptimeParameterHints(allocator: std.mem.Allocator, document: *const Documen
                     if (nested_depth != 0 or parameter_cursor + 1 >= parameters_end or
                         tokens[parameter_cursor + 1].tag != .identifier) continue;
                     const parameter_name = document.source[tokens[parameter_cursor + 1].loc.start..tokens[parameter_cursor + 1].loc.end];
-                    for (tokens, 0..) |call_token, call_index| {
-                        if (call_token.tag != .identifier or !std.mem.eql(u8, document.source[call_token.loc.start..call_token.loc.end], function_name) or
-                            call_index + 1 >= tokens.len or tokens[call_index + 1].tag != .l_paren or
-                            call_index > 0 and tokens[call_index - 1].tag == .keyword_fn) continue;
+                    if (!calls_collected) {
+                        try collectCalls(allocator, document, window, &calls);
+                        calls_collected = true;
+                    }
+                    const call_sites = calls.get(function_name) orelse continue;
+                    for (call_sites.items) |call_index| {
                         const argument_index = callArgumentToken(tokens, call_index + 1, ordinal) orelse continue;
+                        if (!inWindow(window, tokens[argument_index].loc.start)) continue;
                         try found.append(allocator, .{
                             .offset = tokens[argument_index].loc.start,
                             .label = try allocator.print("{s}:", .{parameter_name}),
@@ -179,6 +200,25 @@ fn comptimeParameterHints(allocator: std.mem.Allocator, document: *const Documen
                 else => {},
             }
         }
+    }
+}
+
+/// Every `name(` that is not a declaration, by name, in source order. A call
+/// whose `(` comes after `window` has no argument inside it.
+fn collectCalls(
+    allocator: std.mem.Allocator,
+    document: *const Document,
+    window: std.zig.Token.Loc,
+    calls: *std.StringHashMapUnmanaged(std.ArrayList(usize)),
+) !void {
+    const tokens = document.tokens;
+    for (tokens, 0..) |call_token, call_index| {
+        if (call_index + 1 >= tokens.len or tokens[call_index + 1].loc.start > window.end) break;
+        if (call_token.tag != .identifier or tokens[call_index + 1].tag != .l_paren or
+            call_index > 0 and tokens[call_index - 1].tag == .keyword_fn) continue;
+        const entry = try calls.getOrPut(allocator, document.source[call_token.loc.start..call_token.loc.end]);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(allocator, call_index);
     }
 }
 
@@ -227,7 +267,7 @@ test "semantic classes cover keywords declarations and numbers" {
 test "hints report obvious literal types" {
     var document = try Document.open(std.testing.allocator, "file:///fixture.zig", 1, "const answer = 42;\nconst enabled = true;\n");
     defer document.deinit();
-    const found = try hints(std.testing.allocator, &document);
+    const found = try hints(std.testing.allocator, &document, .{ .start = 0, .end = document.source.len });
     defer std.testing.allocator.free(found);
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqualStrings(": comptime_int", found[0].label);
@@ -239,7 +279,7 @@ test "enum hints expose implicit integer values" {
     defer arena.deinit();
     var document = try Document.open(arena.allocator(), "file:///fixture.zig", 1, "const Mode = enum { idle, busy = 4, done };\n");
     defer document.deinit();
-    const found = try hints(arena.allocator(), &document);
+    const found = try hints(arena.allocator(), &document, .{ .start = 0, .end = document.source.len });
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqualStrings(" = 0", found[0].label);
     try std.testing.expectEqualStrings(" = 5", found[1].label);
@@ -255,7 +295,7 @@ test "comptime calls show parameter-name hints" {
         "fn Matrix(comptime Element: type, comptime size: usize) type { return [size]Element; }\nconst M = Matrix(u32, 3);\n",
     );
     defer document.deinit();
-    const found = try hints(arena.allocator(), &document);
+    const found = try hints(arena.allocator(), &document, .{ .start = 0, .end = document.source.len });
     try std.testing.expectEqual(@as(usize, 2), found.len);
     try std.testing.expectEqualStrings("Element:", found[0].label);
     try std.testing.expectEqualStrings("size:", found[1].label);

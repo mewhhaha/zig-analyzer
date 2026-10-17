@@ -4,7 +4,9 @@ const Suppressions = @import("../configuration.zig").Suppressions;
 const types = @import("../types.zig");
 const syntax_scope = @import("../../syntax/scope.zig");
 const tokenize = @import("../../syntax/tokens.zig").tokenize;
+const statementStart = @import("../../syntax/tokens.zig").statementStart;
 const stdlib_replacements = @import("modernize.zig").stdlib_replacements;
+const managed_container_paths = @import("modernize.zig").managed_container_paths;
 
 /// Whether an index run reports anything under `configuration`.
 pub fn enabled(configuration: types.Configuration) bool {
@@ -78,6 +80,12 @@ pub const Index = struct {
     std_directory: ?[]const u8 = null,
     /// The members of each container body looked up so far; see `declarationIn`.
     members: std.AutoHashMapUnmanaged(MembersKey, Members) = .empty,
+    /// Per run, the deprecated declaration each referenced declaration is or
+    /// aliases (`deprecatedTarget`), and the container a member access reads
+    /// through each (`chainNamespace`): a file names a declaration many
+    /// times. A run's results depend on its root, so they are dropped with it.
+    deprecated_targets: std.AutoHashMapUnmanaged(SiteKey, ?Site) = .empty,
+    chain_namespaces: std.AutoHashMapUnmanaged(SiteKey, ?Site) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, loader: ?Loader) Index {
         return .{ .allocator = allocator, .loader = loader };
@@ -104,6 +112,8 @@ pub const Index = struct {
         var members = index.members.valueIterator();
         while (members.next()) |container| if (container.names) |*names| names.deinit(index.allocator);
         index.members.deinit(index.allocator);
+        index.deprecated_targets.deinit(index.allocator);
+        index.chain_namespaces.deinit(index.allocator);
     }
 
     pub fn addSource(index: *Index, source: Source) !void {
@@ -124,9 +134,12 @@ pub const Index = struct {
         const file = try index.addFile(.{ .path = path, .source = context.source, .tokens = context.tokens, .scopes = context.scopes });
         index.root = file;
         index.used_files.clearRetainingCapacity();
+        index.deprecated_targets.clearRetainingCapacity();
+        index.chain_namespaces.clearRetainingCapacity();
         for (file.tokens, 0..) |token, start| {
             if (start > 0 and file.tokens[start - 1].tag == .period) continue;
             var cursor = start;
+            var modernized: ?ModernizedChain = null;
             var site: Site = if (token.tag == .identifier) blk: {
                 const binding = file.scopes.findBinding(start) orelse continue;
                 if (binding.token_index == start) continue;
@@ -137,17 +150,20 @@ pub const Index = struct {
                 cursor = end;
                 break :blk try index.resolveExpression(file, .{ .start = start, .end = end + 1 }, 24) orelse continue;
             } else continue;
-            if (deprecations and token.tag == .identifier) try index.emitReference(context, file, site, token.loc, imported_only);
+            if (deprecations and token.tag == .identifier) try index.emitReference(context, file, site, start, imported_only);
             while (cursor + 2 < file.tokens.len and file.tokens[cursor + 1].tag == .period and
                 file.tokens[cursor + 2].tag == .identifier)
             {
                 const member_index = cursor + 2;
-                const container = try index.namespace(site, 23) orelse break;
+                const container = try index.chainNamespace(site) orelse break;
                 site = try index.declarationIn(container, tokenText(file, member_index)) orelse {
                     try index.emitRemoved(context, file, start, site, container, member_index);
                     break;
                 };
-                if (deprecations) try index.emitReference(context, file, site, file.tokens[member_index].loc, imported_only);
+                if (deprecations) {
+                    if (modernized == null) modernized = .init(context, file, start);
+                    if (!modernized.?.reports(member_index)) try index.emitReference(context, file, site, member_index, imported_only);
+                }
                 cursor = member_index;
             }
         }
@@ -201,30 +217,69 @@ pub const Index = struct {
         return try index.addFile(source);
     }
 
-    fn emitReference(index: *Index, context: Target, root: *File, raw_site: Site, span: std.zig.Token.Loc, imported_only: bool) !void {
+    /// Reports the reference at `use` in `root` when `raw_site`, or the
+    /// declaration its constant aliases lead to, is deprecated. Uses inside a
+    /// declaration that is itself deprecated, and the declaring file's own
+    /// tests, are the deprecated API's compatibility code and are skipped.
+    fn emitReference(index: *Index, context: Target, root: *File, raw_site: Site, use: usize, imported_only: bool) !void {
+        const site = try index.deprecatedTarget(root, raw_site) orelse return;
+        const declaration = site.declaration.?;
+        const advice = deprecationAdvice(site.file.source.source, site.file.tokens, declaration).?;
+        if (imported_only and site.file == root) return;
+        if (site.file == root and root.scopes.insideTestBlock(use)) return;
+        if (insideDeprecatedDeclaration(root, use)) return;
+        const span = root.tokens[use].loc;
+        // The finding's advice must outlive the temporary imported source index.
+        const message = try context.allocator.print("declaration '{s}' is deprecated{s}{s}", .{
+            tokenText(site.file, declaration), if (advice.len == 0) "" else ": ", advice,
+        });
+        errdefer context.allocator.free(message);
+        try context.emit(.{ .rule = .deprecated_declaration, .level = context.level(.deprecated_declaration), .span = span, .message = message });
+    }
+
+    /// The deprecated declaration `raw_site` is, or that the constants it
+    /// aliases lead to; memoized for the run.
+    fn deprecatedTarget(index: *Index, root: *File, raw_site: Site) !?Site {
+        const raw_declaration = raw_site.declaration orelse return null;
+        // Most references need no lookup: the declaration is deprecated
+        // itself, or it is no constant and aliases nothing.
+        if (deprecationAdvice(raw_site.file.source.source, raw_site.file.tokens, raw_declaration) != null) return raw_site;
+        if (constantInitializer(raw_site.file, raw_declaration) == null) return null;
+        const key: SiteKey = .{ .file = @intFromPtr(raw_site.file), .declaration = raw_declaration };
+        if (index.deprecated_targets.get(key)) |known| return known;
         var site = raw_site;
         var budget: usize = 24;
-        while (budget > 0) : (budget -= 1) {
-            const declaration = site.declaration orelse return;
-            if (deprecationAdvice(site.file.source.source, site.file.tokens, declaration)) |advice| {
-                if (imported_only and site.file == root) return;
-                // The finding's advice must outlive the temporary imported source index.
-                const message = try context.allocator.print("declaration '{s}' is deprecated{s}{s}", .{
-                    tokenText(site.file, declaration), if (advice.len == 0) "" else ": ", advice,
-                });
-                errdefer context.allocator.free(message);
-                try context.emit(.{ .rule = .deprecated_declaration, .level = context.level(.deprecated_declaration), .span = span, .message = message });
-                return;
-            }
+        const target: ?Site = while (budget > 0) : (budget -= 1) {
+            const declaration = site.declaration orelse break null;
+            if (deprecationAdvice(site.file.source.source, site.file.tokens, declaration) != null) break site;
             // A current public namespace/type alias has its own deprecation
             // policy, even when its implementation uses an older spelling.
             // For example, std.Io.Dir.path aliases deprecated std.fs.path.
             if (site.file != root and declaration > 0 and isPublic(site.file, declaration - 1) and
-                try index.isNamespaceAlias(site, budget)) return;
+                try index.isNamespaceAlias(site, budget)) break null;
             // Follow a constant declaration alias, not a variable's current value.
-            const expression = constantInitializer(site.file, declaration) orelse return;
-            site = try index.resolveExpression(site.file, expression, budget) orelse return;
-        }
+            const expression = constantInitializer(site.file, declaration) orelse break null;
+            site = try index.resolveExpression(site.file, expression, budget) orelse break null;
+        } else null;
+        try index.deprecated_targets.put(index.allocator, key, target);
+        return target;
+    }
+
+    /// `namespace(site, 23)` for a member access in a chain, memoized for the
+    /// run per declaration.
+    fn chainNamespace(index: *Index, site: Site) !?Site {
+        const declaration = site.declaration orelse return try index.namespace(site, 23);
+        if (site.body != null) return try index.namespace(site, 23);
+        // A declaration that is neither typed nor a constant names no
+        // container, which `namespace` finds at once.
+        const tokens = site.file.tokens;
+        if (declaration + 1 >= tokens.len or (tokens[declaration + 1].tag != .colon and
+            (declaration == 0 or tokens[declaration - 1].tag != .keyword_const))) return try index.namespace(site, 23);
+        const key: SiteKey = .{ .file = @intFromPtr(site.file), .declaration = declaration };
+        if (index.chain_namespaces.get(key)) |known| return known;
+        const container = try index.namespace(site, 23);
+        try index.chain_namespaces.put(index.allocator, key, container);
+        return container;
     }
 
     fn isNamespaceAlias(index: *Index, raw_site: Site, raw_budget: usize) !bool {
@@ -518,6 +573,9 @@ const removed_namespaces = [_]struct { path: []const u8, advice: []const u8 }{
 /// only public declarations count.
 const MembersKey = struct { file: usize, start: usize, end: usize, public_only: bool };
 
+/// A declaration: the address of its file and its name token.
+const SiteKey = struct { file: usize, declaration: usize };
+
 const Members = struct {
     /// Each top-level declaration name, mapped to its name token, or to null
     /// when it is declared twice; null when a group in the body is unbalanced.
@@ -596,19 +654,93 @@ fn containerName(file: *const File, brace: usize) ?usize {
 /// Whether tokens `start` through `end` spell `std.<path>` from a plain
 /// `const std = @import("std");`, the form `modernize-deprecated-stdlib` reads.
 fn spelledFromStd(file: *const File, start: usize, end: usize, path: []const u8) bool {
+    if (!isPlainStdImport(file, start)) return false;
+    return stdPathEnd(file, start, path) == end;
+}
+
+/// Whether the identifier at `start` is `std` bound by a plain
+/// `const std = @import("std");`.
+fn isPlainStdImport(file: *const File, start: usize) bool {
     if (!tokenIs(file, start, "std")) return false;
     const binding = file.scopes.findBinding(start) orelse return false;
     const declaration = binding.token_index;
-    if (declaration == 0 or declaration + 6 >= file.tokens.len or file.tokens[declaration - 1].tag != .keyword_const or
-        file.tokens[declaration + 1].tag != .equal or !tokenIs(file, declaration + 2, "@import") or
-        !tokenIs(file, declaration + 4, "\"std\"") or file.tokens[declaration + 6].tag != .semicolon) return false;
+    return declaration > 0 and declaration + 6 < file.tokens.len and file.tokens[declaration - 1].tag == .keyword_const and
+        file.tokens[declaration + 1].tag == .equal and tokenIs(file, declaration + 2, "@import") and
+        tokenIs(file, declaration + 4, "\"std\"") and file.tokens[declaration + 6].tag == .semicolon;
+}
+
+/// The last token of `std.<path>` spelled as whole member tokens after the
+/// `std` at `start`, as the modernize tables match it.
+fn stdPathEnd(file: *const File, start: usize, path: []const u8) ?usize {
     var cursor = start;
     var segments = std.mem.splitScalar(u8, path, '.');
     while (segments.next()) |segment| {
-        if (cursor + 2 > end or !tokenIs(file, cursor + 2, segment)) return false;
+        if (cursor + 2 >= file.tokens.len or file.tokens[cursor + 1].tag != .period or
+            file.tokens[cursor + 2].tag != .identifier or !tokenIs(file, cursor + 2, segment)) return null;
         cursor += 2;
     }
-    return cursor == end;
+    return cursor;
+}
+
+/// The members of the chain starting at `chain_start` that
+/// `modernize-deprecated-stdlib` or `modernize-managed-container` already
+/// reports: the chain is spelled from the std import and one of their curated
+/// paths covers the member, with migration advice of its own.
+const ModernizedChain = struct {
+    /// The last member a curated path covers.
+    end: ?usize = null,
+
+    fn init(context: Target, file: *const File, chain_start: usize) ModernizedChain {
+        if (!isPlainStdImport(file, chain_start)) return .{};
+        var chain: ModernizedChain = .{};
+        if (context.level(.modernize_deprecated_stdlib) != .off) {
+            // That rule reports the first table entry the chain matches.
+            for (&stdlib_replacements) |entry| {
+                chain.end = stdPathEnd(file, chain_start, entry.path) orelse continue;
+                break;
+            }
+        }
+        if (context.level(.modernize_managed_container) != .off) {
+            for (managed_container_paths) |path| {
+                const end = stdPathEnd(file, chain_start, path) orelse continue;
+                chain.end = @max(chain.end orelse end, end);
+            }
+        }
+        return chain;
+    }
+
+    fn reports(chain: ModernizedChain, member_index: usize) bool {
+        return member_index <= chain.end orelse return false;
+    }
+};
+
+/// Whether the token at `use` lies in a `const`, `var` or `fn` declaration of
+/// `file`, at any nesting depth, whose doc comment deprecates it.
+fn insideDeprecatedDeclaration(file: *const File, use: usize) bool {
+    var cursor = use;
+    var budget: usize = 64;
+    while (budget > 0) : (budget -= 1) {
+        if (owningDeclaration(file, cursor)) |name| {
+            if (deprecationAdvice(file.source.source, file.tokens, name) != null) return true;
+        }
+        const brace = file.scopes.enclosing_braces[cursor];
+        if (brace == syntax_scope.none_token) return false;
+        cursor = brace;
+    }
+    return false;
+}
+
+/// The name token of the declaration whose statement, within its block,
+/// holds `index`; null when that statement declares nothing.
+fn owningDeclaration(file: *const File, index: usize) ?usize {
+    var cursor = statementStart(file.tokens, index);
+    while (cursor < index) : (cursor += 1) {
+        switch (file.tokens[cursor].tag) {
+            .keyword_const, .keyword_var, .keyword_fn => if (file.tokens[cursor + 1].tag == .identifier) return cursor + 1,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn isPublic(file: *const File, keyword: usize) bool {
@@ -717,6 +849,41 @@ test "local deprecations normalize markers and respect lexical bindings" {
         "fn use() void { _ = a; _ = b; _ = c; _ = d; _ = e; _ = Good; { const a = 0; _ = a; } }", null, false);
     try std.testing.expectEqual(@as(usize, 5), found.len);
     try std.testing.expect(std.mem.find(u8, found[0].message, "use new_a") != null);
+}
+
+test "deprecated declarations used by deprecated code or the declaring file's tests are not reported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = "/// Deprecated: use next\nfn old() void {}\n" ++
+        "/// Deprecated: use other\npub fn older() void { if (true) old(); }\n" ++
+        "/// Deprecated.\npub const Legacy = struct { fn call() void { old(); } };\n" ++
+        "/// Deprecated.\npub const alias = old;\n" ++
+        "fn current() void { old(); }\n" ++
+        "test \"old still works\" { old(); }\n";
+    const found = try testFindings(arena.allocator(), source, null, false);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(std.mem.find(u8, source, "{ old(); }\ntest").? + 2, found[0].span.start);
+}
+
+test "deprecated std uses the modernize tables report are left to them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loader: TestLoader = .{ .sources = &.{
+        .{ .path = "/lib/std/std.zig", .source = "pub const mem = @import(\"mem.zig\");\npub const array_list = @import(\"array_list.zig\");\n" },
+        .{ .path = "/lib/std/mem.zig", .source = "/// Deprecated: in favor of find\npub fn indexOf() void {}\n/// Deprecated: in favor of other\npub fn untabled() void {}\n" },
+        .{ .path = "/lib/std/array_list.zig", .source = "/// Deprecated.\npub fn Managed(comptime T: type) type { return T; }\n" },
+    } };
+    const source = "const std = @import(\"std\");\nconst mem = std.mem;\n" ++
+        "fn f() void { std.mem.indexOf(); std.mem.untabled(); mem.indexOf(); _ = std.array_list.Managed(u8); }\n";
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@backingInt(types.Rule.modernize_deprecated_stdlib)] = .warning;
+    configuration.levels[@backingInt(types.Rule.modernize_managed_container)] = .warning;
+    const found = try testFindingsWith(arena.allocator(), source, loader.callbacks(), true, configuration);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("untabled", source[found[0].span.start..found[0].span.end]);
+    try std.testing.expectEqual(std.mem.find(u8, source, " mem.indexOf").? + " mem.".len, found[1].span.start);
+    // Without the modernize rules, every use is reported here.
+    try std.testing.expectEqual(@as(usize, 4), (try testFindings(arena.allocator(), source, loader.callbacks(), true)).len);
 }
 
 test "imported deprecations follow namespaces constant aliases and explicit receiver types" {

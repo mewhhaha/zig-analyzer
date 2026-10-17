@@ -4,11 +4,13 @@
 //! `ProjectRun` context.
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const configuration_module = @import("configuration.zig");
 const allocation_after_init = @import("project/allocation_after_init.zig");
 const build_options = @import("project/build_options.zig");
 const conventions = @import("project/conventions.zig");
 const import_graph = @import("project/import_graph.zig");
 const literal_boolean_argument = @import("project/literal_boolean_argument.zig");
+const module_exposure = @import("project/module_exposure.zig");
 const ownership = @import("project/ownership.zig");
 const public_api = @import("project/public_api.zig");
 const recursive_call = @import("project/recursive_call.zig");
@@ -17,6 +19,7 @@ const support = @import("test_support.zig");
 const syntax_scope = @import("../syntax/scope.zig");
 const tokenize = @import("../syntax/tokens.zig").tokenize;
 const types = @import("types.zig");
+const unused_suppression = @import("style/unused_suppression.zig");
 
 pub const SourceFile = run_module.SourceFile;
 pub const CompilerShape = run_module.CompilerShape;
@@ -24,6 +27,7 @@ pub const CompilerUnitFacts = run_module.CompilerUnitFacts;
 pub const CompilerFacts = run_module.CompilerFacts;
 pub const Finding = run_module.Finding;
 pub const freeFindings = run_module.freeFindings;
+pub const moduleExposures = module_exposure.exposures;
 
 /// Rules only whole-project analysis can report.
 pub const rules = ownership.rules ++ import_graph.rules ++ build_options.rules ++ conventions.rules ++
@@ -45,6 +49,21 @@ pub fn needsCompilerFacts(configuration: types.Configuration) bool {
         if (catalog.entry(rule).needs == .compiler and configuration.level(rule) != .off) return true;
     }
     return false;
+}
+
+/// The casing each kind of the project's declarations follows by a strong
+/// majority, which `non-idiomatic-name` accepts as the project's convention.
+/// A caller that checks the files one at a time stores it in their
+/// configuration (`Configuration.naming_conventions`) first.
+pub fn namingConventions(allocator: std.mem.Allocator, files: []const SourceFile) !types.NamingConventions {
+    var scratch_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
+    const project_files = try scratch.alloc(run_module.File, files.len);
+    for (files, project_files) |file, *project_file| {
+        project_file.* = run_module.newFile(file, file.tokens orelse try tokenize(scratch, file.source));
+    }
+    return conventions.namingConventions(scratch, project_files);
 }
 
 fn enabled(configuration: types.Configuration) bool {
@@ -84,7 +103,8 @@ pub fn findingsConcurrently(
     compiler_facts: CompilerFacts,
     scopes: ?*syntax_scope.LazyIndexes,
 ) ![]const Finding {
-    if (!enabled(configuration)) return &.{};
+    const project_configuration = projectConfiguration(configuration, files);
+    if (!enabled(project_configuration)) return &.{};
     var scratch_arena: std.heap.ArenaAllocator = .init(allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
@@ -108,7 +128,7 @@ pub fn findingsConcurrently(
         .results = allocator,
         .backing = allocator,
         .files = project_files,
-        .configuration = configuration,
+        .configuration = project_configuration,
         .compiler_facts = compiler_facts,
         .findings = &found,
         .syntaxes = syntaxes,
@@ -116,7 +136,7 @@ pub fn findingsConcurrently(
         .io = io,
     };
 
-    const imports = if (configuration.anyEnabled(&graph_rules)) try import_graph.collectImports(run) else &.{};
+    const imports = if (project_configuration.anyEnabled(&graph_rules)) try import_graph.collectImports(run) else &.{};
     try import_graph.findDuplicateModuleImports(run, imports);
     try import_graph.findUnreferencedTests(run, imports);
     try build_options.find(run);
@@ -127,13 +147,28 @@ pub fn findingsConcurrently(
     try literal_boolean_argument.find(run);
     // The passes from here on read every file's scope index; they are built
     // on several threads up front rather than one at a time as each is reached.
-    if (configuration.anyEnabled(&indexed_rules)) try run_module.forEachIndex(run, files.len, run, buildScopes);
+    if (project_configuration.anyEnabled(&indexed_rules)) try run_module.forEachIndex(run, files.len, run, buildScopes);
     try allocation_after_init.find(run);
     try recursive_call.find(run);
     try import_graph.findImportBoundaryViolations(run, imports);
     try ownership.run(run);
     try public_api.findConfigurationDivergentApis(run);
     try public_api.findUnreachablePublicDeclarations(run, imports);
+    // The passes judge with the project-wide levels; each finding takes the
+    // level its file has, and is dropped where the rule is off.
+    var kept: usize = 0;
+    for (found.items) |entry| {
+        var file_entry = entry;
+        file_entry.finding.level = run.levelFor(entry.file_index, entry.finding.rule);
+        if (file_entry.finding.level == .off) {
+            run_module.freeFinding(allocator, entry.finding);
+            continue;
+        }
+        found.items[kept] = file_entry;
+        kept += 1;
+    }
+    found.shrinkRetainingCapacity(kept);
+    try unused_suppression.runProject(run);
     std.mem.sort(Finding, found.items, {}, struct {
         fn lessThan(_: void, left: Finding, right: Finding) bool {
             if (left.file_index != right.file_index) return left.file_index < right.file_index;
@@ -142,6 +177,21 @@ pub fn findingsConcurrently(
         }
     }.lessThan);
     return try found.toOwnedSlice(allocator);
+}
+
+/// The configuration the project passes run under. An override may turn a
+/// rule on for some paths only, so with overrides a rule is on when it is on
+/// in any file; findings then take their own file's level.
+pub fn projectConfiguration(configuration: types.Configuration, files: []const SourceFile) types.Configuration {
+    if (configuration.overrides.len == 0) return configuration;
+    var project_configuration = configuration;
+    for (files) |file| {
+        const file_configuration = configuration_module.forPath(configuration, file.config_path orelse file.path);
+        for (&project_configuration.levels, file_configuration.levels) |*level, file_level| {
+            if (@backingInt(file_level) > @backingInt(level.*)) level.* = file_level;
+        }
+    }
+    return project_configuration;
 }
 
 fn buildScopes(run: run_module.ProjectRun, file_index: usize) !void {

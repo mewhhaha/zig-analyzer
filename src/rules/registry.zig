@@ -14,10 +14,13 @@ const rule_modules = .{
     @import("hazards/identical_comparison_operands.zig"),
     @import("hazards/identical_conditional_branches.zig"),
     @import("hazards/identical_logical_operands.zig"),
+    @import("hazards/identity_operation.zig"),
     @import("hazards/inclusive_index_bound.zig"),
     @import("hazards/invariant_loop_condition.zig"),
     @import("hazards/io_contract_hazards.zig"),
+    @import("hazards/mutated_range_bound.zig"),
     @import("hazards/nan_comparison.zig"),
+    @import("hazards/never_loop.zig"),
     @import("hazards/padded_byte_compare.zig"),
     @import("hazards/self_assignment.zig"),
     @import("hazards/truncating_intcast.zig"),
@@ -26,9 +29,11 @@ const rule_modules = .{
     @import("hazards/unconditional_busy_loop.zig"),
     @import("hazards/unconsumed_delimiter.zig"),
     @import("hazards/undefined_readvec_destination.zig"),
+    @import("hazards/uninitialized_getorput_value.zig"),
     @import("hazards/unsafe_orelse_unreachable.zig"),
     @import("hazards/unsequenced_state_access.zig"),
     @import("hazards/unsigned_arithmetic_guards.zig"),
+    @import("hazards/unsigned_comparison_constant.zig"),
     @import("hazards/unsigned_reverse_loop.zig"),
     @import("hazards/usize_in_packed_struct.zig"),
 
@@ -107,14 +112,19 @@ const rule_modules = .{
     @import("lifecycle/unflushed_writer.zig"),
 
     // modernize/: Zig version migration
+    @import("modernize/legacy_format_method.zig"),
     @import("modernize/modernize.zig"),
     @import("modernize/modernize_containers.zig"),
     @import("modernize/modernize_layout.zig"),
+    @import("modernize/modernize_reify_type.zig"),
 
     // semantic/: proofs over scope, container, and declaration facts
     @import("semantic/binding_mutation.zig"),
+    @import("semantic/binding_usage.zig"),
     @import("semantic/compiler_hygiene.zig"),
     @import("semantic/containers.zig"),
+    @import("semantic/misplaced_try.zig"),
+    @import("semantic/unreachable_code.zig"),
     @import("semantic/unresolved_names.zig"),
     @import("semantic/unused_private_declaration.zig"),
 
@@ -125,6 +135,7 @@ const rule_modules = .{
     @import("style/function_length.zig"),
     @import("style/imports.zig"),
     @import("style/line_length.zig"),
+    @import("style/missing_deinit_poison.zig"),
     @import("style/official_style.zig"),
     @import("style/parameter_order.zig"),
     @import("style/quadratic_front_removal.zig"),
@@ -132,8 +143,10 @@ const rule_modules = .{
     @import("style/unbounded_loop.zig"),
 };
 
-/// Every engine that reports findings, file-local or project-wide.
-pub const engines = rule_modules ++ .{@import("project.zig")};
+/// Every engine that reports findings, file-local or project-wide. The
+/// unused-suppression rule judges the findings the others report, so the
+/// drivers run it after applying suppression directives instead.
+pub const engines = rule_modules ++ .{ @import("project.zig"), @import("style/unused_suppression.zig") };
 
 /// Runs the file-local modules that have a rule enabled.
 pub fn run(context: RuleRun) !void {

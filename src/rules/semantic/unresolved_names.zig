@@ -315,6 +315,20 @@ test "unresolved calls keep their specific diagnostic" {
     try std.testing.expectEqual(@as(usize, 1), call_count);
 }
 
+test "quoted and plain spellings of a name resolve to the same declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn _(message: []const u8) []const u8 { return message; }\n" ++
+        "const @\"plain\" = 1;\n" ++
+        "const other = 2;\n" ++
+        "const @\"u8\" = 3;\n" ++
+        "fn run() void { _ = @\"_\"(\"Ghostty\"); _ = plain; _ = @\"other\"; _ = @\"missing\"; const byte: u8 = @\"u8\"; _ = byte; }\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("use of unresolved identifier '@\"missing\"'", found[0].message);
+}
+
 test "unresolved names respect lexical scopes and declaration order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

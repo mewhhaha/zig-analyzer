@@ -11,7 +11,9 @@ const annotations = @import("../syntax/annotations.zig");
 const cursor = @import("../syntax/cursor.zig");
 const document_module = @import("../syntax/document.zig");
 const hover = @import("hover.zig");
+const ownership_hints = @import("ownership_hints.zig");
 const services_module = @import("services.zig");
+const test_runner = @import("test_runner.zig");
 
 const Document = document_module.Document;
 const Declaration = document_module.Declaration;
@@ -97,7 +99,10 @@ pub fn inlayHint(
     params: lsp.ParamsType("textDocument/inlayHint"),
 ) !lsp.ResultType("textDocument/inlayHint") {
     const document = services.documents.getConst(params.textDocument.uri) orelse return null;
-    return try inlayHints(document, arena, params.range);
+    const syntax_hints = try inlayHints(document, arena, params.range);
+    const ownership = try ownership_hints.inlayHints(services, arena, document, params.range);
+    if (ownership.len == 0) return syntax_hints;
+    return try std.mem.concat(arena, lsp.types.InlayHint, &.{ syntax_hints, ownership });
 }
 
 pub fn signatureHelp(
@@ -117,7 +122,8 @@ pub fn signatureHelp(
     };
 }
 
-/// One lens per top-level constant the compiler resolved to a type.
+/// One lens per top-level constant the compiler resolved to a type, and a
+/// "Run test" lens per named test.
 pub fn codeLens(
     services: Services,
     arena: std.mem.Allocator,
@@ -148,6 +154,7 @@ pub fn codeLens(
             },
         });
     }
+    try lenses.appendSlice(arena, try test_runner.codeLenses(arena, document));
     return try lenses.toOwnedSlice(arena);
 }
 
@@ -280,10 +287,14 @@ fn semanticTokens(
     errdefer encoded.deinit(allocator);
     var previous_line: u32 = 0;
     var previous_character: u32 = 0;
-    var tokenizer = std.zig.Tokenizer.init(document.source);
-    while (true) {
-        const token = tokenizer.next();
-        if (token.tag == .eof) break;
+    // Only tokens starting on the requested lines can overlap the range, so
+    // positions are computed for those alone.
+    const window: std.zig.Token.Loc = if (requested_range) |limit|
+        document.lineSpan(limit.start.line, limit.end.line)
+    else
+        .{ .start = 0, .end = document.source.len };
+    for (document.tokens[document.firstTokenFrom(window.start)..]) |token| {
+        if (token.tag == .eof or token.loc.start > window.end) break;
         const token_class = annotations.tokenClass(document, token) orelse continue;
         const range = document.range(token.loc);
         if (range.start.line != range.end.line) continue;
@@ -315,7 +326,9 @@ fn inlayHints(
     allocator: std.mem.Allocator,
     requested_range: lsp.types.Range,
 ) ![]const lsp.types.InlayHint {
-    const found = try annotations.hints(allocator, document);
+    // Hints are only generated on the requested lines; the exact range test
+    // follows on their positions.
+    const found = try annotations.hints(allocator, document, document.lineSpan(requested_range.start.line, requested_range.end.line));
     defer allocator.free(found);
     var converted: std.ArrayList(lsp.types.InlayHint) = .empty;
     errdefer converted.deinit(allocator);

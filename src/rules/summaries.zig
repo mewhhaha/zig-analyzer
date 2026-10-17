@@ -8,6 +8,7 @@ const tokenize = @import("../syntax/tokens.zig").tokenize;
 const tokenText = @import("../syntax/tokens.zig").tokenText;
 const matchingDelimiter = @import("../syntax/tokens.zig").matchingDelimiter;
 const enclosingScopeEnd = @import("../syntax/tokens.zig").enclosingScopeEnd;
+const enclosingOpeningBrace = @import("../syntax/tokens.zig").enclosingOpeningBrace;
 const TokenRange = @import("../syntax/tokens.zig").Range;
 
 pub const Source = struct {
@@ -115,11 +116,19 @@ const FileSummary = struct {
     /// Type named by every `receiver: Type` parameter or field of the file, per
     /// receiver name; null when the file spells two different types.
     receiver_types: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    /// The file's functions by where their bodies open, with the function
+    /// whose body most closely holds each one's body (`no_function` for
+    /// none); left empty when two bodies overlap without nesting, so
+    /// `functionContaining` falls back to comparing every body.
+    bodies: []const Body = &.{},
+
+    const Body = struct { function: u32, parent: u32 };
 
     fn deinit(file: *FileSummary, allocator: std.mem.Allocator) void {
         file.local_bindings.deinit(allocator);
         file.functions_by_name.deinit(allocator);
         file.receiver_types.deinit(allocator);
+        allocator.free(file.bodies);
     }
 };
 
@@ -349,12 +358,7 @@ pub const Index = struct {
         token_index: usize,
     ) ?FunctionSummary {
         const file = index.fileForSource(source) orelse return null;
-        var selected: ?FunctionSummary = null;
-        for (index.functions[file.function_start..file.function_end]) |function| {
-            if (token_index <= function.body_start or token_index >= function.body_end) continue;
-            if (selected == null or function.body_start > selected.?.body_start) selected = function;
-        }
-        const function = selected orelse return null;
+        const function = index.innermostBody(file, token_index) orelse return null;
         const unique = index.uniqueFunctionInFile(file.file_index, function.name) orelse return null;
         if (unique.body_start != function.body_start) return null;
         return function;
@@ -414,6 +418,35 @@ pub const Index = struct {
         if (index.sourceHasLocalBinding(source, name)) return null;
         const file_index = index.fileIndexForSource(source) orelse return null;
         return index.uniqueFunctionInFile(file_index, name);
+    }
+
+    /// The function of `file` whose body most closely holds `token_index`:
+    /// of the bodies holding it, the one opening last.
+    fn innermostBody(index: Index, file: FileSummary, token_index: usize) ?FunctionSummary {
+        if (file.bodies.len != file.function_end - file.function_start) {
+            var selected: ?FunctionSummary = null;
+            for (index.functions[file.function_start..file.function_end]) |function| {
+                if (token_index <= function.body_start or token_index >= function.body_end) continue;
+                if (selected == null or function.body_start > selected.?.body_start) selected = function;
+            }
+            return selected;
+        }
+        // The last body opening before the token, then the bodies around it:
+        // nested bodies hold the token only if one of those does.
+        var low: usize = 0;
+        var high = file.bodies.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (index.functions[file.bodies[middle].function].body_start < token_index) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        var candidate: u32 = @intCast(low - 1);
+        while (true) {
+            const function = index.functions[file.bodies[candidate].function];
+            if (token_index < function.body_end) return function;
+            candidate = file.bodies[candidate].parent;
+            if (candidate == no_function) return null;
+        }
     }
 
     fn uniqueFunctionInFile(index: Index, file_index: usize, name: []const u8) ?FunctionSummary {
@@ -590,7 +623,7 @@ pub fn build(
     errdefer index.deinit(allocator);
     try buildLookups(allocator, &index);
     try markRecursiveFunctions(allocator, index);
-    inferDirectEffects(index, configuration);
+    try inferDirectEffects(allocator, index, configuration);
     var calls = try CallFacts.init(allocator, index);
     defer calls.deinit(allocator);
     for (0..index.functions.len) |_| {
@@ -622,7 +655,42 @@ fn buildLookups(allocator: std.mem.Allocator, index: *Index) !void {
         if (file.function_start != file.function_end) {
             try collectReceiverTypes(allocator, file, index.functions[file.function_start].tokens);
         }
+        file.bodies = try nestBodies(allocator, index.functions, file.function_start, file.function_end);
     }
+}
+
+/// The `FileSummary.bodies` of the functions in `[start, end)`: sorted by
+/// where each body opens, each with the innermost body around it. Empty
+/// when two bodies overlap without one holding the other.
+fn nestBodies(allocator: std.mem.Allocator, functions: []const FunctionSummary, start: usize, end: usize) ![]const FileSummary.Body {
+    const bodies = try allocator.alloc(FileSummary.Body, end - start);
+    errdefer allocator.free(bodies);
+    for (bodies, start..) |*body, function| body.* = .{ .function = @intCast(function), .parent = no_function };
+    std.mem.sort(FileSummary.Body, bodies, functions, struct {
+        fn lessThan(all: []const FunctionSummary, left: FileSummary.Body, right: FileSummary.Body) bool {
+            return all[left.function].body_start < all[right.function].body_start;
+        }
+    }.lessThan);
+    // Bodies still open at the current one, innermost last.
+    var open: std.ArrayList(u32) = .empty;
+    defer open.deinit(allocator);
+    for (bodies, 0..) |*body, position| {
+        const function = functions[body.function];
+        while (open.last()) |innermost| {
+            if (functions[bodies[innermost].function].body_end > function.body_start) break;
+            _ = open.pop();
+        }
+        if (open.last()) |innermost| {
+            const parent = functions[bodies[innermost].function];
+            if (parent.body_start == function.body_start or parent.body_end <= function.body_end) {
+                allocator.free(bodies);
+                return &.{};
+            }
+            body.parent = innermost;
+        }
+        try open.append(allocator, @intCast(position));
+    }
+    return bodies;
 }
 
 fn collectReceiverTypes(allocator: std.mem.Allocator, file: *FileSummary, tokens: []const std.zig.Token) !void {
@@ -839,12 +907,30 @@ fn parameterName(source: []const u8, tokens: []const std.zig.Token, start: usize
     return null;
 }
 
-fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
+fn inferDirectEffects(allocator: std.mem.Allocator, index: Index, configuration: types.Configuration) !void {
+    // The braces open at the current token of a body, innermost last, so
+    // that a use's blocks need no backward scan; `enclosingOpeningBrace` finds
+    // the same ones until a `}` closes the body's own brace early.
+    var openings: std.ArrayList(usize) = .empty;
+    defer openings.deinit(allocator);
     for (index.functions) |*function| {
         if (function.unresolved) continue;
+        const first_exit = firstBodyExit(function.*);
+        openings.clearRetainingCapacity();
+        try openings.append(allocator, function.body_start);
+        var openings_known = true;
         // A parameter's effects follow from its own uses in order, so one pass
         // over the body serves every parameter.
         for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
+            switch (token.tag) {
+                .l_brace => try openings.append(allocator, use_index),
+                .r_brace => if (openings.items.len > 1) {
+                    _ = openings.pop();
+                } else {
+                    openings_known = false;
+                },
+                else => {},
+            }
             if (token.tag != .identifier) continue;
             const name = tokenText(function.source, token);
             var outside_nested_functions = false;
@@ -854,14 +940,15 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
                     if (tokenBelongsToNestedFunction(function.*, use_index)) break;
                     outside_nested_functions = true;
                 }
-                inferUseEffect(function, parameter, use_index, configuration);
+                const blocks: UseBlocks = if (openings_known) .{
+                    .opening = openings.last().?,
+                    .outer_opening = if (openings.items.len > 1) openings.items[openings.items.len - 2] else null,
+                    .first_exit = first_exit,
+                } else useBlocks(function.*, use_index);
+                inferUseEffect(function, parameter, use_index, blocks, configuration);
             }
         }
-        for (function.parameter_names, 0..) |parameter_name, parameter| {
-            if (borrowedAliasEscapes(function.*, parameter_name)) {
-                function.parameter_escapes[parameter] = true;
-            }
-        }
+        markEscapingBorrowedAliases(function);
         if (directOwnedReturn(function.*, configuration.resource_contracts)) |owned| {
             function.returns_owned = true;
             function.return_release = owned.release;
@@ -876,11 +963,17 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
 }
 
 /// What the use of `function`'s parameter `parameter` at `use_index` does to it.
-fn inferUseEffect(function: *FunctionSummary, parameter: usize, use_index: usize, configuration: types.Configuration) void {
+fn inferUseEffect(
+    function: *FunctionSummary,
+    parameter: usize,
+    use_index: usize,
+    blocks: UseBlocks,
+    configuration: types.Configuration,
+) void {
     if (useIsDirectRelease(function.*, use_index, configuration.resource_contracts)) {
         mergeEffect(
             &function.parameter_effects[parameter],
-            if (effectUseIsUnconditional(function.*, use_index)) .released else .unknown,
+            if (effectUseIsUnconditional(function.*, use_index, blocks)) .released else .unknown,
         );
         return;
     }
@@ -933,42 +1026,68 @@ fn directContainerMutation(function: FunctionSummary) ?ContainerMutation {
         "getOrPut",
         "rehash",
     };
-    for (function.parameter_names, 0..) |parameter_name, parameter| {
-        for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
-            if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), parameter_name) or
-                use_index + 3 >= function.body_end or function.tokens[use_index + 1].tag != .period or
-                function.tokens[use_index + 2].tag != .identifier or tokenBelongsToNestedFunction(function, use_index)) continue;
-            const direct_method = function.tokens[use_index + 3].tag == .l_paren;
-            if (!direct_method and (use_index + 5 >= function.body_end or function.tokens[use_index + 3].tag != .period or
-                function.tokens[use_index + 4].tag != .identifier or function.tokens[use_index + 5].tag != .l_paren)) continue;
-            const method_index = use_index + @as(usize, if (direct_method) 2 else 4);
-            const method = tokenText(function.source, function.tokens[method_index]);
-            for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) {
-                return .{
-                    .parameter = parameter,
-                    .field = if (direct_method) "" else tokenText(function.source, function.tokens[use_index + 2]),
-                    .method = method,
-                };
+    // The first such use of the first parameter that has one, found in one
+    // pass over the body for every parameter.
+    var selected: ?ContainerMutation = null;
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
+        if (token.tag != .identifier or use_index + 3 >= function.body_end or function.tokens[use_index + 1].tag != .period or
+            function.tokens[use_index + 2].tag != .identifier) continue;
+        const name = tokenText(function.source, token);
+        const parameter = for (function.parameter_names, 0..) |parameter_name, position| {
+            if (std.mem.eql(u8, name, parameter_name)) break position;
+        } else continue;
+        if (selected) |known| if (parameter >= known.parameter) continue;
+        if (tokenBelongsToNestedFunction(function, use_index)) continue;
+        const direct_method = function.tokens[use_index + 3].tag == .l_paren;
+        if (!direct_method and (use_index + 5 >= function.body_end or function.tokens[use_index + 3].tag != .period or
+            function.tokens[use_index + 4].tag != .identifier or function.tokens[use_index + 5].tag != .l_paren)) continue;
+        const method_index = use_index + @as(usize, if (direct_method) 2 else 4);
+        const method = tokenText(function.source, function.tokens[method_index]);
+        for (methods) |candidate| if (std.mem.eql(u8, method, candidate)) {
+            selected = .{
+                .parameter = parameter,
+                .field = if (direct_method) "" else tokenText(function.source, function.tokens[use_index + 2]),
+                .method = method,
             };
-        }
+            break;
+        };
+        // A later use can only be of a later parameter.
+        if (selected) |known| if (known.parameter == 0) return known;
     }
-    return null;
+    return selected;
 }
 
-fn borrowedAliasEscapes(function: FunctionSummary, parameter_name: []const u8) bool {
+/// Marks each parameter that a declaration borrows (`const view = parameter[0..n];`)
+/// and whose alias escapes, reading each declaration once for every parameter.
+fn markEscapingBorrowedAliases(function: *FunctionSummary) void {
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= function.body_end or
             function.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = statementEnd(function.tokens, declaration_index, function.body_end);
         var equal_index = declaration_index + 2;
         while (equal_index < declaration_end and function.tokens[equal_index].tag != .equal) : (equal_index += 1) {}
-        if (equal_index == declaration_end or !knownBorrowingAlias(function, parameter_name, equal_index + 1, declaration_end)) continue;
-        const scope_end = enclosingScopeEnd(function.tokens, declaration_index) orelse continue;
-        const alias = tokenText(function.source, function.tokens[declaration_index + 1]);
-        for (function.tokens[declaration_end + 1 .. @min(scope_end, function.body_end)], declaration_end + 1..) |use, use_index| {
-            if (use.tag == .identifier and std.mem.eql(u8, tokenText(function.source, use), alias) and
-                parameterUseDefinitelyEscapes(function, use_index)) return true;
+        if (equal_index == declaration_end) continue;
+        var escapes: ?bool = null;
+        for (function.parameter_names, function.parameter_escapes) |parameter_name, *parameter_escapes| {
+            if (!knownBorrowingAlias(function.*, parameter_name, equal_index + 1, declaration_end)) continue;
+            if (escapes == null) escapes = aliasEscapes(function.*, declaration_index, declaration_end);
+            if (escapes.?) parameter_escapes.* = true;
         }
+    }
+}
+
+/// Whether the binding the declaration at `declaration_index` names is used
+/// where it definitely escapes.
+fn aliasEscapes(function: FunctionSummary, declaration_index: usize, declaration_end: usize) bool {
+    const scope_end = enclosingScopeEnd(function.tokens, declaration_index) orelse return false;
+    // A `const` in a type (`[]const u8 =>`) is no declaration; its first
+    // `;` can lie past the block that holds it.
+    const uses_end = @min(scope_end, function.body_end);
+    if (declaration_end >= uses_end) return false;
+    const alias = tokenText(function.source, function.tokens[declaration_index + 1]);
+    for (function.tokens[declaration_end + 1 .. uses_end], declaration_end + 1..) |use, use_index| {
+        if (use.tag == .identifier and std.mem.eql(u8, tokenText(function.source, use), alias) and
+            parameterUseDefinitelyEscapes(function, use_index)) return true;
     }
     return false;
 }
@@ -1253,13 +1372,28 @@ fn errdeferReleaseForBinding(
     binding_name: []const u8,
     return_index: usize,
 ) ?[]const u8 {
+    // In a body whose braces balance, an errdefer's block is still open at
+    // the return exactly when every `}` between them closes a `{` opened
+    // after the errdefer, which the walk back counts without looking up each
+    // errdefer's block.
+    const balanced = bracesBalance(function.tokens[function.body_start + 1 .. function.body_end]);
+    var unmatched_closings: usize = 0;
     var defer_index = return_index;
     while (defer_index > function.body_start + 1) {
         defer_index -= 1;
         const token = function.tokens[defer_index];
+        switch (token.tag) {
+            .r_brace => unmatched_closings += 1,
+            .l_brace => unmatched_closings -|= 1,
+            else => {},
+        }
         if (token.tag != .keyword_errdefer) continue;
-        const scope_end = enclosingScopeEnd(function.tokens, defer_index) orelse continue;
-        if (scope_end < return_index) continue;
+        if (balanced) {
+            if (unmatched_closings != 0) continue;
+        } else {
+            const scope_end = enclosingScopeEnd(function.tokens, defer_index) orelse continue;
+            if (scope_end < return_index) continue;
+        }
         const statement_end = statementEnd(function.tokens, defer_index, return_index);
         if (statement_end >= return_index) continue;
         for (function.tokens[defer_index + 1 .. statement_end], defer_index + 1..) |candidate, method_index| {
@@ -1280,6 +1414,17 @@ fn errdeferReleaseForBinding(
         }
     }
     return null;
+}
+
+/// Whether every `}` of `tokens` closes a `{` before it and every `{` is closed.
+fn bracesBalance(tokens: []const std.zig.Token) bool {
+    var depth: usize = 0;
+    for (tokens) |token| switch (token.tag) {
+        .l_brace => depth += 1,
+        .r_brace => depth = std.math.sub(usize, depth, 1) catch return false,
+        else => {},
+    };
+    return depth == 0;
 }
 
 const AllocatorProvenance = struct {
@@ -1449,19 +1594,26 @@ const CallFacts = struct {
     }
 
     fn collectReturns(facts: *CallFacts, allocator: std.mem.Allocator, caller: FunctionSummary, position: usize) !void {
+        // Returns chained in one statement (`if (a) return f() else return g();`)
+        // share its end and the call that closes it, so each is found once.
+        var shared_end: usize = 0;
+        var ending_call: ?usize = null;
         for (caller.tokens[caller.body_start + 1 .. caller.body_end], caller.body_start + 1..) |token, return_index| {
             if (token.tag != .keyword_return or tokenBelongsToNestedFunction(caller, return_index)) continue;
-            const return_end = statementEnd(caller.tokens, return_index, caller.body_end);
+            if (return_index >= shared_end) {
+                shared_end = statementEnd(caller.tokens, return_index, caller.body_end);
+                ending_call = endingCallOpen(caller.tokens, return_index, shared_end);
+            }
+            const return_end = shared_end;
             if (return_index + 1 < return_end and caller.tokens[return_index + 1].tag == .keyword_error) continue;
             const candidates_start: u32 = @intCast(facts.candidates.items.len);
-            for (caller.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, call_open| {
-                if (candidate.tag != .l_paren) continue;
-                const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
-                if (call_end + 1 != return_end) continue;
-                const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
-                try facts.candidates.append(allocator, .{ .call_open = call_open, .call_end = call_end, .callable = callable });
-                try facts.addCaller(allocator, callable, position);
-            }
+            // Only one `(` can match the `)` before the end.
+            if (ending_call) |call_open| if (call_open > return_index) {
+                if (callableBefore(caller.source, caller.tokens, call_open)) |callable| {
+                    try facts.candidates.append(allocator, .{ .call_open = call_open, .call_end = return_end - 1, .callable = callable });
+                    try facts.addCaller(allocator, callable, position);
+                }
+            };
             try facts.returns.append(allocator, .{ .start = candidates_start, .end = @intCast(facts.candidates.items.len) });
         }
     }
@@ -1499,7 +1651,8 @@ fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index, calls: *Cal
                 const caller_parameter = use[0];
                 const argument = use[1];
                 const reported_effect = index.parameterEffectForCall(caller.source, site.callable, argument);
-                const effect = if (reported_effect == .released and !effectUseIsUnconditional(caller.*, site.call_open))
+                const effect = if (reported_effect == .released and
+                    !effectUseIsUnconditional(caller.*, site.call_open, useBlocks(caller.*, site.call_open)))
                     .unknown
                 else
                     reported_effect;
@@ -1701,13 +1854,8 @@ fn uniqueFunctionIndexForCall(index: Index, caller: FunctionSummary, callable: [
     const name = if (separator) |position| callable[position + 1 ..] else callable;
     if (std.mem.findScalar(u8, name, '.') != null) return null;
     const file = index.fileForIndex(file_index) orelse return null;
-    var selected: ?usize = null;
-    for (index.functions[file.function_start..file.function_end], file.function_start..) |function, function_index| {
-        if (!std.mem.eql(u8, function.name, name)) continue;
-        if (selected != null) return null;
-        selected = function_index;
-    }
-    return selected;
+    const first = file.functions_by_name.get(name) orelse return null;
+    return if (index.next_same_name[first] == no_function) first else null;
 }
 
 fn useIsDirectRelease(function: FunctionSummary, use_index: usize, contracts: []const types.ResourceContract) bool {
@@ -1730,23 +1878,50 @@ fn useIsDirectRelease(function: FunctionSummary, use_index: usize, contracts: []
     return false;
 }
 
-fn effectUseIsUnconditional(function: FunctionSummary, use_index: usize) bool {
-    const opening = enclosingOpening(function.tokens, use_index) orelse return false;
+/// The blocks around a use and its function's first exit, as
+/// `effectUseIsUnconditional` reads them.
+const UseBlocks = struct {
+    /// The innermost `{` open at the use (`enclosingOpeningBrace`).
+    opening: ?usize,
+    /// The `{` open at the token before `opening`.
+    outer_opening: ?usize,
+    /// `firstBodyExit` of the function.
+    first_exit: usize,
+};
+
+fn useBlocks(function: FunctionSummary, use_index: usize) UseBlocks {
+    const opening = enclosingOpeningBrace(function.tokens, use_index);
+    return .{
+        .opening = opening,
+        .outer_opening = if (opening) |brace| if (brace == 0) null else enclosingOpeningBrace(function.tokens, brace - 1) else null,
+        .first_exit = firstBodyExit(function),
+    };
+}
+
+/// The first `return` or `try` of the function's own body, not of a
+/// function nested in it; `body_end` when there is none.
+fn firstBodyExit(function: FunctionSummary) usize {
+    for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, index| {
+        if (token.tag != .keyword_return and token.tag != .keyword_try) continue;
+        if (!tokenBelongsToNestedFunction(function, index)) return index;
+    }
+    return function.body_end;
+}
+
+fn effectUseIsUnconditional(function: FunctionSummary, use_index: usize, blocks: UseBlocks) bool {
+    const opening = blocks.opening orelse return false;
     const registration = if (opening == function.body_start) registration: {
         const statement_start = statementStart(function.tokens, use_index, function.body_start + 1);
         if (rangeContainsConditionalEffect(function.tokens, statement_start, use_index)) return false;
         break :registration statement_start;
     } else registration: {
         if (opening == 0 or function.tokens[opening - 1].tag != .keyword_defer or
-            enclosingOpening(function.tokens, opening - 1) != function.body_start or
+            blocks.outer_opening != function.body_start or
             rangeContainsConditionalEffect(function.tokens, opening + 1, use_index)) return false;
         break :registration opening - 1;
     };
-    for (function.tokens[function.body_start + 1 .. registration], function.body_start + 1..) |token, index| {
-        if (token.tag != .keyword_return and token.tag != .keyword_try) continue;
-        if (!tokenBelongsToNestedFunction(function, index)) return false;
-    }
-    return true;
+    // No exit of the body comes before the release registers.
+    return blocks.first_exit >= registration;
 }
 
 fn rangeContainsConditionalEffect(tokens: []const std.zig.Token, start: usize, end: usize) bool {
@@ -1771,23 +1946,6 @@ fn statementStart(tokens: []const std.zig.Token, index: usize, lower_bound: usiz
         }
     }
     return start;
-}
-
-fn enclosingOpening(tokens: []const std.zig.Token, index: usize) ?usize {
-    var depth: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => depth += 1,
-            .l_brace => {
-                if (depth == 0) return cursor;
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
-    return null;
 }
 
 fn useIsStored(function: FunctionSummary, use_index: usize) bool {
@@ -1907,6 +2065,25 @@ fn statementEnd(tokens: []const std.zig.Token, start: usize, limit: usize) usize
     var index = start;
     while (index < limit and tokens[index].tag != .semicolon) : (index += 1) {}
     return index;
+}
+
+/// The `(` in `(start, end)` whose matching `)` is the token before `end`.
+fn endingCallOpen(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
+    if (end < start + 2 or tokens[end - 1].tag != .r_paren) return null;
+    var depth: usize = 0;
+    var cursor = end;
+    while (cursor > start + 1) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .r_paren => depth += 1,
+            .l_paren => {
+                depth -= 1;
+                if (depth == 0) return cursor;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn callableBefore(source: []const u8, tokens: []const std.zig.Token, call_open: usize) ?[]const u8 {
@@ -2408,6 +2585,20 @@ test "propagated ownership requires every success return to be owned" {
     try std.testing.expect(index.ownedReturn("choose") == null);
 }
 
+test "returns chained in one statement each return the call that ends it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn make(allocator: std.mem.Allocator) ![]u8 { return allocator.alloc(u8, 4); }" ++
+        "fn choose(allocator: std.mem.Allocator, small: bool, empty: bool) ![]u8 { " ++
+        "if (empty) return error.Empty else if (small) return make(allocator) else return make(allocator); }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
+    const owned = index.ownedReturn("choose").?;
+    try std.testing.expectEqualStrings("free", owned.release);
+    try std.testing.expectEqual(@as(?usize, 0), owned.allocator_parameter);
+}
+
 test "transformed owned calls do not become owned return contracts" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2603,4 +2794,16 @@ test "definite parameter escapes survive unrelated opaque uses" {
     const index = try build(arena.allocator(), &sources, types.Configuration.defaults());
     try std.testing.expect(index.parameterEscapesForCall(source, "parse", 0));
     try std.testing.expect(!index.parameterEscapesForCall(source, "length", 0));
+}
+
+test "a type's const inside a switch prong is not an alias declaration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // `[]const u8 =>` reads like `const u8 ...`, whose first `;` lies past the
+    // switch that encloses it.
+    const source: [:0]const u8 =
+        "fn describe(text: []const u8, arg: anytype) usize { var i: usize = 0; i += switch (@TypeOf(arg)) { " ++
+        "[]const u8 => format(.{ .node = 0 }, text[i..]), else => 0, }; return i; }";
+    const sources = [_]Source{.{ .file_index = 0, .source = source }};
+    _ = try build(arena.allocator(), &sources, types.Configuration.defaults());
 }

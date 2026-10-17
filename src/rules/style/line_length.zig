@@ -9,22 +9,29 @@ pub const rules = [_]types.Rule{.line_length};
 pub fn run(context: RuleRun) !void {
     const level = context.level(.line_length);
     if (level == .off) return;
+    const limit = context.configuration.line_length_limit;
     var start: usize = 0;
+    // The first token at or after the current line; tokens are in source
+    // order, so one cursor serves every line of the file.
+    var first_token: usize = 0;
     while (start < context.source.len) {
         const relative_end = std.mem.findScalar(u8, context.source[start..], '\n') orelse context.source.len - start;
         const end = start + relative_end;
         // A CRLF line ending is not part of the line's width.
         const line = std.mem.trimEnd(u8, context.source[start..end], "\r");
         const columns = displayColumns(line);
-        if (columns > context.configuration.line_length_limit and
-            (!context.configuration.line_length_allow_unsplittable or !unsplittable(line)))
-        {
-            try context.emit(.{
-                .rule = .line_length,
-                .level = level,
-                .span = .{ .start = start, .end = start + line.len },
-                .message = try context.allocator.print("line is {d} display columns, exceeding the configured limit of {d}", .{ columns, context.configuration.line_length_limit }),
-            });
+        if (columns > limit) {
+            while (first_token < context.tokens.len and context.tokens[first_token].loc.start < start) first_token += 1;
+            if (!context.configuration.line_length_allow_unsplittable or
+                !unsplittable(context, .{ .text = line, .start = start, .columns = columns, .first_token = first_token }))
+            {
+                try context.emit(.{
+                    .rule = .line_length,
+                    .level = level,
+                    .span = .{ .start = start, .end = start + line.len },
+                    .message = try context.allocator.print("line is {d} display columns, exceeding the configured limit of {d}", .{ columns, limit }),
+                });
+            }
         }
         if (end == context.source.len) break;
         start = end + 1;
@@ -121,16 +128,113 @@ const double_width = [_]Range{
     .{ 0x1f947, 0x1f9ff }, .{ 0x1fa70, 0x1faff }, .{ 0x20000, 0x2fffd }, .{ 0x30000, 0x3fffd },
 };
 
+/// A line beyond the limit.
+const Line = struct {
+    text: []const u8,
+    /// Byte offset of `text` in the source.
+    start: usize,
+    columns: usize,
+    /// The first token starting at or after `start`.
+    first_token: usize,
+};
+
 /// Whether the line cannot be wrapped: it names a URL, it is one token
-/// without whitespace, or its only token is a string literal (optionally
-/// followed by `,`, `;`, closing delimiters or `++`). A `\\` multiline string
+/// without whitespace, its only token is a string literal (optionally
+/// followed by `,`, `;`, closing delimiters or `++`), it is a row of a data
+/// table, or one string literal overflows by itself. A `\\` multiline string
 /// line is part of the string's value, so it can never be split.
-fn unsplittable(line: []const u8) bool {
-    const trimmed = std.mem.trim(u8, line, " \t");
+fn unsplittable(context: RuleRun, line: Line) bool {
+    const trimmed = std.mem.trim(u8, line.text, " \t");
     if (std.mem.find(u8, trimmed, "http://") != null or std.mem.find(u8, trimmed, "https://") != null) return true;
     if (std.mem.findAny(u8, trimmed, " \t") == null) return true;
     if (std.mem.startsWith(u8, trimmed, "\\\\")) return true;
-    return loneStringLiteral(trimmed);
+    if (loneStringLiteral(trimmed)) return true;
+    // Tokens from `first_token` on start at or after the line's start.
+    var end_token = line.first_token;
+    while (end_token < context.tokens.len and context.tokens[end_token].tag != .eof and
+        context.tokens[end_token].loc.start - line.start < line.text.len) end_token += 1;
+    if (end_token == line.first_token) return false;
+    return tableRow(context, line, end_token) or stringOverflows(context, line, end_token);
+}
+
+/// Whether the tokens of the line, which end before `end_token`, are whole
+/// elements of an initializer list built only from literals, names, enum and
+/// decl literals, and nested initializers, as the rows of a data table are
+/// (`.{ .seed = 0, .hash = 0x1766974bf7527d81, .b64 = "ICAg" },`). `zig fmt`
+/// keeps such a row on one line, and wrapping it by hand breaks the table's
+/// columns. A row whose code fits is reported, since its trailing comment can
+/// move above it.
+fn tableRow(context: RuleRun, line: Line, end_token: usize) bool {
+    const tokens = context.tokens;
+    const first = line.first_token;
+    if (first == 0 or tokens[end_token - 1].tag != .comma) return false;
+    switch (tokens[first - 1].tag) {
+        .l_brace, .comma => {},
+        else => return false,
+    }
+    var depth: usize = 0;
+    for (tokens[first .. end_token - 1], first..) |token, index| {
+        const previous = tokens[index - 1].tag;
+        const element_start = switch (previous) {
+            .l_brace, .l_paren, .comma, .equal => true,
+            else => false,
+        };
+        switch (token.tag) {
+            .number_literal, .string_literal, .char_literal, .identifier, .comma => {},
+            .minus, .ampersand => if (!element_start) return false,
+            .period => if (tokens[index + 1].tag != .identifier and tokens[index + 1].tag != .l_brace) return false,
+            // `.field = value`
+            .equal => if (index < first + 2 or previous != .identifier or tokens[index - 2].tag != .period or
+                (index - 2 != first and tokens[index - 3].tag != .l_brace and tokens[index - 3].tag != .comma)) return false,
+            .l_brace => {
+                if (previous != .period and previous != .identifier) return false;
+                depth += 1;
+            },
+            // A decl literal call, `.memia(.src0b, .tmp0, .add_size)`.
+            .l_paren => {
+                if (index < first + 2 or previous != .identifier or tokens[index - 2].tag != .period) return false;
+                if (index - 2 != first) switch (tokens[index - 3].tag) {
+                    .l_brace, .l_paren, .comma, .equal => {},
+                    else => return false,
+                };
+                depth += 1;
+            },
+            .r_brace, .r_paren => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => return false,
+        }
+    }
+    if (depth != 0) return false;
+    const code_end = tokens[end_token - 1].loc.end - line.start;
+    return displayColumns(line.text[0..code_end]) > context.configuration.line_length_limit;
+}
+
+/// Whether one string literal is what overflows: the rest of the line fits,
+/// and the literal is too wide even for a continuation line of its own, so
+/// only splitting the string itself would help. A `test` name cannot move at
+/// all, so the rest fitting is enough.
+fn stringOverflows(context: RuleRun, line: Line, end_token: usize) bool {
+    var widest: ?usize = null;
+    var widest_columns: usize = 0;
+    for (context.tokens[line.first_token..end_token], line.first_token..) |token, index| {
+        if (token.tag != .string_literal) continue;
+        const columns = displayColumns(context.tokenText(index));
+        if (columns > widest_columns) {
+            widest = index;
+            widest_columns = columns;
+        }
+    }
+    const string = widest orelse return false;
+    const limit = context.configuration.line_length_limit;
+    if (line.columns - widest_columns > limit) return false;
+    if (context.tokens[line.first_token].tag == .keyword_test and string == line.first_token + 1) return true;
+    const indentation = displayColumns(line.text[0 .. line.text.len - std.mem.trimStart(u8, line.text, " \t").len]);
+    // `zig fmt` indents a continuation line by four columns, and the literal
+    // keeps the `,` or `;` that follows it.
+    const own_line_indentation = if (string == line.first_token) indentation else indentation + 4;
+    return own_line_indentation + widest_columns + 1 > limit;
 }
 
 fn loneStringLiteral(trimmed: []const u8) bool {
@@ -159,7 +263,8 @@ fn expectLineFindings(source: [:0]const u8, expected: usize) !void {
 test "lines beyond the configured width report" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const source = try arena.allocator().printSentinel("const long = \"{s}\";\nconst short = 1;\n", .{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, 0);
+    const source: [:0]const u8 = "const long = first_operand + second_operand + third_operand + fourth_operand + fifth_operand + sixth;\n" ++
+        "const short = 1;\n";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.line_length}, .information));
     try support.expectRules(found, &.{.line_length});
 }
@@ -169,8 +274,43 @@ test "multiline string lines and lone string literals cannot be split" {
     try expectLineFindings("const text =\n    \\\\a multiline string line " ++ words ++ "\n;\n", 0);
     try expectLineFindings("const list = .{\n    \"a lone string literal " ++ words ++ "\",\n    \"x\" ++\n};\n", 0);
     try expectLineFindings("const parts = .{\n    \"a lone string literal " ++ words ++ "\" ++\n        \"tail\",\n};\n", 0);
-    try expectLineFindings("const joined = \"a string after a declaration " ++ words ++ "\" ++\n    \"tail\";\n", 1);
-    try expectLineFindings("fn f() void {\n    call(\"a string argument " ++ words ++ "\", 1);\n}\n", 1);
+}
+
+test "a string literal too wide for a line of its own does not make its line splittable" {
+    const words = "with several words that keep going well past the configured limit of one hundred display columns";
+    try expectLineFindings("const joined = \"a string after a declaration " ++ words ++ "\" ++\n    \"tail\";\n", 0);
+    try expectLineFindings("fn f() void {\n    call(\"a string argument " ++ words ++ "\", 1);\n}\n", 0);
+    try expectLineFindings("const config = .{\n    .field = \"a field value " ++ words ++ "\",\n};\n", 0);
+    try expectLineFindings("test \"a test name that keeps describing what the test checks until it passes the limit\" {}\n", 0);
+    // The literal fits on a continuation line of its own once it moves there.
+    try expectLineFindings("fn f() void {\n    log.info(\"a string argument that fits on its own continuation line\", .{ first, second, third, fourth });\n}\n", 1);
+    // The rest of the line overflows without the literal.
+    try expectLineFindings("fn f() void {\n    call(\"a string argument " ++ words ++ "\", first_operand + second_operand + third_operand + fourth_operand + fifth_operand + sixth_operand);\n}\n", 1);
+}
+
+test "rows of data tables are unsplittable" {
+    try expectLineFindings(
+        \\const cases = [_]Case{
+        \\    .{ .seed = 0xec42b7ab404b8acb, .hash = 0xe5a40d39ab796423, .b64 = "YWFhYQ==", .expected = "AQIDBA==" },
+        \\    .{ ._, .p_w, .insr, .tmp2x, .memia(.src1w, .tmp0, .add_unaligned_size), .ui(0), .sia(-16, .src0), ._ },
+        \\    .{ .src_constraints = .{ .{ .unsigned_int = .byte }, .{ .unsigned_int = .byte }, .any, .any, .any } },
+        \\    0x0123456789abcdef, 0x0123456789abcdef, 0x0123456789abcdef, 0x0123456789abcdef, 0x0123456789abcdef,
+        \\    .{ .name = "first", .items = &.{ .alpha, .beta, .gamma, .delta, .epsilon, .zeta, .eta, .theta, .iota } },
+        \\};
+        \\
+    , 0);
+    // Code, a computed value, a method call, or an overflowing trailing comment is not table data.
+    try expectLineFindings(
+        \\const cases = [_]Case{
+        \\    .{ .seed = first_seed + second_seed + third_seed, .hash = 0xe5a40d39ab796423, .b64 = "YWFhYQ==" },
+        \\    .{ .seed = 0xec42b7ab404b8acb, .hash = hasher.hash(0xe5a40d39ab796423), .b64 = "YWFhYQ==", .x = 1 },
+        \\    .{ .seed = 0xec42b7ab404b8acb, .hash = 0xe5a40d39ab796423 }, // a comment that pushes the row past the limit
+        \\};
+        \\fn f() void {
+        \\    try cg.asmRegisterRegisterMemory(.{ ._, .mov }, .rax, .rbx, .memia(.src0b, .tmp0, .add_unaligned_size));
+        \\}
+        \\
+    , 4);
 }
 
 test "display columns ignore CRLF and count wide and combining characters" {

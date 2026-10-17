@@ -343,3 +343,35 @@ test "LSP imported deprecations use current unsaved dependency documents" {
     const generated_findings = try server.documentFindings(arena.allocator(), server.documents.getConst(uri).?, .defaults());
     for (generated_findings) |finding| try std.testing.expect(finding.rule != .deprecated_declaration);
 }
+
+test "a document nested too deep to parse reports why and serves views without crashing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var transport = TestTransport.init(&.{});
+    defer transport.deinit();
+    var server: Server = undefined;
+    try server.init(std.testing.io, std.testing.allocator, .empty, &transport.transport, .syntax_only);
+    defer server.deinit();
+    var blob: std.ArrayList(u8) = .empty;
+    try blob.appendSlice(arena, "const answer = 42;\nconst blob = ");
+    for (0..60_000) |_| try blob.appendSlice(arena, "{(");
+    const uri = "file:///minified.zig";
+    try openDocument(&server, arena, uri, 1, blob.items);
+
+    const published = lastPublished(&transport, uri) orelse return error.NothingPublished;
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, published, "\"code\""));
+    try std.testing.expect(std.mem.find(u8, published, "\"code\":\"nesting-limit\"") != null);
+    try std.testing.expect(std.mem.find(u8, published, "\"severity\":3") != null);
+    try std.testing.expect(std.mem.find(u8, published, "\"line\":1,\"character\":269") != null);
+    _ = try server.@"textDocument/semanticTokens/full"(arena, .{ .textDocument = .{ .uri = uri } });
+    _ = try server.@"textDocument/hover"(arena, .{ .textDocument = .{ .uri = uri }, .position = .{ .line = 1, .character = 20 } });
+    _ = try server.@"textDocument/inlayHint"(arena, .{ .textDocument = .{ .uri = uri }, .range = .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 1, .character = 0 },
+    } });
+
+    try replaceDocument(&server, arena, uri, 2, "const answer = 42;\n");
+    const repaired = lastPublished(&transport, uri) orelse return error.NothingPublished;
+    try std.testing.expect(std.mem.find(u8, repaired, "nesting-limit") == null);
+}

@@ -4,6 +4,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const containsComment = @import("../../syntax/tokens.zig").containsComment;
+const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{
     .unsafe_orelse_unreachable,
@@ -13,17 +14,21 @@ pub fn run(context: RuleRun) !void {
     const level = context.level(.unsafe_orelse_unreachable);
     if (level == .off) return;
     const tree = context.tree;
+    var test_only: ?syntax_scope.TestOnlyBodies = null;
+    defer if (test_only) |*bodies| bodies.deinit(context.allocator);
     for (0..tree.nodes.len) |raw_node| {
         const node: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
         if (tree.nodeTag(node) != .@"orelse") continue;
         const subject, const fallback = tree.nodeData(node).node_and_node;
         if (tree.nodeTag(fallback) != .unreachable_literal) continue;
         const index = tree.nodeMainToken(node);
-        if (insideTestBody(context.tokens, index)) continue;
+        if (context.scopes.insideTestBlock(index) or invariantIsEstablished(context, subject, tree.lastToken(fallback))) continue;
         if (subjectSpan(context.tokens, index)) |span| {
             const subject_text = context.source[context.tokens[span.start].loc.start..context.tokens[span.end - 1].loc.end];
             if (isGuardedByNullAssertion(context, subject_text, span.start)) continue;
         }
+        if (test_only == null) test_only = try syntax_scope.testOnlyBodies(context.allocator, context.source, context.tokens);
+        if (test_only.?.contains(index)) continue;
 
         try context.emit(.{
             .rule = .unsafe_orelse_unreachable,
@@ -36,6 +41,21 @@ pub fn run(context: RuleRun) !void {
             .fixes = try unwrapFix(context, node, subject),
         });
     }
+}
+
+/// Whether the unwrap of `subject` states an established invariant: a
+/// compile-time absence is a compile error, a call with compile-time-known
+/// arguments gives the same optional on every run, and a comment can give the
+/// reason.
+fn invariantIsEstablished(context: RuleRun, subject: Ast.Node.Index, unreachable_index: usize) bool {
+    const tree = context.tree;
+    const start = tree.firstToken(subject);
+    if (context.comptimeEvaluated(start) or
+        context.explainedByComment(context.statementStart(start), unreachable_index)) return true;
+    return switch (tree.nodeTag(subject)) {
+        .call_one, .call_one_comma, .call, .call_comma => context.comptimeKnownCall(start, tree.nodeMainToken(subject)),
+        else => false,
+    };
 }
 
 /// `x orelse unreachable` spelled `x.?`, which is the same unwrap. The subject
@@ -185,39 +205,10 @@ fn assertionChecksNonNull(context: RuleRun, start: usize, end: usize, subject_te
     return false;
 }
 
-fn insideTestBody(tokens: []const std.zig.Token, index: usize) bool {
-    var nested_closing_braces: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => nested_closing_braces += 1,
-            .l_brace => {
-                if (nested_closing_braces != 0) {
-                    nested_closing_braces -= 1;
-                    continue;
-                }
-                var signature_cursor = cursor;
-                while (signature_cursor > 0) {
-                    signature_cursor -= 1;
-                    switch (tokens[signature_cursor].tag) {
-                        .keyword_test => return true,
-                        .keyword_fn, .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => return false,
-                        .semicolon, .l_brace, .r_brace => break,
-                        else => {},
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-    return false;
-}
-
 test "orelse unreachable warns only when the idiomatic rule is enabled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const source: [:0]const u8 = "const value = optional orelse unreachable;";
+    const source: [:0]const u8 = "fn get(optional: ?u32) u32 { return optional orelse unreachable; }";
     const configuration = support.only(&.{.unsafe_orelse_unreachable}, .information);
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
@@ -274,6 +265,32 @@ test "test fixtures may use orelse unreachable as an assertion" {
     const configuration = support.only(&.{.unsafe_orelse_unreachable}, .information);
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "orelse unreachable accepts compile-time evaluation, test-only helpers and stated invariants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const Kind = enum { a, b };\n" ++
+        "const first = std.meta.stringToEnum(Kind, \"a\") orelse unreachable;\n" ++
+        "fn run(items: []const u32) usize {\n" ++
+        "    const second = comptime std.mem.findScalar(u8, \"ab\", 'b') orelse unreachable;\n" ++
+        "    const third = std.meta.stringToEnum(Kind, \"b\") orelse unreachable;\n" ++
+        "    // The caller appends the sentinel.\n" ++
+        "    const fourth = std.mem.findScalar(u32, items, 0) orelse unreachable;\n" ++
+        "    return second + @intFromEnum(third) + fourth + (std.mem.findScalar(u32, items, 1) orelse unreachable);\n" ++
+        "}\n" ++
+        "fn helper(items: []const u32) usize {\n" ++
+        "    return std.mem.findScalar(u32, items, 2) orelse unreachable;\n" ++
+        "}\n" ++
+        "test \"helper\" {\n" ++
+        "    _ = helper(&.{2});\n" ++
+        "}\n";
+    const configuration = support.only(&.{.unsafe_orelse_unreachable}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(std.mem.find(u8, source, "unreachable);").?, findings[0].span.start);
 }
 
 test "orelse unreachable does not warn when preceded by assert non-null" {

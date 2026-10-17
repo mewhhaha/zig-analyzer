@@ -2,6 +2,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const rule_types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const IdentifierTable = @import("../../syntax/scope.zig").IdentifierTable;
 const container_types = @import("../container_types.zig");
 const reach = @import("reach.zig");
 
@@ -84,41 +85,68 @@ fn elementPointer(context: RuleRun, declaration: usize, declaration_end: usize) 
     };
 }
 
-/// Whether the last name of the path is a list: declared locally before
-/// `before`, or a field or parameter with a list type.
-fn pathIsList(context: RuleRun, path_end: usize, before: usize) bool {
-    const name = context.tokenText(path_end);
-    for (context.tokens, 0..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name)) continue;
+/// What the file says about each name asked about: whether a `name: Type`
+/// gives it a list type, and its first `const name` declaring a list.
+const ListNames = struct {
+    names: std.StringHashMapUnmanaged(Facts) = .empty,
+
+    const Facts = struct { typed: bool = false, first_declaration: ?usize = null };
+
+    fn deinit(lists: *ListNames, allocator: std.mem.Allocator) void {
+        lists.names.deinit(allocator);
+    }
+
+    /// Whether the last name of the path is a list: declared locally before
+    /// `before`, or a field or parameter with a list type.
+    fn pathIsList(lists: *ListNames, context: RuleRun, identifiers: *const IdentifierTable, path_end: usize, before: usize) !bool {
+        const name = context.tokenText(path_end);
+        const entry = try lists.names.getOrPut(context.allocator, name);
+        if (!entry.found_existing) entry.value_ptr.* = listFacts(context, identifiers.all(name));
+        const facts = entry.value_ptr.*;
+        const declared = if (facts.first_declaration) |index| index < before else false;
+        return facts.typed or declared;
+    }
+};
+
+/// The facts of `ListNames` for the identifiers at `positions`, in one pass.
+fn listFacts(context: RuleRun, positions: []const u32) ListNames.Facts {
+    var facts: ListNames.Facts = .{};
+    for (positions) |position| {
+        const index: usize = position;
         if (index + 2 < context.tokens.len and context.tokens[index + 1].tag == .colon) {
             const type_end = @min(index + 12, context.tokens.len);
             if (container_types.kindOfTypeStart(context.source, context.tokens, index + 2, type_end)) |kind| {
-                if (kind.hasItems()) return true;
+                if (kind.hasItems()) facts.typed = true;
             }
         }
-        if (index > 0 and index < before and
+        // A list type makes every use a list.
+        if (facts.typed) break;
+        if (facts.first_declaration == null and index > 0 and
             (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var))
         {
             const declaration_end = context.statementEnd(index - 1) orelse continue;
             if (container_types.declaredKind(context.source, context.tokens, index - 1, declaration_end)) |kind| {
-                if (kind.hasItems()) return true;
+                if (kind.hasItems()) facts.first_declaration = index;
             }
         }
     }
-    return false;
+    return facts;
 }
 
 fn findInvalidatedPointers(context: RuleRun) !void {
     const level = context.level(.invalidated_element_pointer);
     if (level == .off) return;
+    var lists: ListNames = .{};
+    defer lists.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_const and token.tag != .keyword_var) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const pointer = elementPointer(context, declaration_index, declaration_end) orelse continue;
-        if (!pointer.from_items and !pathIsList(context, pointer.path_end, declaration_index)) continue;
+        const identifiers = try context.scopes.identifiers();
+        if (!pointer.from_items and !try lists.pathIsList(context, identifiers, pointer.path_end, declaration_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
-        const invalidation = firstPathInvalidation(context, pointer, declaration_end + 1, scope_end) orelse continue;
+        const invalidation = firstPathInvalidation(context, identifiers, pointer, declaration_end + 1, scope_end) orelse continue;
         const pointer_name = context.tokenText(pointer.name_index);
         const path = context.source[context.tokens[pointer.path_start].loc.start..context.tokens[pointer.path_end].loc.end];
         try context.emit(.{
@@ -156,10 +184,21 @@ fn itemsField(context: RuleRun, start: usize, end: usize) ?usize {
 
 /// The first mutation of the pointer's list after `start` that a later use of
 /// the pointer can observe.
-fn firstPathInvalidation(context: RuleRun, pointer: ElementPointer, start: usize, end: usize) ?Mutation {
+fn firstPathInvalidation(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    pointer: ElementPointer,
+    start: usize,
+    end: usize,
+) ?Mutation {
     const pointer_name = context.tokenText(pointer.name_index);
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !samePath(context, pointer.path_start, pointer.path_end, index, end)) continue;
+    // `samePath` compares spellings, so the path can only start at an
+    // identifier spelled like its first token; a call from the pointer's
+    // last mention on leaves no use of it to reach.
+    const last = reach.lastMention(identifiers, pointer_name, start, end);
+    for (identifiers.within(context.tokenText(pointer.path_start), start, last)) |position| {
+        const index: usize = position;
+        if (!samePath(context, pointer.path_start, pointer.path_end, index, end)) continue;
         const method_index = index + (pointer.path_end - pointer.path_start) + 2;
         if (method_index + 1 >= end or context.tokens[method_index - 1].tag != .period or
             context.tokens[method_index].tag != .identifier or context.tokens[method_index + 1].tag != .l_paren) continue;
@@ -167,7 +206,7 @@ fn firstPathInvalidation(context: RuleRun, pointer: ElementPointer, start: usize
         if (!isListMutation(method)) continue;
         if (removesAfterElement(context, pointer, method_index)) continue;
         const call_end = reach.callEnd(context, method_index) orelse continue;
-        if (reach.firstReachedUse(context, pointer_name, method_index, call_end + 1, end) == null) continue;
+        if (reach.firstReachedUse(context, identifiers, pointer_name, method_index, call_end + 1, end) == null) continue;
         return .{ .index = method_index, .method = method };
     }
     return null;
@@ -191,25 +230,54 @@ fn removesAfterElement(context: RuleRun, pointer: ElementPointer, method_index: 
 fn findMutatedIteration(context: RuleRun) !void {
     const level = context.level(.iterator_invalidated_during_loop);
     if (level == .off) return;
-    for (context.tokens, 0..) |token, declaration_index| {
-        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 7 >= context.tokens.len or
-            context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal or
-            context.tokens[declaration_index + 3].tag != .identifier or context.tokens[declaration_index + 4].tag != .period or
-            !context.tokenIs(declaration_index + 5, "iterator") or context.tokens[declaration_index + 6].tag != .l_paren or
-            context.tokens[declaration_index + 7].tag != .r_paren) continue;
+    const tokens = context.tokens;
+    // Built for the first iterator: the innermost `(` open at each token and
+    // the file's `{` in order.
+    var parentheses: ?[]const u32 = null;
+    defer if (parentheses) |enclosing| context.allocator.free(enclosing);
+    var braces: std.ArrayList(u32) = .empty;
+    defer braces.deinit(context.allocator);
+    var loops: std.ArrayList(u32) = .empty;
+    defer loops.deinit(context.allocator);
+    for (tokens, 0..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 7 >= tokens.len or
+            tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal or
+            tokens[declaration_index + 3].tag != .identifier or tokens[declaration_index + 4].tag != .period or
+            !context.tokenIs(declaration_index + 5, "iterator") or tokens[declaration_index + 6].tag != .l_paren or
+            tokens[declaration_index + 7].tag != .r_paren) continue;
         const map_name = context.tokenText(declaration_index + 3);
         const iterator_name = context.tokenText(declaration_index + 1);
         const declaration_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(declaration_scope, .l_brace, .r_brace) orelse continue;
-        for (context.tokens[declaration_index + 8 .. scope_end], declaration_index + 8..) |candidate, while_index| {
-            if (candidate.tag != .keyword_while or while_index + 1 >= scope_end or context.tokens[while_index + 1].tag != .l_paren) continue;
+        const identifiers = try context.scopes.identifiers();
+        const enclosing = parentheses orelse try openParentheses(context, &braces);
+        parentheses = enclosing;
+        // The `while (` loops after the declaration whose condition calls
+        // `iterator.next(`, found as the parentheses around each call. A loop
+        // whose condition closes past `scope_end - 2` has no body in the scope.
+        loops.clearRetainingCapacity();
+        for (identifiers.within(iterator_name, declaration_index + 8, scope_end)) |position| {
+            const call: usize = position;
+            if (call + 3 >= tokens.len or tokens[call + 1].tag != .period or !context.tokenIs(call + 2, "next") or
+                tokens[call + 3].tag != .l_paren) continue;
+            var opening = enclosing[call];
+            while (opening != no_parenthesis and opening >= declaration_index + 9) : (opening = enclosing[opening]) {
+                if (tokens[opening - 1].tag != .keyword_while) continue;
+                const condition_end = context.scopes.matchingToken(opening) orelse continue;
+                if (call + 3 < condition_end) try loops.append(context.allocator, opening - 1);
+            }
+        }
+        std.mem.sort(u32, loops.items, {}, std.sort.asc(u32));
+        for (loops.items, 0..) |while_position, order| {
+            if (order > 0 and loops.items[order - 1] == while_position) continue;
+            const while_index: usize = while_position;
             const condition_end = context.matchingToken(while_index + 1, .l_paren, .r_paren) orelse continue;
-            if (!containsMethodCall(context, iterator_name, "next", while_index + 2, condition_end)) continue;
-            var body_start = condition_end + 1;
-            while (body_start < scope_end and context.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
-            if (body_start >= scope_end) continue;
+            // The first `{` after the condition.
+            const body = positionsWithin(braces.items, condition_end + 1, scope_end);
+            if (body.len == 0) continue;
+            const body_start: usize = body[0];
             const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-            const mutation = firstMapMutation(context, map_name, body_start + 1, body_end) orelse continue;
+            const mutation = firstMapMutation(context, identifiers, map_name, body_start + 1, body_end) orelse continue;
             try context.emit(.{
                 .rule = .iterator_invalidated_during_loop,
                 .level = level,
@@ -221,6 +289,27 @@ fn findMutatedIteration(context: RuleRun) !void {
             });
         }
     }
+}
+
+const no_parenthesis = std.math.maxInt(u32);
+
+/// The innermost `(` open at each token, kept by the stack that pairs
+/// parentheses in the scope index, and the positions of the file's `{`.
+fn openParentheses(context: RuleRun, braces: *std.ArrayList(u32)) ![]const u32 {
+    const enclosing = try context.allocator.alloc(u32, context.tokens.len);
+    errdefer context.allocator.free(enclosing);
+    var open: std.ArrayList(u32) = .empty;
+    defer open.deinit(context.allocator);
+    for (context.tokens, 0..) |token, index| {
+        switch (token.tag) {
+            .r_paren => _ = open.pop(),
+            .l_brace => try braces.append(context.allocator, @intCast(index)),
+            else => {},
+        }
+        enclosing[index] = open.last() orelse no_parenthesis;
+        if (token.tag == .l_paren) try open.append(context.allocator, @intCast(index));
+    }
+    return enclosing;
 }
 
 /// `for (list.items) |x| try list.append(..)`: the loop walks a slice or key
@@ -301,15 +390,15 @@ fn firstViewMutation(context: RuleRun, view: IteratedView, start: usize, end: us
 
 const Mutation = struct { index: usize, method: []const u8 };
 
-fn firstMapMutation(context: RuleRun, name: []const u8, start: usize, end: usize) ?Mutation {
+fn firstMapMutation(context: RuleRun, identifiers: *const IdentifierTable, name: []const u8, start: usize, end: usize) ?Mutation {
     const methods = [_][]const u8{
         "put",        "putNoClobber",  "fetchPut",        "getOrPut",           "remove",       "fetchRemove",
         "swapRemove", "orderedRemove", "fetchSwapRemove", "fetchOrderedRemove", "clearAndFree", "clearRetainingCapacity",
         "rehash",
     };
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or index + 3 >= end or
-            context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
+    for (identifiers.within(name, start, end)) |position| {
+        const index: usize = position;
+        if (index + 3 >= end or context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
             context.tokens[index + 3].tag != .l_paren) continue;
         const method = context.tokenText(index + 2);
         var mutates = false;
@@ -342,25 +431,24 @@ fn mutationExitsLoop(context: RuleRun, mutation_index: usize, body_end: usize) b
     return false;
 }
 
-fn containsMethodCall(context: RuleRun, receiver: []const u8, method: []const u8, start: usize, end: usize) bool {
-    var index = start;
-    while (index + 3 < end) : (index += 1) {
-        if (context.tokenIs(index, receiver) and context.tokens[index + 1].tag == .period and
-            context.tokenIs(index + 2, method) and context.tokens[index + 3].tag == .l_paren) return true;
-    }
-    return false;
-}
-
 fn findInvalidatedMapEntryPointers(context: RuleRun) !void {
     const level = context.level(.invalidated_element_pointer);
     if (level == .off) return;
+    var lookups: std.ArrayList(u32) = .empty;
+    defer lookups.deinit(context.allocator);
+    for (0..context.tokens.len) |index| {
+        if (mapLookup(context, index)) try lookups.append(context.allocator, @intCast(index));
+    }
+    if (lookups.items.len == 0) return;
+    var aliases: PathAliases = .{};
+    defer aliases.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 6 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
             (context.tokens[declaration_index + 2].tag != .equal and context.tokens[declaration_index + 2].tag != .colon)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const initializer = container_types.initializerStart(context.tokens, declaration_index, declaration_end) orelse continue;
-        const lookup_index = mapLookupInRange(context, initializer, declaration_end) orelse continue;
+        const lookup_index = mapLookupInRange(lookups.items, initializer, declaration_end) orelse continue;
         const path_end = lookup_index - 2;
         const path_start = receiverPathStart(context, path_end, initializer);
         // The lookup must be the initializer itself, not a call buried in a block or switch.
@@ -369,7 +457,8 @@ fn findInvalidatedMapEntryPointers(context: RuleRun) !void {
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const pointer_name = context.tokenText(declaration_index + 1);
         const key = firstArgumentText(context, lookup_index + 1);
-        const mutation = mapPathMutation(context, path_start, path_end, pointer_name, key, declaration_end + 1, scope_end) orelse continue;
+        const identifiers = try context.scopes.identifiers();
+        const mutation = try mapPathMutation(context, identifiers, &aliases, path_start, path_end, pointer_name, key, declaration_end + 1, scope_end) orelse continue;
         const path = context.source[context.tokens[path_start].loc.start..context.tokens[path_end].loc.end];
         try context.emit(.{
             .rule = .invalidated_element_pointer,
@@ -386,17 +475,21 @@ fn findInvalidatedMapEntryPointers(context: RuleRun) !void {
 fn findStaleIndexMaps(context: RuleRun) !void {
     const level = context.level(.stale_index_map);
     if (level == .off) return;
+    var type_bodies: TypeBodies = .{};
+    defer type_bodies.deinit(context.allocator);
     for (context.tokens, 0..) |token, removal_index| {
         if (token.tag != .identifier or (!context.tokenIs(removal_index, "swapRemove") and
             !context.tokenIs(removal_index, "orderedRemove"))) continue;
         const sequence_field = selfFieldBeforeMethod(context, removal_index) orelse continue;
-        const function_body = functionBodyContaining(context, removal_index) orelse continue;
+        const function_body = context.scopes.functionBodyContaining(removal_index) orelse continue;
         const type_body = context.enclosingOpeningBrace(function_body) orelse continue;
         const type_end = context.matchingToken(type_body, .l_brace, .r_brace) orelse continue;
-        if (!fieldIsList(context, sequence_field, type_body + 1, type_end)) continue;
+        const identifiers = try context.scopes.identifiers();
+        const sequence = try type_bodies.sequence(context, identifiers, type_body, type_end, sequence_field);
+        if (!sequence.list) continue;
         const function_end = context.matchingToken(function_body, .l_brace, .r_brace) orelse continue;
-        if (indexMapField(context, sequence_field, type_body + 1, type_end)) |index_field| {
-            if (pathMutated(context, index_field, removal_index + 1, function_end)) continue;
+        if (sequence.index_field) |index_field| {
+            if (pathMutated(context, identifiers, index_field, removal_index + 1, function_end)) continue;
             try context.emit(.{
                 .rule = .stale_index_map,
                 .level = level,
@@ -409,7 +502,10 @@ fn findStaleIndexMaps(context: RuleRun) !void {
             continue;
         }
         if (!context.tokenIs(removal_index, "orderedRemove")) continue;
-        const reference_field = sequenceIndexElementField(context, sequence_field, type_body + 1, type_end) orelse continue;
+        if (sequence.reference_field == null) {
+            sequence.reference_field = sequenceIndexElementField(context, identifiers, sequence_field, type_body + 1, type_end);
+        }
+        const reference_field = sequence.reference_field.? orelse continue;
         const removed_index = singleIdentifierArgument(context, removal_index) orelse continue;
         if (selfReferencesRepaired(
             context,
@@ -430,29 +526,20 @@ fn findStaleIndexMaps(context: RuleRun) !void {
     }
 }
 
-fn mapLookupInRange(context: RuleRun, start: usize, end: usize) ?usize {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and (context.tokenIs(index, "getEntry") or context.tokenIs(index, "getPtr") or
-            context.tokenIs(index, "getOrPut")) and
-            index > start and context.tokens[index - 1].tag == .period and index + 1 < end and
-            context.tokens[index + 1].tag == .l_paren) return index;
-    }
-    return null;
+/// The first of the file's sorted `lookups` with `start < index` and
+/// `index + 1 < end`.
+fn mapLookupInRange(lookups: []const u32, start: usize, end: usize) ?usize {
+    const later = positionsWithin(lookups, start + 1, end);
+    if (later.len == 0 or later[0] + 1 >= end) return null;
+    return later[0];
 }
 
-fn functionBodyContaining(context: RuleRun, target_index: usize) ?usize {
-    var selected: ?usize = null;
-    for (context.tokens[0..target_index], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn) continue;
-        var body_start = function_index + 1;
-        while (body_start < target_index and context.tokens[body_start].tag != .l_brace and
-            context.tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start >= target_index or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (target_index < body_end) selected = body_start;
-    }
-    return selected;
+/// Whether `.getEntry(`, `.getPtr(` or `.getOrPut(` is called at `index`.
+fn mapLookup(context: RuleRun, index: usize) bool {
+    const tokens = context.tokens;
+    return tokens[index].tag == .identifier and (context.tokenIs(index, "getEntry") or context.tokenIs(index, "getPtr") or
+        context.tokenIs(index, "getOrPut")) and
+        index > 0 and tokens[index - 1].tag == .period and index + 1 < tokens.len and tokens[index + 1].tag == .l_paren;
 }
 
 fn receiverPathStart(context: RuleRun, path_end: usize, lower_bound: usize) usize {
@@ -464,27 +551,34 @@ fn receiverPathStart(context: RuleRun, path_end: usize, lower_bound: usize) usiz
 
 fn mapPathMutation(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
+    aliases: *PathAliases,
     path_start: usize,
     path_end: usize,
     pointer_name: []const u8,
     key: []const u8,
     start: usize,
     end: usize,
-) ?Mutation {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !samePath(context, path_start, path_end, index, end)) continue;
+) !?Mutation {
+    // `samePath` compares spellings, so the path can only start at an
+    // identifier spelled like its first token; a call from the pointer's
+    // last mention on leaves no use of it to reach.
+    const last = reach.lastMention(identifiers, pointer_name, start, end);
+    for (identifiers.within(context.tokenText(path_start), start, last)) |position| {
+        const index: usize = position;
+        if (!samePath(context, path_start, path_end, index, end)) continue;
         const method_index = index + (path_end - path_start) + 2;
         if (method_index + 1 >= end or context.tokens[method_index - 1].tag != .period or
             context.tokens[method_index + 1].tag != .l_paren) continue;
-        if (entryMutation(context, method_index, pointer_name, key, end)) |mutation| return mutation;
+        if (entryMutation(context, identifiers, method_index, pointer_name, key, end)) |mutation| return mutation;
     }
     if (path_start == path_end) {
-        const alias = pointerAliasForPath(context, context.tokenText(path_start), start, end) orelse return null;
-        for (context.tokens[start..end], start..) |token, index| {
-            if (token.tag != .identifier or !context.tokenIs(index, alias) or index + 3 >= end or
-                context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
+        const alias = try pointerAliasForPath(context, identifiers, aliases, path_start, start, end) orelse return null;
+        for (identifiers.within(alias, start, last)) |position| {
+            const index: usize = position;
+            if (index + 3 >= end or context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
                 context.tokens[index + 3].tag != .l_paren) continue;
-            if (entryMutation(context, index + 2, pointer_name, key, end)) |mutation| return mutation;
+            if (entryMutation(context, identifiers, index + 2, pointer_name, key, end)) |mutation| return mutation;
         }
     }
     return null;
@@ -493,13 +587,20 @@ fn mapPathMutation(
 /// The mutation at `method_index` when it can invalidate the entry pointer and
 /// a later use observes it. `remove` and `fetchRemove` of another key keep the
 /// entry in place.
-fn entryMutation(context: RuleRun, method_index: usize, pointer_name: []const u8, key: []const u8, end: usize) ?Mutation {
+fn entryMutation(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    method_index: usize,
+    pointer_name: []const u8,
+    key: []const u8,
+    end: usize,
+) ?Mutation {
     const method = context.tokenText(method_index);
     if (!isMapMutation(method)) return null;
     if ((std.mem.eql(u8, method, "remove") or std.mem.eql(u8, method, "fetchRemove")) and
         !std.mem.eql(u8, firstArgumentText(context, method_index + 1), key)) return null;
     const call_end = reach.callEnd(context, method_index) orelse return null;
-    if (reach.firstReachedUse(context, pointer_name, method_index, call_end + 1, end) == null) return null;
+    if (reach.firstReachedUse(context, identifiers, pointer_name, method_index, call_end + 1, end) == null) return null;
     return .{ .index = method_index, .method = method };
 }
 
@@ -521,14 +622,60 @@ fn firstArgumentText(context: RuleRun, open: usize) []const u8 {
     return context.source[context.tokens[open + 1].loc.start..context.tokens[argument_end - 1].loc.end];
 }
 
-fn pointerAliasForPath(context: RuleRun, path: []const u8, start: usize, end: usize) ?[]const u8 {
-    for (context.tokens[start..end], start..) |token, declaration_index| {
-        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 4 >= end or
-            context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal or
-            context.tokens[declaration_index + 3].tag != .ampersand or !context.tokenIs(declaration_index + 4, path)) continue;
-        return context.tokenText(declaration_index + 1);
+/// The first `const alias = &path` in `[start, end)` for the one-token path
+/// at `path_index`.
+fn pointerAliasForPath(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    aliases: *PathAliases,
+    path_index: usize,
+    start: usize,
+    end: usize,
+) !?[]const u8 {
+    const path = context.tokenText(path_index);
+    // Only identifiers are spelled like an identifier.
+    if (context.tokens[path_index].tag == .identifier) {
+        const later = positionsWithin(try aliases.of(context, identifiers, path), start, end);
+        if (later.len == 0 or later[0] + 4 >= end) return null;
+        return context.tokenText(later[0] + 1);
+    }
+    for (start..end) |declaration_index| {
+        if (declaration_index + 4 < end and aliasDeclaration(context, declaration_index, path)) {
+            return context.tokenText(declaration_index + 1);
+        }
     }
     return null;
+}
+
+/// The `const alias = &name` declarations of each name asked about, in order.
+const PathAliases = struct {
+    names: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+
+    fn deinit(aliases: *PathAliases, allocator: std.mem.Allocator) void {
+        var lists = aliases.names.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        aliases.names.deinit(allocator);
+    }
+
+    fn of(aliases: *PathAliases, context: RuleRun, identifiers: *const IdentifierTable, name: []const u8) ![]const u32 {
+        const entry = try aliases.names.getOrPut(context.allocator, name);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+            for (identifiers.all(name)) |position| {
+                if (position >= 4 and aliasDeclaration(context, position - 4, name)) {
+                    try entry.value_ptr.append(context.allocator, position - 4);
+                }
+            }
+        }
+        return entry.value_ptr.items;
+    }
+};
+
+fn aliasDeclaration(context: RuleRun, declaration_index: usize, path: []const u8) bool {
+    const tokens = context.tokens;
+    return (tokens[declaration_index].tag == .keyword_const or tokens[declaration_index].tag == .keyword_var) and
+        tokens[declaration_index + 1].tag == .identifier and tokens[declaration_index + 2].tag == .equal and
+        tokens[declaration_index + 3].tag == .ampersand and context.tokenIs(declaration_index + 4, path);
 }
 
 fn samePath(context: RuleRun, expected_start: usize, expected_end: usize, candidate_start: usize, end: usize) bool {
@@ -549,10 +696,10 @@ fn selfFieldBeforeMethod(context: RuleRun, method_index: usize) ?[]const u8 {
     return context.tokenText(method_index - 2);
 }
 
-fn fieldIsList(context: RuleRun, field: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, field_index| {
-        if (token.tag != .identifier or !context.tokenIs(field_index, field) or field_index + 2 >= end or
-            context.tokens[field_index + 1].tag != .colon) continue;
+fn fieldIsList(context: RuleRun, identifiers: *const IdentifierTable, field: []const u8, start: usize, end: usize) bool {
+    for (identifiers.within(field, start, end)) |position| {
+        const field_index: usize = position;
+        if (field_index + 2 >= end or context.tokens[field_index + 1].tag != .colon) continue;
         const field_end = fieldTypeEnd(context.tokens, field_index + 2, end);
         if (container_types.firstKindIn(context.source, context.tokens, field_index + 2, field_end)) |kind| {
             if (kind.hasItems()) return true;
@@ -561,37 +708,104 @@ fn fieldIsList(context: RuleRun, field: []const u8, start: usize, end: usize) bo
     return false;
 }
 
-fn indexMapField(context: RuleRun, sequence_field: []const u8, start: usize, end: usize) ?[]const u8 {
-    for (context.tokens[start..end], start..) |token, field_index| {
-        if (token.tag != .identifier or field_index + 2 >= end or context.tokens[field_index + 1].tag != .colon) continue;
-        const field_end = fieldTypeEnd(context.tokens, field_index + 2, end);
-        var saw_map = false;
-        var saw_usize = false;
-        for (context.tokens[field_index + 2 .. field_end], field_index + 2..) |type_token, index| {
-            if (type_token.tag != .identifier) continue;
-            const name = context.tokenText(index);
-            if (std.mem.find(u8, name, "HashMap") != null) saw_map = true;
-            if (std.mem.eql(u8, name, "usize")) saw_usize = true;
-        }
-        if (saw_map and saw_usize) {
-            const map_field = context.tokenText(field_index);
-            if (mapStoresSequenceIndex(context, map_field, sequence_field, start, end)) return map_field;
-        }
+/// The first of the type's `map_fields` that stores `sequence_field` indices.
+fn indexMapField(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    map_fields: []const u32,
+    sequence_field: []const u8,
+    start: usize,
+    end: usize,
+) ?[]const u8 {
+    for (map_fields) |field_index| {
+        const map_field = context.tokenText(field_index);
+        if (mapStoresSequenceIndex(context, identifiers, map_field, sequence_field, start, end)) return map_field;
     }
     return null;
 }
 
+/// What each type body asked about says about the sequence fields asked
+/// about, each fact found once: its `name: ...HashMap...usize...`
+/// declarations in order and, per sequence field, whether it is a list, the
+/// index map storing its indices and the element field storing them.
+const TypeBodies = struct {
+    bodies: std.AutoHashMapUnmanaged(u32, Body) = .empty,
+
+    const Body = struct {
+        map_fields: std.ArrayList(u32) = .empty,
+        sequences: std.StringHashMapUnmanaged(Sequence) = .empty,
+    };
+
+    const Sequence = struct {
+        list: bool,
+        index_field: ?[]const u8,
+        /// Null until an `orderedRemove` asks for it.
+        reference_field: ??[]const u8 = null,
+    };
+
+    fn deinit(type_bodies: *TypeBodies, allocator: std.mem.Allocator) void {
+        var bodies = type_bodies.bodies.valueIterator();
+        while (bodies.next()) |body| {
+            body.map_fields.deinit(allocator);
+            body.sequences.deinit(allocator);
+        }
+        type_bodies.bodies.deinit(allocator);
+    }
+
+    /// The facts of `field` in the type body `{` at `type_body`, valid until
+    /// the next call.
+    fn sequence(
+        type_bodies: *TypeBodies,
+        context: RuleRun,
+        identifiers: *const IdentifierTable,
+        type_body: usize,
+        type_end: usize,
+        field: []const u8,
+    ) !*Sequence {
+        const allocator = context.allocator;
+        const body_entry = try type_bodies.bodies.getOrPut(allocator, @intCast(type_body));
+        const body = body_entry.value_ptr;
+        if (!body_entry.found_existing) {
+            body.* = .{};
+            for (context.tokens[type_body + 1 .. type_end], type_body + 1..) |token, field_index| {
+                if (token.tag != .identifier or field_index + 2 >= type_end or context.tokens[field_index + 1].tag != .colon) continue;
+                const field_end = fieldTypeEnd(context.tokens, field_index + 2, type_end);
+                var saw_map = false;
+                var saw_usize = false;
+                for (context.tokens[field_index + 2 .. field_end], field_index + 2..) |type_token, index| {
+                    if (type_token.tag != .identifier) continue;
+                    const name = context.tokenText(index);
+                    if (std.mem.find(u8, name, "HashMap") != null) saw_map = true;
+                    if (std.mem.eql(u8, name, "usize")) saw_usize = true;
+                }
+                if (saw_map and saw_usize) try body.map_fields.append(allocator, @intCast(field_index));
+            }
+        }
+        const entry = try body.sequences.getOrPut(allocator, field);
+        if (!entry.found_existing) {
+            const list = fieldIsList(context, identifiers, field, type_body + 1, type_end);
+            entry.value_ptr.* = .{
+                .list = list,
+                .index_field = if (list) indexMapField(context, identifiers, body.map_fields.items, field, type_body + 1, type_end) else null,
+            };
+        }
+        return entry.value_ptr;
+    }
+};
+
 fn mapStoresSequenceIndex(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     map_field: []const u8,
     sequence_field: []const u8,
     start: usize,
     end: usize,
 ) bool {
-    var index = start;
-    while (index + 5 < end) : (index += 1) {
-        if (!context.tokenIs(index, "self") or context.tokens[index + 1].tag != .period or
-            !context.tokenIs(index + 2, map_field) or context.tokens[index + 3].tag != .period or
+    // `self.map_field.put(`, found from the field name.
+    for (identifiers.within(map_field, start + 2, end)) |position| {
+        const index: usize = position - 2;
+        if (index + 5 >= end or !context.tokenIs(index, "self") or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 3].tag != .period or
             (!context.tokenIs(index + 4, "put") and !context.tokenIs(index + 4, "putNoClobber")) or
             context.tokens[index + 5].tag != .l_paren) continue;
         const call_end = context.matchingToken(index + 5, .l_paren, .r_paren) orelse continue;
@@ -621,23 +835,29 @@ fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize, end: usize) usize {
     return end;
 }
 
-fn pathMutated(context: RuleRun, field: []const u8, start: usize, end: usize) bool {
+fn pathMutated(context: RuleRun, identifiers: *const IdentifierTable, field: []const u8, start: usize, end: usize) bool {
     const methods = [_][]const u8{ "put", "putNoClobber", "fetchPut", "getOrPut", "clearRetainingCapacity", "clearAndFree" };
-    var index = start;
-    while (index + 5 < end) : (index += 1) {
-        if (!context.tokenIs(index, "self") or context.tokens[index + 1].tag != .period or
-            !context.tokenIs(index + 2, field) or context.tokens[index + 3].tag != .period or
+    for (identifiers.within(field, start + 2, end)) |position| {
+        const index: usize = position - 2;
+        if (index + 5 >= end or !context.tokenIs(index, "self") or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 3].tag != .period or
             context.tokens[index + 4].tag != .identifier or context.tokens[index + 5].tag != .l_paren) continue;
         for (methods) |method| if (context.tokenIs(index + 4, method)) return true;
     }
     return false;
 }
 
-fn sequenceIndexElementField(context: RuleRun, sequence_field: []const u8, start: usize, end: usize) ?[]const u8 {
-    var self_index = start;
-    while (self_index + 5 < end) : (self_index += 1) {
-        if (!context.tokenIs(self_index, "self") or context.tokens[self_index + 1].tag != .period or
-            !context.tokenIs(self_index + 2, sequence_field) or context.tokens[self_index + 3].tag != .period or
+fn sequenceIndexElementField(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    sequence_field: []const u8,
+    start: usize,
+    end: usize,
+) ?[]const u8 {
+    for (identifiers.within(sequence_field, start + 2, end)) |position| {
+        const self_index: usize = position - 2;
+        if (self_index + 5 >= end or !context.tokenIs(self_index, "self") or context.tokens[self_index + 1].tag != .period or
+            context.tokens[self_index + 3].tag != .period or
             !context.tokenIs(self_index + 4, "items") or context.tokens[self_index + 5].tag != .l_bracket) continue;
         const bracket_end = context.matchingToken(self_index + 5, .l_bracket, .r_bracket) orelse continue;
         if (bracket_end + 5 >= end or context.tokens[bracket_end + 1].tag != .period or
@@ -679,7 +899,7 @@ fn valueHasSequenceBound(
     sequence_field: []const u8,
     before: usize,
 ) bool {
-    const function_body = functionBodyContaining(context, before) orelse return false;
+    const function_body = context.scopes.functionBodyContaining(before) orelse return false;
     for (context.tokens[function_body + 1 .. before], function_body + 1..) |token, if_index| {
         if (token.tag != .keyword_if or if_index + 1 >= before or context.tokens[if_index + 1].tag != .l_paren) continue;
         const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
@@ -812,6 +1032,17 @@ fn decrementsReference(context: RuleRun, start: usize, end: usize) bool {
             context.tokens[index + 1].tag == .number_literal and context.tokenIs(index + 1, "1")) return true;
     }
     return false;
+}
+
+/// The positions in `[start, end)` of a sorted list.
+fn positionsWithin(positions: []const u32, start: usize, end: usize) []const u32 {
+    const first = std.sort.partitionPoint(u32, positions, start, positionBefore);
+    const last = first + std.sort.partitionPoint(u32, positions[first..], end, positionBefore);
+    return positions[first..last];
+}
+
+fn positionBefore(bound: usize, position: u32) bool {
+    return position < bound;
 }
 
 test "element pointers and active map iterators are invalidated by mutation" {
@@ -1108,4 +1339,20 @@ test "deferred mutations and lookups buried in larger expressions do not report"
 
 test "const pointer parameter types are not declarations" {
     try expectInvalidations("fn f(self: *const Page, y: usize) *Row { assert(y < 3); return &self.rows.ptr(self.m)[y]; }", 0);
+}
+
+test "each removal in a type with an index map reports" {
+    try expectInvalidations("const R = struct { rows: std.ArrayList(Row), by_name: std.StringHashMapUnmanaged(usize), " ++
+        "fn add(self: *R, name: []const u8) !void { try self.by_name.put(name, self.rows.items.len); } " ++
+        "fn a(self: *R, i: usize) void { _ = self.rows.swapRemove(i); } fn b(self: *R, i: usize) void { _ = self.rows.orderedRemove(i); } };", 2);
+}
+
+test "every loop driven by the iterator is checked" {
+    try expectInvalidations("fn f() !void { var m = std.AutoHashMap(u8, u8).init(a); var it = m.iterator(); " ++
+        "while (it.next()) |_| { try m.put(1, 2); } while (it.next()) |_| { _ = m.remove(1); } }", 2);
+}
+
+test "addOne pointers are tracked into list parameters only" {
+    try expectInvalidations("fn f(l: *std.ArrayList(u8), g: A) !void { const p = try l.addOne(g); try l.append(g, 1); p.* = 1; }", 1);
+    try expectInvalidations("fn f(l: *Other, g: A) !void { const p = try l.addOne(g); try l.append(g, 1); p.* = 1; }", 0);
 }

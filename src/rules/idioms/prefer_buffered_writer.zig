@@ -4,6 +4,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const findTag = @import("../../syntax/tokens.zig").findTag;
+const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{.prefer_buffered_writer};
 
@@ -18,7 +19,7 @@ pub fn run(context: RuleRun) !void {
             if (body_token.tag != .identifier or (!context.tokenIs(index, "write") and !context.tokenIs(index, "writeAll") and !context.tokenIs(index, "print")) or
                 index < 2 or context.tokens[index - 1].tag != .period or context.tokens[index - 2].tag != .identifier) continue;
             const writer = context.tokenText(index - 2);
-            if (!bindingComesFromDirectWriter(context, loop_index, writer)) continue;
+            if (!bindingComesFromDirectWriter(context, loop_index, index - 2)) continue;
             try context.emit(.{
                 .rule = .prefer_buffered_writer,
                 .level = level,
@@ -30,34 +31,45 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
-fn bindingComesFromDirectWriter(context: RuleRun, before: usize, name: []const u8) bool {
-    var index: usize = 0;
-    while (index + 5 < before) : (index += 1) {
-        if ((context.tokens[index].tag != .keyword_const and context.tokens[index].tag != .keyword_var) or
-            !context.tokenIs(index + 1, name)) continue;
-        const end = context.statementEnd(index) orelse continue;
-        const declaration = context.source[context.tokens[index].loc.start..context.tokens[end].loc.end];
-        if (std.mem.find(u8, declaration, "stdout()") != null) return true;
-        const writer_call = std.mem.find(u8, declaration, ".writer(") orelse continue;
-        const receiver_start = std.mem.findLastAny(u8, declaration[0..writer_call], " =") orelse continue;
-        const receiver = std.mem.trim(u8, declaration[receiver_start + 1 .. writer_call], " \t\r\n");
-        if (bindingComesFromFileOpen(context, index, receiver)) return true;
-    }
-    return false;
+/// Whether the writer named at `use_index` is declared before the loop at
+/// `before` from `stdout()`, or from `.writer()` on an opened, created or
+/// accepted file.
+fn bindingComesFromDirectWriter(context: RuleRun, before: usize, use_index: usize) bool {
+    const declaration = localDeclaration(context, context.scopes.findBinding(use_index)) orelse return false;
+    if (declaration.keyword >= before) return false;
+    if (std.mem.find(u8, declaration.text, "stdout()") != null) return true;
+    const writer_call = std.mem.find(u8, declaration.text, ".writer(") orelse return false;
+    const receiver_start = std.mem.findLastAny(u8, declaration.text[0..writer_call], " =") orelse return false;
+    const receiver = std.mem.trim(u8, declaration.text[receiver_start + 1 .. writer_call], " \t\r\n");
+    const file = localDeclaration(context, context.scopes.findBindingNamed(receiver, declaration.keyword)) orelse return false;
+    return std.mem.find(u8, file.text, ".openFile(") != null or
+        std.mem.find(u8, file.text, ".createFile(") != null or
+        std.mem.find(u8, file.text, ".accept(") != null;
 }
 
-fn bindingComesFromFileOpen(context: RuleRun, before: usize, name: []const u8) bool {
-    var index: usize = 0;
-    while (index + 4 < before) : (index += 1) {
-        if ((context.tokens[index].tag != .keyword_const and context.tokens[index].tag != .keyword_var) or
-            !context.tokenIs(index + 1, name)) continue;
-        const end = context.statementEnd(index) orelse continue;
-        const declaration = context.source[context.tokens[index].loc.start..context.tokens[end].loc.end];
-        return std.mem.find(u8, declaration, ".openFile(") != null or
-            std.mem.find(u8, declaration, ".createFile(") != null or
-            std.mem.find(u8, declaration, ".accept(") != null;
-    }
-    return false;
+const LocalDeclaration = struct { keyword: usize, text: []const u8 };
+
+/// The source of the `const` or `var` statement that declares `binding`.
+fn localDeclaration(context: RuleRun, binding: ?syntax_scope.Binding) ?LocalDeclaration {
+    const name_index = (binding orelse return null).token_index;
+    if (name_index == 0 or (context.tokens[name_index - 1].tag != .keyword_const and
+        context.tokens[name_index - 1].tag != .keyword_var)) return null;
+    const end = context.statementEnd(name_index - 1) orelse return null;
+    return .{
+        .keyword = name_index - 1,
+        .text = context.source[context.tokens[name_index - 1].loc.start..context.tokens[end].loc.end],
+    };
+}
+
+test "writers declared in another function or from a buffered source stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn open() !void { const writer = std.fs.File.stdout().writer(); _ = writer; }\n" ++
+        "fn f(values: anytype, writer: anytype) !void { for (values) |value| { try writer.print(\"{}\", .{value}); } }\n" ++
+        "fn g(values: anytype, buffered: anytype) !void { const writer = buffered.writer(); for (values) |value| { try writer.write(value); } }";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_buffered_writer}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "unbuffered writes in a loop report" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const tokens_module = @import("../../syntax/tokens.zig");
 
 pub const rules = [_]types.Rule{
     .prefer_expression_initializer,
@@ -33,7 +34,7 @@ pub fn run(context: RuleRun) !void {
         };
 
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse context.tokens.len;
-        if (bindingMutatedAfter(context, expr_info.end + 1, scope_end, name)) continue;
+        if (context.bindingMutatedAfter(expr_info.end + 1, scope_end, name)) continue;
 
         try context.emit(.{
             .rule = .prefer_expression_initializer,
@@ -43,8 +44,135 @@ pub fn run(context: RuleRun) !void {
                 "'{s}' starts undefined and every {s} branch assigns it; initialize a const from the {s} expression",
                 .{ name, expr_info.name, expr_info.name },
             ),
+            .fixes = try initializerFix(context, declaration_index, initializer, expression_index, expr_info.end, scope_end),
         });
     }
+}
+
+/// `const x: T = if (c) a else b;`, or the `switch` with one value per prong,
+/// in place of the undefined declaration and the statement assigning it. The
+/// branches only assign `x`, no condition reads it and nothing mutates it
+/// later, so `const` holds and each value keeps `T` as its result type.
+/// Declined without a type annotation, for text that spans lines or holds a
+/// comment, and when a later method call through `x` may need it mutable.
+fn initializerFix(
+    context: RuleRun,
+    declaration_index: usize,
+    initializer: usize,
+    statement: usize,
+    statement_end: usize,
+    scope_end: usize,
+) ![]const types.Fix {
+    const tokens = context.tokens;
+    const name = context.tokenText(declaration_index + 1);
+    if (declaration_index == 0 or tokens[declaration_index + 2].tag != .colon or
+        methodCalledAfter(context, statement_end + 1, scope_end, name)) return &.{};
+    switch (tokens[declaration_index - 1].tag) {
+        .semicolon, .l_brace, .r_brace => {},
+        else => return &.{},
+    }
+    const span: std.zig.Token.Loc = .{ .start = tokens[declaration_index].loc.start, .end = tokens[statement_end].loc.end };
+    if (tokens_module.containsComment(context.source[span.start..span.end])) return &.{};
+
+    var text: std.Io.Writer.Allocating = .init(context.allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+    try writer.print("const {s} = ", .{context.source[tokens[declaration_index + 1].loc.start..tokens[initializer - 1].loc.end]});
+    const written = if (tokens[statement].tag == .keyword_if)
+        try writeIfValue(context, writer, statement)
+    else
+        try writeSwitchValue(context, writer, statement, tokens_module.lineIndentation(context.source, span.start));
+    if (!written) return &.{};
+    try writer.writeByte(';');
+    return context.singleFix(.{
+        .title = "Initialize a const from the expression",
+        .span = span,
+        .replacement = try text.toOwnedSlice(),
+        .preferred = true,
+    });
+}
+
+/// Writes `if (c) a else if (d) b else c` for an `if` chain whose every block
+/// only assigns one value.
+fn writeIfValue(context: RuleRun, writer: *std.Io.Writer, if_index: usize) !bool {
+    var cursor = if_index;
+    while (true) {
+        const condition_end = context.matchingToken(cursor + 1, .l_paren, .r_paren) orelse return false;
+        const then_end = context.matchingToken(condition_end + 1, .l_brace, .r_brace) orelse return false;
+        try writer.print("if {s} {s} else ", .{
+            singleLine(context, cursor + 1, condition_end) orelse return false,
+            assignedValue(context, condition_end + 1, then_end) orelse return false,
+        });
+        const else_target = then_end + 2;
+        if (context.tokens[else_target].tag == .keyword_if) {
+            cursor = else_target;
+            continue;
+        }
+        const else_end = context.matchingToken(else_target, .l_brace, .r_brace) orelse return false;
+        try writer.writeAll(assignedValue(context, else_target, else_end) orelse return false);
+        return true;
+    }
+}
+
+/// Writes the `switch` with each prong's block replaced by its value, one
+/// prong per line as `zig fmt` lays out every switch.
+fn writeSwitchValue(context: RuleRun, writer: *std.Io.Writer, switch_index: usize, indentation: []const u8) !bool {
+    const operand_end = context.matchingToken(switch_index + 1, .l_paren, .r_paren) orelse return false;
+    const opening = operand_end + 1;
+    const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse return false;
+    try writer.print("switch {s} {{\n", .{singleLine(context, switch_index + 1, operand_end) orelse return false});
+    var cursor = opening + 1;
+    while (cursor < closing) {
+        const arrow = topLevelArrow(context.tokens, cursor, closing) orelse return false;
+        const body_end = context.matchingToken(arrow + 1, .l_brace, .r_brace) orelse return false;
+        try writer.print("{s}    {s} => {s},\n", .{
+            indentation,
+            singleLine(context, cursor, arrow - 1) orelse return false,
+            assignedValue(context, arrow + 1, body_end) orelse return false,
+        });
+        cursor = body_end + 2;
+    }
+    try writer.print("{s}}}", .{indentation});
+    return true;
+}
+
+/// The value of the block `{ x = value; }` from `opening` to `closing`, when
+/// it fits on one line and holds no nested `if` or loop whose `else` could
+/// regroup inside the new expression.
+fn assignedValue(context: RuleRun, opening: usize, closing: usize) ?[]const u8 {
+    for (context.tokens[opening + 3 .. closing - 1]) |token| switch (token.tag) {
+        .keyword_if, .keyword_while, .keyword_for => return null,
+        else => {},
+    };
+    return singleLine(context, opening + 3, closing - 2);
+}
+
+/// Source of the tokens `[first, last]` when it fits on one line.
+fn singleLine(context: RuleRun, first: usize, last: usize) ?[]const u8 {
+    const text = context.source[context.tokens[first].loc.start..context.tokens[last].loc.end];
+    return if (std.mem.findScalar(u8, text, '\n') == null) text else null;
+}
+
+/// Whether a reference to `name` in `[start, end)` calls a method through it
+/// (`x.append(...)`, `x.inner.reset()`), which may take a pointer to a `var`.
+fn methodCalledAfter(context: RuleRun, start: usize, end: usize, name: []const u8) bool {
+    const tokens = context.tokens;
+    for (start..@min(end, tokens.len)) |index| {
+        if (!context.refersToBinding(index, name)) continue;
+        var cursor = index + 1;
+        var member = false;
+        while (cursor + 1 < tokens.len) switch (tokens[cursor].tag) {
+            .period => {
+                if (tokens[cursor + 1].tag != .identifier) break;
+                member = true;
+                cursor += 2;
+            },
+            .l_bracket => cursor = (context.matchingToken(cursor, .l_bracket, .r_bracket) orelse break) + 1,
+            else => break,
+        };
+        if (member and tokens[cursor].tag == .l_paren) return true;
+    }
+    return false;
 }
 
 fn undefinedInitializer(context: RuleRun, start: usize, end: usize) ?usize {
@@ -98,47 +226,6 @@ fn switchAssignsEveryProng(context: RuleRun, switch_index: usize, name: []const 
     }
     if (prong_count >= 2) return closing;
     return null;
-}
-
-fn bindingMutatedAfter(context: RuleRun, start: usize, end: usize, name: []const u8) bool {
-    var index = start;
-    while (index < @min(end, context.tokens.len)) : (index += 1) {
-        if (!context.refersToBinding(index, name)) continue;
-        if (index > 0 and (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var)) {
-            index = context.enclosingScopeEnd(index) orelse index;
-            continue;
-        }
-        if (isLvalueMutation(context, index)) return true;
-    }
-    return false;
-}
-
-fn isLvalueMutation(context: RuleRun, index: usize) bool {
-    if (index > 0 and context.tokens[index - 1].tag == .ampersand) return true;
-    var cursor = index + 1;
-    while (cursor < context.tokens.len) {
-        if (context.tokens[cursor].tag == .period) {
-            cursor += 1;
-            if (cursor < context.tokens.len and (context.tokens[cursor].tag == .identifier or context.tokens[cursor].tag == .asterisk)) {
-                cursor += 1;
-                continue;
-            }
-            return false;
-        } else if (context.tokens[cursor].tag == .l_bracket) {
-            cursor = (context.matchingToken(cursor, .l_bracket, .r_bracket) orelse return false) + 1;
-            continue;
-        }
-        break;
-    }
-    if (cursor < context.tokens.len and isAssignmentOp(context.tokens[cursor].tag)) return true;
-    return false;
-}
-
-fn isAssignmentOp(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .equal, .plus_equal, .plus_percent_equal, .plus_pipe_equal, .minus_equal, .minus_percent_equal, .minus_pipe_equal, .asterisk_equal, .asterisk_percent_equal, .asterisk_pipe_equal, .slash_equal, .percent_equal, .ampersand_equal, .pipe_equal, .caret_equal, .angle_bracket_angle_bracket_left_equal, .angle_bracket_angle_bracket_left_pipe_equal, .angle_bracket_angle_bracket_right_equal => true,
-        else => false,
-    };
 }
 
 fn bindingReferenced(context: RuleRun, start: usize, end: usize, name: []const u8) bool {
@@ -236,6 +323,61 @@ test "locals mutated later in scope stay unchanged" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+/// The source after the fix of its one finding, checked to be formatted as
+/// `zig fmt` renders it, or null when the finding offers no fix.
+fn fixedFor(allocator: std.mem.Allocator, source: [:0]const u8) !?[]const u8 {
+    const found = try findingsFor(allocator, source);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    if (found[0].fixes.len == 0) return null;
+    const fixed = try allocator.dupeSentinel(u8, try support.applyFix(allocator, source, found[0].fixes[0]), 0);
+    var tree = try std.zig.Ast.parse(allocator, fixed, .{ .mode = .zig });
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    try std.testing.expectEqualStrings(fixed, try tree.renderAlloc(allocator));
+    return fixed;
+}
+
+test "an undefined local assigned by an if chain becomes a const if expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(
+        "fn pick(a: bool, b: bool) u32 {\n    const x: u32 = if (a) 1 else if (b and !a) 2 else 3;\n    return x;\n}\n",
+        (try fixedFor(arena.allocator(), "fn pick(a: bool, b: bool) u32 {\n" ++
+            "    var x: u32 = undefined;\n" ++
+            "    if (a) {\n        x = 1;\n    } else if (b and !a) {\n        x = 2;\n    } else {\n        x = 3;\n    }\n" ++
+            "    return x;\n}\n")).?,
+    );
+}
+
+test "an undefined local assigned by every switch prong becomes a const switch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings(
+        "fn pick(mode: Mode) u32 {\n" ++
+            "    const x: u32 = switch (mode) {\n        .fast => 1,\n        .safe, .small => 2,\n        else => 3,\n    };\n" ++
+            "    return x;\n}\n",
+        (try fixedFor(arena.allocator(), "fn pick(mode: Mode) u32 {\n" ++
+            "    var x: u32 = undefined;\n" ++
+            "    switch (mode) {\n        .fast => {\n            x = 1;\n        },\n        .safe, .small => {\n            x = 2;\n        },\n" ++
+            "        else => {\n            x = 3;\n        },\n    }\n" ++
+            "    return x;\n}\n")).?,
+    );
+}
+
+test "an expression initializer is not offered for shapes it cannot keep" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][:0]const u8{
+        // No type for the const to carry.
+        "fn f(c: bool) void { var x = undefined; if (c) { x = 1; } else { x = 2; } use(x); }",
+        // A method may take a pointer to the local.
+        "fn f(c: bool) void { var x: List = undefined; if (c) { x = a; } else { x = b; } x.append(1); }",
+        "fn f(c: bool) void { var x: u8 = undefined; if (c) { x = 1; } else { x = 2; // two\n } use(x); }",
+        "fn f(c: bool) void { var x: S = undefined; if (c) { x = .{\n.a = 1,\n}; } else { x = .{}; } use(x); }",
+        "fn f(c: bool, d: bool) void { var x: u8 = undefined; if (c) { x = if (d) 1 else 2; } else { x = 3; } use(x); }",
+        "fn f(c: bool) void { comptime var x: u8 = undefined; if (c) { x = 1; } else { x = 2; } use(x); }",
+    }) |source| try std.testing.expectEqual(@as(?[]const u8, null), try fixedFor(arena.allocator(), source));
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

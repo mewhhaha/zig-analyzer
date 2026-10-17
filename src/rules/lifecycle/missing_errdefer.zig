@@ -10,6 +10,7 @@ const types = @import("../types.zig");
 const tokenize = @import("../../syntax/tokens.zig").tokenize;
 const support = @import("../test_support.zig");
 const TokenRange = @import("../../syntax/tokens.zig").Range;
+const IdentifierTable = syntax_scope.IdentifierTable;
 
 pub const rules = [_]types.Rule{
     .missing_errdefer,
@@ -28,6 +29,11 @@ const AnalysisPass = enum { local, summaries };
 fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: AnalysisPass) !void {
     const level = context.level(.missing_errdefer);
     if (level == .off) return;
+    var lookups: Lookups = .{
+        .identifiers = try context.scopes.identifiers(),
+        .function_keywords = try functionKeywords(context),
+    };
+    defer lookups.deinit(context.allocator);
 
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or
@@ -35,12 +41,12 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         if (!startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const acquisition = owningAcquisition(context, declaration_index, declaration_end, summary_index, pass) orelse continue;
+        const acquisition = try owningAcquisition(context, &lookups, declaration_index, declaration_end, summary_index, pass) orelse continue;
         // A leak in a test is reported by `std.testing.allocator` itself.
         if (context.scopes.insideTestBlock(declaration_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
-        const function_scope = functionScopeContaining(context, declaration_index) orelse continue;
+        const function_scope = functionScopeContaining(context, lookups.function_keywords, declaration_index) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
         const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
         const callable = context.source[context.tokens[acquisition.callable_start].loc.start..context.tokens[acquisition.method_index].loc.end];
@@ -48,8 +54,9 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
         if (acquisition.kind == .allocation and std.mem.eql(u8, callable, "std.Build.create")) continue;
         if (acquisition.kind == .allocation and acquisitionUsesNamedArena(receiver, acquisition)) continue;
         if (acquisition.kind == .allocation and std.mem.eql(u8, method, "create") and std.ascii.findIgnoreCase(receiver, "pool") != null) continue;
-        if (acquisition.kind == .allocation and declarationLooksArenaBacked(
+        if (acquisition.kind == .allocation and try declarationLooksArenaBacked(
             context,
+            &lookups,
             context.tokenText(acquisition.release_owner_start),
             function_scope.opening,
             function_scope.closing,
@@ -59,8 +66,9 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
             function_scope,
             context.tokenText(acquisition.release_owner_start),
         )) continue;
-        if (acquisition.kind == .allocation and functionParameterReceivesOnlyArena(
+        if (acquisition.kind == .allocation and try functionParameterReceivesOnlyArena(
             context,
+            &lookups,
             function_scope,
             context.tokenText(acquisition.release_owner_start),
             0,
@@ -74,15 +82,17 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
         if (acquisition.kind == .allocation and acquisitionUsesArenaContract(context, function_scope, acquisition)) continue;
         // 'defer pool.deinit(...)' reclaims everything the pool handed out,
         // error path included.
-        if (acquisition.kind == .allocation and scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end))) continue;
+        if (acquisition.kind == .allocation and
+            try scopeDeinitializesReceiver(context, &lookups, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end))) continue;
         const fallible_index = fallibleBeforeBindingUse(
             context,
             declaration_end + 1,
             scope_end,
             binding_name,
             acquisition.kind == .network_stream,
-        ) orelse fallibleBeforePlainCleanup(
+        ) orelse try fallibleBeforePlainCleanup(
             context,
+            &lookups,
             declaration_end + 1,
             scope_end,
             binding_name,
@@ -147,33 +157,35 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
             .fixes = fixes,
         });
     }
-    try findPartiallyInitializedOwnedFields(context, summary_index, pass, level);
-    try findFallibleAggregateFieldInitializers(context, summary_index, pass, level);
+    try findPartiallyInitializedOwnedFields(context, &lookups, summary_index, pass, level);
+    try findFallibleAggregateFieldInitializers(context, &lookups, summary_index, pass, level);
     if (pass == .local) {
-        try findCleanupCapableValuesBeforeInsertion(context, level);
-        try findFallibleContainerBuilders(context, level);
-        try findFallibleSliceBuilders(context, level);
+        try findCleanupCapableValuesBeforeInsertion(context, lookups.identifiers, level);
+        try findFallibleContainerBuilders(context, &lookups, level);
+        try findFallibleSliceBuilders(context, &lookups, level);
     }
 }
 
-fn findFallibleContainerBuilders(context: RuleRun, level: types.Level) !void {
+fn findFallibleContainerBuilders(context: RuleRun, lookups: *Lookups, level: types.Level) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declaresEmptyArrayList(context, declaration_index + 2, declaration_end)) continue;
-        const function_scope = functionScopeContaining(context, declaration_index) orelse continue;
+        const function_scope = functionScopeContaining(context, lookups.function_keywords, declaration_index) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         var first_mutation: ?usize = null;
         var mutation_count: usize = 0;
         var arena_mutation_count: usize = 0;
-        for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, binding_index| {
-            if (candidate.tag != .identifier or !context.tokenIs(binding_index, binding) or
-                binding_index + 3 >= scope_end or context.tokens[binding_index + 1].tag != .period or
+        // An allocator held in a field (`self.a`) often belongs to a
+        // long-lived owner such as an arena, so only the strictest shape counts.
+        var field_allocator = false;
+        for (lookups.identifiers.within(binding, declaration_end + 1, scope_end)) |binding_index| {
+            if (binding_index + 3 >= scope_end or context.tokens[binding_index + 1].tag != .period or
                 context.tokens[binding_index + 2].tag != .identifier or context.tokens[binding_index + 3].tag != .l_paren) continue;
-            const mutation_scope = functionScopeContaining(context, binding_index) orelse continue;
+            const mutation_scope = functionScopeContaining(context, lookups.function_keywords, binding_index) orelse continue;
             if (mutation_scope.declaration != function_scope.declaration) continue;
             const method = context.tokenText(binding_index + 2);
             if (!fallibleContainerMutation(method)) continue;
@@ -183,14 +195,28 @@ fn findFallibleContainerBuilders(context: RuleRun, level: types.Level) !void {
             mutation_count += 1;
             const call_end = context.matchingToken(binding_index + 3, .l_paren, .r_paren) orelse continue;
             const allocator_argument = callArgument(context, binding_index + 4, call_end, 0) orelse continue;
-            if (callArgumentIsArenaBacked(context, allocator_argument, binding_index, 0)) arena_mutation_count += 1;
+            if (try callArgumentIsArenaBacked(context, lookups, allocator_argument, binding_index, 0)) arena_mutation_count += 1;
+            if (allocator_argument.end - allocator_argument.start != 1) field_allocator = true;
         }
         const first = first_mutation orelse continue;
         if (context.scopes.insideTestBlock(declaration_index)) continue;
-        if (mutation_count < 2 and !mutationCanRepeat(context, first, function_scope.opening)) continue;
         if (arena_mutation_count == mutation_count) continue;
-        if (scopeHasContainerCleanup(context, binding, function_scope.declaration, declaration_end + 1, first)) continue;
-        if (!scopeTransfersContainerStorage(context, binding, function_scope.declaration, first + 1, scope_end)) continue;
+        if (scopeHasContainerCleanup(context, lookups.function_keywords, binding, function_scope.declaration, declaration_end + 1, first)) continue;
+        const transfer = try containerStorageTransfer(
+            context,
+            lookups,
+            binding,
+            function_scope.declaration,
+            first + 1,
+            scope_end,
+            !field_allocator,
+        ) orelse continue;
+        // Something must be able to fail once the list holds storage: another
+        // mutation, a repetition of this one, or any later fallible operation.
+        const first_end = context.statementEnd(first) orelse continue;
+        if (mutation_count < 2 and !mutationCanRepeat(context, first, function_scope.opening) and
+            (field_allocator or first_end >= transfer or
+                firstFallibleOperation(context, first_end + 1, statementStart(context.tokens, transfer)) == null)) continue;
         try context.emit(.{
             .rule = .missing_errdefer,
             .level = level,
@@ -203,20 +229,22 @@ fn findFallibleContainerBuilders(context: RuleRun, level: types.Level) !void {
     }
 }
 
-fn findFallibleSliceBuilders(context: RuleRun, level: types.Level) !void {
+fn findFallibleSliceBuilders(context: RuleRun, lookups: *Lookups, level: types.Level) !void {
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 5 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (!declaresEmptySlice(context, declaration_index + 2, declaration_end)) continue;
-        const function_scope = functionScopeContaining(context, declaration_index) orelse continue;
+        const function_scope = functionScopeContaining(context, lookups.function_keywords, declaration_index) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         var first_realloc: ?usize = null;
-        for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |candidate, equal_index| {
-            if (candidate.tag != .equal or equal_index == 0 or !context.tokenIs(equal_index - 1, binding)) continue;
-            const mutation_scope = functionScopeContaining(context, equal_index) orelse continue;
+        // An assignment `binding = ...` puts the name right before its `=`.
+        for (lookups.identifiers.within(binding, declaration_end + 1, scope_end - 1)) |binding_index| {
+            const equal_index = binding_index + 1;
+            if (context.tokens[equal_index].tag != .equal) continue;
+            const mutation_scope = functionScopeContaining(context, lookups.function_keywords, equal_index) orelse continue;
             if (mutation_scope.declaration != function_scope.declaration) continue;
             const assignment_end = context.statementEnd(equal_index) orelse continue;
             if (!rangeContainsTry(context.tokens, statementStart(context.tokens, equal_index), assignment_end)) continue;
@@ -234,8 +262,8 @@ fn findFallibleSliceBuilders(context: RuleRun, level: types.Level) !void {
         const first = first_realloc orelse continue;
         if (context.scopes.insideTestBlock(declaration_index)) continue;
         if (!mutationCanRepeat(context, first, function_scope.opening) or
-            sliceHasErrorCleanup(context, binding, function_scope.declaration, declaration_end + 1, first) or
-            !scopeReturnsBinding(context, binding, function_scope.declaration, first + 1, scope_end)) continue;
+            sliceHasErrorCleanup(context, lookups.function_keywords, binding, function_scope.declaration, declaration_end + 1, first) or
+            !try scopeReturnsBinding(context, lookups, binding, function_scope.declaration, first + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .missing_errdefer,
             .level = level,
@@ -259,10 +287,17 @@ fn declaresEmptySlice(context: RuleRun, start: usize, end: usize) bool {
     return names_slice and names_empty_literal;
 }
 
-fn sliceHasErrorCleanup(context: RuleRun, binding: []const u8, function_declaration: usize, start: usize, end: usize) bool {
+fn sliceHasErrorCleanup(
+    context: RuleRun,
+    function_keywords: []const u32,
+    binding: []const u8,
+    function_declaration: usize,
+    start: usize,
+    end: usize,
+) bool {
     for (context.tokens[start..end], start..) |token, defer_index| {
         if (token.tag != .keyword_errdefer) continue;
-        const cleanup_scope = functionScopeContaining(context, defer_index) orelse continue;
+        const cleanup_scope = functionScopeContaining(context, function_keywords, defer_index) orelse continue;
         if (cleanup_scope.declaration != function_declaration) continue;
         const defer_end = context.statementEnd(defer_index) orelse continue;
         for (context.tokens[defer_index + 1 .. @min(defer_end, end)], defer_index + 1..) |candidate, index| {
@@ -277,10 +312,14 @@ fn sliceHasErrorCleanup(context: RuleRun, binding: []const u8, function_declarat
     return false;
 }
 
-fn scopeReturnsBinding(context: RuleRun, binding: []const u8, function_declaration: usize, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, return_index| {
-        if (token.tag != .keyword_return) continue;
-        const return_scope = functionScopeContaining(context, return_index) orelse continue;
+fn scopeReturnsBinding(context: RuleRun, lookups: *Lookups, binding: []const u8, function_declaration: usize, start: usize, end: usize) !bool {
+    var candidates: std.ArrayList(u32) = .empty;
+    defer candidates.deinit(context.allocator);
+    const statements = try lookups.returnStatements(context);
+    try statements.appendHolding(context.allocator, lookups.identifiers, &candidates, binding, start, end, end);
+    for (candidates.items) |return_keyword| {
+        const return_index: usize = return_keyword;
+        const return_scope = functionScopeContaining(context, lookups.function_keywords, return_index) orelse continue;
         if (return_scope.declaration != function_declaration) continue;
         const return_end = context.statementEnd(return_index) orelse continue;
         for (context.tokens[return_index + 1 .. @min(return_end, end)], return_index + 1..) |value, value_index| {
@@ -335,10 +374,17 @@ fn fallibleContainerMutation(method: []const u8) bool {
     return false;
 }
 
-fn scopeHasContainerCleanup(context: RuleRun, binding: []const u8, function_declaration: usize, start: usize, end: usize) bool {
+fn scopeHasContainerCleanup(
+    context: RuleRun,
+    function_keywords: []const u32,
+    binding: []const u8,
+    function_declaration: usize,
+    start: usize,
+    end: usize,
+) bool {
     for (context.tokens[start..end], start..) |token, defer_index| {
         if (token.tag != .keyword_defer and token.tag != .keyword_errdefer) continue;
-        const cleanup_scope = functionScopeContaining(context, defer_index) orelse continue;
+        const cleanup_scope = functionScopeContaining(context, function_keywords, defer_index) orelse continue;
         if (cleanup_scope.declaration != function_declaration) continue;
         const statement_end = context.statementEnd(defer_index) orelse continue;
         var index = defer_index + 1;
@@ -350,21 +396,67 @@ fn scopeHasContainerCleanup(context: RuleRun, binding: []const u8, function_decl
     return false;
 }
 
-fn scopeTransfersContainerStorage(context: RuleRun, binding: []const u8, function_declaration: usize, start: usize, end: usize) bool {
-    var index = start;
-    while (index + 3 < end) : (index += 1) {
-        if (context.tokenIs(index, binding) and context.tokens[index + 1].tag == .period and
-            context.tokenIs(index + 2, "toOwnedSlice") and context.tokens[index + 3].tag == .l_paren)
-        {
-            const transfer_scope = functionScopeContaining(context, index) orelse continue;
-            if (transfer_scope.declaration == function_declaration) return true;
-        }
+/// Where the list's storage first leaves the function in `[start, end)`:
+/// `list.toOwnedSlice(..)`, or with `returns_count` a `return` of the list
+/// itself, alone or in an aggregate (`return list;`, `return .{ .items = list };`).
+fn containerStorageTransfer(
+    context: RuleRun,
+    lookups: *Lookups,
+    binding: []const u8,
+    function_declaration: usize,
+    start: usize,
+    end: usize,
+    returns_count: bool,
+) !?usize {
+    // Only a use of the name or a return whose statement holds one can transfer.
+    var candidates: std.ArrayList(u32) = .empty;
+    defer candidates.deinit(context.allocator);
+    try candidates.appendSlice(context.allocator, lookups.identifiers.within(binding, start, end -| 3));
+    if (returns_count) {
+        const statements = try lookups.returnStatements(context);
+        try statements.appendHolding(context.allocator, lookups.identifiers, &candidates, binding, start, end -| 1, end);
+    }
+    std.mem.sort(u32, candidates.items, {}, std.sort.asc(u32));
+    var previous: ?u32 = null;
+    for (candidates.items) |candidate| {
+        if (candidate == previous) continue;
+        previous = candidate;
+        const index: usize = candidate;
+        const transfer = if (context.tokens[index].tag == .keyword_return)
+            returnHandsOnBinding(context, binding, index)
+        else
+            context.tokens[index + 1].tag == .period and context.tokenIs(index + 2, "toOwnedSlice") and
+                context.tokens[index + 3].tag == .l_paren;
+        if (!transfer) continue;
+        const transfer_scope = functionScopeContaining(context, lookups.function_keywords, index) orelse continue;
+        if (transfer_scope.declaration == function_declaration) return index;
+    }
+    return null;
+}
+
+/// The sorted `positions` in `[start, end)`.
+fn positionsWithin(positions: []const u32, start: usize, end: usize) []const u32 {
+    const first = std.sort.partitionPoint(u32, positions, start, positionBefore);
+    return positions[first..][0..std.sort.partitionPoint(u32, positions[first..], end, positionBefore)];
+}
+
+fn positionBefore(bound: usize, position: u32) bool {
+    return position < bound;
+}
+
+fn returnHandsOnBinding(context: RuleRun, binding: []const u8, return_index: usize) bool {
+    const return_end = context.statementEnd(return_index) orelse return false;
+    for (context.tokens[return_index + 1 .. return_end], return_index + 1..) |token, index| {
+        if (token.tag != .identifier or !context.refersToBinding(index, binding)) continue;
+        const next = context.tokens[index + 1].tag;
+        if (next != .period and next != .l_bracket and next != .period_asterisk) return true;
     }
     return false;
 }
 
 fn findFallibleAggregateFieldInitializers(
     context: RuleRun,
+    lookups: *Lookups,
     summary_index: ?summaries.Index,
     pass: AnalysisPass,
     level: types.Level,
@@ -385,8 +477,9 @@ fn findFallibleAggregateFieldInitializers(
                 context.tokens[equal_index - 1].tag != .identifier or context.tokens[equal_index - 2].tag != .period) continue;
             if (context.enclosingOpeningBrace(equal_index) != aggregate_open) continue;
             const value_end = aggregateFieldValueEnd(context.tokens, equal_index + 1, aggregate_end);
-            const acquisition = owningAcquisitionAfterEqual(
+            const acquisition = try owningAcquisitionAfterEqual(
                 context,
+                lookups,
                 equal_index,
                 value_end,
                 summary_index,
@@ -394,7 +487,7 @@ fn findFallibleAggregateFieldInitializers(
             ) orelse continue;
             if (acquisition.kind != .allocation or !rangeContainsTry(context.tokens, value_end + 1, aggregate_end) or
                 context.scopes.insideTestBlock(equal_index)) continue;
-            const function_scope = functionScopeContaining(context, equal_index) orelse continue;
+            const function_scope = functionScopeContaining(context, lookups.function_keywords, equal_index) orelse continue;
             if (acquisitionUsesArenaContract(context, function_scope, acquisition)) continue;
             const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
             if (acquisitionUsesNamedArena(receiver, acquisition)) continue;
@@ -444,6 +537,7 @@ fn rangeContainsTry(tokens: []const std.zig.Token, start: usize, end: usize) boo
 
 fn findPartiallyInitializedOwnedFields(
     context: RuleRun,
+    lookups: *Lookups,
     summary_index: ?summaries.Index,
     pass: AnalysisPass,
     level: types.Level,
@@ -453,11 +547,12 @@ fn findPartiallyInitializedOwnedFields(
             context.tokens[equal_index - 2].tag != .period or context.tokens[equal_index - 3].tag != .identifier) continue;
         const owner_index = equal_index - 3;
         const owner = context.tokenText(owner_index);
-        if (!locallyUndefinedBindingBefore(context, owner, owner_index) and
-            !locallyCreatedBindingBefore(context, owner, owner_index)) continue;
+        if (!locallyUndefinedBindingBefore(context, lookups.identifiers, owner, owner_index) and
+            !try locallyCreatedBindingBefore(context, lookups, owner, owner_index)) continue;
         const statement_end = context.statementEnd(equal_index) orelse continue;
-        const acquisition = owningAcquisitionAfterEqual(
+        const acquisition = try owningAcquisitionAfterEqual(
             context,
+            lookups,
             equal_index,
             statement_end,
             summary_index,
@@ -466,16 +561,16 @@ fn findPartiallyInitializedOwnedFields(
         if (acquisition.kind != .allocation or context.scopes.insideTestBlock(equal_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(equal_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
-        const function_scope = functionScopeContaining(context, equal_index) orelse continue;
+        const function_scope = functionScopeContaining(context, lookups.function_keywords, equal_index) orelse continue;
         const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
         const method = context.tokenText(acquisition.method_index);
         if (acquisitionUsesNamedArena(receiver, acquisition) or
-            declarationLooksArenaBacked(context, context.tokenText(acquisition.release_owner_start), function_scope.opening, function_scope.closing) or
+            try declarationLooksArenaBacked(context, lookups, context.tokenText(acquisition.release_owner_start), function_scope.opening, function_scope.closing) or
             functionDocumentsArenaAllocator(context, function_scope, context.tokenText(acquisition.release_owner_start)) or
             allocatorPathIsBuildArena(context, function_scope, acquisition.release_owner_start, acquisition.release_owner_end) or
             acquisitionUsesArenaContract(context, function_scope, acquisition) or
-            scopeDeinitializesReceiver(context, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end)) or
-            scopeDeinitializesReceiver(context, scope_opening, scope_end, owner)) continue;
+            try scopeDeinitializesReceiver(context, lookups, scope_opening, scope_end, context.tokenText(acquisition.release_owner_end)) or
+            try scopeDeinitializesReceiver(context, lookups, scope_opening, scope_end, owner)) continue;
         if (std.mem.eql(u8, method, "create") and std.ascii.findIgnoreCase(receiver, "pool") != null) continue;
         const fallible_index = fallibleBeforeBindingUse(context, statement_end + 1, scope_end, owner, false) orelse continue;
         const field = context.tokenText(equal_index - 1);
@@ -526,11 +621,11 @@ fn findPartiallyInitializedOwnedFields(
     }
 }
 
-fn locallyUndefinedBindingBefore(context: RuleRun, name: []const u8, before: usize) bool {
+fn locallyUndefinedBindingBefore(context: RuleRun, identifiers: *const IdentifierTable, name: []const u8, before: usize) bool {
     const scope = context.enclosingOpeningBrace(before) orelse return false;
-    for (context.tokens[scope + 1 .. before], scope + 1..) |token, declaration_index| {
-        if (token.tag != .keyword_var or declaration_index + 3 >= before or
-            !context.tokenIs(declaration_index + 1, name)) continue;
+    for (identifiers.within(name, scope + 2, before)) |name_index| {
+        const declaration_index = name_index - 1;
+        if (context.tokens[declaration_index].tag != .keyword_var or declaration_index + 3 >= before) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= before) continue;
         for (context.tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |candidate, index| {
@@ -541,21 +636,22 @@ fn locallyUndefinedBindingBefore(context: RuleRun, name: []const u8, before: usi
     return false;
 }
 
-fn locallyCreatedBindingBefore(context: RuleRun, name: []const u8, before: usize) bool {
+fn locallyCreatedBindingBefore(context: RuleRun, lookups: *Lookups, name: []const u8, before: usize) !bool {
     const scope = context.enclosingOpeningBrace(before) orelse return false;
-    for (context.tokens[scope + 1 .. before], scope + 1..) |token, declaration_index| {
-        if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 1 >= before or
-            !context.tokenIs(declaration_index + 1, name)) continue;
+    for (lookups.identifiers.within(name, scope + 2, before)) |name_index| {
+        const declaration_index = name_index - 1;
+        const keyword = context.tokens[declaration_index].tag;
+        if (keyword != .keyword_const and keyword != .keyword_var) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= before) continue;
-        const acquisition = owningAcquisition(context, declaration_index, declaration_end, null, .local) orelse continue;
+        const acquisition = try owningAcquisition(context, lookups, declaration_index, declaration_end, null, .local) orelse continue;
         if (context.tokenIs(acquisition.method_index, "create")) return true;
     }
     return false;
 }
 
-fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level) !void {
-    // Both lookups scan the whole file for a name, so each name is looked up once.
+fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, identifiers: *const IdentifierTable, level: types.Level) !void {
+    // Both lookups visit every use of a name, so each name is looked up once.
     var return_types: std.StringHashMapUnmanaged(?[]const u8) = .empty;
     defer return_types.deinit(context.allocator);
     var cleanup_types: std.StringHashMapUnmanaged(bool) = .empty;
@@ -564,9 +660,9 @@ fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level)
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or !startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const owner_type = try calledReturnType(context, &return_types, declaration_index + 2, declaration_end) orelse continue;
+        const owner_type = try calledReturnType(context, identifiers, &return_types, declaration_index + 2, declaration_end) orelse continue;
         const releases = try cleanup_types.getOrPut(context.allocator, owner_type);
-        if (!releases.found_existing) releases.value_ptr.* = typeCleanupReleasesOwnership(context, owner_type);
+        if (!releases.found_existing) releases.value_ptr.* = typeCleanupReleasesOwnership(context, identifiers, owner_type);
         if (!releases.value_ptr.* or context.scopes.insideTestBlock(declaration_index)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
@@ -575,6 +671,7 @@ fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level)
         if (!callsFallibleContainerInsertion(context, statementStart(context.tokens, fallible_index), fallible_end)) continue;
         if (insertionTakesOwnershipOnFailure(
             context,
+            identifiers,
             binding,
             statementStart(context.tokens, fallible_index),
             fallible_end,
@@ -601,6 +698,7 @@ fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level)
 
 fn insertionTakesOwnershipOnFailure(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     binding: []const u8,
     statement_start: usize,
     statement_end: usize,
@@ -613,7 +711,7 @@ fn insertionTakesOwnershipOnFailure(
         const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
         const argument_index = bareArgumentIndex(context, binding, method_index + 2, call_end) orelse continue;
         const parameter_index = argument_index + @intFromBool(method_index > 0 and context.tokens[method_index - 1].tag == .period);
-        if (functionCleansParameterBeforeInsertion(context, context.tokenText(method_index), parameter_index)) return true;
+        if (functionCleansParameterBeforeInsertion(context, identifiers, context.tokenText(method_index), parameter_index)) return true;
     }
     return false;
 }
@@ -638,16 +736,22 @@ fn bareArgumentIndex(context: RuleRun, binding: []const u8, start: usize, end: u
     return null;
 }
 
-fn functionCleansParameterBeforeInsertion(context: RuleRun, function_name: []const u8, parameter_index: usize) bool {
+fn functionCleansParameterBeforeInsertion(
+    context: RuleRun,
+    identifiers: *const IdentifierTable,
+    function_name: []const u8,
+    parameter_index: usize,
+) bool {
+    // `fn name` puts the name right after the keyword.
     var declaration_count: usize = 0;
-    for (context.tokens, 0..) |token, function_index| {
-        if (token.tag == .keyword_fn and function_index + 1 < context.tokens.len and
-            context.tokenIs(function_index + 1, function_name)) declaration_count += 1;
+    for (identifiers.all(function_name)) |name_index| {
+        if (name_index > 0 and context.tokens[name_index - 1].tag == .keyword_fn) declaration_count += 1;
     }
     if (declaration_count != 1) return false;
-    for (context.tokens, 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= context.tokens.len or
-            !context.tokenIs(function_index + 1, function_name) or context.tokens[function_index + 2].tag != .l_paren) continue;
+    for (identifiers.all(function_name)) |name_index| {
+        if (name_index == 0 or context.tokens[name_index - 1].tag != .keyword_fn or name_index + 1 >= context.tokens.len or
+            context.tokens[name_index + 1].tag != .l_paren) continue;
+        const function_index = name_index - 1;
         const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
         const parameter = parameterName(context, function_index + 3, parameters_end, parameter_index) orelse continue;
         var body_start = parameters_end + 1;
@@ -712,6 +816,7 @@ fn callsFallibleContainerInsertionWithBinding(context: RuleRun, binding: []const
 
 fn calledReturnType(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     return_types: *std.StringHashMapUnmanaged(?[]const u8),
     start: usize,
     end: usize,
@@ -729,16 +834,17 @@ fn calledReturnType(
     if (context.tokens[call_index + 1].tag == .l_brace) return name;
     if (context.tokens[call_index + 1].tag != .l_paren) return null;
     const known = try return_types.getOrPut(context.allocator, name);
-    if (!known.found_existing) known.value_ptr.* = functionReturnType(context, name);
+    if (!known.found_existing) known.value_ptr.* = functionReturnType(context, identifiers, name);
     return known.value_ptr.*;
 }
 
 /// The last identifier between the parameters and the body of the first
 /// `fn name(` in the file.
-fn functionReturnType(context: RuleRun, name: []const u8) ?[]const u8 {
-    for (context.tokens, 0..) |token, fn_index| {
-        if (token.tag != .keyword_fn or fn_index + 2 >= context.tokens.len or
-            !context.tokenIs(fn_index + 1, name) or context.tokens[fn_index + 2].tag != .l_paren) continue;
+fn functionReturnType(context: RuleRun, identifiers: *const IdentifierTable, name: []const u8) ?[]const u8 {
+    for (identifiers.all(name)) |name_index| {
+        if (name_index == 0 or context.tokens[name_index - 1].tag != .keyword_fn or name_index + 1 >= context.tokens.len or
+            context.tokens[name_index + 1].tag != .l_paren) continue;
+        const fn_index = name_index - 1;
         const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse continue;
         var body_start = parameters_end + 1;
         var return_type: ?[]const u8 = null;
@@ -750,26 +856,25 @@ fn functionReturnType(context: RuleRun, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn typeCleanupReleasesOwnership(context: RuleRun, type_name: []const u8) bool {
-    for (context.tokens, 0..) |token, type_index| {
-        if (token.tag != .identifier or !context.tokenIs(type_index, type_name) or type_index == 0 or
-            context.tokens[type_index - 1].tag != .keyword_const or type_index + 3 >= context.tokens.len or
+fn typeCleanupReleasesOwnership(context: RuleRun, identifiers: *const IdentifierTable, type_name: []const u8) bool {
+    for (identifiers.all(type_name)) |type_index| {
+        if (type_index == 0 or context.tokens[type_index - 1].tag != .keyword_const or type_index + 3 >= context.tokens.len or
             context.tokens[type_index + 1].tag != .equal or context.tokens[type_index + 2].tag != .keyword_struct or
             context.tokens[type_index + 3].tag != .l_brace) continue;
         const body_start = type_index + 3;
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        for (context.tokens[body_start + 1 .. body_end], body_start + 1..) |candidate, fn_index| {
-            if (candidate.tag != .keyword_fn or fn_index + 2 >= body_end or
-                !context.tokenIs(fn_index + 1, "deinit") or context.tokens[fn_index + 2].tag != .l_paren) continue;
+        // `fn deinit(` puts the name right after the keyword.
+        for (identifiers.within("deinit", body_start + 2, body_end)) |name_index| {
+            const fn_index = name_index - 1;
+            if (context.tokens[fn_index].tag != .keyword_fn or fn_index + 2 >= body_end or
+                context.tokens[fn_index + 2].tag != .l_paren) continue;
             const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse continue;
             var cleanup_start = parameters_end + 1;
             while (cleanup_start < body_end and context.tokens[cleanup_start].tag != .l_brace) : (cleanup_start += 1) {}
             if (cleanup_start >= body_end) continue;
             const cleanup_end = context.matchingToken(cleanup_start, .l_brace, .r_brace) orelse continue;
-            for (context.tokens[cleanup_start + 1 .. cleanup_end], cleanup_start + 1..) |cleanup_token, method_index| {
-                if (cleanup_token.tag == .identifier and
-                    (context.tokenIs(method_index, "free") or context.tokenIs(method_index, "destroy") or
-                        context.tokenIs(method_index, "close") or context.tokenIs(method_index, "deinit"))) return true;
+            for ([_][]const u8{ "free", "destroy", "close", "deinit" }) |release| {
+                if (identifiers.firstWithin(release, cleanup_start + 1, cleanup_end) != null) return true;
             }
         }
     }
@@ -811,11 +916,12 @@ fn acquisitionUsesNamedArena(receiver: []const u8, acquisition: Acquisition) boo
 
 fn owningAcquisition(
     context: RuleRun,
+    lookups: *Lookups,
     declaration_index: usize,
     declaration_end: usize,
     summary_index: ?summaries.Index,
     pass: AnalysisPass,
-) ?Acquisition {
+) !?Acquisition {
     var parenthesis_depth: usize = 0;
     var bracket_depth: usize = 0;
     var brace_depth: usize = 0;
@@ -837,16 +943,17 @@ fn owningAcquisition(
         if (equal_index != null) break;
     }
     const equal = equal_index orelse return null;
-    return owningAcquisitionAfterEqual(context, equal, declaration_end, summary_index, pass);
+    return owningAcquisitionAfterEqual(context, lookups, equal, declaration_end, summary_index, pass);
 }
 
 fn owningAcquisitionAfterEqual(
     context: RuleRun,
+    lookups: *Lookups,
     equal: usize,
     declaration_end: usize,
     summary_index: ?summaries.Index,
     pass: AnalysisPass,
-) ?Acquisition {
+) !?Acquisition {
     if (equal + 4 >= declaration_end or context.tokens[equal + 1].tag != .keyword_try or
         context.tokens[equal + 2].tag != .identifier) return null;
     var path_end = equal + 2;
@@ -862,7 +969,7 @@ fn owningAcquisitionAfterEqual(
         const name = if (separator) |position| callable[position + 1 ..] else callable;
         if (known_summaries.ownedReturnCall(context.source, receiver, name)) |owned| {
             if (std.mem.eql(u8, name, "alloc") and receiver != null and
-                !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
+                !try receiverLooksLikeAllocator(context, lookups, equal + 2, path_end - 2)) return null;
             const owner = if (owned.allocator_parameter) |allocator_parameter| owner: {
                 const argument = callArgument(context, path_end + 2, call_close, allocator_parameter) orelse return null;
                 if (!identifierPathArgument(context, argument)) return null;
@@ -911,7 +1018,7 @@ fn owningAcquisitionAfterEqual(
         };
     }
     if (std.mem.eql(u8, resources.allocationRelease(context.tokenText(path_end)) orelse "", "free") and
-        !receiverLooksLikeAllocator(context, equal + 2, path_end - 2)) return null;
+        !try receiverLooksLikeAllocator(context, lookups, equal + 2, path_end - 2)) return null;
     if (context.tokenIs(path_end, "create") and !receiverOwnsCreatedMemory(context, equal + 2, path_end - 2)) return null;
     return .{
         .callable_start = equal + 2,
@@ -973,25 +1080,13 @@ fn argumentsReferenceArena(context: RuleRun, start: usize, end: usize) bool {
     return false;
 }
 
-fn receiverLooksLikeAllocator(context: RuleRun, receiver_start: usize, receiver_end: usize) bool {
+fn receiverLooksLikeAllocator(context: RuleRun, lookups: *Lookups, receiver_start: usize, receiver_end: usize) !bool {
     const receiver_name = context.tokenText(receiver_end);
     if (std.ascii.findIgnoreCase(receiver_name, "alloc") != null or
         std.ascii.findIgnoreCase(receiver_name, "arena") != null or
         std.mem.eql(u8, receiver_name, "gpa")) return true;
     if (receiver_start != receiver_end) return false;
-    for (context.tokens, 0..) |token, identifier_index| {
-        if (token.tag != .identifier or !context.tokenIs(identifier_index, receiver_name) or
-            identifier_index + 2 >= context.tokens.len or context.tokens[identifier_index + 1].tag != .colon) continue;
-        var type_index = identifier_index + 2;
-        while (type_index < context.tokens.len) : (type_index += 1) {
-            switch (context.tokens[type_index].tag) {
-                .comma, .r_paren, .equal, .semicolon, .l_brace => break,
-                .identifier => if (context.tokenIs(type_index, "Allocator")) return true,
-                else => {},
-            }
-        }
-    }
-    return false;
+    return lookups.declaredAllocator(context, receiver_name);
 }
 
 fn isAllocatingMethod(name: []const u8) bool {
@@ -1000,36 +1095,49 @@ fn isAllocatingMethod(name: []const u8) bool {
 
 fn declarationLooksArenaBacked(
     context: RuleRun,
+    lookups: *Lookups,
     root_name: []const u8,
     scope_opening: usize,
     scope_end: usize,
-) bool {
-    return declarationLooksArenaBackedAtDepth(context, root_name, scope_opening, scope_end, 0);
+) !bool {
+    // The scope's `{` decides its `}`, so the answer depends on the two keys only.
+    const key: ScopedName = .{ .scope = @intCast(scope_opening), .name = root_name };
+    if (lookups.arena_backed.get(key)) |known| return known;
+    const arena_backed = declarationLooksArenaBackedAtDepth(context, lookups.identifiers, root_name, scope_opening, scope_end, 0);
+    try lookups.arena_backed.put(context.allocator, key, arena_backed);
+    return arena_backed;
 }
 
 fn declarationLooksArenaBackedAtDepth(
     context: RuleRun,
+    identifiers: *const IdentifierTable,
     root_name: []const u8,
     scope_opening: usize,
     scope_end: usize,
     depth: usize,
 ) bool {
     if (depth == 4) return false;
-    for (context.tokens[scope_opening + 1 .. scope_end], scope_opening + 1..) |token, index| {
-        if ((token.tag != .keyword_const and token.tag != .keyword_var) or
-            index + 1 >= context.tokens.len or
-            !context.tokenIs(index + 1, root_name)) continue;
+    // `const name` or `var name` puts the name right after the keyword.
+    for (identifiers.within(root_name, scope_opening + 2, scope_end)) |name_index| {
+        const index = name_index - 1;
+        const token = context.tokens[index];
+        if (token.tag != .keyword_const and token.tag != .keyword_var) continue;
         const end = context.statementEnd(index) orelse continue;
         const declaration = context.source[token.loc.start..context.tokens[end].loc.end];
         if (std.mem.find(u8, declaration, "ArenaAllocator") != null or
             std.mem.find(u8, declaration, "FixedBufferAllocator") != null) return true;
+        // A stack buffer that falls back to an arena frees nothing on its own.
+        const buffer_first = std.mem.find(u8, declaration, "BufferFirstAllocator") != null or
+            std.mem.find(u8, declaration, "StackFallbackAllocator") != null or
+            std.mem.find(u8, declaration, "stackFallback") != null;
+        if (buffer_first and std.ascii.findIgnoreCase(declaration, "arena") != null) return true;
         var value_index = index + 2;
         while (value_index + 3 < end) : (value_index += 1) {
             if (context.tokens[value_index].tag != .identifier or context.tokens[value_index + 1].tag != .period or
                 !context.tokenIs(value_index + 2, "allocator") or context.tokens[value_index + 3].tag != .l_paren) continue;
             const receiver = context.tokenText(value_index);
             if (std.mem.eql(u8, receiver, root_name)) continue;
-            if (declarationLooksArenaBackedAtDepth(context, receiver, scope_opening, scope_end, depth + 1)) return true;
+            if (declarationLooksArenaBackedAtDepth(context, identifiers, receiver, scope_opening, scope_end, depth + 1)) return true;
         }
     }
     return false;
@@ -1041,22 +1149,33 @@ const ScopeRange = struct { declaration: usize, opening: usize, closing: usize }
 /// `test` keyword: the last such keyword before `target` whose body encloses
 /// it. A keyword sits between its body and the brace enclosing that body, so
 /// only the blocks around `target` and the tokens before each are searched.
-fn functionScopeContaining(context: RuleRun, target: usize) ?ScopeRange {
+fn functionScopeContaining(context: RuleRun, function_keywords: []const u32, target: usize) ?ScopeRange {
     var brace = context.enclosingOpeningBrace(target);
     while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
         if (closing <= target) continue;
         const lower = if (context.enclosingOpeningBrace(opening)) |parent| parent + 1 else 0;
-        var declaration_index = opening;
-        while (declaration_index > lower) {
-            declaration_index -= 1;
-            const tag = context.tokens[declaration_index].tag;
-            if (tag != .keyword_fn and tag != .keyword_test) continue;
+        // The `fn` and `test` keywords in `[lower, opening)`, nearest first.
+        const keywords = positionsWithin(function_keywords, lower, opening);
+        var remaining = keywords.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            const declaration_index: usize = keywords[remaining];
             if (functionBodyOpening(context, declaration_index, target) != opening) continue;
             return .{ .declaration = declaration_index, .opening = opening, .closing = closing };
         }
     }
     return null;
+}
+
+/// Every `fn` and `test` keyword, in order.
+fn functionKeywords(context: RuleRun) ![]const u32 {
+    var keywords: std.ArrayList(u32) = .empty;
+    defer keywords.deinit(context.allocator);
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag == .keyword_fn or token.tag == .keyword_test) try keywords.append(context.allocator, @intCast(index));
+    }
+    return keywords.toOwnedSlice(context.allocator);
 }
 
 /// Where the body of the `fn` or `test` at `declaration_index` opens, looking
@@ -1116,10 +1235,27 @@ fn functionParameterIsAllocator(context: RuleRun, function: ScopeRange, paramete
 
 fn functionParameterReceivesOnlyArena(
     context: RuleRun,
+    lookups: *Lookups,
     function: ScopeRange,
     parameter_name: []const u8,
     depth: usize,
-) bool {
+) std.mem.Allocator.Error!bool {
+    if (depth != 0) return parameterReceivesOnlyArena(context, lookups, function, parameter_name, depth);
+    // The body's `{` decides the function, so from depth 0 the answer depends on the two keys only.
+    const key: ScopedName = .{ .scope = @intCast(function.opening), .name = parameter_name };
+    if (lookups.arena_parameters.get(key)) |known| return known;
+    const receives = try parameterReceivesOnlyArena(context, lookups, function, parameter_name, 0);
+    try lookups.arena_parameters.put(context.allocator, key, receives);
+    return receives;
+}
+
+fn parameterReceivesOnlyArena(
+    context: RuleRun,
+    lookups: *Lookups,
+    function: ScopeRange,
+    parameter_name: []const u8,
+    depth: usize,
+) std.mem.Allocator.Error!bool {
     if (functionParameterMatchesArenaContract(context, function, parameter_name)) return true;
     if (depth == 8 or function.declaration + 2 >= function.opening or
         context.tokens[function.declaration + 1].tag != .identifier) return false;
@@ -1127,14 +1263,14 @@ fn functionParameterReceivesOnlyArena(
     const parameter_index = functionParameterIndex(context, function, parameter_name) orelse return false;
     const function_name = context.tokenText(function.declaration + 1);
     var found_call = false;
-    for (context.tokens, 0..) |token, call_index| {
-        if (token.tag != .identifier or !context.tokenIs(call_index, function_name)) continue;
+    for (lookups.identifiers.all(function_name)) |name_index| {
+        const call_index: usize = name_index;
         if (call_index > 0 and context.tokens[call_index - 1].tag == .keyword_fn) continue;
         if (call_index + 1 >= context.tokens.len or context.tokens[call_index + 1].tag != .l_paren or
             (call_index > 0 and context.tokens[call_index - 1].tag == .period)) return false;
         const call_end = context.matchingToken(call_index + 1, .l_paren, .r_paren) orelse return false;
         const argument = callArgument(context, call_index + 2, call_end, parameter_index) orelse return false;
-        if (!callArgumentIsArenaBacked(context, argument, call_index, depth + 1)) return false;
+        if (!try callArgumentIsArenaBacked(context, lookups, argument, call_index, depth + 1)) return false;
         found_call = true;
     }
     return found_call;
@@ -1166,17 +1302,23 @@ fn functionParameterIndex(context: RuleRun, function: ScopeRange, parameter_name
     return null;
 }
 
-fn callArgumentIsArenaBacked(context: RuleRun, argument: TokenRange, call_index: usize, depth: usize) bool {
+fn callArgumentIsArenaBacked(
+    context: RuleRun,
+    lookups: *Lookups,
+    argument: TokenRange,
+    call_index: usize,
+    depth: usize,
+) std.mem.Allocator.Error!bool {
     if (argument.start >= argument.end) return false;
     for (context.tokens[argument.start..argument.end], argument.start..) |token, index| {
         if (token.tag == .identifier and std.ascii.findIgnoreCase(context.tokenText(index), "arena") != null) return true;
     }
     if (argument.start + 1 != argument.end or context.tokens[argument.start].tag != .identifier) return false;
     const argument_name = context.tokenText(argument.start);
-    const caller = functionScopeContaining(context, call_index) orelse return false;
-    if (declarationLooksArenaBacked(context, argument_name, caller.opening, caller.closing)) return true;
+    const caller = functionScopeContaining(context, lookups.function_keywords, call_index) orelse return false;
+    if (try declarationLooksArenaBacked(context, lookups, argument_name, caller.opening, caller.closing)) return true;
     if (!functionParameterIsAllocator(context, caller, argument_name)) return false;
-    return functionParameterReceivesOnlyArena(context, caller, argument_name, depth);
+    return functionParameterReceivesOnlyArena(context, lookups, caller, argument_name, depth);
 }
 
 fn allocatorPathIsBuildArena(
@@ -1257,25 +1399,28 @@ fn functionParameterTypeName(context: RuleRun, function: ScopeRange, parameter_n
     return null;
 }
 
-fn scopeDeinitializesReceiver(context: RuleRun, scope_opening: usize, scope_end: usize, receiver_segment: []const u8) bool {
-    var index = scope_opening + 1;
-    while (index + 3 < scope_end) : (index += 1) {
-        const tag = context.tokens[index].tag;
-        if (tag != .keyword_defer and tag != .keyword_errdefer) continue;
-        const body_end = if (context.tokens[index + 1].tag == .l_brace)
-            context.matchingToken(index + 1, .l_brace, .r_brace) orelse scope_end
-        else
-            context.statementEnd(index + 1) orelse scope_end;
-        var body_index = index + 1;
-        while (body_index + 2 < @min(body_end, scope_end)) : (body_index += 1) {
-            if (context.tokens[body_index].tag == .identifier and
-                context.tokenIs(body_index, receiver_segment) and
-                context.tokens[body_index + 1].tag == .period and
-                context.tokenIs(body_index + 2, "deinit")) return true;
+fn scopeDeinitializesReceiver(
+    context: RuleRun,
+    lookups: *Lookups,
+    scope_opening: usize,
+    scope_end: usize,
+    receiver_segment: []const u8,
+) !bool {
+    const key: ScopedName = .{ .scope = @intCast(scope_opening), .name = receiver_segment };
+    if (lookups.deinitialized_receivers.get(key)) |known| return known;
+    const bodies = try lookups.deferBodies(context, scope_opening, scope_end);
+    var deinitializes = false;
+    // The bodies are disjoint, so a call lies in the last one starting before it or in none.
+    for (lookups.identifiers.within(receiver_segment, scope_opening + 2, scope_end)) |receiver| {
+        if (context.tokens[receiver + 1].tag != .period or !context.tokenIs(receiver + 2, "deinit")) continue;
+        const preceding = std.sort.partitionPoint(DeferBody, bodies, @as(usize, receiver), DeferBody.startsBefore);
+        if (preceding > 0 and receiver + 2 < bodies[preceding - 1].end) {
+            deinitializes = true;
+            break;
         }
-        index = @min(body_end, scope_end - 1);
     }
-    return false;
+    try lookups.deinitialized_receivers.put(context.allocator, key, deinitializes);
+    return deinitializes;
 }
 
 /// Whether a `defer` or `errdefer` in `[start, scope_end)` cleans up `binding`
@@ -1318,24 +1463,59 @@ fn scopeHasErrorPathCleanup(context: RuleRun, binding: []const u8, field: ?[]con
 
 fn fallibleBeforePlainCleanup(
     context: RuleRun,
+    lookups: *Lookups,
     start: usize,
     scope_end: usize,
     binding: []const u8,
     release: []const u8,
-) ?usize {
+) !?usize {
     const scope = context.enclosingOpeningBrace(start) orelse return null;
-    for (context.tokens[start..scope_end], start..) |token, method_index| {
-        if (token.tag != .identifier or !context.tokenIs(method_index, release) or
-            method_index + 1 >= scope_end or context.tokens[method_index + 1].tag != .l_paren or
-            context.enclosingOpeningBrace(method_index) != scope) continue;
-        const statement_start = statementStart(context.tokens, method_index);
-        if (rangeContainsToken(context.tokens, statement_start, method_index, .keyword_defer) or
-            rangeContainsToken(context.tokens, statement_start, method_index, .keyword_errdefer)) continue;
-        const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
-        if (!callArgumentsContainBinding(context, method_index + 2, call_end, binding)) continue;
-        return firstFallibleOperation(context, start, statement_start);
+    const enclosing = try lookups.enclosingParentheses(context);
+    // A release call names the binding inside its parentheses, so it is one
+    // of the calls around a use. Only a `(` opened after `start` and still
+    // open at `scope_end` could hold a use past it; then every call is read.
+    const open_at_end = enclosing[scope_end];
+    if (open_at_end != syntax_scope.none_token and open_at_end > start) {
+        for (start..scope_end) |method_index| {
+            if (plainCleanupCall(context, scope, scope_end, binding, release, method_index)) |statement_start|
+                return firstFallibleOperation(context, start, statement_start);
+        }
+        return null;
     }
-    return null;
+    var first: ?usize = null;
+    var statement_start: usize = undefined;
+    for (lookups.identifiers.within(binding, start + 2, scope_end)) |use| {
+        var opening = enclosing[use];
+        while (opening != syntax_scope.none_token and opening > start) : (opening = enclosing[opening]) {
+            const method_index = opening - 1;
+            if (first != null and method_index >= first.?) continue;
+            statement_start = plainCleanupCall(context, scope, scope_end, binding, release, method_index) orelse continue;
+            first = method_index;
+        }
+    }
+    if (first == null) return null;
+    return firstFallibleOperation(context, start, statement_start);
+}
+
+/// Where the statement of the call at `method_index` starts when it calls
+/// `release` on `binding` directly in `scope` outside any defer.
+fn plainCleanupCall(
+    context: RuleRun,
+    scope: usize,
+    scope_end: usize,
+    binding: []const u8,
+    release: []const u8,
+    method_index: usize,
+) ?usize {
+    if (context.tokens[method_index].tag != .identifier or !context.tokenIs(method_index, release) or
+        method_index + 1 >= scope_end or context.tokens[method_index + 1].tag != .l_paren or
+        context.enclosingOpeningBrace(method_index) != scope) return null;
+    const statement_start = statementStart(context.tokens, method_index);
+    if (rangeContainsToken(context.tokens, statement_start, method_index, .keyword_defer) or
+        rangeContainsToken(context.tokens, statement_start, method_index, .keyword_errdefer)) return null;
+    const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse return null;
+    if (!callArgumentsContainBinding(context, method_index + 2, call_end, binding)) return null;
+    return statement_start;
 }
 
 fn rangeContainsToken(tokens: []const std.zig.Token, start: usize, end: usize, tag: std.zig.Token.Tag) bool {
@@ -1384,10 +1564,15 @@ fn fallibleBeforeBindingUse(
         const borrowing_call = callsBorrowingBufferMethod(context, cursor, end);
         var fallible_index: ?usize = null;
         var error_return_index: ?usize = null;
+        // The block of `if (bad) { gpa.free(copy); return error.X; }`, which
+        // releases the binding itself before its error return.
+        var releasing_exit_block: ?usize = null;
         for (context.tokens[cursor .. end + 1], cursor..) |chunk_token, chunk_index| {
             switch (chunk_token.tag) {
                 .keyword_return => if (returnsExplicitError(context, chunk_index, end)) {
-                    error_return_index = chunk_index;
+                    if (errorReturnFollowsRelease(context, binding, chunk_index)) {
+                        releasing_exit_block = context.enclosingOpeningBrace(chunk_index);
+                    } else error_return_index = chunk_index;
                 },
                 // A nested function declaration's body does not execute here, so a
                 // 'try' inside it is not a fallible operation on this path.
@@ -1401,6 +1586,7 @@ fn fallibleBeforeBindingUse(
         for (context.tokens[cursor .. end + 1], cursor..) |chunk_token, chunk_index| {
             if (chunk_token.tag != .identifier or !context.tokenIs(chunk_index, binding)) continue;
             if (error_return_index != null) continue;
+            if (releasing_exit_block != null and context.enclosingOpeningBrace(chunk_index) == releasing_exit_block) continue;
             const borrowed_use = bindingUseIsBorrowed(context, chunk_index, end);
             if (fallible_index != null and (borrowing_call or
                 callsFallibleContainerInsertion(context, cursor, end) or
@@ -1415,6 +1601,24 @@ fn fallibleBeforeBindingUse(
         cursor = end + 1;
     }
     return null;
+}
+
+/// Whether the error return at `return_index` follows a release of `binding`
+/// in its own block, so that path leaves nothing behind.
+fn errorReturnFollowsRelease(context: RuleRun, binding: []const u8, return_index: usize) bool {
+    const block = context.enclosingOpeningBrace(return_index) orelse return false;
+    for (context.tokens[block + 1 .. return_index], block + 1..) |token, method_index| {
+        if (token.tag != .identifier or method_index + 1 >= return_index or
+            context.tokens[method_index + 1].tag != .l_paren or context.enclosingOpeningBrace(method_index) != block) continue;
+        const releases = context.tokenIs(method_index, "free") or context.tokenIs(method_index, "destroy") or
+            context.tokenIs(method_index, "deinit");
+        if (!releases) continue;
+        if (method_index >= 2 and context.tokens[method_index - 1].tag == .period and
+            context.tokenIs(method_index - 2, binding)) return true;
+        const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
+        if (callArgumentsContainBinding(context, method_index + 2, call_end, binding)) return true;
+    }
+    return false;
 }
 
 fn returnsExplicitError(context: RuleRun, return_index: usize, end: usize) bool {
@@ -1460,6 +1664,216 @@ fn callsFallibleContainerInsertion(context: RuleRun, start: usize, end: usize) b
     for (insertion_methods) |method| if (callsMethod(context, start, end, method)) return true;
     return false;
 }
+
+/// What the passes of one run look up again and again, so that each lookup
+/// visits the uses of one name instead of the whole file or scope. Every
+/// part is built by its first use.
+const Lookups = struct {
+    identifiers: *const syntax_scope.IdentifierTable,
+    /// Every `fn` and `test` keyword, in order.
+    function_keywords: []const u32,
+    /// The innermost `(` open at each token.
+    parentheses: ?[]const u32 = null,
+    return_statements: ?ReturnStatements = null,
+    /// Names that some `name: T` declares with `Allocator` in `T`.
+    allocator_names: ?std.StringHashMapUnmanaged(void) = null,
+    /// `declarationLooksArenaBacked` by function body and name.
+    arena_backed: ScopedNames = .empty,
+    /// `functionParameterReceivesOnlyArena` from depth 0 by function body and parameter.
+    arena_parameters: ScopedNames = .empty,
+    /// `scopeDeinitializesReceiver` by scope and receiver.
+    deinitialized_receivers: ScopedNames = .empty,
+    /// The defers `scopeDeinitializesReceiver` reads in each scope.
+    scope_defers: std.AutoHashMapUnmanaged(u32, []const DeferBody) = .empty,
+
+    fn deinit(lookups: *Lookups, allocator: std.mem.Allocator) void {
+        allocator.free(lookups.function_keywords);
+        if (lookups.parentheses) |parentheses| allocator.free(parentheses);
+        if (lookups.return_statements) |*statements| statements.deinit(allocator);
+        if (lookups.allocator_names) |*names| names.deinit(allocator);
+        lookups.arena_backed.deinit(allocator);
+        lookups.arena_parameters.deinit(allocator);
+        lookups.deinitialized_receivers.deinit(allocator);
+        var bodies = lookups.scope_defers.valueIterator();
+        while (bodies.next()) |scope_bodies| allocator.free(scope_bodies.*);
+        lookups.scope_defers.deinit(allocator);
+    }
+
+    fn enclosingParentheses(lookups: *Lookups, context: RuleRun) ![]const u32 {
+        if (lookups.parentheses) |parentheses| return parentheses;
+        const enclosing = try context.allocator.alloc(u32, context.tokens.len);
+        errdefer context.allocator.free(enclosing);
+        // Paired the way the scope index pairs them, so a `(` open at a token
+        // has its `)` after it or none.
+        var open: std.ArrayList(u32) = .empty;
+        defer open.deinit(context.allocator);
+        for (context.tokens, 0..) |token, index| {
+            enclosing[index] = open.last() orelse syntax_scope.none_token;
+            switch (token.tag) {
+                .l_paren => try open.append(context.allocator, @intCast(index)),
+                .r_paren => _ = open.pop(),
+                else => {},
+            }
+        }
+        lookups.parentheses = enclosing;
+        return enclosing;
+    }
+
+    /// The defers and errdefers of the scope that `scopeDeinitializesReceiver`
+    /// reads: each one's body is skipped, so a defer inside it is not read.
+    fn deferBodies(lookups: *Lookups, context: RuleRun, scope_opening: usize, scope_end: usize) ![]const DeferBody {
+        if (lookups.scope_defers.get(@intCast(scope_opening))) |bodies| return bodies;
+        var bodies: std.ArrayList(DeferBody) = .empty;
+        defer bodies.deinit(context.allocator);
+        var index = scope_opening + 1;
+        while (index + 3 < scope_end) : (index += 1) {
+            const tag = context.tokens[index].tag;
+            if (tag != .keyword_defer and tag != .keyword_errdefer) continue;
+            const body_end = if (context.tokens[index + 1].tag == .l_brace)
+                context.matchingToken(index + 1, .l_brace, .r_brace) orelse scope_end
+            else
+                context.statementEnd(index + 1) orelse scope_end;
+            try bodies.append(context.allocator, .{ .keyword = @intCast(index), .end = @intCast(@min(body_end, scope_end)) });
+            index = @min(body_end, scope_end - 1);
+        }
+        const owned = try bodies.toOwnedSlice(context.allocator);
+        errdefer context.allocator.free(owned);
+        try lookups.scope_defers.put(context.allocator, @intCast(scope_opening), owned);
+        return owned;
+    }
+
+    fn returnStatements(lookups: *Lookups, context: RuleRun) !ReturnStatements {
+        if (lookups.return_statements == null) lookups.return_statements = try .init(context);
+        return lookups.return_statements.?;
+    }
+
+    /// Whether some `name:` in the file has `Allocator` in its type.
+    fn declaredAllocator(lookups: *Lookups, context: RuleRun, name: []const u8) !bool {
+        if (lookups.allocator_names == null) {
+            var names: std.StringHashMapUnmanaged(void) = .empty;
+            errdefer names.deinit(context.allocator);
+            for (context.tokens, 0..) |token, identifier_index| {
+                if (token.tag != .identifier or identifier_index + 2 >= context.tokens.len or
+                    context.tokens[identifier_index + 1].tag != .colon) continue;
+                var type_index = identifier_index + 2;
+                while (type_index < context.tokens.len) : (type_index += 1) {
+                    switch (context.tokens[type_index].tag) {
+                        .comma, .r_paren, .equal, .semicolon, .l_brace => break,
+                        .identifier => if (context.tokenIs(type_index, "Allocator")) {
+                            try names.put(context.allocator, context.tokenText(identifier_index), {});
+                            break;
+                        },
+                        else => {},
+                    }
+                }
+            }
+            lookups.allocator_names = names;
+        }
+        return lookups.allocator_names.?.contains(name);
+    }
+};
+
+/// Every `return` with the `;` ending its statement and the innermost earlier
+/// return whose statement holds it.
+const ReturnStatements = struct {
+    keywords: []const u32,
+    /// `statementEnd` of each return, or `none_token`.
+    ends: []const u32,
+    /// Index into `keywords` of the innermost earlier statement holding each
+    /// keyword, or `none_token`.
+    holders: []const u32,
+    /// Whether two statements overlap without one holding the other, which
+    /// only unbalanced input can do. Then no lookup trusts `holders`.
+    crossing: bool,
+
+    fn init(context: RuleRun) !ReturnStatements {
+        var keywords: std.ArrayList(u32) = .empty;
+        defer keywords.deinit(context.allocator);
+        for (context.tokens, 0..) |token, index| {
+            if (token.tag == .keyword_return) try keywords.append(context.allocator, @intCast(index));
+        }
+        const ends = try context.allocator.alloc(u32, keywords.items.len);
+        errdefer context.allocator.free(ends);
+        const holders = try context.allocator.alloc(u32, keywords.items.len);
+        errdefer context.allocator.free(holders);
+        var crossing = false;
+        // The statements still open at the current keyword, innermost last.
+        var open: std.ArrayList(u32) = .empty;
+        defer open.deinit(context.allocator);
+        for (keywords.items, 0..) |keyword, entry| {
+            while (open.last()) |last| {
+                if (ends[last] > keyword) break;
+                _ = open.pop();
+            }
+            holders[entry] = open.last() orelse syntax_scope.none_token;
+            const end = context.statementEnd(keyword) orelse {
+                ends[entry] = syntax_scope.none_token;
+                continue;
+            };
+            ends[entry] = @intCast(end);
+            if (open.last()) |last| crossing = crossing or end > ends[last];
+            try open.append(context.allocator, @intCast(entry));
+        }
+        return .{ .keywords = try keywords.toOwnedSlice(context.allocator), .ends = ends, .holders = holders, .crossing = crossing };
+    }
+
+    fn deinit(statements: *ReturnStatements, allocator: std.mem.Allocator) void {
+        allocator.free(statements.keywords);
+        allocator.free(statements.ends);
+        allocator.free(statements.holders);
+    }
+
+    /// Appends the returns in `[start, end)` whose statements hold a use of
+    /// `name` before `uses_end`, or every return there when statements cross.
+    fn appendHolding(
+        statements: ReturnStatements,
+        allocator: std.mem.Allocator,
+        identifiers: *const IdentifierTable,
+        list: *std.ArrayList(u32),
+        name: []const u8,
+        start: usize,
+        end: usize,
+        uses_end: usize,
+    ) !void {
+        if (statements.crossing) return list.appendSlice(allocator, positionsWithin(statements.keywords, start, end));
+        for (identifiers.within(name, start + 1, uses_end)) |use| {
+            const preceding = std.sort.partitionPoint(u32, statements.keywords, @as(usize, use), positionBefore);
+            if (preceding == 0) continue;
+            // A statement holding the use holds every return between them, so
+            // it is the innermost holder of the last return before the use or
+            // one of that holder's own holders.
+            var holder: u32 = @intCast(preceding - 1);
+            while (holder != syntax_scope.none_token and
+                (statements.ends[holder] == syntax_scope.none_token or statements.ends[holder] <= use)) holder = statements.holders[holder];
+            while (holder != syntax_scope.none_token and statements.keywords[holder] >= start) : (holder = statements.holders[holder]) {
+                if (statements.keywords[holder] < end) try list.append(allocator, statements.keywords[holder]);
+            }
+        }
+    }
+};
+
+const ScopedName = struct { scope: u32, name: []const u8 };
+
+const ScopedNames = std.HashMapUnmanaged(ScopedName, bool, struct {
+    pub fn hash(_: @This(), key: ScopedName) u64 {
+        return std.hash.Wyhash.hash(key.scope, key.name);
+    }
+
+    pub fn eql(_: @This(), left: ScopedName, right: ScopedName) bool {
+        return left.scope == right.scope and std.mem.eql(u8, left.name, right.name);
+    }
+}, std.hash_map.default_max_load_percentage);
+
+/// A `defer` or `errdefer` that `scopeDeinitializesReceiver` reads, with
+/// the end of its body clamped to the scope.
+const DeferBody = struct {
+    keyword: u32,
+    end: u32,
+
+    fn startsBefore(position: usize, body: DeferBody) bool {
+        return body.keyword < position;
+    }
+};
 
 fn lineIndent(source: []const u8, offset: usize) []const u8 {
     const line_start = if (std.mem.findScalarLast(u8, source[0..offset], '\n')) |newline| newline + 1 else 0;
@@ -1974,6 +2388,49 @@ test "fallible container builders need cleanup before ownership transfer" {
     try std.testing.expect(std.mem.find(u8, findings[0].message, "backing allocation") != null);
 }
 
+test "container builders returned whole or in an aggregate need cleanup before the transfer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn whole(gpa: std.mem.Allocator) !std.ArrayList(u8) {" ++
+        "var list: std.ArrayList(u8) = .empty; try list.append(gpa, 1); try list.append(gpa, 2); return list; }" ++
+        "fn wrapped(gpa: std.mem.Allocator) !Holder {" ++
+        "var list: std.ArrayList(u8) = .empty; try list.append(gpa, 1); try list.append(gpa, 2); return .{ .list = list }; }" ++
+        "fn later(gpa: std.mem.Allocator) !std.ArrayList(u8) {" ++
+        "var list: std.ArrayList(u8) = .empty; try list.append(gpa, 1); try validate(); return list; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 3), findings.len);
+    for (findings) |finding| try std.testing.expect(std.mem.find(u8, finding.message, "backing allocation") != null);
+}
+
+test "a single growth with nothing fallible after it needs no container cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn single(gpa: std.mem.Allocator) !std.ArrayList(u8) {" ++
+        "var list: std.ArrayList(u8) = .empty; try list.append(gpa, 1); return list; }" ++
+        "fn length(gpa: std.mem.Allocator) !usize {" ++
+        "var list: std.ArrayList(u8) = .empty; defer list.deinit(gpa); try list.append(gpa, 1); try list.append(gpa, 2); return list.items.len; }" ++
+        // An owner's allocator field is often an arena; only `toOwnedSlice` counts for it.
+        "fn owned(self: *Graph) !std.ArrayList(u8) {" ++
+        "var list: std.ArrayList(u8) = .empty; try list.append(self.a, 1); try list.append(self.a, 2); return list; }";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "an error return after releasing the value by hand does not leak it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const clean: [:0]const u8 =
+        "fn copy(gpa: std.mem.Allocator, text: []const u8) ![]u8 { const owned = try gpa.dupe(u8, text);" ++
+        "if (owned.len > 8) { gpa.free(owned); return error.TooLong; } return owned; }";
+    try std.testing.expectEqual(@as(usize, 0), (try findingsFor(arena.allocator(), clean)).len);
+    const leaking: [:0]const u8 =
+        "fn copy(gpa: std.mem.Allocator, text: []const u8) ![]u8 { const owned = try gpa.dupe(u8, text);" ++
+        "if (owned.len > 8) { gpa.free(owned); return error.TooLong; } try validate(); return owned; }";
+    try std.testing.expectEqual(@as(usize, 1), (try findingsFor(arena.allocator(), leaking)).len);
+}
+
 test "container builders with early error cleanup stay clean" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2302,6 +2759,7 @@ test "the enclosing function scope matches a scan of every earlier function" {
     var syntax = try @import("../context.zig").Syntax.init(allocator, source, tokens);
     var found: std.ArrayList(types.Finding) = .empty;
     const context = syntax.ruleRun(allocator, types.Configuration.defaults(), &found);
+    const keywords = try functionKeywords(context);
     for (0..tokens.len) |target| {
         var expected: ?ScopeRange = null;
         for (tokens[0..target], 0..) |token, declaration_index| {
@@ -2311,10 +2769,36 @@ test "the enclosing function scope matches a scan of every earlier function" {
             const body_closing = context.matchingToken(body_opening, .l_brace, .r_brace) orelse continue;
             if (target < body_closing) expected = .{ .declaration = declaration_index, .opening = body_opening, .closing = body_closing };
         }
-        try std.testing.expectEqual(expected, functionScopeContaining(context, target));
+        try std.testing.expectEqual(expected, functionScopeContaining(context, keywords, target));
     }
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
     return support.findings(allocator, run, source, types.Configuration.defaults());
+}
+
+test "plain releases nested in another call and returns nested in a return are found" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\fn nested(allocator: std.mem.Allocator) !void { const bytes = try allocator.alloc(u8, 4); try check(); allocator.free(keep(bytes)); }
+        \\fn deferred(allocator: std.mem.Allocator) !void { const owned = try allocator.alloc(u8, 4); defer allocator.free(owned); try check(); }
+        \\fn returned(a: std.mem.Allocator, flag: bool) !std.ArrayList(u8) {
+        \\    var list: std.ArrayList(u8) = .empty;
+        \\    try list.append(a, 1);
+        \\    if (flag) return error.Bad;
+        \\    try list.append(a, 2);
+        \\    return .{ .items = list.items, .capacity = blk: {
+        \\        if (flag) return list;
+        \\        break :blk list.capacity;
+        \\    } };
+        \\}
+        \\fn check() !void {}
+        \\fn keep(bytes: []u8) []u8 { return bytes; }
+    ;
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expectEqualStrings("bytes", source[findings[0].span.start..findings[0].span.end]);
+    try std.testing.expectEqualStrings("list", source[findings[1].span.start..findings[1].span.end]);
 }

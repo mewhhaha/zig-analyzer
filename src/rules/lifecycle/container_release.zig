@@ -3,7 +3,9 @@
 //! The allocation engine tracks `alloc`/`dupe` results; this pass covers the
 //! values that release themselves with `deinit`: any std container (identified
 //! through `container_types`), an `ArenaAllocator`, and local structs with a
-//! `deinit` method. It reports under `use_after_release` and `double_release`.
+//! `deinit` method. It reports under `use_after_release` and `double_release`,
+//! and under `mismatched_allocation_release` an unmanaged container grown
+//! through one allocator parameter and released through another.
 
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
@@ -16,7 +18,10 @@ const views = @import("invalidated_container_view.zig");
 pub fn run(context: RuleRun) !void {
     const use_level = context.level(.use_after_release);
     const double_level = context.level(.double_release);
-    if (use_level == .off and double_level == .off) return;
+    const mismatch_level = context.level(.mismatched_allocation_release);
+    if (use_level == .off and double_level == .off and mismatch_level == .off) return;
+    // The scans below visit a binding's uses through the identifier table.
+    _ = try context.scopes.identifiers();
     var owners = try ownerTypes(context);
     defer owners.deinit(context.allocator);
     var aliases: views.AllocatorAliases = .{};
@@ -32,6 +37,7 @@ pub fn run(context: RuleRun) !void {
         try checkReleases(context, declaration + 1, declaration_end + 1, scope_end, subject, use_level, double_level);
         if (subject == .arena) try checkArenaAllocations(context, &aliases, declaration + 1, declaration_end + 1, scope_end, use_level);
         if (subject != .arena) try checkCopies(context, declaration + 1, declaration_end + 1, scope_end, double_level);
+        if (subject == .container) try checkAllocators(context, declaration + 1, declaration_end + 1, scope_end, mismatch_level);
     }
 }
 
@@ -117,8 +123,9 @@ fn checkReleases(
     double_level: types.Level,
 ) !void {
     const name = context.tokenText(name_index);
-    for (context.tokens[start..scope_end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or context.tokens[index - 1].tag == .period) continue;
+    var uses = context.scopes.identifiersNamed(name, start, scope_end);
+    while (uses.next()) |index| {
+        if (context.tokens[index - 1].tag == .period) continue;
         const release = releaseCall(context, index, scope_end) orelse continue;
         const keyword = statementKeyword(context, index);
         if (keyword == .keyword_errdefer) continue;
@@ -126,10 +133,9 @@ fn checkReleases(
         const call_end = reach.callEnd(context, release) orelse continue;
         var fresh = false;
         // The first later mention that control flow can reach decides.
-        var cursor = call_end + 1;
-        while (cursor < scope_end) : (cursor += 1) {
-            if (!context.tokenIs(cursor, name) or context.tokens[cursor].tag != .identifier or
-                context.tokens[cursor - 1].tag == .period or !reach.mutationReaches(context, index, cursor)) continue;
+        var mentions = context.scopes.identifiersNamed(name, call_end + 1, scope_end);
+        while (mentions.next()) |cursor| {
+            if (context.tokens[cursor - 1].tag == .period or !reach.mutationReaches(context, index, cursor)) continue;
             if (context.tokens[cursor - 1].tag == .keyword_const or context.tokens[cursor - 1].tag == .keyword_var) {
                 fresh = true;
                 break;
@@ -207,9 +213,9 @@ const DeferredRelease = struct {
 };
 
 fn deferredReleaseAfter(context: RuleRun, name: []const u8, declaration: usize, release: usize, scope_end: usize) ?DeferredRelease {
-    for (context.tokens[declaration..scope_end], declaration..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or index == release or
-            context.tokens[index - 1].tag == .period or releaseCall(context, index, scope_end) == null) continue;
+    var uses = context.scopes.identifiersNamed(name, declaration, scope_end);
+    while (uses.next()) |index| {
+        if (index == release or context.tokens[index - 1].tag == .period or releaseCall(context, index, scope_end) == null) continue;
         const keyword = reach.deferKeyword(context, index) orelse continue;
         if (context.tokens[keyword].tag != .keyword_defer) continue;
         if (keyword < release) {
@@ -290,9 +296,9 @@ fn flagAssignment(context: RuleRun, index: usize, flag: []const u8, value: []con
 }
 
 fn reassignedBetween(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, name) and index + 1 < end and
-            context.tokens[index + 1].tag == .equal and context.tokens[index - 1].tag != .period) return true;
+    var uses = context.scopes.identifiersNamed(name, start, end);
+    while (uses.next()) |index| {
+        if (index + 1 < end and context.tokens[index + 1].tag == .equal and context.tokens[index - 1].tag != .period) return true;
     }
     return false;
 }
@@ -311,10 +317,14 @@ fn checkCopies(
     double_level: types.Level,
 ) !void {
     const name = context.tokenText(name_index);
-    for (context.tokens[start..scope_end], start..) |token, copy| {
+    // `const copy = name;` names the original three tokens after its keyword.
+    var uses = context.scopes.identifiersNamed(name, start + 3, scope_end);
+    while (uses.next()) |use| {
+        const copy = use - 3;
+        const token = context.tokens[copy];
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or copy + 4 >= scope_end or
             context.tokens[copy + 1].tag != .identifier or context.tokens[copy + 2].tag != .equal or
-            !context.tokenIs(copy + 3, name) or context.tokens[copy + 4].tag != .semicolon) continue;
+            context.tokens[copy + 4].tag != .semicolon) continue;
         const copy_name = context.tokenText(copy + 1);
         const original_release = firstPlainRelease(context, name, copy + 5, scope_end) orelse continue;
         const copy_release = firstPlainRelease(context, copy_name, copy + 5, scope_end) orelse continue;
@@ -334,10 +344,75 @@ fn checkCopies(
     }
 }
 
+/// `list.append(a, x)` and then `list.deinit(b)`, where `a` and `b` are
+/// distinct allocator parameters: the release goes to an allocator that did not
+/// hand out the storage. Reassigning the container may start a lifetime with
+/// another allocator, so only the calls before it count.
+fn checkAllocators(context: RuleRun, name_index: usize, start: usize, scope_end: usize, level: types.Level) !void {
+    if (level == .off) return;
+    const name = context.tokenText(name_index);
+    var first_growth: ?usize = null;
+    var other_growth: ?usize = null;
+    var release: ?usize = null;
+    var uses = context.scopes.identifiersNamed(name, start, scope_end);
+    while (uses.next()) |index| {
+        if (!context.refersToBinding(index, name) or index + 5 >= scope_end) continue;
+        if (context.tokens[index + 1].tag == .equal) break;
+        if (context.tokens[index + 1].tag != .period or context.tokens[index + 2].tag != .identifier or
+            context.tokens[index + 3].tag != .l_paren) continue;
+        const method = context.tokenText(index + 2);
+        const releases = std.mem.eql(u8, method, "deinit");
+        if (!releases and !container_types.isOneOf(method, &container_types.list_growth) and
+            !container_types.isOneOf(method, &container_types.map_growth)) continue;
+        const argument = index + 4;
+        if ((context.tokens[argument + 1].tag != .comma and context.tokens[argument + 1].tag != .r_paren) or
+            !allocatorParameter(context, argument)) continue;
+        if (releases) {
+            release = release orelse argument;
+        } else if (first_growth) |first| {
+            if (other_growth == null and !context.tokenIs(argument, context.tokenText(first))) other_growth = argument;
+        } else first_growth = argument;
+    }
+    const released = release orelse return;
+    const first = first_growth orelse return;
+    const grown = if (!context.tokenIs(released, context.tokenText(first))) first else other_growth orelse return;
+    try context.emit(.{
+        .rule = .mismatched_allocation_release,
+        .level = level,
+        .span = context.tokens[released].loc,
+        .message = try context.allocator.print(
+            "container '{s}' grows through allocator '{s}' but is released through different allocator '{s}'",
+            .{ name, context.tokenText(grown), context.tokenText(released) },
+        ),
+    });
+}
+
+/// Whether the identifier at `index` names a function parameter declared
+/// with an `Allocator` type. Locals are left out: they may alias one another.
+fn allocatorParameter(context: RuleRun, index: usize) bool {
+    if (context.tokens[index].tag != .identifier) return false;
+    const binding = context.scopes.findBinding(index) orelse return false;
+    const declaration = binding.token_index;
+    if (declaration == 0 or declaration + 2 >= context.tokens.len or context.tokens[declaration + 1].tag != .colon) return false;
+    switch (context.tokens[declaration - 1].tag) {
+        .l_paren, .comma, .keyword_noalias => {},
+        else => return false,
+    }
+    var names_allocator = false;
+    for (context.tokens[declaration + 2 ..], declaration + 2..) |token, type_index| switch (token.tag) {
+        .comma, .r_paren => return names_allocator,
+        .identifier => names_allocator = names_allocator or context.tokenIs(type_index, "Allocator"),
+        .l_paren, .l_bracket, .l_brace, .equal, .semicolon => return false,
+        else => {},
+    };
+    return false;
+}
+
 /// A `name.deinit(` that is a plain call or a `defer`, not an `errdefer`.
 fn firstPlainRelease(context: RuleRun, name: []const u8, start: usize, end: usize) ?usize {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or context.tokens[index - 1].tag == .period or
+    var uses = context.scopes.identifiersNamed(name, start, end);
+    while (uses.next()) |index| {
+        if (context.tokens[index - 1].tag == .period or
             releaseCall(context, index, end) == null or statementKeyword(context, index) == .keyword_errdefer) continue;
         return index;
     }
@@ -355,8 +430,9 @@ fn checkArenaAllocations(
 ) !void {
     const arena = context.tokenText(arena_index);
     var release: ?usize = null;
-    for (context.tokens[start..scope_end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, arena) or context.tokens[index - 1].tag == .period or
+    var uses = context.scopes.identifiersNamed(arena, start, scope_end);
+    while (uses.next()) |index| {
+        if (context.tokens[index - 1].tag == .period or
             releaseCall(context, index, scope_end) == null or statementKeyword(context, index) != null) continue;
         release = index;
         break;
@@ -385,9 +461,9 @@ fn checkArenaAllocations(
 }
 
 fn firstUse(context: RuleRun, name: []const u8, release: usize, start: usize, end: usize) ?usize {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag != .identifier or !context.tokenIs(index, name) or context.tokens[index - 1].tag == .period or
-            !reach.mutationReaches(context, release, index)) continue;
+    var uses = context.scopes.identifiersNamed(name, start, end);
+    while (uses.next()) |index| {
+        if (context.tokens[index - 1].tag == .period or !reach.mutationReaches(context, release, index)) continue;
         if (context.tokens[index - 1].tag == .keyword_const or context.tokens[index - 1].tag == .keyword_var) return null;
         if (index + 1 < end and context.tokens[index + 1].tag == .equal) return null;
         if (reach.harmlessUse(context, index)) continue;
@@ -449,6 +525,33 @@ test "a release in a returning branch does not taint the sibling branch" {
     );
     try expectRules(
         "fn f(gpa: std.mem.Allocator, c: bool) !void { var l: std.ArrayList(u8) = .empty; if (c) { l.deinit(gpa); } else { try l.append(gpa, 1); l.deinit(gpa); } }",
+        &.{},
+    );
+}
+
+test "a container released through a different allocator parameter is mismatched" {
+    try expectRules(
+        "fn f(a: std.mem.Allocator, b: std.mem.Allocator) !void { var l: std.ArrayList(u8) = .empty; try l.append(a, 1); l.deinit(b); }",
+        &.{.mismatched_allocation_release},
+    );
+    try expectRules(
+        "fn f(a: std.mem.Allocator, b: std.mem.Allocator) !void { var m: std.AutoHashMapUnmanaged(u8, u8) = .empty; defer m.deinit(b); try m.put(b, 1, 1); try m.put(a, 2, 2); }",
+        &.{.mismatched_allocation_release},
+    );
+}
+
+test "a container released through the allocator that grew it is clean" {
+    try expectRules(
+        "fn f(a: std.mem.Allocator, b: std.mem.Allocator) !void { var l: std.ArrayList(u8) = .empty; defer l.deinit(a); try l.append(a, 1); _ = b; }",
+        &.{},
+    );
+    // Locals may alias the same allocator, and a reassignment may start a new lifetime.
+    try expectRules(
+        "fn f(self: *S) !void { const gpa = self.gpa; var l: std.ArrayList(u8) = .empty; try l.append(gpa, 1); l.deinit(self.gpa); }",
+        &.{},
+    );
+    try expectRules(
+        "fn f(a: std.mem.Allocator, b: std.mem.Allocator) !void { var l: std.ArrayList(u8) = .empty; try l.append(a, 1); l.deinit(a); l = .empty; try l.append(b, 1); l.deinit(b); }",
         &.{},
     );
 }

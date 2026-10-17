@@ -14,8 +14,20 @@ intentional truncation.
 
 ## When it fires
 
-Field types declared in local structs and slice lengths written through
-`std.mem.writeInt` are included.
+The target type comes from the cast's result location: a typed declaration,
+`@as`, a value written through `std.mem.writeInt`, the function's one-name
+return type, a field of a struct this file declares (initialized as
+`S{ .a = @intCast(n) }`, as an anonymous literal of a known type, or assigned
+as `s.a = @intCast(n)`), an assigned typed local, or a parameter of a function
+this file declares. The value is a binding declared once with one type name, a
+field of a local struct, or the length of a slice.
+
+Values that cannot be out of range are not reported: casts evaluated at compile
+time, where the compiler checks the range; `@ptrFromInt(@as(usize,
+@intCast(address)))`, which restores an address an earlier `@intFromPtr`
+widened; values whose initializer shifts or masks them into the target
+(`const rot: u32 = @intCast(l >> 59)` cast to `u5`); and values selected by a
+`switch` on a length derived from them.
 
 Enable it for input conversion and protocol code where runtime values must be
 validated before narrowing.

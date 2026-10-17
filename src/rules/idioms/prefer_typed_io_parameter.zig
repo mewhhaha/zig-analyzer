@@ -4,6 +4,7 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const RuleRun = @import("../context.zig").RuleRun;
+const legacy_format_method = @import("../modernize/legacy_format_method.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 
@@ -137,6 +138,8 @@ pub fn run(context: RuleRun) !void {
         // std.json calls `jsonStringify` with its `*std.json.Stringify`, whose
         // `write` and `print` share the writer's names but not its interface.
         if (prototype.name_token) |name| if (std.mem.eql(u8, tree.tokenSlice(name), "jsonStringify")) continue;
+        // That rule's migration replaces the whole signature, writer included.
+        if (context.level(.legacy_format_method) != .off and legacy_format_method.legacyFormat(tree, prototype) != null) continue;
         var parameters = prototype.iterate(tree);
         while (parameters.next()) |parameter| {
             const anytype_token = parameter.anytype_ellipsis3 orelse continue;
@@ -247,7 +250,8 @@ test "parameters passed on, reflected on, or used through other methods stay any
         "fn compileTime(comptime writer: anytype) void { writer.flush(); }\n" ++
         "fn legacyReader(reader: anytype) !u8 { return reader.readByte(); }\n" ++
         "fn mixed(writer: anytype) !void { _ = try writer.takeByte(); }\n" ++
-        "const Details = struct { bytes: []const u8, pub fn jsonStringify(self: Details, writer: anytype) !void { try writer.print(\"{s}\", .{self.bytes}); } };\n";
+        "const Details = struct { bytes: []const u8, pub fn jsonStringify(self: Details, writer: anytype) !void { try writer.print(\"{s}\", .{self.bytes}); } };\n" ++
+        "const Point = struct { x: i32, pub fn format(self: Point, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void { _ = fmt; _ = options; try writer.print(\"{d}\", .{self.x}); } };\n";
     const found = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }

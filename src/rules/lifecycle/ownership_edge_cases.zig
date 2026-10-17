@@ -8,6 +8,8 @@ const support = @import("../test_support.zig");
 const TokenRange = @import("../../syntax/tokens.zig").Range;
 
 pub fn run(context: RuleRun) !void {
+    // The scans below visit a binding's uses through the identifier table.
+    _ = try context.scopes.identifiers();
     var declarations = try Declarations.init(context);
     defer declarations.deinit(context.allocator);
     try findReallocFallbackLeaks(context);
@@ -225,9 +227,10 @@ fn findShortenedAllocationReturns(context: RuleRun) !void {
         if (!rangeCallsMethod(context, "alloc", declaration_index + 2, declaration_end)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
-        var index = declaration_end + 1;
-        while (index + 3 < scope_end) : (index += 1) {
-            if (!context.tokenIs(index, binding) or context.tokens[index + 1].tag != .l_bracket) continue;
+        var uses = context.scopes.identifiersNamed(binding, declaration_end + 1, scope_end);
+        while (uses.next()) |index| {
+            if (index + 3 >= scope_end) break;
+            if (context.tokens[index + 1].tag != .l_bracket) continue;
             const slice_end = context.matchingToken(index + 1, .l_bracket, .r_bracket) orelse continue;
             if (slice_end >= scope_end or !containsRange(context, index + 2, slice_end) or
                 fullAllocationSlice(context, binding, index + 2, slice_end)) continue;
@@ -422,8 +425,10 @@ fn findPartialOwnershipTransfers(context: RuleRun, declarations: *const Declarat
         const owner_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
+        // A transferring return names the binding after its `return`.
+        const last_use = lastUse(context, binding, declaration_end + 1, scope_end) orelse continue;
         var index = declaration_end + 1;
-        while (index + 2 < scope_end) : (index += 1) {
+        while (index + 2 < scope_end and index < last_use) : (index += 1) {
             if (context.tokens[index].tag != .keyword_return or context.enclosingOpeningBrace(index) != owner_scope) continue;
             const return_end = context.statementEnd(index) orelse continue;
             const transferred_field = bindingFieldInRange(context, binding, index + 1, return_end) orelse continue;
@@ -671,6 +676,14 @@ fn functionReturnType(context: RuleRun, declarations: *const Declarations, name:
         return selected;
     }
     return null;
+}
+
+/// The last identifier spelled `name` in `[start, end)`.
+fn lastUse(context: RuleRun, name: []const u8, start: usize, end: usize) ?usize {
+    var last: ?usize = null;
+    var uses = context.scopes.identifiersNamed(name, start, end);
+    while (uses.next()) |use| last = use;
+    return last;
 }
 
 fn bindingFieldInRange(context: RuleRun, binding: []const u8, start: usize, end: usize) ?[]const u8 {

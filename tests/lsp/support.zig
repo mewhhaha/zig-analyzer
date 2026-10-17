@@ -6,6 +6,7 @@ const lsp = @import("lsp");
 const zig_analyzer = @import("zig_analyzer");
 
 const Server = zig_analyzer.lsp.server.Server;
+const Input = zig_analyzer.lsp.deferred_diagnostics.Input;
 
 /// Feeds `incoming` to the server one message at a time and keeps what the
 /// server writes, in order. Must not move after `init`.
@@ -37,6 +38,24 @@ pub const TestTransport = struct {
         return transport.outputs.items[index];
     }
 
+    /// An `incoming` entry standing for the editor pausing: a server waiting
+    /// for input there sees none, and reading skips it.
+    pub const pause = "";
+
+    /// Input for `Server.Options.diagnostics`: ready while scripted messages
+    /// remain, until the script reaches a `pause`.
+    pub fn input(transport: *TestTransport) Input {
+        return .{ .context = transport, .waitFn = waitForInput };
+    }
+
+    fn waitForInput(context: *anyopaque, _: std.Io, _: std.Io.Duration) bool {
+        const transport: *TestTransport = @ptrCast(@alignCast(context));
+        if (transport.incoming_index == transport.incoming.len) return false;
+        if (transport.incoming[transport.incoming_index].len != 0) return true;
+        transport.incoming_index += 1;
+        return false;
+    }
+
     /// Scripted messages name documents inside this checkout by a
     /// `file://examples/...` or `file://fixtures/...` placeholder; it becomes
     /// an absolute URI, so configuration lookup finds the checkout's
@@ -49,6 +68,8 @@ pub const TestTransport = struct {
         allocator: std.mem.Allocator,
     ) lsp.Transport.ReadError![]u8 {
         const test_transport: *TestTransport = @fieldParentPtr("transport", transport);
+        while (test_transport.incoming_index < test_transport.incoming.len and
+            test_transport.incoming[test_transport.incoming_index].len == 0) test_transport.incoming_index += 1;
         if (test_transport.incoming_index == test_transport.incoming.len) return error.EndOfStream;
         var message = try allocator.dupe(u8, test_transport.incoming[test_transport.incoming_index]);
         errdefer allocator.free(message);

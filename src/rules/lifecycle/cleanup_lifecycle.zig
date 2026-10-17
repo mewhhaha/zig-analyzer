@@ -2,6 +2,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const RuleRun = @import("../context.zig").RuleRun;
+const syntax_scope = @import("../../syntax/scope.zig");
 const resources = @import("../resources.zig");
 const support = @import("../test_support.zig");
 
@@ -15,6 +16,7 @@ pub fn run(context: RuleRun) !void {
 fn findReassignedCleanupBindings(context: RuleRun) !void {
     const level = context.level(.defer_uses_reassigned_binding);
     if (level == .off) return;
+    var identifiers: ?*const syntax_scope.IdentifierTable = null;
     for (context.tokens, 0..) |token, defer_index| {
         if (token.tag != .keyword_defer) continue;
         const scope_opening = context.enclosingOpeningBrace(defer_index) orelse continue;
@@ -23,21 +25,26 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
         // Unbalanced braces can end the statement past its block.
         if (defer_end >= scope_end) continue;
         const cleanup_binding = cleanupBinding(context, defer_index + 1, defer_end) orelse continue;
-        for (context.tokens[defer_end + 1 .. scope_end], defer_end + 1..) |candidate, index| {
-            if (candidate.tag != .identifier or !context.tokenIs(index, cleanup_binding) or index + 1 >= scope_end or
+        const table = identifiers orelse try context.scopes.identifiers();
+        identifiers = table;
+        for (table.within(cleanup_binding, defer_end + 1, scope_end)) |index| {
+            if (index + 1 >= scope_end or
                 !context.refersToBinding(index, cleanup_binding) or context.tokens[index + 1].tag != .equal or
                 context.enclosingOpeningBrace(index) != scope_opening) continue;
             if (index > 0 and (context.tokens[index - 1].tag == .keyword_const or
                 context.tokens[index - 1].tag == .keyword_var)) continue;
             const assignment_end = context.statementEnd(index) orelse continue;
             if (replacementConsumesOriginal(context, cleanup_binding, index + 2, assignment_end) or
+                replacementReslicesOriginal(context, cleanup_binding, index + 2, assignment_end) or
+                replacementNamesConsumingResult(context, cleanup_binding, defer_end + 1, index, index + 2) or
+                contentsMovedOutBefore(context, cleanup_binding, defer_end + 1, index) or
                 replacementRestoresWriterList(context, cleanup_binding, defer_end + 1, index, index + 2, assignment_end) or
                 replacementRelinquishesOwnership(context, cleanup_binding, defer_end + 1, index, index + 2, assignment_end) or
                 releasedBeforeReplacement(context, cleanup_binding, defer_end + 1, index)) continue;
             try context.emit(.{
                 .rule = .defer_uses_reassigned_binding,
                 .level = level,
-                .span = candidate.loc,
+                .span = context.tokens[index].loc,
                 .message = try context.allocator.print(
                     "binding '{s}' is reassigned after deferred cleanup captures it; cleanup will target the replacement and may leak the original value",
                     .{cleanup_binding},
@@ -51,6 +58,11 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
 fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
     const level = context.level(.resource_cleanup_on_error_only);
     if (level == .off) return;
+    var identifiers: ?*const syntax_scope.IdentifierTable = null;
+    var parentheses: ?[]const u32 = null;
+    defer if (parentheses) |built| context.allocator.free(built);
+    var returns: ?[]const u32 = null;
+    defer if (returns) |built| context.allocator.free(built);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
@@ -59,16 +71,25 @@ fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
+        const table = identifiers orelse try context.scopes.identifiers();
+        identifiers = table;
+        const enclosing = parentheses orelse try enclosingParentheses(context);
+        parentheses = enclosing;
         var error_cleanup = false;
         var normal_cleanup = false;
-        for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |_, index| {
-            if (!context.tokenIs(index, resource.release)) continue;
-            const statement_start = precedingStatementKeyword(context.tokens, index);
-            if (!releaseReferencesBinding(context, binding_name, index, scope_end)) continue;
-            if (statement_start == .keyword_errdefer) error_cleanup = true else normal_cleanup = true;
+        // A release of the binding names it as the receiver (`name.close()`) or
+        // inside the call's parentheses, so its uses lead to every release.
+        for (table.within(binding_name, declaration_end + 1, scope_end)) |use| {
+            if (use + 2 < scope_end and context.tokens[use + 1].tag == .period)
+                markRelease(context, binding_name, resource.release, use + 2, scope_end, &error_cleanup, &normal_cleanup);
+            var opening = enclosing[use];
+            while (opening != syntax_scope.none_token and opening >= declaration_end + 2) : (opening = enclosing[opening])
+                markRelease(context, binding_name, resource.release, opening - 1, scope_end, &error_cleanup, &normal_cleanup);
         }
-        if (!error_cleanup or normal_cleanup or
-            bindingTransferred(context, binding_name, resource.release, declaration_end + 1, scope_end)) continue;
+        if (!error_cleanup or normal_cleanup) continue;
+        const return_keywords = returns orelse try returnKeywords(context);
+        returns = return_keywords;
+        if (bindingTransferred(context, table, enclosing, return_keywords, binding_name, resource.release, declaration_end + 1, scope_end)) continue;
         try context.emit(.{
             .rule = .resource_cleanup_on_error_only,
             .level = level,
@@ -79,6 +100,37 @@ fn findErrorOnlyResourceCleanup(context: RuleRun) !void {
             ),
         });
     }
+}
+
+fn markRelease(
+    context: RuleRun,
+    binding_name: []const u8,
+    release: []const u8,
+    index: usize,
+    scope_end: usize,
+    error_cleanup: *bool,
+    normal_cleanup: *bool,
+) void {
+    if (!context.tokenIs(index, release) or !releaseReferencesBinding(context, binding_name, index, scope_end)) return;
+    if (precedingStatementKeyword(context.tokens, index) == .keyword_errdefer) error_cleanup.* = true else normal_cleanup.* = true;
+}
+
+/// The innermost `(` still open at each token, paired the way the scope index
+/// pairs parentheses, or `none_token`.
+fn enclosingParentheses(context: RuleRun) ![]const u32 {
+    const enclosing = try context.allocator.alloc(u32, context.tokens.len);
+    errdefer context.allocator.free(enclosing);
+    var open: std.ArrayList(u32) = .empty;
+    defer open.deinit(context.allocator);
+    for (context.tokens, 0..) |token, index| {
+        enclosing[index] = open.last() orelse syntax_scope.none_token;
+        switch (token.tag) {
+            .l_paren => try open.append(context.allocator, @intCast(index)),
+            .r_paren => _ = open.pop(),
+            else => {},
+        }
+    }
+    return enclosing;
 }
 
 fn cleanupBinding(context: RuleRun, start: usize, end: usize) ?[]const u8 {
@@ -126,6 +178,55 @@ fn replacementConsumesOriginal(context: RuleRun, name: []const u8, start: usize,
         }
     }
     return names_original and transfers_allocation;
+}
+
+/// `slice = slice[0..n]` or `slice = slice.ptr[0..n]`, typically after a
+/// successful `resize`: the replacement is the same allocation, so the
+/// deferred cleanup still releases it.
+fn replacementReslicesOriginal(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    if (start + 1 >= end or !context.refersToBinding(start, name)) return false;
+    var cursor = start + 1;
+    if (cursor + 2 < end and context.tokens[cursor].tag == .period and context.tokenIs(cursor + 1, "ptr")) cursor += 2;
+    if (context.tokens[cursor].tag != .l_bracket) return false;
+    const closing = context.matchingToken(cursor, .l_bracket, .r_bracket) orelse return false;
+    return closing + 1 == end;
+}
+
+/// `const moved = a.remap(values, n); values = moved.?;`: the replacement is
+/// a binding declared since the cleanup whose value reallocates the original.
+fn replacementNamesConsumingResult(
+    context: RuleRun,
+    name: []const u8,
+    search_start: usize,
+    assignment_index: usize,
+    replacement_start: usize,
+) bool {
+    if (context.tokens[replacement_start].tag != .identifier) return false;
+    const binding = context.scopes.findBinding(replacement_start) orelse return false;
+    const declaration = binding.token_index;
+    if (declaration <= search_start or declaration >= assignment_index or
+        (context.tokens[declaration - 1].tag != .keyword_const and context.tokens[declaration - 1].tag != .keyword_var)) return false;
+    const declaration_end = context.statementEnd(declaration) orelse return false;
+    return declaration_end < assignment_index and replacementConsumesOriginal(context, name, declaration + 1, declaration_end);
+}
+
+/// `var l = w.toArrayList(); ... w = .fromArrayList(gpa, &l);`: a call that
+/// moves the contents out of the binding leaves it empty, so replacing it
+/// afterwards loses nothing.
+fn contentsMovedOutBefore(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    const moving_methods = [_][]const u8{
+        "toOwnedSlice",
+        "toOwnedSliceSentinel",
+        "toArrayList",
+        "toArrayListAligned",
+        "moveToUnmanaged",
+    };
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or index + 3 >= end or context.tokens[index + 1].tag != .period or
+            context.tokens[index + 3].tag != .l_paren or !context.refersToBinding(index, name)) continue;
+        for (moving_methods) |method| if (context.tokenIs(index + 2, method)) return true;
+    }
+    return false;
 }
 
 fn replacementRelinquishesOwnership(
@@ -195,27 +296,51 @@ fn replacementRestoresWriterList(
     return false;
 }
 
-fn bindingTransferred(context: RuleRun, name: []const u8, release: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, index| {
-        if (token.tag == .identifier and context.tokenIs(index, name) and index > start and
-            context.tokens[index - 1].tag == .equal) return true;
-        if (token.tag == .keyword_return) {
-            const return_end = context.statementEnd(index) orelse continue;
-            for (context.tokens[index + 1 .. @min(return_end, end)], index + 1..) |return_token, return_index| {
-                if (return_token.tag == .identifier and context.tokenIs(return_index, name)) return true;
-            }
-        }
-        if (token.tag == .l_paren and index > start and context.tokens[index - 1].tag == .identifier and
-            !context.tokenIs(index - 1, release))
-        {
-            const closing = context.matchingToken(index, .l_paren, .r_paren) orelse continue;
-            if (closing >= end) continue;
-            for (index + 1..closing) |argument_index| {
-                if (context.refersToBinding(argument_index, name)) return true;
-            }
+/// Whether `[start, end)` assigns `name`, returns it, or passes it to a call
+/// other than `release`. Each needs a use of the name: after the `=`, inside
+/// the return statement, or inside the call's parentheses.
+fn bindingTransferred(
+    context: RuleRun,
+    identifiers: *const syntax_scope.IdentifierTable,
+    enclosing: []const u32,
+    returns: []const u32,
+    name: []const u8,
+    release: []const u8,
+    start: usize,
+    end: usize,
+) bool {
+    for (identifiers.within(name, start, end)) |use| {
+        if (use > start and context.tokens[use - 1].tag == .equal) return true;
+        if (!context.refersToBinding(use, name)) continue;
+        var opening = enclosing[use];
+        while (opening != syntax_scope.none_token and opening > start) : (opening = enclosing[opening]) {
+            if (context.tokens[opening - 1].tag != .identifier or context.tokenIs(opening - 1, release)) continue;
+            const closing = context.matchingToken(opening, .l_paren, .r_paren) orelse continue;
+            if (closing < end) return true;
         }
     }
+    const first = std.sort.partitionPoint(u32, returns, start, positionBefore);
+    for (returns[first..]) |return_keyword| {
+        const index: usize = return_keyword;
+        if (index >= end) break;
+        const return_end = context.statementEnd(index) orelse continue;
+        if (identifiers.firstWithin(name, index + 1, @min(return_end, end)) != null) return true;
+    }
     return false;
+}
+
+fn positionBefore(bound: usize, position: u32) bool {
+    return position < bound;
+}
+
+/// Every `return` keyword, in order.
+fn returnKeywords(context: RuleRun) ![]const u32 {
+    var returns: std.ArrayList(u32) = .empty;
+    defer returns.deinit(context.allocator);
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag == .keyword_return) try returns.append(context.allocator, @intCast(index));
+    }
+    return returns.toOwnedSlice(context.allocator);
 }
 
 fn precedingStatementKeyword(tokens: []const std.zig.Token, index: usize) std.zig.Token.Tag {
@@ -267,6 +392,29 @@ test "advanced realloc and moved empty resources preserve deferred cleanup" {
         "fn move(owner: anytype, a: anytype) void { var stack = acquire(); defer stack.deinit(a); owner.stack = stack; stack = .{}; }";
     const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     for (findings) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
+}
+
+test "reslices remaps and moved-out values keep the deferred cleanup correct" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn shrink(a: anytype) !void { var slice = try a.alloc(u8, 20); defer a.free(slice); if (a.resize(slice, 17)) slice = slice[0..17]; }" ++
+        "fn shrinkPointer(a: anytype) !void { var slice = try a.alloc(u8, 20); defer a.free(slice); if (!a.resize(slice, 17)) return; slice = slice.ptr[0..17]; }" ++
+        "fn remap(a: anytype) !void { var values = try a.alloc(u8, 10); defer a.free(values); const remapped = a.remap(values, 200); values = remapped.?; }" ++
+        "fn moved(a: anytype) !void { var w: Allocating = .init(a); defer w.deinit(); var list = w.toArrayList(); defer list.deinit(a); w = .fromArrayList(a, &list); }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    for (findings) |finding| try std.testing.expect(finding.rule != .defer_uses_reassigned_binding);
+}
+
+test "replacing a deferred allocation with unrelated memory still warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn other(a: anytype, source: []u8) !void { var bytes = try a.alloc(u8, 4); defer a.free(bytes); bytes = source[0..2]; }" ++
+        "fn remapOther(a: anytype, source: []u8) !void { var bytes = try a.alloc(u8, 4); defer a.free(bytes); const moved = a.remap(source, 8); bytes = moved.?; }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(types.Rule.defer_uses_reassigned_binding, finding.rule);
 }
 
 test "cleanup reassignment ignores ownership moves and shadow declarations" {
@@ -347,4 +495,16 @@ test "a declared resource pair reports cleanup registered only for errors" {
     try std.testing.expectEqual(types.Rule.resource_cleanup_on_error_only, declared[0].rule);
     const builtin = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     try std.testing.expectEqual(@as(usize, 0), builtin.len);
+}
+
+test "a resource passed inside a call argument is transferred" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn nested(dir: anytype) !void { var file = try dir.openFile(\"x\", .{}); errdefer file.close(); try check(wrap(file)); }\n" ++
+        "fn passed(dir: anytype, gpa: anytype) !void { var file = try dir.openFile(\"x\", .{}); errdefer file.close(); try check(); register(gpa, .{ .handle = file }); }\n" ++
+        "fn kept(dir: anytype) !void { var kept_file = try dir.openFile(\"x\", .{}); errdefer kept_file.close(); try check(); }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqualStrings("kept_file", source[findings[0].span.start..findings[0].span.end]);
 }

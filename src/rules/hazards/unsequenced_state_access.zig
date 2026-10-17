@@ -78,11 +78,21 @@ fn copiedInSiblingField(
 ) ?usize {
     for (context.tokens[aggregate_start + 1 .. aggregate_end], aggregate_start + 1..) |token, index| {
         if (index == receiver_index or token.tag != .identifier or
-            !context.refersToBinding(index, binding) or
+            !context.refersToBinding(index, binding) or !wholeFieldValue(context.tokens, index) or
             aggregateField(context.tokens, aggregate_start, index) == mutation_field) continue;
         return index;
     }
     return null;
+}
+
+/// Whether the identifier at `index` is a field's entire value (`.lexer =
+/// lexer` or a bare tuple element), which copies the binding. A method call or
+/// field read through it (`it.next()`, `it.index`) copies nothing.
+fn wholeFieldValue(tokens: []const std.zig.Token, index: usize) bool {
+    const before = tokens[index - 1].tag;
+    const after = tokens[index + 1].tag;
+    return (before == .equal or before == .l_brace or before == .comma) and
+        (after == .comma or after == .r_brace);
 }
 
 fn aggregateField(tokens: []const std.zig.Token, aggregate_start: usize, target: usize) usize {
@@ -125,7 +135,9 @@ test "sequenced mutation immutable values and observational methods stay clean" 
         "fn sequenced(source: []const u8) !Parser { var lexer = Lexer{ .source = source }; " ++
         "const current = try lexer.next(); return .{ .lexer = lexer, .current = current }; }\n" ++
         "fn immutable(lexer: Lexer) Pair { return .{ .left = lexer, .right = lexer.next() }; }\n" ++
-        "fn observed() Pair { var lexer = Lexer{}; return .{ .left = lexer, .count = lexer.len() }; }";
+        "fn observed() Pair { var lexer = Lexer{}; return .{ .left = lexer, .count = lexer.len() }; }\n" ++
+        "fn pair(text: []const u8) [2][]const u8 { var it = split(text); return .{ it.next().?, it.next().? }; }\n" ++
+        "fn named(line: []const u8) Entry { var it = tokenize(line); return .{ .name = it.next() orelse return error.Missing, .rest = it.rest() }; }";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);

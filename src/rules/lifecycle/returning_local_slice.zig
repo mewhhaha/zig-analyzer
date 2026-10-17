@@ -1,4 +1,5 @@
 const std = @import("std");
+const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = @import("../context.zig").RuleRun;
 const container_types = @import("../container_types.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
@@ -284,7 +285,23 @@ const Views = struct {
             const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse return null;
             return if (closing + 1 == value_end and views.literalHoldsView(context, opening, closing)) .aggregate else null;
         }
+        if (views.streamOverArray(context, cursor, value_end)) return .aggregate;
         return views.path(context, cursor, value_end);
+    }
+
+    /// Whether `[start, end)` is a `file.writer(io, &array)`, `reader`,
+    /// streaming or `.fixed(&array)` call, whose result keeps the array as its
+    /// buffer.
+    fn streamOverArray(views: *const Views, context: RuleRun, start: usize, end: usize) bool {
+        const tokens = context.tokens;
+        if (end < start + 4 or tokens[end - 1].tag != .r_paren) return false;
+        const opening = context.scopes.matchingToken(end - 1) orelse return false;
+        if (opening < start + 2 or tokens[opening - 2].tag != .period) return false;
+        const method = context.tokenText(opening - 1);
+        if (!container_types.isOneOf(method, &.{ "writer", "writerStreaming", "reader", "readerStreaming", "fixed" })) return false;
+        var last = opening + 1;
+        while (context.topLevelComma(last, end - 1)) |comma| last = comma + 1;
+        return views.buffer(context, last, end - 1);
     }
 
     /// The view either branch of `if (c) a else b` at `if_index` yields.
@@ -632,13 +649,15 @@ fn structFieldType(context: RuleRun, type_range: tokens_util.Range, field: []con
     return null;
 }
 
-/// Whether `index` sits in a `comptime { ... }` block of the function body
-/// opening at `function_scope`.
+/// Whether `index` sits in a `comptime { ... }` or `comptime label: { ... }`
+/// block of the function body opening at `function_scope`.
 fn insideComptimeBlock(context: RuleRun, index: usize, function_scope: usize) bool {
+    const tokens = context.tokens;
     var brace = context.enclosingOpeningBrace(index);
     while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
         if (opening <= function_scope) return false;
-        if (opening > 0 and context.tokens[opening - 1].tag == .keyword_comptime) return true;
+        const block = if (opening >= 3 and tokens[opening - 1].tag == .colon and tokens[opening - 2].tag == .identifier) opening - 2 else opening;
+        if (block > 0 and tokens[block - 1].tag == .keyword_comptime) return true;
     }
     return false;
 }
@@ -649,6 +668,10 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
     var functions: FunctionAddresses = .{};
     defer functions.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
+        if (token.tag == .keyword_fn and context.isNamedFunction(declaration_index)) {
+            try findReturnedParameterAddresses(context, &functions, level, declaration_index);
+            continue;
+        }
         if (token.tag != .keyword_var or declaration_index + 1 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or
             !context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
@@ -670,6 +693,53 @@ fn findReturnedLocalPointers(context: RuleRun) !void {
                 .message = try context.allocator.print(
                     "returned value stores a pointer to local binding '{s}', whose storage expires when the function returns",
                     .{binding_name},
+                ),
+            });
+        }
+    }
+}
+
+/// `return &value;` or `return .{ .ptr = &value };` for a runtime parameter:
+/// the parameter is the callee's own copy, which expires when it returns. A
+/// projection such as `&value.field` is left out, since through a pointer
+/// type it addresses the caller's memory instead.
+fn findReturnedParameterAddresses(
+    context: RuleRun,
+    functions: *FunctionAddresses,
+    level: types.Level,
+    fn_index: usize,
+) !void {
+    const tokens = context.tokens;
+    const function = context.functionRange(fn_index) orelse return;
+    if (context.scopes.enclosingFunctionBody(function.body_start + 1) != function.body_start) return;
+    var returns: ?*const FunctionAddresses.Addresses = null;
+    var depth: usize = 0;
+    for (tokens[function.parameters_start + 1 .. function.parameters_end], function.parameters_start + 1..) |token, index| {
+        switch (token.tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => depth -|= 1,
+            else => {},
+        }
+        if (depth != 0 or token.tag != .identifier or tokens[index + 1].tag != .colon) continue;
+        // A `comptime` parameter is a compile-time value, not stack storage.
+        switch (tokens[index - 1].tag) {
+            .l_paren, .comma, .keyword_noalias => {},
+            else => continue,
+        }
+        const name = context.tokenText(index);
+        const addresses = returns orelse try functions.of(context, function.body_start, function.body_end, collectReturnedAddresses);
+        returns = addresses;
+        for (addresses.named(name)) |returned| {
+            const after = returned.address + 2;
+            if (after < tokens.len and (tokens[after].tag == .period or tokens[after].tag == .l_bracket or
+                tokens[after].tag == .period_asterisk)) continue;
+            try context.emit(.{
+                .rule = .local_storage_escape,
+                .level = level,
+                .span = tokens[returned.address + 1].loc,
+                .message = try context.allocator.print(
+                    "returned value holds the address of parameter '{s}', a copy that expires when the function returns",
+                    .{name},
                 ),
             });
         }
@@ -775,9 +845,20 @@ fn collectReturnedAddresses(
     const tokens = context.tokens;
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(context.allocator);
+    // Every `return` asks for its statement's end, and each prong of a long
+    // `switch` scans the rest of it; once the scans have read the body's
+    // length, the ends of the whole body are found in one pass.
+    var statement_ends: ?syntax_scope.StatementEnds = null;
+    defer if (statement_ends) |*ends| ends.deinit(context.allocator);
+    var scanned: usize = 0;
     for (tokens[function_scope + 1 .. function_end], function_scope + 1..) |candidate, return_index| {
         if (candidate.tag != .keyword_return or context.scopes.enclosingFunctionBody(return_index) != function_scope) continue;
-        const return_end = context.statementEnd(return_index) orelse continue;
+        if (statement_ends == null and scanned > function_end - function_scope) {
+            statement_ends = try context.scopes.statementEndsIn(context.allocator, function_scope);
+        }
+        const found_end = if (statement_ends) |ends| ends.at(context.scopes, return_index) else context.statementEnd(return_index);
+        if (statement_ends == null) scanned += (found_end orelse function_end) -| return_index;
+        const return_end = found_end orelse continue;
         const start = return_index + 1;
         names.clearRetainingCapacity();
         if (start + 1 < return_end and tokens[start].tag == .ampersand) {
@@ -974,14 +1055,6 @@ fn functionParameterExists(context: RuleRun, body_opening: usize, name: []const 
     return false;
 }
 
-fn localBindingExists(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
-    for (context.tokens[start..end], start..) |token, declaration_index| {
-        if ((token.tag == .keyword_const or token.tag == .keyword_var) and declaration_index + 1 < end and
-            context.tokenIs(declaration_index + 1, name)) return true;
-    }
-    return false;
-}
-
 fn returnedAddressOfBinding(context: RuleRun, binding: []const u8, start: usize, end: usize) ?usize {
     if (start + 1 < end and context.tokens[start].tag == .ampersand and context.tokenIs(start + 1, binding)) return start;
     var saw_initializer = false;
@@ -1001,15 +1074,7 @@ fn returnedAddressOfBinding(context: RuleRun, binding: []const u8, start: usize,
 
 fn enclosingFunctionHasOnlyComptimeParameters(context: RuleRun, declaration_index: usize) bool {
     const body_opening = context.enclosingOpeningBrace(declaration_index) orelse return false;
-    var function_index = body_opening;
-    while (function_index > 0) {
-        function_index -= 1;
-        switch (context.tokens[function_index].tag) {
-            .keyword_fn => break,
-            .semicolon, .l_brace, .r_brace => return false,
-            else => {},
-        }
-    } else return false;
+    const function_index = context.scopes.functionKeyword(body_opening) orelse return false;
 
     var parameters_opening = function_index + 1;
     while (parameters_opening < body_opening and context.tokens[parameters_opening].tag != .l_paren) : (parameters_opening += 1) {}
@@ -1067,7 +1132,7 @@ fn constArrayIsStackStorage(
             if (functionParameterExists(context, function_scope, name) and !isComptimeParameter(context, function_scope, name)) {
                 return true;
             }
-            if (localBindingExists(context, name, function_scope + 1, declaration_index)) {
+            if (context.rangeDeclaresName(name, function_scope + 1, declaration_index)) {
                 return true;
             }
         }
@@ -1192,6 +1257,21 @@ test "fields of heap pointers and direct methods stay clean" {
     for (findings) |finding| try std.testing.expect(finding.rule != .local_storage_escape);
 }
 
+test "returning the address of a runtime parameter expires its storage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn direct(value: u32) *const u32 { return &value; }" ++
+        "fn wrapped(value: u32) Holder { return .{ .ptr = &value }; }" ++
+        "fn field(self: *Owner) *u32 { return &self.count; }" ++
+        "fn element(items: []u32) *u32 { return &items[0]; }" ++
+        "fn constant(comptime value: u32) *const u32 { return &value; }" ++
+        "fn nested(value: u32) void { const inner = struct { fn get(other: u32) u32 { return other; } }; _ = inner.get(value); }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(types.Rule.local_storage_escape, finding.rule);
+}
+
 test "deferred removal keeps an intrusive local node within its lifetime" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1234,11 +1314,38 @@ test "comptime var arrays are interned and outlive the function" {
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
+test "storage built in a labeled comptime block outlives the function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn table(values: []const u8) []const u8 {\n" ++
+        "    _ = values;\n" ++
+        "    const result = comptime result: {\n" ++
+        "        var result: [4]u8 = undefined;\n" ++
+        "        @memset(&result, 0);\n" ++
+        "        break :result result;\n" ++
+        "    };\n" ++
+        "    return &result;\n" ++
+        "}\n";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
 test "functions with only comptime parameters return promoted local slices" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 =
         "fn description(comptime input: []const u8) []const u8 { var output: [input.len]u8 = undefined; return output[0..1]; }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "comptime-only functions with braced return types return promoted local slices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn named(comptime input: []const u8) struct { text: []const u8 } { var output: [input.len]u8 = undefined; return .{ .text = output[0..1] }; }\n" ++
+        "fn checked(comptime input: []const u8) error{Empty}![]const u8 { var output: [input.len]u8 = undefined; return output[0..1]; }";
     const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
@@ -1287,6 +1394,20 @@ test "formatting results and fixed writers over a local array are views of it" {
     const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     try std.testing.expectEqual(@as(usize, 5), findings.len);
     for (findings) |finding| try std.testing.expectEqual(types.Rule.returning_local_slice, finding.rule);
+}
+
+test "a returned file writer or reader over a local array escapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn direct(io: std.Io) std.Io.File.Writer { var buf: [64]u8 = undefined; return std.Io.File.stdout().writer(io, &buf); }\n" ++
+        "fn bound(io: std.Io, file: std.Io.File) std.Io.File.Reader { var buf: [64]u8 = undefined; const r = file.reader(io, &buf); return r; }\n" ++
+        "fn borrowed(io: std.Io, buf: []u8) std.Io.File.Writer { return std.Io.File.stdout().writer(io, buf); }\n" ++
+        "fn flushed(io: std.Io) !void { var buf: [64]u8 = undefined; var w = std.Io.File.stdout().writer(io, &buf);" ++
+        " try w.interface.writeAll(\"x\"); try w.interface.flush(); }";
+    const findings = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    for (findings) |finding| try std.testing.expectEqual(types.Rule.local_storage_escape, finding.rule);
 }
 
 test "views held by a returned aggregate, module state or an outliving container escape" {

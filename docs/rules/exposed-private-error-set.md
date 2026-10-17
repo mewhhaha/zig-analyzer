@@ -8,9 +8,12 @@ Reports a public function signature that names a private error-set declaration.
 
 ## Why it matters
 
-The published error contract becomes impossible for callers to name or
-exhaustively switch over. This is API-design guidance enabled by the `strict`
-profile, not a correctness diagnostic.
+The error set is part of the function's contract, but a private declaration
+keeps it out of the documented API. Error values are global, so callers can
+still match each error by name; what they cannot do is refer to the set itself,
+to reuse it in their own signatures or find it in the generated documentation.
+This is API-design guidance enabled by the `strict` profile, not a correctness
+diagnostic.
 
 ## When it fires
 

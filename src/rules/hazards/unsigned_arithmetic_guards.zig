@@ -1,22 +1,79 @@
 //! Unsigned arithmetic evaluated before the guard that makes it safe: a clamp applied after the overflow, or a range end added before it is compared.
 const std = @import("std");
 const statementStart = @import("../../syntax/tokens.zig").statementStart;
-const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const TokenRange = @import("../../syntax/tokens.zig").Range;
 const findTag = @import("../../syntax/tokens.zig").findTag;
+const lengthPath = @import("../../syntax/tokens.zig").lengthPath;
+const lengthSum = @import("../../syntax/tokens.zig").lengthSum;
+const isAssignment = @import("../../syntax/tokens.zig").isAssignment;
+const isComparison = @import("../../syntax/tokens.zig").isComparison;
 
 pub const rules = [_]types.Rule{ .overflow_before_clamp, .unchecked_range_end };
 
 pub fn run(context: RuleRun) !void {
-    try findOverflowBeforeClamp(context);
-    try findUncheckedRangeEnds(context);
-    try findUncheckedDeclaredRangeEnds(context);
+    var fields = try FieldTypes.init(context);
+    defer fields.deinit(context.allocator);
+    try findOverflowBeforeClamp(context, &fields);
+    try findUncheckedRangeEnds(context, &fields);
+    try findUncheckedDeclaredRangeEnds(context, &fields);
 }
 
-fn findOverflowBeforeClamp(context: RuleRun) !void {
+/// What the `name: Type` declarations of each name in the file declare, so
+/// the field types of a path are looked up once instead of rescanning the file.
+const FieldTypes = struct {
+    facts: std.StringHashMapUnmanaged(Fact) = .empty,
+
+    const Fact = struct {
+        /// Every declaration has an unsigned integer type.
+        unsigned: bool,
+        /// The widest `uN` declared, or null when one declaration is not a `uN` name.
+        bits: ?usize,
+    };
+
+    fn init(context: RuleRun) !FieldTypes {
+        var fields: FieldTypes = .{};
+        errdefer fields.deinit(context.allocator);
+        for (context.tokens, 0..) |token, name_index| {
+            if (token.tag != .identifier or name_index + 2 >= context.tokens.len or
+                context.tokens[name_index + 1].tag != .colon) continue;
+            const unsigned = typeRangeIsUnsigned(context, name_index + 2, context.tokens.len);
+            const bits = if (context.tokens[name_index + 2].tag == .identifier)
+                unsignedTypeBits(context.tokenText(name_index + 2))
+            else
+                null;
+            const entry = try fields.facts.getOrPut(context.allocator, context.tokenText(name_index));
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{ .unsigned = unsigned, .bits = bits };
+                continue;
+            }
+            entry.value_ptr.unsigned = entry.value_ptr.unsigned and unsigned;
+            entry.value_ptr.bits = if (entry.value_ptr.bits) |widest| if (bits) |known| @max(widest, known) else null else null;
+        }
+        return fields;
+    }
+
+    fn deinit(fields: *FieldTypes, allocator: std.mem.Allocator) void {
+        fields.facts.deinit(allocator);
+    }
+
+    /// Whether every declaration named `field_name` has an unsigned integer type.
+    fn hasUnsignedType(fields: *const FieldTypes, field_name: []const u8) bool {
+        const fact = fields.facts.get(field_name) orelse return false;
+        return fact.unsigned;
+    }
+
+    /// The widest unsigned integer type a field named `field_name` is declared
+    /// with, or null when one of its declarations is not an unsigned integer.
+    fn unsignedBits(fields: *const FieldTypes, field_name: []const u8) ?usize {
+        const fact = fields.facts.get(field_name) orelse return null;
+        return fact.bits;
+    }
+};
+
+fn findOverflowBeforeClamp(context: RuleRun, fields: *const FieldTypes) !void {
     const level = context.level(.overflow_before_clamp);
     if (level == .off) return;
 
@@ -39,6 +96,12 @@ fn findOverflowBeforeClamp(context: RuleRun) !void {
                 !runtimeExpression(context, operator_index + 1, argument.end)) continue;
             if (bitSizeMinusLeadingZeros(context, argument.start, argument.end, operator_index)) continue;
             if (boundedUnsignedDifferenceInSignedType(context, argument.start, argument.end, operator_index)) continue;
+            if (wideSignedOperation(context, argument.start, argument.end, operator_index)) continue;
+            if (operator_tag == .plus and
+                (additionCannotWrap(context, fields, argument.start, operator_index, argument.end) or
+                    comptimeKnownName(context, argument.start, operator_index, 0) or
+                    comptimeKnownName(context, operator_index + 1, argument.end, 0) or
+                    loopConditionBoundsSum(context, argument.start, operator_index, argument.end))) continue;
             if (arithmeticHasVisibleGuard(context, operator_index, argument.start, argument.end, clamp_index)) continue;
 
             const operation = if (context.tokens[operator_index].tag == .plus) "addition" else "subtraction";
@@ -57,7 +120,7 @@ fn findOverflowBeforeClamp(context: RuleRun) !void {
     }
 }
 
-fn findUncheckedRangeEnds(context: RuleRun) !void {
+fn findUncheckedRangeEnds(context: RuleRun, fields: *const FieldTypes) !void {
     const level = context.level(.unchecked_range_end);
     if (level == .off) return;
     for (context.tokens, 0..) |token, operator_index| {
@@ -72,8 +135,8 @@ fn findUncheckedRangeEnds(context: RuleRun) !void {
         if (!comparison and !slice_end) continue;
         if (left_start == operator_index or operator_index + 1 == right_end or
             !runtimeExpression(context, left_start, operator_index) or
-            !unsignedIntegerExpression(context, left_start, operator_index) or
-            !unsignedIntegerExpression(context, operator_index + 1, right_end)) continue;
+            !unsignedIntegerExpression(context, fields, left_start, operator_index) or
+            !unsignedIntegerExpression(context, fields, operator_index + 1, right_end)) continue;
         const runtime_length = runtimeExpression(context, operator_index + 1, right_end) and
             (rangeNamesLength(context, left_start, right_end) or
                 extentComparedWithSameDimension(context, operator_index + 1, right_end, statement_end));
@@ -84,8 +147,12 @@ fn findUncheckedRangeEnds(context: RuleRun) !void {
             leftOperandEndsWithCall(context.tokens, operator_index) or
             leftOperandComesFromSearchMatch(context, left_start, operator_index, operator_index + 1, right_end) or
             narrowedOperandsCannotOverflowUsize(context, left_start, operator_index, right_end) or
-            additionCannotWrap(context, left_start, operator_index, right_end) or
-            additionInsideAssertion(context, statement_start, operator_index)) continue;
+            additionCannotWrap(context, fields, left_start, operator_index, right_end) or
+            additionInsideAssertion(context, statement_start, operator_index) or
+            loopConditionBoundsSum(context, left_start, operator_index, right_end)) continue;
+        if (comparison and (guardOnlyPanics(context, statement_start, operator_index) or
+            (cursorFromZero(context, left_start, operator_index) and
+                literalOrLength(context, operator_index + 1, right_end)))) continue;
         if (runtime_length and rightOperandBoundedByRemaining(
             context,
             left_start,
@@ -117,7 +184,7 @@ fn findUncheckedRangeEnds(context: RuleRun) !void {
     }
 }
 
-fn findUncheckedDeclaredRangeEnds(context: RuleRun) !void {
+fn findUncheckedDeclaredRangeEnds(context: RuleRun, fields: *const FieldTypes) !void {
     const level = context.level(.unchecked_range_end);
     if (level == .off) return;
     for (context.tokens, 0..) |token, declaration_index| {
@@ -131,16 +198,16 @@ fn findUncheckedDeclaredRangeEnds(context: RuleRun) !void {
         const right_end = additionOperandEnd(context.tokens, operator_index + 1, statement_end);
         if (right_end != statement_end or !runtimeExpression(context, left_start, operator_index) or
             !runtimeExpression(context, operator_index + 1, right_end) or
-            !unsignedIntegerExpression(context, left_start, operator_index) or
-            !unsignedIntegerExpression(context, operator_index + 1, right_end) or
+            !unsignedIntegerExpression(context, fields, left_start, operator_index) or
+            !unsignedIntegerExpression(context, fields, operator_index + 1, right_end) or
             !rangeRepresentsLength(context, operator_index + 1, right_end, operator_index)) continue;
-        if (additionCannotWrap(context, left_start, operator_index, right_end) or
+        if (additionCannotWrap(context, fields, left_start, operator_index, right_end) or
             rightOperandBoundedByRemaining(context, left_start, operator_index, right_end) or
             leftOperandComesFromSearchMatch(context, left_start, operator_index, operator_index + 1, right_end) or
             arithmeticHasVisibleGuard(context, operator_index, left_start, right_end, declaration_index)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
-        const function_body = functionBodyContaining(context, declaration_index) orelse continue;
+        const function_body = context.scopes.functionBodyContaining(declaration_index) orelse continue;
         if (!bindingFeedsBoundedRange(context, binding, function_body, statement_end + 1, scope_end, 0)) continue;
         try context.emit(.{
             .rule = .unchecked_range_end,
@@ -163,7 +230,7 @@ fn arithmeticHasVisibleGuard(
 ) bool {
     const left_name = runtimeName(context, left_start, operator_index) orelse return false;
     const right_name = runtimeName(context, operator_index + 1, right_end) orelse return false;
-    const body_start = functionBodyContaining(context, use_index) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(use_index) orelse return false;
     const scope = context.enclosingOpeningBrace(use_index) orelse return false;
     const companion: std.zig.Token.Tag = if (context.tokens[operator_index].tag == .plus) .minus else .plus;
 
@@ -197,11 +264,14 @@ fn arithmeticHasVisibleGuard(
             guard_index + 1 < use_index and context.tokens[guard_index + 1].tag == .l_paren)
         {
             const condition_end = context.matchingToken(guard_index + 1, .l_paren, .r_paren) orelse continue;
-            if (condition_end < use_index and guardConditionMatches(
+            if (condition_end >= use_index) continue;
+            if (guardConditionMatches(context, left_name, right_name, companion, guard_index + 2, condition_end)) return true;
+            // An assertion that evaluates the same sum has already trapped on its overflow.
+            if (guardConditionMatches(
                 context,
                 left_name,
                 right_name,
-                companion,
+                context.tokens[operator_index].tag,
                 guard_index + 2,
                 condition_end,
             )) return true;
@@ -313,50 +383,177 @@ fn additionIsSliceEnd(context: RuleRun, left_start: usize, right_end: usize) boo
 /// (`a.len + 1 + b.len`), a narrower unsigned value widened to a
 /// length's `usize` (`buf_len + bytes.len` with `buf_len: u8`), and many-pointer
 /// arithmetic, which is not integer overflow.
-fn additionCannotWrap(context: RuleRun, operand_start: usize, operator_index: usize, right_end: usize) bool {
+fn additionCannotWrap(context: RuleRun, fields: *const FieldTypes, operand_start: usize, operator_index: usize, right_end: usize) bool {
     // The left operand of a returned sum starts at its `return`.
     const left_start = if (context.tokens[operand_start].tag == .keyword_return) operand_start + 1 else operand_start;
     if (left_start >= operator_index) return false;
-    if (lengthTermsOnly(context, left_start, right_end)) return true;
+    if (lengthSum(context.source, context.tokens, left_start, right_end)) return true;
     if (operator_index >= left_start + 2 and context.tokens[operator_index - 2].tag == .period and
         context.tokenIs(operator_index - 1, "ptr")) return true;
-    return (lengthPath(context, operator_index + 1, right_end) and narrowUnsignedPath(context, left_start, operator_index)) or
-        (lengthPath(context, left_start, operator_index) and narrowUnsignedPath(context, operator_index + 1, right_end));
+    return (lengthPath(context.source, context.tokens, operator_index + 1, right_end) and narrowUnsignedPath(context, fields, left_start, operator_index)) or
+        (lengthPath(context.source, context.tokens, left_start, operator_index) and narrowUnsignedPath(context, fields, operator_index + 1, right_end));
 }
 
-/// Whether `[start, end)` is a `+`-separated sum of `.len` paths and number literals.
-fn lengthTermsOnly(context: RuleRun, start: usize, end: usize) bool {
-    var cursor = start;
-    var lengths: usize = 0;
-    while (cursor < end) {
-        if (context.tokens[cursor].tag == .number_literal) {
-            cursor += 1;
-        } else {
-            var term_end = cursor;
-            while (term_end < end and context.tokens[term_end].tag != .plus) : (term_end += 1) {}
-            if (!lengthPath(context, cursor, term_end)) return false;
-            lengths += 1;
-            cursor = term_end;
+/// Whether the operation is evaluated in a signed type of at least 64 bits.
+/// Values that reach its range come only from sentinels; coordinates and
+/// deltas widened to `i64` for signed arithmetic cannot overflow, and
+/// `@max(0, a - b)` is the correct clamp for signed values.
+fn wideSignedOperation(context: RuleRun, start: usize, end: usize, operator_index: usize) bool {
+    const left_name = runtimeName(context, start, operator_index) orelse return false;
+    const bits = signedOperationBits(context, left_name, start, end, operator_index) orelse return false;
+    return bits >= 64;
+}
+
+/// Whether `[start, end)` is one identifier naming a value known at compile
+/// time: a `comptime` or `type` parameter, or a `const` whose initializer uses
+/// only literals, operators, primitive types and other such names. Adding one
+/// is a fixed lookahead, like adding a literal.
+fn comptimeKnownName(context: RuleRun, start: usize, end: usize, depth: usize) bool {
+    if (depth == 3 or start + 1 != end or context.tokens[start].tag != .identifier) return false;
+    const declaration = (context.scopes.findBinding(start) orelse return false).token_index;
+    if (declaration == 0 or declaration + 2 >= context.tokens.len) return false;
+    if (context.tokens[declaration - 1].tag == .keyword_comptime or
+        (context.tokens[declaration + 1].tag == .colon and context.tokenIs(declaration + 2, "type"))) return true;
+    if (context.tokens[declaration - 1].tag != .keyword_const) return false;
+    const declaration_end = context.statementEnd(declaration - 1) orelse return false;
+    const equal_index = findTag(context.tokens, declaration + 1, declaration_end, .equal) orelse return false;
+    if (equal_index + 1 >= declaration_end) return false;
+    for (context.tokens[equal_index + 1 .. declaration_end], equal_index + 1..) |token, index| switch (token.tag) {
+        .number_literal,
+        .char_literal,
+        .keyword_if,
+        .keyword_else,
+        .keyword_and,
+        .keyword_or,
+        .l_paren,
+        .r_paren,
+        .plus,
+        .minus,
+        .asterisk,
+        .slash,
+        .percent,
+        .angle_bracket_angle_bracket_left,
+        .angle_bracket_angle_bracket_right,
+        .equal_equal,
+        .bang_equal,
+        .angle_bracket_left,
+        .angle_bracket_left_equal,
+        .angle_bracket_right,
+        .angle_bracket_right_equal,
+        => {},
+        .identifier => if (!integerTypeName(context.tokenText(index)) and !context.tokenIs(index, "bool") and
+            !comptimeKnownName(context, index, index + 1, depth + 1)) return false,
+        else => return false,
+    };
+    return true;
+}
+
+/// Whether the sum's left operand is bounded by a length in the condition of
+/// an enclosing `while` loop (`while (i < bytes.len)`, `while (i <= haystack.len
+/// - needle.len)`, or `while (i <= end)` with `end` such a constant) and the
+/// right operand is a length or a literal: the sum then stays within two
+/// in-memory lengths and cannot wrap.
+fn loopConditionBoundsSum(context: RuleRun, left_start: usize, operator_index: usize, right_end: usize) bool {
+    if (left_start + 1 != operator_index or context.tokens[left_start].tag != .identifier or
+        !literalOrLength(context, operator_index + 1, right_end)) return false;
+    const cursor = context.tokenText(left_start);
+    var brace = context.enclosingOpeningBrace(operator_index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (whileCondition(context, opening)) |condition| {
+            if (conditionBoundsByLength(context, cursor, condition.start, condition.end)) return true;
         }
-        if (cursor == end) break;
-        if (context.tokens[cursor].tag != .plus) return false;
-        cursor += 1;
+        if (context.scopes.functionKeyword(opening) != null) return false;
     }
-    return lengths != 0 and cursor == end;
+    return false;
 }
 
-/// Whether `[start, end)` is a dotted path ending in `.len`.
-fn lengthPath(context: RuleRun, start: usize, end: usize) bool {
-    if (end < start + 3 or !context.tokenIs(end - 1, "len") or (end - start) % 2 == 0) return false;
-    for (context.tokens[start..end], 0..) |token, offset| {
-        if (token.tag != if (offset % 2 == 0) std.zig.Token.Tag.identifier else .period) return false;
+fn literalOrLength(context: RuleRun, start: usize, end: usize) bool {
+    return (start + 1 == end and context.tokens[start].tag == .number_literal) or
+        lengthPath(context.source, context.tokens, start, end);
+}
+
+/// The condition of the `while` loop whose body opens at `opening`.
+fn whileCondition(context: RuleRun, opening: usize) ?TokenRange {
+    if (opening < 3 or context.tokens[opening - 1].tag != .r_paren) return null;
+    var condition_end = opening - 1;
+    var condition_start = context.scopes.matchingToken(condition_end) orelse return null;
+    // `while (condition) : (i += 1) {`
+    if (condition_start >= 2 and context.tokens[condition_start - 1].tag == .colon and
+        context.tokens[condition_start - 2].tag == .r_paren)
+    {
+        condition_end = condition_start - 2;
+        condition_start = context.scopes.matchingToken(condition_end) orelse return null;
+    }
+    if (condition_start == 0 or context.tokens[condition_start - 1].tag != .keyword_while) return null;
+    return .{ .start = condition_start + 1, .end = condition_end };
+}
+
+/// Whether the loop condition `[start, end)` compares `cursor <` or `cursor <=`
+/// against an expression naming a length, with no `or` that could let the
+/// loop run past it.
+fn conditionBoundsByLength(context: RuleRun, cursor: []const u8, start: usize, end: usize) bool {
+    if (rangeContainsTag(context.tokens, .keyword_or, start, end)) return false;
+    var index = start;
+    while (index + 2 < end) : (index += 1) {
+        if (context.tokens[index].tag != .identifier or !context.tokenIs(index, cursor) or
+            (context.tokens[index + 1].tag != .angle_bracket_left and
+                context.tokens[index + 1].tag != .angle_bracket_left_equal)) continue;
+        const bound_end = findTag(context.tokens, index + 2, end, .keyword_and) orelse end;
+        if (rangeHasLengthField(context, index + 2, bound_end)) return true;
+        if (bound_end != index + 3 or context.tokens[index + 2].tag != .identifier) continue;
+        const declaration = (context.scopes.findBinding(index + 2) orelse continue).token_index;
+        if (declaration == 0 or context.tokens[declaration - 1].tag != .keyword_const) continue;
+        const declaration_end = context.statementEnd(declaration - 1) orelse continue;
+        if (rangeHasLengthField(context, declaration + 1, declaration_end)) return true;
+    }
+    return false;
+}
+
+fn rangeHasLengthField(context: RuleRun, start: usize, end: usize) bool {
+    var index = start;
+    while (index + 1 < end) : (index += 1) {
+        if (context.tokens[index].tag == .period and context.tokenIs(index + 1, "len")) return true;
+    }
+    return false;
+}
+
+/// Whether the comparison is the condition of an `if` whose branch only
+/// panics: the guard is an assertion, and an overflow trap fails it the same way.
+fn guardOnlyPanics(context: RuleRun, statement_start: usize, operator_index: usize) bool {
+    if (context.tokens[statement_start].tag != .keyword_if or statement_start + 1 >= operator_index or
+        context.tokens[statement_start + 1].tag != .l_paren) return false;
+    const condition_end = context.scopes.matchingToken(statement_start + 1) orelse return false;
+    if (condition_end < operator_index or condition_end + 2 >= context.tokens.len) return false;
+    var branch = condition_end + 1;
+    if (context.tokens[branch].tag == .l_brace) branch += 1;
+    return context.tokens[branch].tag == .keyword_unreachable or
+        (context.tokens[branch].tag == .builtin and context.tokenIs(branch, "@panic"));
+}
+
+/// Whether the left operand is a local `var` that starts at 0 and is only
+/// advanced with `+=`: a cursor walking a buffer from its start, which a
+/// comparison against that buffer's length bounds.
+fn cursorFromZero(context: RuleRun, left_start: usize, operator_index: usize) bool {
+    if (left_start + 1 != operator_index or context.tokens[left_start].tag != .identifier) return false;
+    const declaration = (context.scopes.findBinding(left_start) orelse return false).token_index;
+    if (declaration == 0 or context.tokens[declaration - 1].tag != .keyword_var) return false;
+    const declaration_end = context.statementEnd(declaration - 1) orelse return false;
+    if (declaration_end < declaration + 3 or context.tokens[declaration_end - 2].tag != .equal or
+        !context.tokenIs(declaration_end - 1, "0")) return false;
+    const scope_end = context.enclosingScopeEnd(declaration) orelse return false;
+    const name = context.tokenText(left_start);
+    for (context.tokens[declaration_end + 1 .. scope_end], declaration_end + 1..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, name) or context.tokens[index - 1].tag == .period) continue;
+        if (context.tokens[index - 1].tag == .ampersand) return false;
+        const next = context.tokens[index + 1].tag;
+        if (isAssignment(next) and next != .plus_equal) return false;
     }
     return true;
 }
 
 /// Whether `[start, end)` is a binding or field path declared with an
 /// unsigned integer type narrower than `usize`.
-fn narrowUnsignedPath(context: RuleRun, start: usize, end: usize) bool {
+fn narrowUnsignedPath(context: RuleRun, fields: *const FieldTypes, start: usize, end: usize) bool {
     if (end <= start or (end - start) % 2 == 0) return false;
     for (context.tokens[start..end], 0..) |token, offset| {
         if (token.tag != if (offset % 2 == 0) std.zig.Token.Tag.identifier else .period) return false;
@@ -364,7 +561,7 @@ fn narrowUnsignedPath(context: RuleRun, start: usize, end: usize) bool {
     const bits = if (end - start == 1)
         declaredUnsignedBits(context, start)
     else
-        fieldUnsignedBits(context, context.tokenText(end - 1));
+        fields.unsignedBits(context.tokenText(end - 1));
     return if (bits) |known| known < @bitSizeOf(usize) else false;
 }
 
@@ -375,20 +572,6 @@ fn declaredUnsignedBits(context: RuleRun, name_index: usize) ?usize {
     if (declaration + 3 >= context.tokens.len or context.tokens[declaration + 1].tag != .colon or
         context.tokens[declaration + 2].tag != .identifier or context.tokens[declaration + 3].tag == .period) return null;
     return unsignedTypeBits(context.tokenText(declaration + 2));
-}
-
-/// The widest unsigned integer type a field named `field_name` is declared
-/// with, or null when one of its declarations is not an unsigned integer.
-fn fieldUnsignedBits(context: RuleRun, field_name: []const u8) ?usize {
-    var widest: ?usize = null;
-    for (context.tokens, 0..) |token, field_index| {
-        if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or
-            field_index + 2 >= context.tokens.len or context.tokens[field_index + 1].tag != .colon) continue;
-        if (context.tokens[field_index + 2].tag != .identifier) return null;
-        const bits = unsignedTypeBits(context.tokenText(field_index + 2)) orelse return null;
-        widest = @max(widest orelse 0, bits);
-    }
-    return widest;
 }
 
 /// Whether the addition is an argument of `assert(...)`: an assertion states
@@ -518,7 +701,7 @@ fn constantLookaheadHasVisibleGuard(
 ) bool {
     const cursor_name = runtimeName(context, left_start, operator_index) orelse return false;
     const literal = context.tokenText(operator_index + 1);
-    const body_start = functionBodyContaining(context, use_index) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(use_index) orelse return false;
     const scope = context.enclosingOpeningBrace(use_index) orelse return false;
     for (context.tokens[body_start + 1 .. use_index], body_start + 1..) |token, guard_index| {
         if (token.tag != .keyword_if or context.enclosingOpeningBrace(guard_index) != scope or
@@ -545,19 +728,6 @@ fn extentComparedWithSameDimension(
     return context.rangeContainsName(extent, comparison_index + 1, statement_end);
 }
 
-fn isComparison(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .angle_bracket_left,
-        .angle_bracket_left_equal,
-        .angle_bracket_right,
-        .angle_bracket_right_equal,
-        .equal_equal,
-        .bang_equal,
-        => true,
-        else => false,
-    };
-}
-
 fn leftOperandComesFromSearchMatch(
     context: RuleRun,
     left_start: usize,
@@ -567,7 +737,7 @@ fn leftOperandComesFromSearchMatch(
 ) bool {
     const offset_name = runtimeName(context, left_start, operator_index) orelse return false;
     const needle_name = lengthReceiverName(context, right_start, right_end) orelse return false;
-    const body_start = functionBodyContaining(context, operator_index) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(operator_index) orelse return false;
     for (context.tokens[body_start + 1 .. operator_index], body_start + 1..) |token, call_index| {
         if (token.tag != .identifier or
             (!context.tokenIs(call_index, "indexOf") and !context.tokenIs(call_index, "indexOfPos")) or
@@ -611,7 +781,7 @@ fn narrowedOperandsCannotOverflowUsize(
     const left_name = runtimeName(context, left_start, operator_index) orelse return false;
     const receiver = lengthReceiverName(context, operator_index + 1, right_end) orelse return false;
     const left_bits = unsignedOriginBits(context, left_name, operator_index, 0) orelse return false;
-    const body_start = functionBodyContaining(context, operator_index) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(operator_index) orelse return false;
     for (context.tokens[body_start + 1 .. operator_index], body_start + 1..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 4 >= operator_index or
             context.tokens[declaration_index + 1].tag != .identifier or
@@ -660,7 +830,7 @@ fn rightOperandBoundedByRemaining(
 ) bool {
     const left_name = runtimeName(context, left_start, operator_index) orelse return false;
     const right_name = runtimeName(context, operator_index + 1, right_end) orelse return false;
-    const body_start = functionBodyContaining(context, operator_index) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(operator_index) orelse return false;
     for (context.tokens[body_start + 1 .. operator_index], body_start + 1..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 2 >= operator_index or
             !context.tokenIs(declaration_index + 1, right_name)) continue;
@@ -687,17 +857,17 @@ fn riskyConstantLookahead(
     return lookahead >= 4;
 }
 
-fn unsignedIntegerExpression(context: RuleRun, start: usize, end: usize) bool {
+fn unsignedIntegerExpression(context: RuleRun, fields: *const FieldTypes, start: usize, end: usize) bool {
     if (start >= end) return false;
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag == .number_literal) return true;
         if (token.tag != .identifier) continue;
         if (context.tokenIs(index, "len") and index > start and context.tokens[index - 1].tag == .period) return true;
         if (index >= start + 2 and context.tokens[index - 1].tag == .period) {
-            if (fieldHasUnsignedType(context, context.tokenText(index))) return true;
+            if (fields.hasUnsignedType(context.tokenText(index))) return true;
             continue;
         }
-        if (unsignedTypedBinding(context, context.tokenText(index), index)) return true;
+        if (unsignedTypedBinding(context, fields, context.tokenText(index), index)) return true;
     }
     return false;
 }
@@ -737,20 +907,6 @@ fn bindingFeedsBoundedRange(
     return false;
 }
 
-fn functionBodyContaining(context: RuleRun, target_index: usize) ?usize {
-    var selected: ?usize = null;
-    for (context.tokens[0..target_index], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= target_index or
-            context.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
-        const body_start = syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
-        if (body_start >= target_index or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (target_index < body_end) selected = body_start;
-    }
-    return selected;
-}
-
 fn rangeContainsComparison(tokens: []const std.zig.Token, start: usize, end: usize) bool {
     for (tokens[start..end]) |token| if (isComparison(token.tag)) return true;
     return false;
@@ -759,11 +915,11 @@ fn rangeContainsComparison(tokens: []const std.zig.Token, start: usize, end: usi
 fn rangeRepresentsLength(context: RuleRun, start: usize, end: usize, before: usize) bool {
     if (rangeNamesLength(context, start, end)) return true;
     const name = runtimeName(context, start, end) orelse return false;
-    const body_start = functionBodyContaining(context, before) orelse return false;
+    const body_start = context.scopes.functionBodyContaining(before) orelse return false;
     for (context.tokens[body_start + 1 .. before], body_start + 1..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 2 >= before or
             !context.tokenIs(declaration_index + 1, name)) continue;
-        if (functionBodyContaining(context, declaration_index) != body_start) continue;
+        if (context.scopes.functionBodyContaining(declaration_index) != body_start) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= before) continue;
         for (context.tokens[declaration_index + 2 .. declaration_end], declaration_index + 2..) |candidate, index| {
@@ -912,8 +1068,8 @@ fn unsignedOriginBits(context: RuleRun, name: []const u8, before: usize, depth: 
 }
 
 fn integerTypedBinding(context: RuleRun, name: []const u8, before: usize) bool {
-    const function_body = functionBodyContaining(context, before) orelse return false;
-    const function_start = functionStartForBody(context, function_body) orelse return false;
+    const function_body = context.scopes.functionBodyContaining(before) orelse return false;
+    const function_start = context.scopes.functionKeyword(function_body) orelse return false;
     var name_index = before;
     while (name_index > function_start) {
         name_index -= 1;
@@ -931,7 +1087,7 @@ fn integerTypedBinding(context: RuleRun, name: []const u8, before: usize) bool {
 }
 
 fn selfFieldHasIntegerType(context: RuleRun, field_name: []const u8, before: usize) bool {
-    const function_body = functionBodyContaining(context, before) orelse return false;
+    const function_body = context.scopes.functionBodyContaining(before) orelse return false;
     const type_body = context.enclosingOpeningBrace(function_body) orelse return false;
     for (context.tokens[type_body + 1 .. function_body], type_body + 1..) |token, field_index| {
         if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or
@@ -984,21 +1140,9 @@ fn rangeHasCursorName(context: RuleRun, start: usize, end: usize) bool {
     return false;
 }
 
-fn fieldHasUnsignedType(context: RuleRun, field_name: []const u8) bool {
-    var found = false;
-    for (context.tokens, 0..) |token, field_index| {
-        if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or
-            field_index + 2 >= context.tokens.len or context.tokens[field_index + 1].tag != .colon) continue;
-        const unsigned = typeRangeIsUnsigned(context, field_index + 2, context.tokens.len);
-        if (!unsigned) return false;
-        found = true;
-    }
-    return found;
-}
-
-fn unsignedTypedBinding(context: RuleRun, name: []const u8, before: usize) bool {
-    const function_body = functionBodyContaining(context, before) orelse return false;
-    const function_start = functionStartForBody(context, function_body) orelse return false;
+fn unsignedTypedBinding(context: RuleRun, fields: *const FieldTypes, name: []const u8, before: usize) bool {
+    const function_body = context.scopes.functionBodyContaining(before) orelse return false;
+    const function_start = context.scopes.functionKeyword(function_body) orelse return false;
     var name_index = before;
     while (name_index > function_start) {
         name_index -= 1;
@@ -1015,8 +1159,8 @@ fn unsignedTypedBinding(context: RuleRun, name: []const u8, before: usize) bool 
             if (token.tag == .identifier and context.tokenIs(index, "readInt")) return true;
         }
         if (arithmeticInRange(context, .plus, name_index + 2, declaration_end)) |operator_index| {
-            return unsignedIntegerExpression(context, name_index + 2, operator_index) and
-                unsignedIntegerExpression(context, operator_index + 1, declaration_end);
+            return unsignedIntegerExpression(context, fields, name_index + 2, operator_index) and
+                unsignedIntegerExpression(context, fields, operator_index + 1, declaration_end);
         }
     }
     return false;
@@ -1031,7 +1175,7 @@ fn rangeContainsNameInFunction(
 ) bool {
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag == .identifier and context.tokenIs(index, name) and
-            functionBodyContaining(context, index) == function_body) return true;
+            context.scopes.functionBodyContaining(index) == function_body) return true;
     }
     return false;
 }
@@ -1048,25 +1192,15 @@ fn rangeUsesBindingAsSliceEnd(
         for (context.tokens[range_index + 1 .. end], range_index + 1..) |candidate, index| {
             if (candidate.tag == .r_bracket) break;
             if (candidate.tag == .identifier and context.tokenIs(index, binding) and
-                functionBodyContaining(context, index) == function_body) return true;
+                context.scopes.functionBodyContaining(index) == function_body) return true;
         }
     }
     return false;
 }
 
 fn enclosingFunctionDeclaration(context: RuleRun, target: usize) ?usize {
-    var selected: ?usize = null;
-    for (context.tokens[0..target], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn) continue;
-        var body_start = function_index + 1;
-        while (body_start < target and context.tokens[body_start].tag != .l_brace and
-            context.tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start == target or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (target < body_end) selected = function_index;
-    }
-    return selected;
+    const body = context.scopes.functionBodyContaining(target) orelse return null;
+    return context.scopes.functionKeyword(body);
 }
 
 fn signedTypeBits(name: []const u8) ?usize {
@@ -1074,19 +1208,6 @@ fn signedTypeBits(name: []const u8) ?usize {
     return std.fmt.parseInt(usize, name[1..], 10) catch |err| switch (err) {
         error.InvalidCharacter, error.Overflow => null,
     };
-}
-
-fn functionStartForBody(context: RuleRun, body_start: usize) ?usize {
-    var function_index = body_start;
-    while (function_index > 0) {
-        function_index -= 1;
-        if (context.tokens[function_index].tag != .keyword_fn or function_index + 2 >= body_start or
-            context.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = context.matchingToken(function_index + 2, .l_paren, .r_paren) orelse continue;
-        const candidate_body = syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
-        if (candidate_body == body_start) return function_index;
-    }
-    return null;
 }
 
 fn typeRangeIsInteger(context: RuleRun, start: usize, end: usize) bool {

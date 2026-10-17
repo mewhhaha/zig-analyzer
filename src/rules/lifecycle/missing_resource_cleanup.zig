@@ -30,9 +30,13 @@ fn findMissingResourceCleanup(context: RuleRun) !void {
     if (level == .off) return;
     for (tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= tokens.len or
-            tokens[declaration_index + 1].tag != .identifier or tokens[declaration_index + 2].tag != .equal) continue;
+            tokens[declaration_index + 1].tag != .identifier) continue;
+        const annotated = tokens[declaration_index + 2].tag == .colon;
+        if (!annotated and tokens[declaration_index + 2].tag != .equal) continue;
         if (!context.scopes.insideFunctionOrTestBody(declaration_index)) continue;
         const statement_end = context.statementEnd(declaration_index) orelse continue;
+        // `var out: std.Io.Writer.Allocating = .init(gpa);` names what `.init` builds in its annotation.
+        if (annotated and !annotatesAllocatingWriter(context, declaration_index + 3, statement_end)) continue;
         const acquisition = initializerAcquisition(context, declaration_index + 3, statement_end) orelse continue;
         const resource = acquisition.pair;
         if (resource.kind == .managed and managedMemoryIsReclaimed(context, declaration_index, statement_end, acquisition.call_index)) continue;
@@ -156,6 +160,13 @@ fn findMissingResourceCleanup(context: RuleRun) !void {
     }
 }
 
+/// Whether the type annotation starting at `start` is `Writer.Allocating`.
+fn annotatesAllocatingWriter(context: RuleRun, start: usize, end: usize) bool {
+    const equal = tokens_util.findTag(context.tokens, start, end, .equal) orelse return false;
+    return equal >= start + 3 and context.tokenIs(equal - 1, "Allocating") and
+        context.tokens[equal - 2].tag == .period and context.tokenIs(equal - 3, "Writer");
+}
+
 fn firstSimpleCallArgument(
     source: []const u8,
     tokens: []const std.zig.Token,
@@ -198,8 +209,9 @@ fn initializerAcquisition(context: RuleRun, start: usize, end: usize) ?Acquisiti
     return null;
 }
 
-/// Managed memory whose release nobody needs to see: memory from an arena or
-/// the build graph's allocator, an arena created in `pub fn main`, which process
+/// Managed memory whose release nobody needs to see: memory from an arena (or
+/// a `const` alias of one), a fixed buffer, or the build graph's allocator, an
+/// arena created in `pub fn main`, which process
 /// exit reclaims, and memory in a `test` block, where `std.testing.allocator`
 /// already reports leaks.
 fn managedMemoryIsReclaimed(context: RuleRun, declaration_index: usize, statement_end: usize, call_index: usize) bool {
@@ -209,7 +221,8 @@ fn managedMemoryIsReclaimed(context: RuleRun, declaration_index: usize, statemen
         if (argument_end > call_index + 2) {
             const allocator_name = context.source[context.tokens[call_index + 2].loc.start..context.tokens[argument_end - 1].loc.end];
             if (std.ascii.findIgnoreCase(allocator_name, "arena") != null or
-                resources.buildGraphAllocator(context.source, context.tokens, context.scopes, allocator_name, declaration_index)) return true;
+                resources.buildGraphAllocator(context.source, context.tokens, context.scopes, allocator_name, declaration_index) or
+                resources.allocatorFreesWholesale(context, call_index + 2)) return true;
         }
     }
     if (!context.rangeContainsName("ArenaAllocator", declaration_index, statement_end)) return false;
@@ -485,7 +498,8 @@ fn bindingObviouslyEscapes(
     var index = start;
     while (index < @min(end, tokens.len)) : (index += 1) {
         if (!tokenIs(source, tokens[index], binding_name)) continue;
-        if (index > 0 and tokens[index - 1].tag == .keyword_return) return true;
+        // `return file;` hands it on; `return writer.written();` only borrows it.
+        if (index > 0 and tokens[index - 1].tag == .keyword_return and useHandsOnResource(source, tokens, index)) return true;
         // `_ = file;` discards the binding; it does not take the resource.
         if (index > 1 and tokens[index - 1].tag == .equal and !tokenIs(source, tokens[index - 2], "_") and
             bindingIsWholeAssignedValue(tokens, index, end)) return true;
@@ -959,4 +973,37 @@ test "an arena in main and managed memory in tests need no visible deinit" {
         "}\n";
     const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
     try support.expectSpans(source, found, &.{ "leaked", "file" });
+}
+
+test "an allocating writer needs a deinit unless its bytes are handed on" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn borrowed(gpa: std.mem.Allocator) ![]u8 {\n" ++
+        "    var leaked: std.Io.Writer.Allocating = .init(gpa);\n" ++
+        "    try leaked.writer.print(\"x\", .{});\n" ++
+        "    return leaked.written();\n" ++
+        "}\n" ++
+        "fn owned(gpa: std.mem.Allocator) ![]u8 {\n" ++
+        "    var out: std.Io.Writer.Allocating = .init(gpa);\n" ++
+        "    errdefer out.deinit();\n" ++
+        "    try out.writer.print(\"x\", .{});\n" ++
+        "    return out.toOwnedSlice();\n" ++
+        "}\n" ++
+        "fn released(gpa: std.mem.Allocator, sink: *std.Io.Writer) !void {\n" ++
+        "    var scratch = std.Io.Writer.Allocating.init(gpa);\n" ++
+        "    defer scratch.deinit();\n" ++
+        "    try scratch.writer.print(\"x\", .{});\n" ++
+        "    try sink.writeAll(scratch.written());\n" ++
+        "}\n" ++
+        "fn arenaBacked(sink: *std.Io.Writer) !void {\n" ++
+        "    var state = std.heap.ArenaAllocator.init(std.heap.page_allocator);\n" ++
+        "    defer state.deinit();\n" ++
+        "    const allocator = state.allocator();\n" ++
+        "    var text: std.Io.Writer.Allocating = .init(allocator);\n" ++
+        "    try text.writer.print(\"x\", .{});\n" ++
+        "    try sink.writeAll(text.written());\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    try support.expectSpans(source, found, &.{"leaked"});
 }

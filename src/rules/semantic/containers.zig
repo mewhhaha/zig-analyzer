@@ -4,6 +4,7 @@ const std = @import("std");
 const syntax_scope = @import("../../syntax/scope.zig");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
+const identifierName = @import("../../syntax/tokens.zig").identifierName;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const lineIndentation = @import("../../syntax/tokens.zig").lineIndentation;
 const rule_context = @import("../context.zig");
@@ -26,42 +27,51 @@ pub const rules = [_]types.Rule{
 
 pub fn run(context: RuleRun) !void {
     const allocator = context.allocator;
-    var containers: std.ArrayList(Container) = .empty;
+    var collected: std.ArrayList(Container) = .empty;
     defer {
-        for (containers.items) |c| allocator.free(c.fields);
-        containers.deinit(allocator);
+        for (collected.items) |c| allocator.free(c.fields);
+        collected.deinit(allocator);
     }
     const initial_containers = try collectContainers(context);
     defer allocator.free(initial_containers);
-    try containers.appendSlice(allocator, initial_containers);
-    for (context.resolved_shapes) |shape| {
-        if (containerDeclared(containers.items, shape.type_name)) continue;
-        const fields = try allocator.alloc(Field, shape.fields.len);
-        for (shape.fields, fields) |name, *field| field.* = .{
-            .name = name,
-            .required = shape.kind != .structure,
-        };
-        try containers.append(allocator, .{
-            .name = shape.type_name,
-            .kind = switch (shape.kind) {
-                .enumeration => .enumeration,
-                .tagged_union => .tagged_union,
-                .structure => .structure,
-            },
-            .fields = fields,
-            .scope = .{ .opening = null, .closing = context.tokens.len },
-            .body = null,
-            .resolved = true,
-            .has_usingnamespace = false,
-        });
+    try collected.appendSlice(allocator, initial_containers);
+    if (context.resolved_shapes.len != 0) {
+        // The names declared so far, the file's and the shapes' added before.
+        var declared: std.StringHashMapUnmanaged(void) = .empty;
+        defer declared.deinit(allocator);
+        for (collected.items) |container| try declared.put(allocator, identifierName(container.name), {});
+        for (context.resolved_shapes) |shape| {
+            if ((try declared.getOrPut(allocator, identifierName(shape.type_name))).found_existing) continue;
+            const fields = try allocator.alloc(Field, shape.fields.len);
+            for (shape.fields, fields) |name, *field| field.* = .{
+                .name = name,
+                .required = shape.kind != .structure,
+            };
+            try collected.append(allocator, .{
+                .name = shape.type_name,
+                .kind = switch (shape.kind) {
+                    .enumeration => .enumeration,
+                    .tagged_union => .tagged_union,
+                    .structure => .structure,
+                },
+                .fields = fields,
+                .scope = .{ .opening = null },
+                .body = null,
+                .resolved = true,
+                .has_usingnamespace = false,
+            });
+        }
     }
+    var containers: Containers = try .init(allocator, collected.items);
+    defer containers.deinit(allocator);
     var declarations: Declarations = .{};
     defer declarations.deinit(allocator);
-    try findUnresolvedMembers(context, containers.items, &declarations);
+    try findUnresolvedMembers(context, &containers, &declarations);
     try findUnresolvedModuleMembers(context);
-    try findComptimeReflectionIssues(context, containers.items, &declarations);
-    try findSwitches(context, containers.items);
-    try findStructInitializers(context, containers.items);
+    try findRemovedTypeInfoMembers(context);
+    try findComptimeReflectionIssues(context, &containers, &declarations);
+    try findSwitches(context, &containers);
+    try findStructInitializers(context, &containers);
 }
 
 const ContainerKind = enum { enumeration, tagged_union, structure, error_set };
@@ -96,14 +106,97 @@ const Container = struct {
     has_usingnamespace: bool,
 };
 
+/// The block from the `{` at `opening` to its matching `}`, or to the end of
+/// the file when it has none; null for the file itself.
 const TokenScope = struct {
     opening: ?usize,
-    closing: usize,
+};
+
+/// The file's containers, with each name's containers ordered by the block
+/// that declares them, so a lookup visits only the containers of its name.
+const Containers = struct {
+    items: []const Container,
+    /// `identifierName` of each name to its containers' positions in `items`,
+    /// sorted by `scopeDepth` and then by position.
+    by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+
+    fn init(allocator: std.mem.Allocator, items: []const Container) !Containers {
+        var containers: Containers = .{ .items = items };
+        errdefer containers.deinit(allocator);
+        for (items, 0..) |container, position| {
+            const entry = try containers.by_name.getOrPut(allocator, identifierName(container.name));
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(allocator, @intCast(position));
+        }
+        var lists = containers.by_name.valueIterator();
+        while (lists.next()) |positions| std.mem.sort(u32, positions.items, items, struct {
+            fn lessThan(all: []const Container, left: u32, right: u32) bool {
+                const left_depth = scopeDepth(all[left].scope);
+                const right_depth = scopeDepth(all[right].scope);
+                return left_depth < right_depth or left_depth == right_depth and left < right;
+            }
+        }.lessThan);
+        return containers;
+    }
+
+    fn deinit(containers: *Containers, allocator: std.mem.Allocator) void {
+        var lists = containers.by_name.valueIterator();
+        while (lists.next()) |positions| positions.deinit(allocator);
+        containers.by_name.deinit(allocator);
+    }
+
+    /// The containers named `name`, ordered as `by_name` keeps them.
+    fn named(containers: *const Containers, name: []const u8) []const u32 {
+        return (containers.by_name.getPtr(identifierName(name)) orelse return &.{}).items;
+    }
+
+    /// The first of `positions` (a `named` list) whose scope depth is not
+    /// below `depth`, or `positions.len`.
+    fn firstAtDepth(containers: *const Containers, positions: []const u32, depth: usize) usize {
+        var low: usize = 0;
+        var high = positions.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (scopeDepth(containers.items[positions[middle]].scope) < depth) low = middle + 1 else high = middle;
+        }
+        return low;
+    }
+
+    /// The first container named `name`, in `items` order, declared directly
+    /// in the block whose `{` is at `opening`.
+    fn declaredIn(containers: *const Containers, name: []const u8, opening: usize) ?Container {
+        const positions = containers.named(name);
+        const first = containers.firstAtDepth(positions, opening + 1);
+        if (first == positions.len) return null;
+        const container = containers.items[positions[first]];
+        return if (container.scope.opening == opening) container else null;
+    }
+
+    /// The container named `name` whose scope most deeply contains the
+    /// identifier at `use_index`, the first in `items` order on a tie. A
+    /// scope runs from the `{` of the block holding the declaration to its
+    /// matching `}` (or the end of the file), and the blocks that contain an
+    /// identifier this way are exactly its chain of enclosing braces,
+    /// innermost first; past them only the file-level containers (depth 0)
+    /// remain, which contain every token.
+    fn innermost(containers: *const Containers, scope_index: *const syntax_scope.Index, name: []const u8, use_index: usize) ?Container {
+        const positions = containers.named(name);
+        if (positions.len == 0) return null;
+        var brace = scope_index.enclosingOpeningBrace(use_index);
+        while (brace) |opening| : (brace = scope_index.enclosingOpeningBrace(opening)) {
+            const first = containers.firstAtDepth(positions, opening + 1);
+            if (first < positions.len and containers.items[positions[first]].scope.opening == opening) return containers.items[positions[first]];
+            // No container of the name is declared in an enclosing block further out.
+            if (first == 0 or containers.items[positions[first - 1]].scope.opening == null) break;
+        }
+        const outermost = containers.items[positions[0]];
+        return if (outermost.scope.opening == null) outermost else null;
+    }
 };
 
 fn findUnresolvedMembers(
     context: RuleRun,
-    containers: []const Container,
+    containers: *const Containers,
     declarations: *Declarations,
 ) !void {
     const source = context.source;
@@ -169,9 +262,193 @@ pub fn findUnresolvedModuleMembers(context: RuleRun) !void {
     }
 }
 
+/// A payload of `std.lang.Type`: the union tag that selects it and every member
+/// it has in the Zig release the analyzer is built for, fields and declarations.
+const TypeInfoShape = struct {
+    tag: []const u8,
+    type_name: []const u8,
+    members: []const []const u8,
+};
+
+// Verified against `std.lang.Type` in the Zig 0.17.0 standard library.
+const type_info_shapes = [_]TypeInfoShape{
+    .{ .tag = "int", .type_name = "Int", .members = &.{ "signedness", "bits" } },
+    .{ .tag = "float", .type_name = "Float", .members = &.{"bits"} },
+    .{ .tag = "pointer", .type_name = "Pointer", .members = &.{ "size", "attrs", "child", "sentinel_ptr", "sentinel", "Size", "Attributes" } },
+    .{ .tag = "array", .type_name = "Array", .members = &.{ "len", "child", "sentinel_ptr", "sentinel" } },
+    .{ .tag = "struct", .type_name = "Struct", .members = &.{ "is_tuple", "layout", "backing_integer", "field_names", "field_types", "field_attrs", "decl_names", "FieldAttributes" } },
+    .{ .tag = "optional", .type_name = "Optional", .members = &.{"child"} },
+    .{ .tag = "error_union", .type_name = "ErrorUnion", .members = &.{ "error_set", "payload" } },
+    .{ .tag = "enum", .type_name = "Enum", .members = &.{ "tag_type", "mode", "field_names", "field_values", "decl_names", "Mode" } },
+    .{ .tag = "union", .type_name = "Union", .members = &.{ "layout", "tag_type", "backing_integer", "field_names", "field_types", "field_attrs", "decl_names", "FieldAttributes" } },
+    .{ .tag = "fn", .type_name = "Fn", .members = &.{ "attrs", "is_generic", "return_type", "param_types", "param_attrs", "ParamAttributes", "Attributes" } },
+    .{ .tag = "opaque", .type_name = "Opaque", .members = &.{"decl_names"} },
+    .{ .tag = "vector", .type_name = "Vector", .members = &.{ "len", "child" } },
+};
+
+/// What replaced a member that older releases' `std.builtin.Type` payloads had.
+fn removedTypeInfoAdvice(type_name: []const u8, member: []const u8) ?[]const u8 {
+    const Replacement = struct { type_name: []const u8, member: []const u8, advice: []const u8 };
+    const replacements = [_]Replacement{
+        .{ .type_name = "Struct", .member = "fields", .advice = "iterate field_names, field_types and field_attrs together" },
+        .{ .type_name = "Union", .member = "fields", .advice = "iterate field_names, field_types and field_attrs together" },
+        .{ .type_name = "Enum", .member = "fields", .advice = "iterate field_names and field_values together" },
+        .{ .type_name = "Enum", .member = "is_exhaustive", .advice = "compare mode with .exhaustive" },
+        .{ .type_name = "Fn", .member = "params", .advice = "use param_types and param_attrs" },
+        .{ .type_name = "Fn", .member = "calling_convention", .advice = "use attrs.@\"callconv\"" },
+        .{ .type_name = "Fn", .member = "is_var_args", .advice = "use attrs.varargs" },
+        .{ .type_name = "Pointer", .member = "is_const", .advice = "use attrs.@\"const\"" },
+        .{ .type_name = "Pointer", .member = "is_volatile", .advice = "use attrs.@\"volatile\"" },
+        .{ .type_name = "Pointer", .member = "is_allowzero", .advice = "use attrs.@\"allowzero\"" },
+        .{ .type_name = "Pointer", .member = "alignment", .advice = "use attrs.@\"align\"" },
+        .{ .type_name = "Pointer", .member = "address_space", .advice = "use attrs.@\"addrspace\"" },
+    };
+    for (replacements) |entry| {
+        if (std.mem.eql(u8, entry.type_name, type_name) and std.mem.eql(u8, entry.member, member)) return entry.advice;
+    }
+    if (std.mem.eql(u8, member, "decls")) return "use decl_names";
+    return null;
+}
+
+/// `@typeInfo(T).@"struct".fields` and the other members `std.lang.Type`
+/// payloads no longer have, read directly or through an untyped constant
+/// holding `@typeInfo(T)` or one of its payloads. The payload shapes are fixed
+/// by the Zig release, so these are compile errors. A file that tests for the
+/// member's name with `@hasField`/`@hasDecl` or reads `zig_version` may keep
+/// the old spelling in a branch comptime never analyzes, and is left alone.
+fn findRemovedTypeInfoMembers(context: RuleRun) !void {
+    const level = context.level(.unresolved_member);
+    if (level == .off) return;
+    const tokens = context.tokens;
+    var aliases: std.ArrayList(TypeInfoAlias) = .empty;
+    defer aliases.deinit(context.allocator);
+    var guards: TypeInfoGuards = .{};
+    defer guards.deinit(context.allocator);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .builtin or !tokenIs(context.source, token, "@typeInfo") or
+            index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
+        const closing = context.scopes.matchingToken(index + 1) orelse continue;
+        try checkTypeInfoMember(context, level, closing + 1, null, &guards);
+        if (index >= 3 and tokens[index - 1].tag == .equal and tokens[index - 2].tag == .identifier and
+            tokens[index - 3].tag == .keyword_const)
+        {
+            const end = context.scopes.statementEnd(index) orelse continue;
+            if (end == closing + 1) {
+                try aliases.append(context.allocator, .{ .name = index - 2, .shape = null });
+            } else if (end == closing + 3 and tokens[closing + 1].tag == .period) {
+                const shape = typeInfoShape(context, closing + 2) orelse continue;
+                try aliases.append(context.allocator, .{ .name = index - 2, .shape = shape });
+            }
+        }
+    }
+    if (aliases.items.len == 0) return;
+    // Each spelling's aliases in declaration order.
+    var aliases_by_name: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+    defer {
+        var lists = aliases_by_name.valueIterator();
+        while (lists.next()) |positions| positions.deinit(context.allocator);
+        aliases_by_name.deinit(context.allocator);
+    }
+    for (aliases.items, 0..) |alias, position| {
+        const entry = try aliases_by_name.getOrPut(context.allocator, tokenText(context.source, tokens[alias.name]));
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(context.allocator, @intCast(position));
+    }
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .identifier or index + 1 >= tokens.len or tokens[index + 1].tag != .period or
+            (index > 0 and tokens[index - 1].tag == .period)) continue;
+        const positions = aliases_by_name.get(tokenText(context.source, token)) orelse continue;
+        // Only the first alias spelled like the use, other than the use itself, is tried.
+        const alias = for (positions.items) |position| {
+            if (aliases.items[position].name != index) break aliases.items[position];
+        } else continue;
+        const binding = context.scopes.findBinding(index) orelse continue;
+        if (binding.token_index != alias.name) continue;
+        try checkTypeInfoMember(context, level, index + 1, alias.shape, &guards);
+    }
+}
+
+const TypeInfoAlias = struct {
+    /// The constant's name token.
+    name: usize,
+    /// The payload it holds, or null for the whole `@typeInfo` union.
+    shape: ?*const TypeInfoShape,
+};
+
+fn typeInfoShape(context: RuleRun, tag_index: usize) ?*const TypeInfoShape {
+    if (tag_index >= context.tokens.len or context.tokens[tag_index].tag != .identifier) return null;
+    const tag = identifierName(tokenText(context.source, context.tokens[tag_index]));
+    for (&type_info_shapes) |*shape| if (std.mem.eql(u8, shape.tag, tag)) return shape;
+    return null;
+}
+
+/// Checks `.tag.member` (or `.member` when the payload is already `known`)
+/// starting at the period `period`.
+fn checkTypeInfoMember(context: RuleRun, level: types.Level, period: usize, known: ?*const TypeInfoShape, guards: *TypeInfoGuards) !void {
+    const tokens = context.tokens;
+    var cursor = period;
+    const shape = known orelse shape: {
+        if (cursor + 1 >= tokens.len or tokens[cursor].tag != .period) return;
+        const shape = typeInfoShape(context, cursor + 1) orelse return;
+        cursor += 2;
+        break :shape shape;
+    };
+    if (cursor + 1 >= tokens.len or tokens[cursor].tag != .period or tokens[cursor + 1].tag != .identifier) return;
+    const member_index = cursor + 1;
+    const member = identifierName(tokenText(context.source, tokens[member_index]));
+    for (shape.members) |name| if (std.mem.eql(u8, name, member)) return;
+    if (try guards.covers(context, member)) return;
+    const message = if (removedTypeInfoAdvice(shape.type_name, member)) |advice|
+        try context.allocator.print("type 'std.lang.Type.{s}' has no member named '{s}' in Zig 0.17; {s}", .{ shape.type_name, member, advice })
+    else
+        try context.allocator.print("type 'std.lang.Type.{s}' has no member named '{s}'", .{ shape.type_name, member });
+    try context.emit(.{
+        .rule = .unresolved_member,
+        .level = level,
+        .span = tokens[member_index].loc,
+        .message = message,
+    });
+}
+
+/// What lets a file select between Zig releases at comptime: reading
+/// `zig_version`, or `@hasField`/`@hasDecl` tests of a member name.
+const TypeInfoGuards = struct {
+    built: bool = false,
+    zig_version: bool = false,
+    tested: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(guards: *TypeInfoGuards, allocator: std.mem.Allocator) void {
+        guards.tested.deinit(allocator);
+    }
+
+    fn covers(guards: *TypeInfoGuards, context: RuleRun, member: []const u8) !bool {
+        if (!guards.built) {
+            guards.built = true;
+            const tokens = context.tokens;
+            for (tokens, 0..) |token, index| switch (token.tag) {
+                .identifier => if (tokenIs(context.source, token, "zig_version")) {
+                    guards.zig_version = true;
+                },
+                .builtin => {
+                    if ((!tokenIs(context.source, token, "@hasField") and !tokenIs(context.source, token, "@hasDecl")) or
+                        index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) continue;
+                    const closing = context.scopes.matchingToken(index + 1) orelse continue;
+                    if (closing == 0 or tokens[closing - 1].tag != .string_literal) continue;
+                    const literal = tokenText(context.source, tokens[closing - 1]);
+                    if (literal.len >= 2) try guards.tested.append(context.allocator, literal[1 .. literal.len - 1]);
+                },
+                else => {},
+            };
+        }
+        if (guards.zig_version) return true;
+        for (guards.tested.items) |name| if (std.mem.eql(u8, name, member)) return true;
+        return false;
+    }
+};
+
 fn containerForReceiver(
     context: RuleRun,
-    containers: []const Container,
+    containers: *const Containers,
     receiver_name: []const u8,
     receiver_index: usize,
 ) ?Container {
@@ -182,7 +459,7 @@ fn containerForReceiver(
 /// The container the binding visible at `use_index` holds when its
 /// declaration says so: `name: T`, `name = T{ ... };`, or `name = f(...);`
 /// (with `catch`) for a function declared to return `T` or `E!T`.
-fn bindingContainer(context: RuleRun, containers: []const Container, use_index: usize) ?Container {
+fn bindingContainer(context: RuleRun, containers: *const Containers, use_index: usize) ?Container {
     const tokens = context.tokens;
     const binding = context.scopes.findBinding(use_index) orelse return null;
     const index = binding.token_index;
@@ -213,7 +490,7 @@ fn bindingContainer(context: RuleRun, containers: []const Container, use_index: 
 
 /// The container returned by the function a bare call at `callee_index`
 /// names.
-fn callResultContainer(context: RuleRun, containers: []const Container, callee_index: usize) ?Container {
+fn callResultContainer(context: RuleRun, containers: *const Containers, callee_index: usize) ?Container {
     const binding = context.scopes.findBinding(callee_index) orelse return null;
     const name_index = binding.token_index;
     if (name_index == 0 or context.tokens[name_index - 1].tag != .keyword_fn) return null;
@@ -223,7 +500,7 @@ fn callResultContainer(context: RuleRun, containers: []const Container, callee_i
 /// The container the function named at `name_index` is declared to return,
 /// or the payload of its error union, resolved where the function is
 /// declared.
-fn returnContainer(context: RuleRun, containers: []const Container, name_index: usize) ?Container {
+fn returnContainer(context: RuleRun, containers: *const Containers, name_index: usize) ?Container {
     const tokens = context.tokens;
     if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return null;
     const parameters_end = context.matchingToken(name_index + 1, .l_paren, .r_paren) orelse return null;
@@ -252,18 +529,14 @@ fn typePathEnd(tokens: []const std.zig.Token, start: usize) ?usize {
 /// first segment is resolved lexically, and every later one must be a
 /// container declared directly in the one before. A path that leaves the
 /// file's containers (`std.lang.Signedness`) names none.
-fn containerAtPath(context: RuleRun, containers: []const Container, first: usize, last: usize) ?Container {
+fn containerAtPath(context: RuleRun, containers: *const Containers, first: usize, last: usize) ?Container {
     const source = context.source;
     const tokens = context.tokens;
     var container = containerNamed(containers, context.scopes, tokenText(source, tokens[first]), first) orelse return null;
     var segment = first + 2;
     while (segment <= last) : (segment += 2) {
         const body = container.body orelse return null;
-        const name = tokenText(source, tokens[segment]);
-        container = for (containers) |candidate| {
-            const opening = candidate.scope.opening orelse continue;
-            if (opening == body and identifierNamesEqual(candidate.name, name)) break candidate;
-        } else return null;
+        container = containers.declaredIn(tokenText(source, tokens[segment]), body) orelse return null;
     }
     return container;
 }
@@ -393,7 +666,7 @@ fn fieldIsRequired(tokens: []const std.zig.Token, colon: usize, closing: usize) 
 
 fn findComptimeReflectionIssues(
     context: RuleRun,
-    containers: []const Container,
+    containers: *const Containers,
     declarations: *Declarations,
 ) !void {
     const source = context.source;
@@ -579,7 +852,7 @@ fn isPublicMember(tokens: []const std.zig.Token, first: usize, member_index: usi
 
 fn findSwitches(
     context: RuleRun,
-    containers: []const Container,
+    containers: *const Containers,
 ) !void {
     const source = context.source;
     const tokens = context.tokens;
@@ -649,7 +922,8 @@ fn findSwitches(
         }
         if (else_index) |index| {
             const level = context.level(.non_exhaustive_switch_else);
-            if (level == .off or missing.items.len > maximum_named_else_cases) continue;
+            if (level == .off or missing.items.len > maximum_named_else_cases or
+                elseIsDeliberate(context, switch_index, index)) continue;
             const fixes: []const Fix = if (elseCaptureCanBePreserved(tokens, index, closing)) fixes: {
                 const replacement = try caseSelectorText(context.allocator, missing.items);
                 const allocated = try Fix.single(context.allocator, .{
@@ -689,19 +963,30 @@ fn findSwitches(
 
 const maximum_named_else_cases = 8;
 
+/// Whether the `else` prong at `else_index` of the switch at `switch_index`
+/// is a deliberate catch-all: a `@compileError` for unsupported cases, or the
+/// `true`/`false` answer of a predicate that returns the switch as its `bool`.
+fn elseIsDeliberate(context: RuleRun, switch_index: usize, else_index: usize) bool {
+    const tokens = context.tokens;
+    if (else_index + 2 >= tokens.len or tokens[else_index + 1].tag != .equal_angle_bracket_right) return false;
+    const value = else_index + 2;
+    if (context.tokenIs(value, "@compileError")) return true;
+    if (!context.tokenIs(value, "true") and !context.tokenIs(value, "false")) return false;
+    if (tokens[value + 1].tag != .comma and tokens[value + 1].tag != .r_brace) return false;
+    if (switch_index == 0 or tokens[switch_index - 1].tag != .keyword_return) return false;
+    const body = context.functionBodyHolding(switch_index) orelse return false;
+    return body > 0 and context.tokenIs(body - 1, "bool");
+}
+
 fn containerNamed(
-    containers: []const Container,
+    containers: *const Containers,
     scope_index: *const syntax_scope.Index,
     requested_name: []const u8,
     use_index: usize,
 ) ?Container {
     var name = requested_name;
     for (0..16) |_| {
-        var selected: ?Container = null;
-        for (containers) |container| {
-            if (!identifierNamesEqual(container.name, name) or !scopeContains(container.scope, use_index)) continue;
-            if (selected == null or scopeDepth(container.scope) > scopeDepth(selected.?.scope)) selected = container;
-        }
+        const selected = containers.innermost(scope_index, name, use_index);
         const visible_binding = scope_index.findBindingNamed(name, use_index);
         if (selected) |container| {
             if (visible_binding == null or scopeDepth(container.scope) >= visible_binding.?.scope_rank) return container;
@@ -712,21 +997,8 @@ fn containerNamed(
     return null;
 }
 
-fn containerDeclared(containers: []const Container, name: []const u8) bool {
-    for (containers) |container| {
-        if (identifierNamesEqual(container.name, name)) return true;
-    }
-    return false;
-}
-
 fn enclosingTokenScope(context: RuleRun, index: usize) TokenScope {
-    const opening = context.enclosingOpeningBrace(index) orelse return .{ .opening = null, .closing = context.tokens.len };
-    return .{ .opening = opening, .closing = context.matchingToken(opening, .l_brace, .r_brace) orelse context.tokens.len };
-}
-
-fn scopeContains(scope: TokenScope, index: usize) bool {
-    if (index >= scope.closing) return false;
-    return if (scope.opening) |opening| index > opening else true;
+    return .{ .opening = context.enclosingOpeningBrace(index) };
 }
 
 fn scopeDepth(scope: TokenScope) usize {
@@ -940,7 +1212,7 @@ fn errorSwitchProngText(
 
 fn findStructInitializers(
     context: RuleRun,
-    containers: []const Container,
+    containers: *const Containers,
 ) !void {
     const source = context.source;
     const tokens = context.tokens;
@@ -1066,13 +1338,6 @@ fn missingMessage(
 
 fn identifierNamesEqual(left: []const u8, right: []const u8) bool {
     return std.mem.eql(u8, identifierName(left), identifierName(right));
-}
-
-fn identifierName(spelling: []const u8) []const u8 {
-    if (spelling.len >= 3 and std.mem.startsWith(u8, spelling, "@\"") and spelling[spelling.len - 1] == '"') {
-        return spelling[2 .. spelling.len - 1];
-    }
-    return spelling;
 }
 
 test "struct findings ignore function return types" {
@@ -1201,6 +1466,27 @@ test "switch types follow qualified paths from where they are written" {
         try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn qualified").?);
     };
     try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
+}
+
+test "receivers resolve to the same-named container of the innermost enclosing block" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { fast, safe };\n" ++
+        "const Outer = struct {\n" ++
+        "    const Mode = enum { left, right };\n" ++
+        "    fn turn() void { _ = Mode.left; _ = Mode.fast; }\n" ++
+        "    const Inner = struct {\n" ++
+        "        fn turn() void { _ = Mode.right; _ = Mode.safe; }\n" ++
+        "    };\n" ++
+        "};\n" ++
+        "const Other = struct {\n" ++
+        "    fn go() void { _ = Mode.fast; _ = Mode.left; }\n" ++
+        "};\n" ++
+        "fn pick(mode: Outer.Mode) void { switch (mode) { .left => {} } }\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{ .unresolved_member, .missing_switch_prong }, .warning));
+    try support.expectSpans(source, found, &.{ "fast", "safe", "left", "switch" });
+    try std.testing.expect(std.mem.find(u8, found[3].message, ".right") != null);
 }
 
 test "a bare call's result type comes from the function visible at the call" {
@@ -1350,6 +1636,24 @@ test "switch prongs never propose the non-exhaustive '_' marker" {
     try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
 }
 
+test "a resolved shape does not replace a container the file or an earlier shape declares" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Local = enum { a, b };\n" ++
+        "fn run(local: Local, remote: Remote) void {\n" ++
+        "    switch (local) { .a => {}, .b => {} }\n" ++
+        "    switch (remote) { .x => {} }\n" ++
+        "}\n";
+    const found = try support.findingsShaped(arena.allocator(), run, &.{
+        .{ .type_name = "Local", .kind = .enumeration, .fields = &.{ "a", "b", "c" } },
+        .{ .type_name = "Remote", .kind = .enumeration, .fields = &.{ "x", "y" } },
+        .{ .type_name = "Remote", .kind = .enumeration, .fields = &.{"x"} },
+    }, source, support.only(&.{.missing_switch_prong}, .warning));
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("switch is missing cases for type 'Remote': .y", found[0].message);
+}
+
 test "inline else is exhaustive by construction" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1396,6 +1700,27 @@ test "switch else permits fallback over nine remaining cases" {
     const configuration = support.only(&.{.non_exhaustive_switch_else}, .warning);
     const found = try support.findings(arena.allocator(), run, source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
+}
+
+test "switch else accepts predicate answers and compile errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = enum { active, feeding, complete, idle };\n" ++
+        "fn isComplete(state: State) bool {\n" ++
+        "    return switch (state) { .complete => true, else => false };\n" ++
+        "}\n" ++
+        "fn weight(comptime state: State) u8 {\n" ++
+        "    return switch (state) { .active => 1, else => @compileError(\"unsupported\") };\n" ++
+        "}\n" ++
+        "fn flag(state: State) bool {\n" ++
+        "    const done = switch (state) { .complete => true, else => false };\n" ++
+        "    return done;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.non_exhaustive_switch_else}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expect(found[0].span.start > std.mem.find(u8, source, "fn flag").?);
 }
 
 test "missing members are reported only for proven local receiver shapes" {
@@ -1464,6 +1789,76 @@ test "anonymous struct fields resolve by their numbered names" {
         "const Event = struct { u8, bool, }; fn use(event: Event) void { _ = event.@\"0\"; _ = event.@\"1\"; }\n";
     const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
+test "type info shapes list exactly the members of the pinned std.lang.Type payloads" {
+    inline for (type_info_shapes) |shape| {
+        const Payload = @field(std.lang.Type, shape.type_name);
+        try std.testing.expect(@hasField(std.lang.Type, shape.tag));
+        inline for (shape.members) |member| try std.testing.expect(@hasField(Payload, member) or @hasDecl(Payload, member));
+        inline for (@typeInfo(Payload).@"struct".field_names) |field| {
+            const listed = for (shape.members) |member| {
+                if (std.mem.eql(u8, member, field)) break true;
+            } else false;
+            try std.testing.expect(listed);
+        }
+    }
+}
+
+test "removed @typeInfo payload members are unresolved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Item = struct { a: u8 };\n" ++
+        "const fields = @typeInfo(Item).@\"struct\".fields;\n" ++
+        "const enum_fields = @typeInfo(E).@\"enum\".fields;\n" ++
+        "const decls = @typeInfo(Item).@\"struct\".decls;\n" ++
+        "const is_const = @typeInfo(P).pointer.is_const;\n" ++
+        "fn use(comptime T: type) void {\n" ++
+        "    const info = @typeInfo(T).@\"union\";\n" ++
+        "    _ = info.fields;\n" ++
+        "    const whole = @typeInfo(T);\n" ++
+        "    _ = whole.@\"fn\".params;\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unresolved_member}, .@"error"));
+    var messages: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .unresolved_member) try messages.append(arena.allocator(), finding.message);
+    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
+    try std.testing.expectEqualStrings(
+        "type 'std.lang.Type.Struct' has no member named 'fields' in Zig 0.17; iterate field_names, field_types and field_attrs together",
+        messages.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "type 'std.lang.Type.Enum' has no member named 'fields' in Zig 0.17; iterate field_names and field_values together",
+        messages.items[1],
+    );
+    try std.testing.expectEqualStrings("type 'std.lang.Type.Struct' has no member named 'decls' in Zig 0.17; use decl_names", messages.items[2]);
+    try std.testing.expectEqualStrings("type 'std.lang.Type.Pointer' has no member named 'is_const' in Zig 0.17; use attrs.@\"const\"", messages.items[3]);
+    try std.testing.expectEqualStrings(
+        "type 'std.lang.Type.Union' has no member named 'fields' in Zig 0.17; iterate field_names, field_types and field_attrs together",
+        messages.items[4],
+    );
+    try std.testing.expectEqualStrings("type 'std.lang.Type.Fn' has no member named 'params' in Zig 0.17; use param_types and param_attrs", messages.items[5]);
+}
+
+test "current @typeInfo members and version-guarded files are not reported" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const current: [:0]const u8 =
+        "const names = @typeInfo(Item).@\"struct\".field_names;\n" ++
+        "const bits = @typeInfo(u8).int.bits;\n" ++
+        "const attrs = @typeInfo(P).pointer.attrs.@\"const\";\n" ++
+        "const custom = item.@\"struct\".fields;\n" ++
+        "fn use(comptime T: type) void { var info = @typeInfo(T).@\"struct\"; _ = info.fields; }\n";
+    for (try support.findings(arena.allocator(), run, current, Configuration.defaults())) |finding| {
+        try std.testing.expect(finding.rule != .unresolved_member);
+    }
+    const guarded: [:0]const u8 =
+        "const builtin = @import(\"builtin\");\n" ++
+        "const fields = if (builtin.zig_version.minor >= 16) @typeInfo(Item).@\"struct\".field_names else @typeInfo(Item).@\"struct\".fields;\n";
+    for (try support.findings(arena.allocator(), run, guarded, Configuration.defaults())) |finding| {
+        try std.testing.expect(finding.rule != .unresolved_member);
+    }
 }
 
 test "quoted declarations resolve through their unquoted field syntax" {

@@ -18,6 +18,12 @@ first receiver parameter (`self`, or typed as `Self`, `@This()` or an alias of
 it, the enclosing container or `anyopaque`), and a comptime parameter whose
 type names an earlier runtime parameter, as `comptime lessThan: fn
 (@TypeOf(context), T, T) bool` does. A `T: type` parameter counts as comptime.
+Two pairs keep their conventional order: a comptime format string or function
+directly followed by the runtime `anytype` arguments it takes
+(`print(w, comptime fmt, args)`, `spawn(config, comptime f, args)`), and a
+comptime callback whose function type takes the type of an earlier runtime
+parameter, the context it is called with
+(`context: Context, comptime callback: fn (Context, *Completion) void`).
 The rule reports only ordering and does not rearrange parameters or call
 sites.
 

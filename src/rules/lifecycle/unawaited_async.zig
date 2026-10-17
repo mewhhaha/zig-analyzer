@@ -8,6 +8,11 @@
 //! is reported too, unless a `defer` or `errdefer` registered before it
 //! finishes the task. That check skips test blocks, where a failed `try`
 //! already fails the test.
+//!
+//! The same task-spawn recognition reports `concurrent` calls whose
+//! `error.ConcurrencyUnavailable` is asserted away with `catch unreachable`:
+//! the error is a runtime condition (a single-threaded `Io`, no thread or
+//! memory left for the task), not a programming error.
 
 const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
@@ -18,9 +23,10 @@ const support = @import("../test_support.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const TaskOwner = resources.TaskOwner;
 
-pub const rules = [_]types.Rule{.unawaited_async};
+pub const rules = [_]types.Rule{ .unawaited_async, .assumed_concurrency };
 
 pub fn run(context: RuleRun) !void {
+    try findAssumedConcurrency(context);
     const level = context.level(.unawaited_async);
     if (level == .off) return;
     // Groups and selects already checked, by declaration.
@@ -41,6 +47,45 @@ pub fn run(context: RuleRun) !void {
         if ((try checked.getOrPut(context.allocator, binding.token_index)).found_existing) continue;
         const owner = taskOwner(context, binding.token_index) orelse continue;
         try checkTasks(context, level, binding.token_index, owner, (context.statementEnd(binding.token_index - 1) orelse continue) + 1);
+    }
+}
+
+/// `io.concurrent(f, .{}) catch unreachable` and the same on a `Group` or
+/// `Select`.
+fn findAssumedConcurrency(context: RuleRun) !void {
+    const level = context.level(.assumed_concurrency);
+    if (level == .off) return;
+    const tokens = context.tokens;
+    for (tokens, 0..) |token, method| {
+        if (token.tag != .identifier or method < 2 or tokens[method - 1].tag != .period or
+            tokens[method + 1].tag != .l_paren or !context.tokenIs(method, "concurrent")) continue;
+        const closing = context.matchingToken(method + 1, .l_paren, .r_paren) orelse continue;
+        if (tokens[closing + 1].tag != .keyword_catch or tokens[closing + 2].tag != .keyword_unreachable) continue;
+        if (!spawnsOnIo(context, method, closing)) continue;
+        try context.emit(.{
+            .rule = .assumed_concurrency,
+            .level = level,
+            .span = tokens[closing + 2].loc,
+            .message = "'concurrent' fails with error.ConcurrencyUnavailable when the Io cannot run the task concurrently (a single-threaded Io, or no thread or memory left), and 'catch unreachable' makes that illegal behavior; handle the error or use 'async'",
+        });
+    }
+}
+
+/// Whether the `concurrent` call at `method` spawns an `std.Io` task:
+/// `io.concurrent(f, args)`, `group.concurrent(io, f, args)` or
+/// `select.concurrent(.field, f, args)` on a local `Io.Select`.
+fn spawnsOnIo(context: RuleRun, method: usize, closing: usize) bool {
+    const tokens = context.tokens;
+    switch (argumentCount(tokens, method + 1, closing)) {
+        2 => return receiverIsIo(context, method),
+        3 => {
+            const comma = tokens_util.topLevelComma(tokens, method + 2, closing) orelse return false;
+            if (tokens[comma - 1].tag == .identifier and context.namesIo(comma - 1)) return true;
+            if (tokens[method - 2].tag != .identifier or (method >= 3 and tokens[method - 3].tag == .period)) return false;
+            const binding = context.scopes.findBinding(method - 2) orelse return false;
+            return taskOwner(context, binding.token_index) == .select;
+        },
+        else => return false,
     }
 }
 
@@ -296,6 +341,64 @@ fn coveredByDefer(context: RuleRun, mentions: *const Mentions, exit: usize) bool
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
     return support.findings(allocator, run, source, support.only(&.{.unawaited_async}, .warning));
+}
+
+fn concurrencyFindings(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {
+    return support.findings(allocator, run, source, support.only(&.{.assumed_concurrency}, .warning));
+}
+
+test "concurrent calls asserted not to fail report" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\fn work() void {}
+        \\const Done = union(enum) { done: void };
+        \\fn future(io: Io) void {
+        \\    var pending = io.concurrent(work, .{}) catch unreachable;
+        \\    pending.await(io);
+        \\}
+        \\fn group(self: *Server, buffer: []Done) void {
+        \\    var workers: Io.Group = .init;
+        \\    defer workers.cancel(self.io);
+        \\    workers.concurrent(self.io, work, .{}) catch unreachable;
+        \\    var racing: Io.Select(Done) = .init(self.io, buffer);
+        \\    defer racing.cancelDiscard();
+        \\    racing.concurrent(.done, work, .{}) catch unreachable;
+        \\}
+        \\const Server = struct { io: Io };
+    ;
+    const found = try concurrencyFindings(arena.allocator(), source);
+    try support.expectSpans(source, found, &.{ "unreachable", "unreachable", "unreachable" });
+}
+
+test "handled concurrency errors and other concurrent methods stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\fn work() void {}
+        \\fn propagated(io: Io) !void {
+        \\    var pending = try io.concurrent(work, .{});
+        \\    pending.await(io);
+        \\}
+        \\fn fallback(io: Io) void {
+        \\    var pending = io.concurrent(work, .{}) catch return work();
+        \\    pending.await(io);
+        \\}
+        \\fn grouped(io: Io) void {
+        \\    var workers: Io.Group = .init;
+        \\    defer workers.cancel(io);
+        \\    workers.concurrent(io, work, .{}) catch workers.async(io, work, .{});
+        \\}
+        \\fn unrelated(pool: anytype) void {
+        \\    pool.concurrent(work, .{}) catch unreachable;
+        \\    pool.queue.concurrent(1, work, .{}) catch unreachable;
+        \\}
+    ;
+    try std.testing.expectEqual(@as(usize, 0), (try concurrencyFindings(arena.allocator(), source)).len);
 }
 
 test "futures, groups and selects that never finish report" {

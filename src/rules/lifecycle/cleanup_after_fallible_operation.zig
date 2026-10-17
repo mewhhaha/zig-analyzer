@@ -7,6 +7,8 @@ const support = @import("../test_support.zig");
 pub fn run(context: RuleRun) !void {
     const level = context.level(.cleanup_after_fallible_operation);
     if (level == .off) return;
+    // The scans below visit a binding's uses through the identifier table.
+    _ = try context.scopes.identifiers();
 
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
@@ -44,11 +46,14 @@ pub fn run(context: RuleRun) !void {
 }
 
 fn findExpiredInsertionRollback(context: RuleRun, level: types.Level) !void {
+    var bodies: ?FunctionBodies = null;
+    defer if (bodies) |*built| built.deinit(context.allocator);
     for (context.tokens, 0..) |token, errdefer_index| {
         if (token.tag != .keyword_errdefer) continue;
         const rollback_scope = context.enclosingOpeningBrace(errdefer_index) orelse continue;
         const rollback_scope_end = context.matchingToken(rollback_scope, .l_brace, .r_brace) orelse continue;
-        const function = containingFunction(context, errdefer_index) orelse continue;
+        if (bodies == null) bodies = try .init(context);
+        const function = bodies.?.containing(errdefer_index) orelse continue;
         if (rollback_scope == function.body_start) continue;
         const rollback = removalCall(context, errdefer_index + 1, rollback_scope_end) orelse continue;
         if (!matchingFallibleInsertion(context, rollback_scope + 1, errdefer_index, rollback)) continue;
@@ -76,21 +81,65 @@ const Removal = struct {
     key: []const u8,
 };
 
-fn containingFunction(context: RuleRun, index: usize) ?FunctionBody {
-    var function_index = index;
-    while (function_index > 0) {
-        function_index -= 1;
-        if (context.tokens[function_index].tag != .keyword_fn) continue;
-        var body_start = function_index + 1;
-        while (body_start < index and context.tokens[body_start].tag != .l_brace and
-            context.tokens[body_start].tag != .semicolon) : (body_start += 1)
-        {}
-        if (body_start >= index or context.tokens[body_start].tag != .l_brace) continue;
-        const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
-        if (index < body_end) return .{ .body_start = body_start, .body_end = body_end };
+/// The body of the nearest `fn` before a token that holds it, where a
+/// body is the first `{` after the `fn` when no `;` comes first. The braces
+/// nest, so the innermost one around the token is that body; it is found by
+/// a binary search and a walk out instead of a scan back over every `fn`.
+const FunctionBodies = struct {
+    /// Distinct bodies by their `{`, each with the body around it.
+    bodies: []const Body,
+
+    const Body = struct { start: u32, end: u32, parent: u32 };
+    const none = std.math.maxInt(u32);
+
+    fn init(context: RuleRun) !FunctionBodies {
+        const allocator = context.allocator;
+        var bodies: std.ArrayList(Body) = .empty;
+        errdefer bodies.deinit(allocator);
+        // Bodies still open at the current one, innermost last.
+        var open: std.ArrayList(u32) = .empty;
+        defer open.deinit(allocator);
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, function_index| {
+            if (token.tag != .keyword_fn or tokens.len > none) continue;
+            var body_start = function_index + 1;
+            while (body_start < tokens.len and tokens[body_start].tag != .l_brace and
+                tokens[body_start].tag != .semicolon) : (body_start += 1)
+            {}
+            if (body_start >= tokens.len or tokens[body_start].tag != .l_brace) continue;
+            const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
+            // A `fn` type before the body shares its brace with the declaration.
+            if (bodies.last()) |previous| if (previous.start == body_start) continue;
+            while (open.last()) |innermost| {
+                if (bodies.items[innermost].end > body_start) break;
+                _ = open.pop();
+            }
+            try bodies.append(allocator, .{ .start = @intCast(body_start), .end = @intCast(body_end), .parent = open.last() orelse none });
+            try open.append(allocator, @intCast(bodies.items.len - 1));
+        }
+        return .{ .bodies = try bodies.toOwnedSlice(allocator) };
     }
-    return null;
-}
+
+    fn deinit(function_bodies: *FunctionBodies, allocator: std.mem.Allocator) void {
+        allocator.free(function_bodies.bodies);
+    }
+
+    fn containing(function_bodies: *const FunctionBodies, index: usize) ?FunctionBody {
+        const bodies = function_bodies.bodies;
+        var low: usize = 0;
+        var high = bodies.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (bodies[middle].start < index) low = middle + 1 else high = middle;
+        }
+        if (low == 0) return null;
+        var candidate: u32 = @intCast(low - 1);
+        while (candidate != none) : (candidate = bodies[candidate].parent) {
+            if (index < bodies[candidate].end) return .{ .body_start = bodies[candidate].start, .body_end = bodies[candidate].end };
+        }
+        return null;
+    }
+};
 
 fn removalCall(context: RuleRun, start: usize, end: usize) ?Removal {
     for (context.tokens[start..end], start..) |token, method_index| {
@@ -208,7 +257,11 @@ fn deferredCleanup(
     end: usize,
     scope_opening: usize,
 ) ?usize {
-    for (context.tokens[start..end], start..) |token, defer_index| {
+    // A matching `defer` comes before a later use of the binding it releases.
+    var last_use: usize = start;
+    var uses = context.scopes.identifiersNamed(binding_name, start, end);
+    while (uses.next()) |use| last_use = use;
+    for (context.tokens[start..last_use], start..) |token, defer_index| {
         if (token.tag != .keyword_defer or context.enclosingOpeningBrace(defer_index) != scope_opening) continue;
         const statement_end = context.statementEnd(defer_index) orelse continue;
         if (statement_end >= end) continue;
@@ -222,9 +275,10 @@ fn deferredCleanup(
 }
 
 fn directCleanup(context: RuleRun, binding_name: []const u8, release: []const u8, start: usize, end: usize) ?usize {
-    var index = start;
-    while (index + 3 < end) : (index += 1) {
-        if (!context.tokenIs(index, binding_name) or context.tokens[index + 1].tag != .period or
+    var uses = context.scopes.identifiersNamed(binding_name, start, end);
+    while (uses.next()) |index| {
+        if (index + 3 >= end) break;
+        if (context.tokens[index + 1].tag != .period or
             !context.tokenIs(index + 2, release) or context.tokens[index + 3].tag != .l_paren) continue;
         const statement_start = index -| 4;
         for (context.tokens[statement_start..index]) |token| if (token.tag == .keyword_defer) return null;

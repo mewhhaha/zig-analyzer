@@ -103,13 +103,13 @@ fn bindingIsMutated(
             (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var) or
             identifierIsCaptureBinding(tokens, index);
         if (shadows_binding) {
-            index = context.enclosingScopeEnd(index) orelse index;
+            index = shadowEnd(context, index);
             continue;
         }
         if (index > 0 and tokens[index - 1].tag == .ampersand) return true;
         if (usedByAssembly(tokens, index)) return true;
         if (usedByFieldMutation(context.scopes, index)) return true;
-        if (usedByMutableOptionalCapture(tokens, index)) return true;
+        if (usedByMutableOptionalCapture(context.scopes, index)) return true;
         if (usedByMutableSwitchCapture(context.scopes, index)) return true;
         if (index + 1 >= tokens.len) continue;
         if (usedAsSlice(context.scopes, index)) return true;
@@ -119,15 +119,66 @@ fn bindingIsMutated(
     return false;
 }
 
-/// `name[a..b]` borrows a mutable view of the binding's storage, which can be
-/// written through (`@memcpy(name[0..n], ...)`, `name[0..n].* = ...`) or passed
-/// on; treat the slice as a potential mutable alias.
+/// The last token where the binding declared at `index` hides an outer one
+/// of its name: the end of a capture's payload, as in
+/// `var item = if (found) |item| item.* else .{};`, or of a declaration's block.
+fn shadowEnd(context: RuleRun, index: usize) usize {
+    const tokens = context.tokens;
+    if (identifierIsCaptureBinding(tokens, index)) if (context.scopes.resolve(index)) |binding| if (binding.token_index == index) {
+        var end = index;
+        while (end + 1 < tokens.len and tokens[end + 1].loc.start < binding.scope.end) end += 1;
+        return end;
+    };
+    return context.enclosingScopeEnd(index) orelse index;
+}
+
+/// `name[a..b]`, also reached through fields, element subscripts and optional
+/// unwraps (`name.field[a..]`, `name[i].field[a..]`), borrows a mutable view of
+/// the binding's storage, which can be written through (`@memcpy(name[0..n], ...)`,
+/// `name[0..n].* = ...`) or passed on; treat the slice as a potential mutable
+/// alias, as the compiler does.
 fn usedAsSlice(scopes: *const syntax_scope.Index, index: usize) bool {
+    return storagePath(scopes, index).sliced;
+}
+
+const StoragePath = struct {
+    /// The first token after the path.
+    end: usize,
+    /// One of its subscripts is a range.
+    sliced: bool = false,
+};
+
+/// The field, element subscript and `.?` suffixes after the binding at `index`
+/// that still address the binding's own storage; a method call or a `.*`
+/// dereference leaves it.
+fn storagePath(scopes: *const syntax_scope.Index, index: usize) StoragePath {
     const tokens = scopes.tokens;
-    if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_bracket) return false;
-    const closing = scopes.matchingToken(index + 1) orelse return false;
+    var path: StoragePath = .{ .end = index + 1 };
+    while (path.end < tokens.len) switch (tokens[path.end].tag) {
+        .l_bracket => {
+            if (subscriptIsRange(scopes, path.end)) path.sliced = true;
+            path.end = (scopes.matchingToken(path.end) orelse return path) + 1;
+        },
+        .period => {
+            if (path.end + 1 >= tokens.len) return path;
+            switch (tokens[path.end + 1].tag) {
+                .question_mark => {},
+                .identifier => if (path.end + 2 < tokens.len and tokens[path.end + 2].tag == .l_paren) return path,
+                else => return path,
+            }
+            path.end += 2;
+        },
+        else => return path,
+    };
+    return path;
+}
+
+/// Whether the subscript opening at `opening` is a range `[a..b]`.
+fn subscriptIsRange(scopes: *const syntax_scope.Index, opening: usize) bool {
+    const tokens = scopes.tokens;
+    const closing = scopes.matchingToken(opening) orelse return false;
     var depth: usize = 0;
-    for (tokens[index + 2 .. closing]) |token| switch (token.tag) {
+    for (tokens[opening + 1 .. closing]) |token| switch (token.tag) {
         .l_paren, .l_bracket, .l_brace => depth += 1,
         .r_paren, .r_bracket, .r_brace => depth -|= 1,
         .ellipsis2 => if (depth == 0) return true,
@@ -207,15 +258,19 @@ fn usedByFieldMutation(scopes: *const syntax_scope.Index, use_index: usize) bool
     return use_index >= 3 and tokens[use_index - 3].tag == .ampersand;
 }
 
-fn usedByMutableOptionalCapture(tokens: []const std.zig.Token, use_index: usize) bool {
-    if (use_index < 2 or use_index + 5 >= tokens.len) return false;
+/// `if (name) |*payload|`, also through a storage path such as `name.field`.
+fn usedByMutableOptionalCapture(scopes: *const syntax_scope.Index, use_index: usize) bool {
+    const tokens = scopes.tokens;
+    if (use_index < 2) return false;
     if (tokens[use_index - 1].tag != .l_paren or
         (tokens[use_index - 2].tag != .keyword_if and tokens[use_index - 2].tag != .keyword_while)) return false;
-    return tokens[use_index + 1].tag == .r_paren and
-        tokens[use_index + 2].tag == .pipe and
-        tokens[use_index + 3].tag == .asterisk and
-        tokens[use_index + 4].tag == .identifier and
-        tokens[use_index + 5].tag == .pipe;
+    const end = storagePath(scopes, use_index).end;
+    if (end + 4 >= tokens.len) return false;
+    return tokens[end].tag == .r_paren and
+        tokens[end + 1].tag == .pipe and
+        tokens[end + 2].tag == .asterisk and
+        tokens[end + 3].tag == .identifier and
+        tokens[end + 4].tag == .pipe;
 }
 
 fn usedByMutableSwitchCapture(scopes: *const syntax_scope.Index, use_index: usize) bool {
@@ -269,7 +324,7 @@ fn findUndefinedValueEscapes(context: RuleRun) !void {
                 index = context.enclosingScopeEnd(index) orelse index;
                 continue;
             }
-            if (usedByTypeQuery(source, tokens, index) or useBelongsToErrdefer(tokens, index) or
+            if (usedByTypeQuery(source, tokens, index) or useBelongsToErrdefer(context.scopes, index) or
                 namesDeclarationOrLabel(tokens, index)) continue;
             const use = undefinedUse(context, shape, written_fields, index);
             switch (use) {
@@ -464,7 +519,7 @@ fn postfixChain(context: RuleRun, start: usize) Postfix {
     while (chain.end < tokens.len) {
         switch (tokens[chain.end].tag) {
             .l_bracket => {
-                if (usedAsSlice(context.scopes, chain.end - 1)) chain.view = true;
+                if (subscriptIsRange(context.scopes, chain.end)) chain.view = true;
                 chain.end = (context.matchingToken(chain.end, .l_bracket, .r_bracket) orelse return chain) + 1;
             },
             .period_asterisk => chain.end += 1,
@@ -605,21 +660,16 @@ fn usedByTypeQuery(source: []const u8, tokens: []const std.zig.Token, use_index:
     return tokenIs(source, tokens[use_index - 2], "@TypeOf") or tokenIs(source, tokens[use_index - 2], "@typeInfo");
 }
 
-fn useBelongsToErrdefer(tokens: []const std.zig.Token, use_index: usize) bool {
+/// Whether the use at `use_index` is part of an `errdefer` statement, directly
+/// or in a block that statement holds, so it runs only when the function fails.
+fn useBelongsToErrdefer(scopes: *const syntax_scope.Index, use_index: usize) bool {
     var cursor = use_index;
-    var braces: usize = 0;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => braces += 1,
-            .l_brace => braces -|= 1,
-            .keyword_errdefer => return true,
-            .semicolon => if (braces == 0) return false,
-            .keyword_fn, .keyword_test => return false,
-            else => {},
-        }
+    while (true) {
+        if (scopes.tokens[scopes.statementStart(cursor)].tag == .keyword_errdefer) return true;
+        const opening = scopes.enclosingOpeningBrace(cursor) orelse return false;
+        if (scopes.braceKind(opening) != .block) return false;
+        cursor = opening;
     }
-    return false;
 }
 
 fn findPointerParameterIdioms(context: RuleRun) !void {
@@ -637,22 +687,29 @@ fn findPointerParameterIdioms(context: RuleRun) !void {
         if (index + 1 < tokens.len and tokens[index + 1].tag == .l_paren) continue;
         try value_referenced_names.put(context.allocator, tokenText(source, token), {});
     }
-    for (tokens, 0..) |token, fn_index| {
-        if (token.tag != .keyword_fn or fn_index + 3 >= tokens.len or tokens[fn_index + 2].tag != .l_paren) continue;
+    // The index found each body by parsing its signature, so braces in a
+    // return type (`error{...}!T`, `struct {...}`) are not taken for it.
+    for (context.scopes.function_bodies) |function| {
+        const fn_index: usize = function.keyword;
+        const body_open: usize = function.body;
         const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse continue;
-        var body_open = parameters_end + 1;
-        while (body_open < tokens.len and tokens[body_open].tag != .l_brace and tokens[body_open].tag != .semicolon) : (body_open += 1) {}
-        if (body_open >= tokens.len or tokens[body_open].tag != .l_brace) continue;
         const body_close = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
-        // deinit takes '*T' by convention: it invalidates the value even when its
-        // body happens to only read through the pointer.
-        if (tokens[fn_index + 1].tag == .identifier and tokenIs(source, tokens[fn_index + 1], "deinit")) continue;
-        if (tokens[fn_index + 1].tag == .identifier and
-            value_referenced_names.contains(tokenText(source, tokens[fn_index + 1]))) continue;
+        const function_name = tokenText(source, tokens[fn_index + 1]);
+        // deinit and destroy take '*T' by convention: they invalidate the value
+        // even when their body only reads through the pointer (or hands a
+        // handle to the code that frees it).
+        if (std.mem.startsWith(u8, function_name, "deinit") or std.mem.startsWith(u8, function_name, "destroy")) continue;
+        if (value_referenced_names.contains(function_name)) continue;
+        // A public or exported signature is API: other files may pin it (a
+        // vtable, a callback field, a function type) where this file cannot
+        // see, and narrowing it is the owner's decision.
+        if (exposedFunction(tokens, fn_index)) continue;
         var parameter_index = fn_index + 3;
         while (parameter_index + 3 < parameters_end) : (parameter_index += 1) {
             if (tokens[parameter_index].tag != .identifier or tokens[parameter_index + 1].tag != .colon or
                 tokens[parameter_index + 2].tag != .asterisk or tokens[parameter_index + 3].tag != .identifier) continue;
+            // A field of a struct type in the list (`args: struct { server: *Server }`) is no parameter.
+            if ((context.enclosingOpeningBrace(parameter_index) orelse 0) > fn_index) continue;
             const parameter_name = tokenText(source, tokens[parameter_index]);
             if (!pointerParameterReadOnly(context.scopes, parameter_name, body_open, body_close)) continue;
             if (pointerParameterMayOwnMutableParameter(
@@ -680,6 +737,20 @@ fn findPointerParameterIdioms(context: RuleRun) !void {
             });
         }
     }
+}
+
+/// Whether the `fn` at `fn_index` is declared `pub` or `export`.
+fn exposedFunction(tokens: []const std.zig.Token, fn_index: usize) bool {
+    var cursor = fn_index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .keyword_pub, .keyword_export => return true,
+            .keyword_inline, .keyword_noinline, .keyword_extern, .string_literal => {},
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn pointerParameterMayOwnMutableParameter(
@@ -773,8 +844,80 @@ fn pointerParameterReadOnly(
             tokens[cursor + 3].tag == .identifier) return false;
         if (cursor == index + 1) return false;
         if (cursor < body_close and (isAssignment(tokens[cursor].tag) or tokens[cursor].tag == .l_paren)) return false;
+        // A member handed to a call, or bound to a local or capture that is
+        // used to mutate, may be a pointer or handle the pointee owns.
+        if (wholeCallArgument(scopes, index, cursor)) return false;
+        if (memberAlias(tokens, index, cursor)) |alias| {
+            if (aliasMutates(scopes, tokenText(source, tokens[alias]), alias + 1, body_close)) return false;
+        }
     }
     return uses != 0;
+}
+
+/// Whether the expression `[start, end)` is a whole argument of a call other
+/// than a by-value builtin or `assert`.
+fn wholeCallArgument(scopes: *const syntax_scope.Index, start: usize, end: usize) bool {
+    const tokens = scopes.tokens;
+    if (start == 0 or end >= tokens.len or (tokens[end].tag != .comma and tokens[end].tag != .r_paren)) return false;
+    var cursor = start - 1;
+    if (tokens[cursor].tag != .l_paren and tokens[cursor].tag != .comma) return false;
+    while (tokens[cursor].tag != .l_paren) {
+        switch (tokens[cursor].tag) {
+            .r_paren, .r_bracket, .r_brace => cursor = scopes.matchingToken(cursor) orelse return false,
+            .l_bracket, .l_brace, .semicolon => return false,
+            else => {},
+        }
+        if (cursor == 0) return false;
+        cursor -= 1;
+    }
+    if (cursor == 0) return false;
+    const callee = tokens[cursor - 1];
+    return switch (callee.tag) {
+        .identifier => !tokenIs(scopes.source, callee, "assert"),
+        // The builtins that write through their destination.
+        .builtin => tokenIs(scopes.source, callee, "@memcpy") or tokenIs(scopes.source, callee, "@memset") or
+            tokenIs(scopes.source, callee, "@memmove"),
+        else => false,
+    };
+}
+
+/// The local the member path `[start, end)` is bound to whole:
+/// `const name = path;` or the capture of `if (path) |name|`, `while` or `for`.
+fn memberAlias(tokens: []const std.zig.Token, start: usize, end: usize) ?usize {
+    if (start >= 3 and end < tokens.len and tokens[end].tag == .semicolon and tokens[start - 1].tag == .equal and
+        tokens[start - 2].tag == .identifier and
+        (tokens[start - 3].tag == .keyword_const or tokens[start - 3].tag == .keyword_var)) return start - 2;
+    if (start >= 2 and end + 2 < tokens.len and tokens[start - 1].tag == .l_paren and tokens[end].tag == .r_paren and
+        tokens[end + 1].tag == .pipe and tokens[end + 2].tag == .identifier) return switch (tokens[start - 2].tag) {
+        .keyword_if, .keyword_while, .keyword_for => end + 2,
+        else => null,
+    };
+    return null;
+}
+
+/// Whether the local `name` is used in `[start, end)` to mutate what it
+/// points to: a method called on it or on a member, an assignment through it,
+/// or the whole local handed to a call.
+fn aliasMutates(scopes: *const syntax_scope.Index, name: []const u8, start: usize, end: usize) bool {
+    const tokens = scopes.tokens;
+    for (tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or !tokenIs(scopes.source, token, name) or tokens[index - 1].tag == .period) continue;
+        var cursor = index + 1;
+        while (cursor + 1 < end) {
+            switch (tokens[cursor].tag) {
+                .period_asterisk => cursor += 1,
+                .period => if (tokens[cursor + 1].tag == .identifier) {
+                    cursor += 2;
+                } else break,
+                .l_bracket => cursor = (scopes.matchingToken(cursor) orelse break) + 1,
+                else => break,
+            }
+        }
+        if (cursor >= end) continue;
+        if (cursor > index + 1 and (tokens[cursor].tag == .l_paren or isAssignment(tokens[cursor].tag))) return true;
+        if (wholeCallArgument(scopes, index, cursor)) return true;
+    }
+    return false;
 }
 
 fn switchHasPointerCapture(scopes: *const syntax_scope.Index, condition_open: usize, limit: usize) bool {
@@ -904,6 +1047,66 @@ test "slicing a var array keeps it mutable" {
     for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
 }
 
+test "slicing or capturing a field or element of a var keeps it mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(src: []const u32) void {\n" ++
+        "    var key = generate();\n" ++
+        "    zero(key.secret[0..]);\n" ++
+        "    var native: Native = .{};\n" ++
+        "    std.mem.reverse(u32, native.r[0..]);\n" ++
+        "    var copy: Pair = .{};\n" ++
+        "    @memcpy(copy.arr[0..2], src[0..2]);\n" ++
+        "    var tail: Pair = .{};\n" ++
+        "    const rest = tail.arr[1..];\n" ++
+        "    rest[0] = 7;\n" ++
+        "    var pairs: [2]Pair = undefined;\n" ++
+        "    @memset(pairs[0].arr[0..], 0);\n" ++
+        "    var nested: Nested = .{};\n" ++
+        "    @memset(nested.inner.?[0..], 0);\n" ++
+        "    var optional: Holder = .{};\n" ++
+        "    if (optional.value) |*value| value.* = 0;\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .never_mutated_var);
+}
+
+test "a capture named like the var it initializes hides it only in its payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(storage: *Storage) u32 {\n" ++
+        "    var loading: Loading = if (storage.loading) |loading| loading: {\n" ++
+        "        break :loading loading.*;\n" ++
+        "    } else .{};\n" ++
+        "    if (loading.id == 0) loading.id = 1;\n" ++
+        "    var item: Loading = if (storage.loading) |item| item.* else .{};\n" ++
+        "    var kept: Loading = if (storage.loading) |kept| blk: {\n" ++
+        "        kept.id = 2;\n" ++
+        "        break :blk kept.*;\n" ++
+        "    } else .{};\n" ++
+        "    return loading.id + item.id + kept.id;\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.never_mutated_var}, .warning));
+    try support.expectSpans(source, found, &.{ "item", "kept" });
+}
+
+test "slicing through a dereference or call result does not mutate the binding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run() void {\n" ++
+        "    var holder: Holder = .{};\n" ++
+        "    @memset(holder.ptr.*[0..], 0);\n" ++
+        "    var view: View = .{};\n" ++
+        "    _ = view.items()[0..];\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.never_mutated_var}, .warning));
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqualStrings("variable 'holder' is never mutated", found[0].message);
+}
+
 test "mutation through @field keeps a var mutable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -957,6 +1160,41 @@ test "undefined tracking ignores same-named members type queries and guarded err
     for (found) |finding| try std.testing.expect(finding.rule != .undefined_value_escape);
 }
 
+test "undefined uses belong to an errdefer only inside its statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn afterBlock() !u32 {\n" ++
+        "    var value: u32 = undefined;\n" ++
+        "    errdefer {\n" ++
+        "        log();\n" ++
+        "    }\n" ++
+        "    return value;\n" ++
+        "}\n" ++
+        "fn laterStatement() !void {\n" ++
+        "    var value: u32 = undefined;\n" ++
+        "    errdefer {\n" ++
+        "        log();\n" ++
+        "        report(value);\n" ++
+        "    }\n" ++
+        "    value = 1;\n" ++
+        "    try work(value);\n" ++
+        "}\n" ++
+        "fn functionType() !void {\n" ++
+        "    var value: u32 = undefined;\n" ++
+        "    errdefer notify(@as(*const fn () void, callback), value);\n" ++
+        "    value = 1;\n" ++
+        "    try work(value);\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    var escapes: usize = 0;
+    for (found) |finding| if (finding.rule == .undefined_value_escape) {
+        escapes += 1;
+        try std.testing.expect(finding.span.start < std.mem.find(u8, source, "fn laterStatement").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), escapes);
+}
+
 test "pointer parameters mutated through nested members or subscripts stay mutable" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -980,6 +1218,34 @@ test "pointer parameters mutated through nested members or subscripts stay mutab
         try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn observe").?);
     };
     try std.testing.expectEqual(@as(usize, 1), pointer_count);
+}
+
+test "pointer parameters of functions with braced return types are checked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const State = struct { count: u32 };\n" ++
+        "fn errorSet(state: *State) error{Empty}!u32 {\n" ++
+        "    if (state.count == 0) return error.Empty;\n" ++
+        "    return state.count;\n" ++
+        "}\n" ++
+        "fn structure(state: *State) struct { value: u32 } {\n" ++
+        "    return .{ .value = state.count };\n" ++
+        "}\n" ++
+        "fn reset(state: *State) error{Empty}!void {\n" ++
+        "    state.count = 0;\n" ++
+        "}\n" ++
+        "fn refresh(state: *State, args: struct { owner: *State }) error{Empty}!void {\n" ++
+        "    state.count = args.owner.count;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.mutable_pointer_parameter}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var pointer_count: usize = 0;
+    for (found) |finding| if (finding.rule == .mutable_pointer_parameter) {
+        pointer_count += 1;
+        try std.testing.expect(finding.span.start < std.mem.find(u8, source, "fn reset").?);
+    };
+    try std.testing.expectEqual(@as(usize, 2), pointer_count);
 }
 
 test "pointer parameters mutated through captures or returned pointers stay mutable" {
@@ -1166,4 +1432,24 @@ test "constrained signatures and field address escapes keep mutable pointers" {
     const configuration = support.only(&.{.mutable_pointer_parameter}, .warning);
     const found = try support.findings(arena.allocator(), run, source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .mutable_pointer_parameter);
+}
+
+test "public, destroy-style and handle-passing pointer parameters stay mutable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Blob = struct { handle: *anyopaque, slot: ?*Slot, size: usize };\n" ++
+        "pub fn size(blob: *Blob) usize { return blob.size; }\n" ++
+        "export fn blobSize(blob: *Blob) usize { return blob.size; }\n" ++
+        "fn destroyBlob(blob: *Blob) void { _ = blob.size; }\n" ++
+        "fn release(blob: *Blob) void { c.hb_blob_destroy(blob.handle); }\n" ++
+        "fn retain(blob: *Blob, count: usize) void { const handle = blob.handle; retainHandle(count, handle); }\n" ++
+        "fn fill(blob: *Blob, bytes: []const u8) void { if (blob.slot) |slot| slot.write(bytes); }\n" ++
+        "fn check(blob: *Blob) void { assert(blob.size > 0); }\n" ++
+        "fn measure(blob: *Blob) usize { const length = blob.size; return length * 2; }\n";
+    const configuration = support.only(&.{.mutable_pointer_parameter}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expect(found[0].span.start > std.mem.find(u8, source, "fn check").?);
+    try std.testing.expect(found[1].span.start > std.mem.find(u8, source, "fn measure").?);
 }

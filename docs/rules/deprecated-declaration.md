@@ -26,6 +26,13 @@ unavailable are skipped. A comment deprecating only default initialization does
 not deprecate the entire type; `modernize-container-init` handles that usage
 separately.
 
+Uses inside a declaration that is itself deprecated (a deprecated wrapper
+implemented with another deprecated name) and uses in the declaring file's own
+`test` blocks are compatibility code, not migrations, and are skipped. A
+standard-library use spelled from `std` that `modernize-deprecated-stdlib` or
+`modernize-managed-container` names in its curated migration table is left to
+that rule while it is enabled, so the same use is not reported twice.
+
 The diagnostic carries the author's migration advice. Imported public namespace
 and type aliases use their own deprecation markers, allowing current names that
 internally alias older spellings. Function and value reexports retain inherited

@@ -14,7 +14,12 @@ allocation whenever the aggregate is destroyed.
 ## When it fires
 
 Ownership evidence comes from recognized owned returns stored in aggregate
-fields or container elements. Cleanup that is delegated or passes an element to
+fields or container elements; a literal nested in another one initializes the
+nested type's fields. The cleanup is the `deinit` the type declares itself, not
+one of a nested type, and a field counts as released when the cleanup frees it,
+calls its `deinit`, `close` or `release`, or releases the payload a `switch` or
+optional capture binds. Types of the same name in one file are checked against
+the fields each declares. Cleanup that is delegated or passes an element to
 an opaque cleanup function remains opaque. Destructive container operations are
 checked in any method, not only methods named `deinit` or `clear`. An aggregate
 that owns an `ArenaAllocator` field and deinitializes it releases every field

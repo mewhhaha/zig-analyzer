@@ -25,7 +25,7 @@ fn handleEveryError() u8 {
     };
 }
 
-fn unwrapOptional(value: ?u8) u8 {
+pub fn unwrapOptional(value: ?u8) u8 {
     // expect: unsafe-orelse-unreachable
     return value orelse unreachable;
 }

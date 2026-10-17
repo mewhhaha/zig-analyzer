@@ -1,6 +1,7 @@
 const std = @import("std");
 const lsp = @import("lsp");
-const tokenize = @import("tokens.zig").tokenize;
+const tokens_util = @import("tokens.zig");
+const tokenize = tokens_util.tokenize;
 const syntax_scope = @import("scope.zig");
 
 pub const Declaration = struct {
@@ -19,6 +20,8 @@ pub const Declaration = struct {
 pub const Document = struct {
     allocator: std.mem.Allocator,
     uri: []const u8,
+    /// The newest version applied. While `edited` holds text not parsed yet,
+    /// `source` and everything derived from it describe an older version.
     version: i32,
     generation: u32,
     source: [:0]u8,
@@ -28,6 +31,16 @@ pub const Document = struct {
     /// Which binding each identifier refers to: the one scope resolver that
     /// rename, references, hover and the lint rules share.
     scopes: syntax_scope.Index,
+    /// The token nesting past the limits of `tokens.excessiveNesting` when the
+    /// source is too deep to parse safely. The tree, tokens, declarations and
+    /// scopes are then those of an empty file, and nothing is analyzed.
+    excessive_nesting: ?std.zig.Token.Loc,
+    /// Where each line of `source` starts, so positions convert in O(log n).
+    line_starts: []const usize,
+    /// The index in `declarations` of the first declaration of each name.
+    declaration_names: std.StringHashMapUnmanaged(u32),
+    /// Text `applyText` produced after `source`; `refresh` parses it.
+    edited: ?[:0]u8 = null,
 
     pub fn open(
         allocator: std.mem.Allocator,
@@ -39,8 +52,7 @@ pub const Document = struct {
         errdefer allocator.free(owned_uri);
         const owned_source = try copySource(allocator, source);
         errdefer allocator.free(owned_source);
-        var parsed = try parseSource(allocator, owned_source);
-        errdefer parsed.deinit(allocator);
+        const parsed = try parseSource(allocator, owned_source);
         return .{
             .allocator = allocator,
             .uri = owned_uri,
@@ -51,27 +63,55 @@ pub const Document = struct {
             .tokens = parsed.tokens,
             .declarations = parsed.declarations,
             .scopes = parsed.scopes,
+            .excessive_nesting = parsed.excessive_nesting,
+            .line_starts = parsed.line_starts,
+            .declaration_names = parsed.declaration_names,
         };
     }
 
     pub fn deinit(document: *Document) void {
-        document.scopes.deinit();
-        document.tree.deinit(document.allocator);
-        document.allocator.free(document.tokens);
-        document.allocator.free(document.declarations);
+        document.releaseSyntax();
         document.allocator.free(document.source);
+        if (document.edited) |edited| document.allocator.free(edited);
         document.allocator.free(document.uri);
         document.* = undefined;
     }
 
+    /// Frees what `parseSource` derived from `source`.
+    fn releaseSyntax(document: *const Document) void {
+        var parsed: ParsedSource = .{
+            .tree = document.tree,
+            .tokens = document.tokens,
+            .declarations = document.declarations,
+            .scopes = document.scopes,
+            .line_starts = document.line_starts,
+            .declaration_names = document.declaration_names,
+        };
+        parsed.deinit(document.allocator);
+    }
+
+    /// Applies `changes` and parses the result.
     pub fn applyChanges(
+        document: *Document,
+        next_version: i32,
+        changes: []const lsp.types.TextDocument.ContentChangeEvent,
+    ) !void {
+        try document.applyText(next_version, changes);
+        try document.refresh();
+    }
+
+    /// Applies `changes` to the text only. Until `refresh`, `source` and
+    /// everything derived from it keep describing the text before them, so a
+    /// burst of edits is parsed once.
+    pub fn applyText(
         document: *Document,
         next_version: i32,
         changes: []const lsp.types.TextDocument.ContentChangeEvent,
     ) !void {
         if (next_version <= document.version) return error.StaleVersion;
 
-        var current_source: [:0]const u8 = document.source;
+        const previous_source = document.text();
+        var current_source: [:0]const u8 = previous_source;
         var owned_source: ?[:0]u8 = null;
         errdefer if (owned_source) |owned| document.allocator.free(owned);
 
@@ -120,36 +160,75 @@ pub const Document = struct {
             current_source = replaced_source;
         }
 
-        const next_source = owned_source orelse try copySource(document.allocator, document.source);
-        errdefer document.allocator.free(next_source);
+        const next_source = owned_source orelse try copySource(document.allocator, previous_source);
+        if (document.edited) |edited| document.allocator.free(edited);
+        document.edited = next_source;
+        document.version = next_version;
+    }
 
-        var parsed = try parseSource(document.allocator, next_source);
-        errdefer parsed.deinit(document.allocator);
-
-        document.scopes.deinit();
-        document.tree.deinit(document.allocator);
-        document.allocator.free(document.tokens);
-        document.allocator.free(document.declarations);
+    /// Parses the text `applyText` left, if any, and makes it the source.
+    pub fn refresh(document: *Document) !void {
+        const next_source = document.edited orelse return;
+        const parsed = try parseSource(document.allocator, next_source);
+        document.releaseSyntax();
         document.allocator.free(document.source);
+        document.edited = null;
         document.source = next_source;
         document.tree = parsed.tree;
         document.tokens = parsed.tokens;
         document.declarations = parsed.declarations;
         document.scopes = parsed.scopes;
-        document.version = next_version;
+        document.excessive_nesting = parsed.excessive_nesting;
+        document.line_starts = parsed.line_starts;
+        document.declaration_names = parsed.declaration_names;
         document.generation +%= 1;
         if (document.generation == 0) document.generation = 1;
     }
 
+    /// The newest text, which `source` lags behind until `refresh`.
+    pub fn text(document: *const Document) [:0]const u8 {
+        return document.edited orelse document.source;
+    }
+
     pub fn byteOffset(document: *const Document, position: lsp.types.Position) usize {
-        return lsp.offsets.positionToIndex(document.source, position, .@"utf-16");
+        if (position.line >= document.line_starts.len) return document.source.len;
+        const line_start = document.line_starts[position.line];
+        const line = std.mem.sliceTo(document.source[line_start..], '\n');
+        return line_start + lsp.offsets.getNCodeUnitByteCount(line, position.character, .@"utf-16");
     }
 
     pub fn range(document: *const Document, span: std.zig.Token.Loc) lsp.types.Range {
         // Spans can come from compiler replies computed against different
-        // text; locToRange asserts in-bounds codepoint-aligned offsets, so
-        // clamp here instead of trusting the producer.
-        return lsp.offsets.locToRange(document.source, clampSpan(document.source, span), .@"utf-16");
+        // text; positions need in-bounds codepoint-aligned offsets, so clamp
+        // here instead of trusting the producer.
+        const clamped = clampSpan(document.source, span);
+        return .{ .start = document.positionAt(clamped.start), .end = document.positionAt(clamped.end) };
+    }
+
+    /// The bytes of lines `first` through `last`, each line's newline left out
+    /// but the end inclusive: exactly the offsets whose positions lie on them.
+    pub fn lineSpan(document: *const Document, first: u32, last: u32) std.zig.Token.Loc {
+        const starts = document.line_starts;
+        if (first >= starts.len) return .{ .start = document.source.len, .end = document.source.len };
+        const end = if (@as(usize, last) + 1 < starts.len) starts[last + 1] - 1 else document.source.len;
+        return .{ .start = starts[first], .end = @max(starts[first], end) };
+    }
+
+    /// Index of the first token starting at or after `offset`.
+    pub fn firstTokenFrom(document: *const Document, offset: usize) usize {
+        return std.sort.lowerBound(std.zig.Token, document.tokens, offset, struct {
+            fn order(target: usize, token: std.zig.Token) std.math.Order {
+                return std.math.order(target, token.loc.start);
+            }
+        }.order);
+    }
+
+    /// The position of `offset`, an in-bounds codepoint boundary of `source`:
+    /// a binary search for its line, then UTF-16 units counted within it.
+    fn positionAt(document: *const Document, offset: usize) lsp.types.Position {
+        const line = tokens_util.lineOf(document.line_starts, offset);
+        const line_text = document.source[document.line_starts[line]..offset];
+        return .{ .line = @intCast(line), .character = @intCast(lsp.offsets.countCodeUnits(line_text, .@"utf-16")) };
     }
 
     pub fn identifierAt(document: *const Document, byte_offset: usize) ?std.zig.Token.Loc {
@@ -168,10 +247,19 @@ pub const Document = struct {
     }
 
     pub fn declarationNamed(document: *const Document, name: []const u8) ?Declaration {
-        for (document.declarations) |declaration| {
-            if (std.mem.eql(u8, declaration.name, name)) return declaration;
-        }
-        return null;
+        const index = document.declaration_names.get(name) orelse return null;
+        return document.declarations[index];
+    }
+
+    /// Whether some declaration's name spans exactly `span`.
+    pub fn declaresSpan(document: *const Document, span: std.zig.Token.Loc) bool {
+        // Declarations are collected in source order.
+        const index = std.sort.lowerBound(Declaration, document.declarations, span.start, struct {
+            fn order(start: usize, declaration: Declaration) std.math.Order {
+                return std.math.order(start, declaration.span.start);
+            }
+        }.order);
+        return index < document.declarations.len and std.meta.eql(document.declarations[index].span, span);
     }
 
     pub fn identifierSpans(
@@ -266,6 +354,23 @@ pub const Store = struct {
         try document.applyChanges(version, changes);
     }
 
+    /// `change` without parsing: see `Document.applyText`.
+    pub fn changeText(
+        store: *Store,
+        uri: []const u8,
+        version: i32,
+        changes: []const lsp.types.TextDocument.ContentChangeEvent,
+    ) !void {
+        const document = store.documents.getPtr(uri) orelse return error.DocumentNotOpen;
+        try document.applyText(version, changes);
+    }
+
+    /// Parses every document whose text changed since it was parsed.
+    pub fn refresh(store: *Store) !void {
+        var documents = store.documents.valueIterator();
+        while (documents.next()) |document| try document.refresh();
+    }
+
     pub fn close(store: *Store, uri: []const u8) bool {
         const removed = store.documents.fetchRemove(uri) orelse return false;
         var document = removed.value;
@@ -287,8 +392,13 @@ const ParsedSource = struct {
     tokens: []const std.zig.Token,
     declarations: []Declaration,
     scopes: syntax_scope.Index,
+    excessive_nesting: ?std.zig.Token.Loc = null,
+    line_starts: []const usize = &.{},
+    declaration_names: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(parsed: *ParsedSource, allocator: std.mem.Allocator) void {
+        parsed.declaration_names.deinit(allocator);
+        allocator.free(parsed.line_starts);
         parsed.scopes.deinit();
         parsed.tree.deinit(allocator);
         allocator.free(parsed.tokens);
@@ -297,14 +407,42 @@ const ParsedSource = struct {
 };
 
 fn parseSource(allocator: std.mem.Allocator, source: [:0]const u8) !ParsedSource {
+    const line_starts = try tokens_util.lineStarts(allocator, source);
+    errdefer allocator.free(line_starts);
+    const owned_tokens = try tokenize(allocator, source);
+    var parsed = if (tokens_util.excessiveNesting(owned_tokens)) |excess| deep: {
+        // Parsing would overflow the stack: stand in an empty file.
+        const span = owned_tokens[excess].loc;
+        allocator.free(owned_tokens);
+        var empty = try parseTokens(allocator, "", try tokenize(allocator, ""));
+        empty.excessive_nesting = span;
+        break :deep empty;
+    } else try parseTokens(allocator, source, owned_tokens);
+    parsed.line_starts = line_starts;
+    return parsed;
+}
+
+/// Takes ownership of `owned_tokens`, the tokens of `source`.
+fn parseTokens(allocator: std.mem.Allocator, source: [:0]const u8, owned_tokens: []const std.zig.Token) !ParsedSource {
+    errdefer allocator.free(owned_tokens);
     var tree = try std.zig.Ast.parse(allocator, source, .{ .mode = .zig });
     errdefer tree.deinit(allocator);
-    const owned_tokens = try tokenize(allocator, source);
-    errdefer allocator.free(owned_tokens);
     const declarations = try collectDeclarations(allocator, source, owned_tokens);
     errdefer allocator.free(declarations);
+    var declaration_names: std.StringHashMapUnmanaged(u32) = .empty;
+    errdefer declaration_names.deinit(allocator);
+    for (declarations, 0..) |declaration, index| {
+        const entry = try declaration_names.getOrPut(allocator, declaration.name);
+        if (!entry.found_existing) entry.value_ptr.* = @intCast(index);
+    }
     const scopes = try syntax_scope.Index.init(allocator, source, owned_tokens);
-    return .{ .tree = tree, .tokens = owned_tokens, .declarations = declarations, .scopes = scopes };
+    return .{
+        .tree = tree,
+        .tokens = owned_tokens,
+        .declarations = declarations,
+        .scopes = scopes,
+        .declaration_names = declaration_names,
+    };
 }
 
 fn collectDeclarations(
@@ -390,6 +528,64 @@ test "document indexes declarations despite a trailing parse error" {
     try std.testing.expectEqualStrings("generated", document.declarations[0].name);
     try std.testing.expectEqualStrings("answer", document.declarations[1].name);
     try std.testing.expectEqualStrings("broken", document.declarations[2].name);
+}
+
+test "a document nested too deep to parse stands in an empty file until it is fixed" {
+    const allocator = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "const x = ");
+    for (0..50_000) |_| try text.appendSlice(allocator, "[(");
+    const blob = text.items;
+    var document = try Document.open(allocator, "file:///blob.zig", 1, blob);
+    defer document.deinit();
+    try std.testing.expectEqualStrings("[", blob[document.excessive_nesting.?.start..document.excessive_nesting.?.end]);
+    try std.testing.expectEqual(@as(usize, 1), document.tokens.len);
+    try std.testing.expectEqual(@as(usize, 0), document.tree.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), document.declarations.len);
+    try std.testing.expect(document.tokenAt(20) == null);
+
+    try document.applyChanges(2, &.{.{ .text_document_content_change_whole_document = .{ .text = "const x = 1;\n" } }});
+    try std.testing.expectEqual(@as(?std.zig.Token.Loc, null), document.excessive_nesting);
+    try std.testing.expectEqualStrings("x", document.declarations[0].name);
+}
+
+test "indexed positions agree with a scan of the whole text" {
+    const source = "const 🦎 = \"¶↉\";\n\n  x\r\n🇺🇸 y\n";
+    var document = try Document.open(std.testing.allocator, "file:///positions.zig", 1, source);
+    defer document.deinit();
+    for (0..source.len + 1) |offset| {
+        if (offset < source.len and source[offset] & 0b1100_0000 == 0b1000_0000) continue;
+        const expected = lsp.offsets.indexToPosition(source, offset, .@"utf-16");
+        try std.testing.expectEqual(expected, document.range(.{ .start = offset, .end = offset }).start);
+        try std.testing.expectEqual(lsp.offsets.locToRange(source, .{ .start = 0, .end = offset }, .@"utf-16"), document.range(.{ .start = 0, .end = offset }));
+    }
+    for (0..7) |line| for (0..20) |character| {
+        const position: lsp.types.Position = .{ .line = @intCast(line), .character = @intCast(character) };
+        try std.testing.expectEqual(lsp.offsets.positionToIndex(source, position, .@"utf-16"), document.byteOffset(position));
+    };
+}
+
+test "text edits wait for a refresh while the parsed source stays whole" {
+    var document = try Document.open(std.testing.allocator, "file:///deferred.zig", 1, "const first = 1;\n");
+    defer document.deinit();
+    try document.applyText(2, &.{.{ .text_document_content_change_whole_document = .{ .text = "const second = 2;\n" } }});
+    try document.applyText(3, &.{.{ .text_document_content_change_partial = .{
+        .range = .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 1, .character = 0 } },
+        .text = "const third = 3;\n",
+    } }});
+    try std.testing.expectError(error.StaleVersion, document.applyText(3, &.{}));
+    try std.testing.expectEqual(@as(i32, 3), document.version);
+    try std.testing.expectEqualStrings("const first = 1;\n", document.source);
+    try std.testing.expectEqualStrings("first", document.declarations[0].name);
+    try std.testing.expectEqualStrings("const second = 2;\nconst third = 3;\n", document.text());
+
+    try document.refresh();
+    try std.testing.expectEqual(@as(?[:0]u8, null), document.edited);
+    try std.testing.expectEqualStrings("const second = 2;\nconst third = 3;\n", document.source);
+    try std.testing.expectEqualStrings("third", document.declarationNamed("third").?.name);
+    try std.testing.expect(document.declarationNamed("first") == null);
+    try std.testing.expectEqual(@as(u32, 1), document.range(document.declarationNamed("third").?.span).start.line);
 }
 
 test "incremental changes use UTF-16 positions" {

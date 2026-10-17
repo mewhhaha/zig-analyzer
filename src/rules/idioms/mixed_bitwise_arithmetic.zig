@@ -107,7 +107,7 @@ test "mixed shift and addition offers parentheses" {
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.mixed_bitwise_arithmetic}, .warning));
     try support.expectRules(found, &.{.mixed_bitwise_arithmetic});
     try std.testing.expectEqual(@as(usize, 1), found[0].fixes.len);
-    try std.testing.expect(found[0].fixes[0].edits[0].replacement[0] == '(');
+    try std.testing.expectEqual('(', found[0].fixes[0].edits[0].replacement[0]);
 }
 
 test "an operator with two mixed operands reports once and parenthesizes both" {

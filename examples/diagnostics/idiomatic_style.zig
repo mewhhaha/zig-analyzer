@@ -45,7 +45,7 @@ fn localBytes() []u8 {
     return bytes[0..];
 }
 
-fn inspectCapture(optional: ?u32) void {
+pub fn inspectCapture(optional: ?u32) void {
     // expect: unsafe-orelse-unreachable
     _ = optional orelse unreachable;
     // expect: redundant-optional-unwrap

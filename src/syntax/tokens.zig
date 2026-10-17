@@ -22,12 +22,62 @@ pub fn tokenize(allocator: std.mem.Allocator, source: [:0]const u8) ![]std.zig.T
     }
 }
 
+/// How deeply `(`, `{` and `[` may nest in a file the analyzer parses.
+/// `std.zig.Ast.parse` recurses at every level, so a pasted minified or
+/// generated blob nested far deeper would overflow the stack (a Debug build
+/// fails near 2000 parentheses on an 8 MiB stack); such a file is skipped
+/// instead. Real code stays near 20 levels; clang stops at the same 256.
+pub const max_nesting_depth = 256;
+
+/// How many `else if` links one chain may have. The parser also recurses per
+/// link, though far less steeply (a Debug build on an 8 MiB stack still
+/// parses 5000); real chains reach about 250.
+pub const max_else_if_chain = 2000;
+
+/// Index of the first token nesting past `max_nesting_depth` or
+/// `max_else_if_chain`, or null when `tokens` are safe to parse.
+pub fn excessiveNesting(tokens: []const std.zig.Token) ?usize {
+    // The `else if` links of the chain running at each bracket level. A chain
+    // ends at a `;` or `,` there, or at a `}` back at its level not followed
+    // by `else`.
+    var chains: [max_nesting_depth + 1]usize = @splat(0);
+    var depth: usize = 0;
+    for (tokens, 0..) |token, index| switch (token.tag) {
+        .l_paren, .l_brace, .l_bracket => {
+            depth += 1;
+            if (depth > max_nesting_depth) return index;
+            chains[depth] = 0;
+        },
+        .r_paren, .r_bracket => depth -|= 1,
+        .r_brace => {
+            depth -|= 1;
+            if (index + 1 < tokens.len and tokens[index + 1].tag != .keyword_else) chains[depth] = 0;
+        },
+        .semicolon, .comma => chains[depth] = 0,
+        .keyword_else => if (index + 1 < tokens.len and tokens[index + 1].tag == .keyword_if) {
+            chains[depth] += 1;
+            if (chains[depth] > max_else_if_chain) return index;
+        },
+        else => {},
+    };
+    return null;
+}
+
 pub fn tokenText(source: []const u8, token: std.zig.Token) []const u8 {
     return source[token.loc.start..token.loc.end];
 }
 
 pub fn tokenIs(source: []const u8, token: std.zig.Token, expected: []const u8) bool {
     return std.mem.eql(u8, tokenText(source, token), expected);
+}
+
+/// The name an identifier spelling denotes: `@"name"` and `name` are the same
+/// identifier. Escape sequences inside the quotes are left as written.
+pub fn identifierName(spelling: []const u8) []const u8 {
+    if (spelling.len >= 3 and spelling[0] == '@' and spelling[1] == '"' and spelling[spelling.len - 1] == '"') {
+        return spelling[2 .. spelling.len - 1];
+    }
+    return spelling;
 }
 
 /// Index of the `closing_tag` that balances the `opening_tag` at `opening_index`.
@@ -133,6 +183,21 @@ pub fn topLevelComma(tokens: []const std.zig.Token, start: usize, end: usize) ?u
     return null;
 }
 
+/// End of the type that starts at `start` in a field or parameter: the first
+/// `,`, `=`, `{`, `}` or `;` before `end` outside parentheses and brackets, or
+/// `end`.
+pub fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize, end: usize) usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) switch (tokens[index].tag) {
+        .l_paren, .l_bracket => depth += 1,
+        .r_paren, .r_bracket => depth -|= 1,
+        .comma, .equal, .l_brace, .r_brace, .semicolon => if (depth == 0) return index,
+        else => {},
+    };
+    return end;
+}
+
 /// Exclusive end of the arguments between the parentheses at `opening` and
 /// `closing`: `closing`, or the trailing comma `zig fmt` writes after a
 /// multi-line list. Null when there are no arguments.
@@ -168,6 +233,16 @@ pub fn threeArguments(tokens: []const std.zig.Token, opening: usize, closing: us
 /// Source text of the tokens in `range`, trimmed of surrounding whitespace.
 pub fn rangeSource(source: []const u8, tokens: []const std.zig.Token, range: Range) []const u8 {
     return std.mem.trim(u8, source[tokens[range.start].loc.start..tokens[range.end - 1].loc.end], " \t\r\n");
+}
+
+/// Whether `[start, end)` is exactly a dotted identifier path (`a`, `a.b.c`).
+pub fn isDottedPath(tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    if (start >= end) return false;
+    for (tokens[start..end], 0..) |token, offset| {
+        const expected: Tag = if (offset % 2 == 0) .identifier else .period;
+        if (token.tag != expected) return false;
+    }
+    return (end - start) % 2 == 1;
 }
 
 /// Dotted identifier path (`a.b.c`, optionally ending in `.*`) as a token range.
@@ -217,6 +292,11 @@ fn isPathNode(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
 /// `//` comment (doc comments included). Slashes inside string and character
 /// literals and multiline string lines are not comments.
 pub fn containsComment(text: []const u8) bool {
+    return commentStart(text) != null;
+}
+
+/// Offset of the first `//` comment in `text`, read as `containsComment` does.
+pub fn commentStart(text: []const u8) ?usize {
     var index: usize = 0;
     while (index < text.len) : (index += 1) {
         switch (text[index]) {
@@ -229,11 +309,11 @@ pub fn containsComment(text: []const u8) bool {
             '\\' => if (index + 1 < text.len and text[index + 1] == '\\') {
                 while (index < text.len and text[index] != '\n') : (index += 1) {}
             },
-            '/' => if (index + 1 < text.len and text[index + 1] == '/') return true,
+            '/' => if (index + 1 < text.len and text[index + 1] == '/') return index,
             else => {},
         }
     }
-    return false;
+    return null;
 }
 
 /// Zig character literal (`'x'`, `'\n'`, `'\x41'`) equal to the one-byte string
@@ -269,9 +349,38 @@ pub fn lineEnd(source: []const u8, offset: usize) usize {
     return @min(offset, source.len) + relative + 1;
 }
 
+/// End of the text of the line holding `offset`: the offset of its `\n`, or
+/// `source.len` on the last line. Unlike `lineEnd`, it excludes the newline.
+pub fn lineContentEnd(source: []const u8, offset: usize) usize {
+    return std.mem.findScalarPos(u8, source, @min(offset, source.len), '\n') orelse source.len;
+}
+
+/// The offset every line of `source` starts at: 0, then one past each `\n`.
+pub fn lineStarts(allocator: std.mem.Allocator, source: []const u8) ![]usize {
+    const starts = try allocator.alloc(usize, std.mem.countScalar(u8, source, '\n') + 1);
+    starts[0] = 0;
+    var line: usize = 1;
+    var offset: usize = 0;
+    while (std.mem.findScalarPos(u8, source, offset, '\n')) |newline| : (line += 1) {
+        offset = newline + 1;
+        starts[line] = offset;
+    }
+    return starts;
+}
+
+/// The 0-based line holding `offset`, given the `lineStarts` of its source.
+pub fn lineOf(line_starts: []const usize, offset: usize) usize {
+    return std.sort.partitionPoint(usize, line_starts, offset, struct {
+        fn startsAtOrBefore(target: usize, start: usize) bool {
+            return start <= target;
+        }
+    }.startsAtOrBefore) - 1;
+}
+
 /// The whole lines holding `[start, end)`, widened so deleting them leaves
-/// formatted source: blank lines that would end up doubled, leading a block, or
-/// trailing before its closing brace go with them.
+/// formatted source: blank lines that would end up doubled, leading a block or
+/// the file, or trailing before its closing brace or the end of the file go
+/// with them.
 pub fn removedLinesSpan(source: []const u8, start: usize, end: usize) std.zig.Token.Loc {
     var span: std.zig.Token.Loc = .{ .start = lineStart(source, start), .end = lineEnd(source, end) };
     const previous_line = if (span.start == 0) "" else std.mem.trimEnd(u8, source[lineStart(source, span.start - 1)..span.start], " \t\r\n");
@@ -280,9 +389,21 @@ pub fn removedLinesSpan(source: []const u8, start: usize, end: usize) std.zig.To
         while (span.end < source.len and lineIsBlank(source, span.end)) span.end = lineEnd(source, span.end);
     }
     const next_line = std.mem.trimStart(u8, source[span.end..lineEnd(source, span.end)], " \t");
-    const closes_block = next_line.len > 0 and next_line[0] == '}';
+    const closes_block = span.end >= source.len or next_line.len > 0 and next_line[0] == '}';
     if (closes_block) {
         while (span.start > 0 and lineIsBlank(source, lineStart(source, span.start - 1))) span.start = lineStart(source, span.start - 1);
+    }
+    // A block left with nothing in it is written `{}`.
+    if (closes_block and span.end < source.len and span.start > 0) {
+        const opening_line = source[lineStart(source, span.start - 1) .. span.start - 1];
+        const opening = std.mem.trim(u8, opening_line, " \t\r");
+        if (opening.len != 0 and opening[opening.len - 1] == '{' and
+            !std.mem.startsWith(u8, opening, "//") and !std.mem.startsWith(u8, opening, "\\\\"))
+        {
+            const brace_end = lineStart(source, span.start - 1) + std.mem.trimEnd(u8, opening_line, " \t\r").len;
+            const closing = span.end + (lineEnd(source, span.end) - span.end - next_line.len);
+            return .{ .start = brace_end, .end = closing };
+        }
     }
     return span;
 }
@@ -363,6 +484,31 @@ pub fn callExpressionStart(tokens: []const std.zig.Token, opening: usize) ?usize
         }
     }
     return start;
+}
+
+/// First token of the dotted identifier path (`a.b.c`) right before the call
+/// parentheses at `opening`, or null when no identifier precedes them. Unlike
+/// `callExpressionStart`, a call or index in the chain ends the path, so
+/// `a().b(` starts at `b`.
+pub fn dottedCalleeStart(tokens: []const std.zig.Token, opening: usize) ?usize {
+    if (opening == 0 or tokens[opening - 1].tag != .identifier) return null;
+    var start = opening - 1;
+    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
+    return start;
+}
+
+/// Whether `tag` is one of the six comparison operators.
+pub fn isComparison(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .angle_bracket_left,
+        .angle_bracket_left_equal,
+        .angle_bracket_right,
+        .angle_bracket_right_equal,
+        .equal_equal,
+        .bang_equal,
+        => true,
+        else => false,
+    };
 }
 
 pub fn isAssignment(tag: std.zig.Token.Tag) bool {
@@ -457,6 +603,60 @@ pub fn foreignDeclaration(tokens: []const std.zig.Token, index: usize) bool {
     return index > 1 and tokens[index - 1].tag == .string_literal and tokens[index - 2].tag == .keyword_extern;
 }
 
+/// Whether `[start, end)` is a `+`-separated sum of `.len` paths and number
+/// literals with at least one length (`a.len + 1 + b.len`). Lengths of objects
+/// in memory cannot add up past `usize`, so such a sum cannot wrap.
+pub fn lengthSum(source: []const u8, tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    var cursor = start;
+    var lengths: usize = 0;
+    while (cursor < end) {
+        if (tokens[cursor].tag == .number_literal) {
+            cursor += 1;
+        } else {
+            var term_end = cursor;
+            while (term_end < end and tokens[term_end].tag != .plus) : (term_end += 1) {}
+            if (!lengthPath(source, tokens, cursor, term_end)) return false;
+            lengths += 1;
+            cursor = term_end;
+        }
+        if (cursor == end) break;
+        if (tokens[cursor].tag != .plus) return false;
+        cursor += 1;
+    }
+    return lengths != 0 and cursor == end;
+}
+
+/// Whether `[start, end)` is a dotted path ending in `.len`.
+pub fn lengthPath(source: []const u8, tokens: []const std.zig.Token, start: usize, end: usize) bool {
+    if (end < start + 3 or !tokenIs(source, tokens[end - 1], "len") or (end - start) % 2 == 0) return false;
+    for (tokens[start..end], 0..) |token, offset| {
+        if (token.tag != if (offset % 2 == 0) Tag.identifier else .period) return false;
+    }
+    return true;
+}
+
+/// What a primitive number type name spells.
+pub const NumberKind = enum { unsigned, signed, float };
+
+/// The kind of the primitive number type `name` (`u8`, `usize`, `i64`,
+/// `c_int`, `f32`, `comptime_float`), or null for any other name.
+pub fn primitiveNumberKind(name: []const u8) ?NumberKind {
+    const unsigned_c = [_][]const u8{ "usize", "c_uint", "c_ushort", "c_ulong", "c_ulonglong" };
+    const signed_c = [_][]const u8{ "isize", "c_int", "c_short", "c_long", "c_longlong", "comptime_int" };
+    const floats = [_][]const u8{ "f16", "f32", "f64", "f80", "f128", "c_longdouble", "comptime_float" };
+    for (unsigned_c) |known| if (std.mem.eql(u8, name, known)) return .unsigned;
+    for (signed_c) |known| if (std.mem.eql(u8, name, known)) return .signed;
+    for (floats) |known| if (std.mem.eql(u8, name, known)) return .float;
+    if (name.len < 2) return null;
+    const kind: NumberKind = switch (name[0]) {
+        'u' => .unsigned,
+        'i' => .signed,
+        else => return null,
+    };
+    for (name[1..]) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return kind;
+}
+
 test "tokenize keeps the trailing eof token" {
     const tokens = try tokenize(std.testing.allocator, "const x = 1;");
     defer std.testing.allocator.free(tokens);
@@ -479,6 +679,57 @@ test "delimiters, statements and scopes" {
     try std.testing.expectEqual(Tag.r_brace, tokens[enclosingScopeEnd(tokens, declaration).?].tag);
     try std.testing.expectEqualStrings("fn", tokenText(sample, tokens[0]));
     try std.testing.expect(tokenIs(sample, tokens[1], "f"));
+}
+
+test "nesting past the limit is found at its first excess bracket" {
+    const allocator = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "const x = ");
+    try text.appendNTimes(allocator, '(', max_nesting_depth - 1);
+    try text.appendSlice(allocator, "[1]");
+    try text.appendNTimes(allocator, ')', max_nesting_depth - 1);
+    try text.appendSlice(allocator, "; fn f() void {}\x00");
+    const balanced = try tokenize(allocator, text.items[0 .. text.items.len - 1 :0]);
+    defer allocator.free(balanced);
+    try std.testing.expectEqual(@as(?usize, null), excessiveNesting(balanced));
+
+    text.clearRetainingCapacity();
+    try text.appendSlice(allocator, "const x = ");
+    try text.appendNTimes(allocator, '{', max_nesting_depth);
+    try text.appendSlice(allocator, "(\x00");
+    const deep = try tokenize(allocator, text.items[0 .. text.items.len - 1 :0]);
+    defer allocator.free(deep);
+    try std.testing.expectEqual(Tag.l_paren, deep[excessiveNesting(deep).?].tag);
+}
+
+test "else-if chains count their links, and separate statements do not chain" {
+    const allocator = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    try text.appendSlice(allocator, "fn f(a: u32) u32 { if (a == 0) { return 0; }");
+    for (0..max_else_if_chain) |_| try text.appendSlice(allocator, " else if (a == 1) { return 1; }");
+    // Statements one after another, and an expression chain ended by `;`.
+    for (0..max_else_if_chain) |_| try text.appendSlice(allocator, " if (a == 2) { return 2; } else if (a == 3) {}");
+    for (0..2) |_| {
+        try text.appendSlice(allocator, " _ = if (a == 4) 4");
+        for (0..max_else_if_chain / 2 + 1) |_| try text.appendSlice(allocator, " else if (a == 5) 5");
+        try text.appendSlice(allocator, " else 6;");
+    }
+    try text.appendSlice(allocator, " return 7; }\x00");
+    const longest = try tokenize(allocator, text.items[0 .. text.items.len - 1 :0]);
+    defer allocator.free(longest);
+    try std.testing.expectEqual(@as(?usize, null), excessiveNesting(longest));
+
+    text.items.len -= " return 7; }\x00".len;
+    try text.appendSlice(allocator, " if (a == 8) {} else if (a == 9) {}");
+    for (0..max_else_if_chain) |_| try text.appendSlice(allocator, " else if (a == 9) {}");
+    try text.appendSlice(allocator, " }\x00");
+    const too_long = try tokenize(allocator, text.items[0 .. text.items.len - 1 :0]);
+    defer allocator.free(too_long);
+    const excess = excessiveNesting(too_long).?;
+    try std.testing.expectEqual(Tag.keyword_else, too_long[excess].tag);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text.items[too_long[excess].loc.start..], "else"));
 }
 
 test "arguments split at top-level commas only" {
@@ -505,6 +756,10 @@ test "paths extend over fields and dereference" {
     const before = pathBefore(tokens, after.end).?;
     try std.testing.expectEqual(@as(usize, 0), before.start);
     try std.testing.expectEqual(@as(?Range, null), pathAfter(tokens, tokens.len - 1));
+    try std.testing.expect(isDottedPath(tokens, 0, 5));
+    try std.testing.expect(!isDottedPath(tokens, 0, 4));
+    try std.testing.expect(!isDottedPath(tokens, 0, 6));
+    try std.testing.expect(!isDottedPath(tokens, 0, 0));
 }
 
 test "one-byte string literals become character literals" {
@@ -519,6 +774,32 @@ test "one-byte string literals become character literals" {
     try std.testing.expectEqual(@as(?[]const u8, null), try parseSingleByteLiteral(a, "\"\\\""));
 }
 
+test "sums of lengths and literals are recognized" {
+    const source: [:0]const u8 = "_ = .{ a.len + 1 + b.c.len, a.len, 1 + 2, a.len + b, a.len + b.len * 2 };";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    const Case = struct { start: usize, end: usize, expected: bool };
+    const cases = [_]Case{
+        .{ .start = 4, .end = 15, .expected = true },
+        .{ .start = 16, .end = 19, .expected = true },
+        .{ .start = 20, .end = 23, .expected = false },
+        .{ .start = 24, .end = 29, .expected = false },
+        .{ .start = 30, .end = 39, .expected = false },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.expected, lengthSum(source, tokens, case.start, case.end));
+    try std.testing.expect(lengthPath(source, tokens, 10, 15));
+    try std.testing.expect(!lengthPath(source, tokens, 9, 15));
+}
+
+test "line starts locate the line of every offset" {
+    const source = "ab\n\ncd\n";
+    const starts = try lineStarts(std.testing.allocator, source);
+    defer std.testing.allocator.free(starts);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 3, 4, 7 }, starts);
+    for ([_]usize{ 0, 0, 0, 1, 2, 2, 2, 3 }, 0..) |line, offset| try std.testing.expectEqual(line, lineOf(starts, offset));
+    try std.testing.expectEqual(@as(usize, 3), lineOf(starts, 100));
+}
+
 test "comments are recognized outside literals only" {
     try std.testing.expect(containsComment("x // note"));
     try std.testing.expect(containsComment("/// doc"));
@@ -527,4 +808,20 @@ test "comments are recognized outside literals only" {
     try std.testing.expect(!containsComment("const s =\n    \\\\ // text\n;"));
     try std.testing.expect(containsComment("const s = \"a\"; // after"));
     try std.testing.expect(!containsComment("a /* not zig */ b"));
+    try std.testing.expectEqual(@as(?usize, 16), commentStart("const s = \"//\"; // after"));
+}
+
+test "removing a block's only statement leaves an empty block" {
+    const cases = [_]struct { source: []const u8, line: []const u8, expected: []const u8 }{
+        .{ .source = "fn f(x: u32) void {\n    if (x > 3) {\n        _ = x;\n    }\n}\n", .line = "_ = x;", .expected = "fn f(x: u32) void {\n    if (x > 3) {}\n}\n" },
+        .{ .source = "const S = struct {\n    // keep {\n    const a = 1;\n};\n", .line = "const a = 1;", .expected = "const S = struct {\n    // keep {\n};\n" },
+        .{ .source = "fn f() void {\n    one();\n    two();\n}\n", .line = "two();", .expected = "fn f() void {\n    one();\n}\n" },
+    };
+    for (cases) |case| {
+        const start = std.mem.find(u8, case.source, case.line).?;
+        const span = removedLinesSpan(case.source, start, start + case.line.len);
+        const result = try std.mem.concat(std.testing.allocator, u8, &.{ case.source[0..span.start], case.source[span.end..] });
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings(case.expected, result);
+    }
 }

@@ -4,6 +4,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const topLevelComma = @import("../../syntax/tokens.zig").topLevelComma;
+const dottedCalleeStart = @import("../../syntax/tokens.zig").dottedCalleeStart;
 
 pub const rules = [_]types.Rule{
     .prefer_testing_expect_equal_slices,
@@ -98,7 +99,7 @@ fn findSliceExpectations(context: RuleRun) !void {
         if (std.mem.eql(u8, element_type, "u8")) continue;
         const expected = sourceBetween(context, type_comma + 1, argument_comma);
         const actual = sourceBetween(context, argument_comma + 1, eql_end);
-        const call_start = callExpressionStart(context.tokens, expect_index + 1) orelse expect_index;
+        const call_start = dottedCalleeStart(context.tokens, expect_index + 1) orelse expect_index;
         const qualification = context.source[context.tokens[call_start].loc.start..token.loc.start];
         const edits = try context.allocator.alloc(types.Edit, 1);
         edits[0] = .{
@@ -265,13 +266,6 @@ fn oneFix(context: RuleRun, title: []const u8, edits: []const types.Edit) ![]con
 
 fn sourceBetween(context: RuleRun, start: usize, end: usize) []const u8 {
     return std.mem.trim(u8, context.source[context.tokens[start].loc.start..context.tokens[end - 1].loc.end], " \t\r\n");
-}
-
-fn callExpressionStart(tokens: []const std.zig.Token, opening: usize) ?usize {
-    if (opening == 0 or tokens[opening - 1].tag != .identifier) return null;
-    var start = opening - 1;
-    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
-    return start;
 }
 
 test "testing idioms produce framework-specific fixes" {

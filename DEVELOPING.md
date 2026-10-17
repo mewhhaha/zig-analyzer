@@ -42,10 +42,24 @@ to each module, the contract tests (`compiler/protocol_invariant.zig`), the
 editor exchanges in `tests/lsp/` (one file per feature, sharing
 `tests/lsp/support.zig`), the build-graph tests (`tests/build_graph.zig`, which
 configure the small projects in `fixtures/projects/` with the host `zig`), the
-rule examples and docs checks, fix round trips, the fixtures, the examples and
-the fuzz cases. `zig build backend-test` runs `tests/compiler_integration.zig`
-and `tests/lsp_compiler.zig`, which fail when the backend is missing rather
-than skip.
+rule examples and docs checks, fix round trips, the fixtures, the examples,
+the fuzz cases and the scaling check. `zig build backend-test` runs
+`tests/compiler_integration.zig` and `tests/lsp_compiler.zig`, which fail when
+the backend is missing rather than skip.
+
+`tests/rule_scaling.zig` guards the lifecycle and container proof engines, the
+binding usage scan and the cross-file container checks against quadratic
+regressions. For each engine it builds a file of N and of 4N
+repetitions of a shape that once made the engine quadratic (one function with
+many allocations, views or lists, containers nested in one root container,
+repeated same-named containers, containers grown through helper calls) and fails when the larger file takes more than
+8 times the smaller one's time: linear work takes about 4 times, and the
+engines it guards took 9 to 60 times before they were fixed. It times only the
+rules, on this thread's CPU clock, keeps the fastest of a few runs and
+remeasures a ratio over the bound once, so machine load hardly moves it. It
+checks a ratio, not a time, so it runs in the default Debug build (about 2.5 s).
+A failure names the rule and the repeated line; add a case for a new engine,
+or for a shape that exposed a quadratic path in one.
 
 ### Fix gates
 
@@ -92,7 +106,11 @@ needs:
   the previous build, with new findings read and confirmed; and
 - **a performance check:** the previous release build and the candidate run
   back to back. A whole-file scan per declaration once slowed `Sema.zig` from
-  0.9 s to 4.2 s.
+  0.9 s to 4.2 s. Real files rarely show a quadratic path at their size, so
+  also time a rule on N and 4N copies of a shape that stresses it (one long
+  function, deep or repeated containers, a wrapped file such as
+  `pub const Copy1 = struct { <Sema.zig> };` repeated); `tests/rule_scaling.zig`
+  keeps the shapes that once exposed one.
 
 The usual corpora are the installed std lib, the Zig compiler's `Sema.zig` and
 x86_64 `CodeGen.zig` (both in `.zig-analyzer/zig-<version>/src/`), ghostty,
@@ -112,8 +130,10 @@ done
 ```
 
 Build each binary with `zig build -Doptimize=fast --prefix <dir>`, write
-`{"lints":{"correctness":"warning","style":"warning"}}` to each corpus's
-`zig-analyzer.json`, run `<dir>/bin/zig-analyzer check --no-cache .` in it,
+`{"lints":{"profile":["strict","modernize","disciplined"],"correctness":"warning","style":"warning"}}`
+to each corpus's `zig-analyzer.json` (tier settings only set the level of
+rules a profile or the defaults turn on, so add the profile-less style rules a
+change touches under `lints.rules`), run `<dir>/bin/zig-analyzer check --no-cache .` in it,
 and compare per-rule counts with
 `grep -oE '\[[a-z-]+\]' <output> | sort | uniq -c`. On a loaded machine,
 compare user+sys CPU time from interleaved runs rather than wall time.
@@ -176,8 +196,10 @@ larger than end index 0`, so rely on the deterministic runs.
 `tests/rule_fixes.zig` applies each catalog example's quick fixes and fix-all
 edits, then checks that the result still parses, preserves formatting when
 the input was formatted, and has no further fix-all edits for the same rule.
-It also applies all enabled rules' fix-all edits together and checks that
-their combined result parses. The example diagnostics and test-reachability
+It also applies all enabled rules' fix-all edits together, in repeated passes
+as `check --fix` does (one fix can expose another), and checks that the
+combined result parses, stays formatted when the input was, and leaves no
+fix-all edit for another run. The example diagnostics and test-reachability
 checks ensure the documented examples report their marked findings and every
 source module with tests participates in the suite.
 
@@ -218,17 +240,30 @@ shutdown; the walkthrough is the editor-facing smoke test.
 
 ```text
 zig-analyzer lsp
-zig-analyzer check [--fix] [--no-cache] <path>
+zig-analyzer check [--fix] [--no-cache] [--strict-config]
+                   [--baseline <file>] [--write-baseline <file>]
+                   [--format <text|json|sarif|github>] [--rule <code>]...
+                   [--fail-on <hint|information|warning|error|never>] [path]
+zig-analyzer explain [rule]
 zig-analyzer doctor
 zig-analyzer backend bootstrap
 zig-analyzer version
 ```
 
-Project checks analyze files concurrently but buffer their output in sorted
-path order. Unchanged-file findings are cached under
-`.zig-cache/zig-analyzer/check-v1`; file contents, relative path, lint
+Project checks analyze files concurrently. Every pass turns what it finds
+into report entries (`src/project/check_report.zig`), kept in sorted path
+order, and the chosen format renders them at the end, so a new pass or
+notice appears in every format; the text format must stay byte-identical,
+since scripts and the corpus comparisons read it. Unchanged-file findings,
+with their related spans and fix availability, are cached under
+`.zig-cache/zig-analyzer/check-v2`; file contents, relative path, lint
 configuration, and executable identity all participate in invalidation. Use
 `--no-cache` for uncached profiling or cache troubleshooting.
+
+`explain` prints a rule's page from `docs/rules`, which the build embeds
+(`rule_pages` in `build.zig`), with its generated parts rendered from the
+catalog; only `explain` reads the embedded pages, so `zig build rule-docs`
+still builds while a new rule's page is missing.
 
 `doctor` checks the host Zig version and every compatibility field in the
 compiler-backend manifest. If the patch or protocol changes, rerun

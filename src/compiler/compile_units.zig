@@ -94,10 +94,24 @@ pub fn buildGraph(io: std.Io, build_root: []const u8, mode: Mode) !?*BuildGraph 
     {
         store.mutex.lockUncancelable(io);
         defer store.mutex.unlock(io);
-        if (store.entries.get(build_root)) |entry| {
-            if (mode == .cached) return entry.graph.retain();
-            if (entry.stamp.eql(stamp) and (mode == .modules or !entry.graph.modules_only)) return entry.graph.retain();
-        } else if (mode == .cached) return null;
+        while (true) {
+            if (store.entries.get(build_root)) |entry| {
+                if (mode == .cached) return entry.graph.retain();
+                if (entry.stamp.eql(stamp) and (mode == .modules or !entry.graph.modules_only)) return entry.graph.retain();
+            } else if (mode == .cached) return null;
+            // Another caller is configuring this build (the check's
+            // cross-file pass and its compiler facts both may); the graph it
+            // stores may serve this one too.
+            if (!store.configuring.contains(build_root)) break;
+            store.configured.waitUncancelable(io, &store.mutex);
+        }
+        try store.configuring.put(std.heap.page_allocator, build_root, {});
+    }
+    defer {
+        store.mutex.lockUncancelable(io);
+        _ = store.configuring.remove(build_root);
+        store.mutex.unlock(io);
+        store.configured.broadcast(io);
     }
     // Configuring can take seconds; do it without holding the store.
     const discovered = try build_configuration.discover(io, std.heap.page_allocator, build_root);
@@ -264,4 +278,8 @@ const Entry = struct {
 var store: struct {
     mutex: std.Io.Mutex = .init,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    /// The build roots being configured, each by one caller at a time; the
+    /// key belongs to that caller. `configured` is signaled when one ends.
+    configuring: std.StringHashMapUnmanaged(void) = .empty,
+    configured: std.Io.Condition = .init,
 } = .{};

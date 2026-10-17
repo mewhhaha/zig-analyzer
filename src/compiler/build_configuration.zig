@@ -74,7 +74,7 @@ fn loadUnits(io: std.Io, graph: *BuildGraph, arena: std.mem.Allocator) !void {
     }
     graph.notices = extractor.notices.items;
     if (graph.selection == null) {
-        graph.failure = "neither the check nor the install step builds a Zig compile unit";
+        graph.failure = build_graph.no_units_failure;
     }
 }
 

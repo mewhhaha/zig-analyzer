@@ -32,6 +32,9 @@ fn findCollapsedErrors(context: RuleRun) !void {
         if (!collapses) continue;
         if (absenceImmediatelyTested(context, fallback_index)) continue;
         if (std.mem.eql(u8, fallback, "false") and conditionTestsFallback(context, fallback_index)) continue;
+        // A call that fails in one way, or only on input it cannot represent,
+        // has no other failure for the empty result to hide.
+        if (context.operandOnlyError(catch_index) != null or failsOnlyOnInput(context, catch_index)) continue;
         try context.emit(.{
             .rule = .error_collapsed_to_absence,
             .level = level,
@@ -42,6 +45,29 @@ fn findCollapsedErrors(context: RuleRun) !void {
             ),
         });
     }
+}
+
+/// Whether the call before the `catch` at `catch_index` fails only on input
+/// it cannot represent: `std.math` division, and a `parse` function given no
+/// allocator or reader, whose every failure means the text is invalid.
+fn failsOnlyOnInput(context: RuleRun, catch_index: usize) bool {
+    const tokens = context.tokens;
+    if (catch_index == 0 or tokens[catch_index - 1].tag != .r_paren) return false;
+    const opening = context.scopes.matchingToken(catch_index - 1) orelse return false;
+    if (opening == 0 or tokens[opening - 1].tag != .identifier) return false;
+    const callee = context.tokenText(opening - 1);
+    if (opening >= 3 and tokens[opening - 2].tag == .period and context.tokenIs(opening - 3, "math")) {
+        const division = [_][]const u8{ "divCeil", "divFloor", "divTrunc", "divExact", "mod", "rem" };
+        for (division) |name| if (std.mem.eql(u8, callee, name)) return true;
+        return false;
+    }
+    if (!std.mem.startsWith(u8, callee, "parse")) return false;
+    const resources = [_][]const u8{ "alloc", "arena", "gpa", "reader", "interface" };
+    for (tokens[opening + 1 .. catch_index - 1], opening + 1..) |token, index| {
+        if (token.tag != .identifier) continue;
+        for (resources) |resource| if (std.ascii.findIgnoreCase(context.tokenText(index), resource) != null) return false;
+    }
+    return true;
 }
 
 // 'x catch null == null' and 'if (x catch null) |value|' handle the absence on
@@ -169,6 +195,27 @@ test "catch false tested by an if or while condition handles the failure at once
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 2), findings.len);
     for (findings) |finding| try std.testing.expect(finding.span.start > std.mem.find(u8, source, "try require").?);
+}
+
+test "single-error and invalid-input failures may collapse to absence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "fn check(gpa: std.mem.Allocator, text: []const u8, buf: []u8, a: u64, b: u64) void {\n" ++
+        "    _ = std.math.add(u64, a, b) catch null;\n" ++
+        "    _ = std.math.divCeil(u64, a, b) catch 0;\n" ++
+        "    _ = std.fmt.parseInt(u32, text, 10) catch null;\n" ++
+        "    _ = std.fmt.bufPrint(buf, \"{d}\", .{a}) catch null;\n" ++
+        "    _ = gpa.dupeZ(u8, text) catch null;\n" ++
+        "    _ = std.fmt.allocPrint(gpa, \"{d}\", .{a}) catch null;\n" ++
+        "    _ = Config.parse(gpa, text) catch null;\n" ++
+        "    _ = load(text) catch null;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.error_collapsed_to_absence}, .warning);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expect(findings[0].span.start > std.mem.find(u8, source, "Config.parse").?);
 }
 
 test "collapsed errors and unused captures are distinguished" {

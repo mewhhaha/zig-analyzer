@@ -3,6 +3,7 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{.prefer_arena};
 
@@ -11,12 +12,15 @@ pub fn run(context: RuleRun) !void {
     if (level == .off) return;
     var scenarios = try failureScenarios(context);
     defer scenarios.deinit(context.allocator);
+    var test_only: ?syntax_scope.TestOnlyBodies = null;
+    defer if (test_only) |*bodies| bodies.deinit(context.allocator);
     for (context.tokens, 0..) |token, opening| {
         if (token.tag != .l_brace) continue;
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
         var allocation_count: usize = 0;
         var cleanup_count: usize = 0;
         var allocator_name: ?[]const u8 = null;
+        var allocator_index: usize = 0;
         var nested_depth: usize = 0;
         var has_direct_return = false;
         for (context.tokens[opening + 1 .. closing], opening + 1..) |body_token, index| {
@@ -35,7 +39,10 @@ pub fn run(context: RuleRun) !void {
             const method = context.tokenText(index + 2);
             if (std.mem.eql(u8, method, "alloc") or std.mem.eql(u8, method, "create") or std.mem.eql(u8, method, "dupe")) {
                 const candidate = context.tokenText(index);
-                if (allocator_name == null) allocator_name = candidate;
+                if (allocator_name == null) {
+                    allocator_name = candidate;
+                    allocator_index = index;
+                }
                 if (std.mem.eql(u8, allocator_name.?, candidate)) allocation_count += 1;
             }
             // An errdefer release keeps the allocation alive on success, which an arena would not.
@@ -44,9 +51,13 @@ pub fn run(context: RuleRun) !void {
                 context.tokens[index - 1].tag == .keyword_defer) cleanup_count += 1;
         }
         if (allocation_count < 3 or cleanup_count < allocation_count or has_direct_return) continue;
+        // Leak-checked tests release each allocation on purpose: one arena would hide a leak.
+        if (context.scopes.insideTestBlock(opening + 1) or testingAllocator(context, allocator_index)) continue;
         if (scenarios.count() != 0) if (enclosingFunctionName(context, opening)) |name| {
             if (scenarios.contains(name)) continue;
         };
+        if (test_only == null) test_only = try syntax_scope.testOnlyBodies(context.allocator, context.source, context.tokens);
+        if (test_only.?.contains(opening)) continue;
         try context.emit(.{
             .rule = .prefer_arena,
             .level = level,
@@ -70,6 +81,19 @@ fn failureScenarios(context: RuleRun) !std.StringHashMapUnmanaged(void) {
         }
     }
     return names;
+}
+
+/// Whether the allocator named at `index` is declared from `std.testing`'s
+/// leak-checking or failing allocators.
+fn testingAllocator(context: RuleRun, index: usize) bool {
+    const binding = context.scopes.findBinding(index) orelse return false;
+    const name = binding.token_index;
+    if (name == 0 or (context.tokens[name - 1].tag != .keyword_const and context.tokens[name - 1].tag != .keyword_var)) return false;
+    const end = context.statementEnd(name - 1) orelse return false;
+    const declaration = context.source[context.tokens[name].loc.start..context.tokens[end].loc.start];
+    const testing_allocators = [_][]const u8{ "testing.allocator", "failing_allocator", "FailingAllocator" };
+    for (testing_allocators) |spelling| if (std.mem.find(u8, declaration, spelling) != null) return true;
+    return false;
 }
 
 /// The name of the function whose body is or encloses the block at `opening`.
@@ -115,6 +139,34 @@ test "failure-sweep scenarios and errdefer-released allocations are not arena ca
         "}\n" ++
         "test {\n" ++
         "    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario, .{});\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_arena}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "leak-checked tests and testing allocators are not arena candidates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const a = std.testing.allocator;\n" ++
+        "test \"leak checked\" {\n" ++
+        "    const x = try std.testing.allocator.alloc(u8, 1); defer std.testing.allocator.free(x);\n" ++
+        "    const y = try std.testing.allocator.alloc(u8, 1); defer std.testing.allocator.free(y);\n" ++
+        "    const z = try std.testing.allocator.alloc(u8, 1); defer std.testing.allocator.free(z);\n" ++
+        "}\n" ++
+        "pub fn shared() !void {\n" ++
+        "    const x = try a.alloc(u8, 1); defer a.free(x);\n" ++
+        "    const y = try a.alloc(u8, 1); defer a.free(y);\n" ++
+        "    const z = try a.alloc(u8, 1); defer a.free(z);\n" ++
+        "}\n" ++
+        "fn helper(gpa: std.mem.Allocator) !void {\n" ++
+        "    const x = try gpa.alloc(u8, 1); defer gpa.free(x);\n" ++
+        "    const y = try gpa.alloc(u8, 1); defer gpa.free(y);\n" ++
+        "    const z = try gpa.alloc(u8, 1); defer gpa.free(z);\n" ++
+        "}\n" ++
+        "test {\n" ++
+        "    try helper(a);\n" ++
         "}\n";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_arena}, .information));
     try std.testing.expectEqual(@as(usize, 0), found.len);
