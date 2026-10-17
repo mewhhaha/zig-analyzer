@@ -6,7 +6,7 @@ Releases support x86_64 Linux and include the patched compiler backend.
 Download the archive and its checksum from the latest release on the
 [releases page](https://github.com/mewhhaha/zig-analyzer/releases), then verify
 and extract it. Replace `<version>` with the release version, for example
-`0.17.0-2`:
+`0.17.0-3`:
 
 ```sh
 sha256sum --check zig-analyzer-<version>-x86_64-linux.tar.xz.sha256
@@ -25,7 +25,7 @@ ln -s ~/.local/opt/zig-analyzer-<version>-x86_64-linux/bin/zig-analyzer ~/.local
 ```
 
 The machine still needs the Zig release named by the base of the version
-(`0.17.0` for `0.17.0-2`) on `PATH`; `zig-analyzer doctor` verifies
+(`0.17.0` for `0.17.0-3`) on `PATH`; `zig-analyzer doctor` verifies
 both it and the bundled backend.
 
 ## Build and install from source

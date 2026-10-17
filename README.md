@@ -144,17 +144,18 @@ error result hides partial progress.
 The engine runs without crashes over the complete Zig standard library, and the rule fuzz harness (`zig build fuzz-rules`)
 feeds mutated and generated programs through every rule. Measured with the
 optimized build (`check --no-cache`, 16 threads, wall clock, five runs each):
-this repository (240 files) takes about 1.0 s, a copy of the 0.17.0 standard
-library (563 files) about 5 s, and single files take 0.7 s for the 16.5k-line
-LLVM `Builder.zig` and the 20k-line `Io/Threaded.zig`. Cost grows faster than
-linearly with file size: the compiler's 35.6k-line `Sema.zig` takes about 4.5 s.
+this repository (289 files) takes about 1.0 s, a copy of the 0.17.0 standard
+library (563 files) about 1.7 s, and single files take about 0.2 s for the
+16.5k-line LLVM `Builder.zig` and the 20k-line `Io/Threaded.zig`. The
+compiler's 35.6k-line `Sema.zig` takes about 0.35 s; `tests/rule_scaling.zig`
+keeps rule cost linear in file size.
 
 ## Installation
 
 Each release provides a relocatable x86_64 Linux archive containing both
 zig-analyzer and its patched compiler backend. Verify the published SHA-256
 checksum before installing it. Building from source requires exactly the Zig
-release the version names (`0.17.0` for `0.17.0-2`):
+release the version names (`0.17.0` for `0.17.0-3`):
 
 ```sh
 zig build -Doptimize=fast
@@ -171,7 +172,7 @@ upgrade instructions.
 
 Release versions track the supported Zig release: the base version names the
 Zig version the analyzer targets, and a numeric suffix increments with each
-zig-analyzer release, as in `0.17.0-2`. The suffix carries no compatibility
+zig-analyzer release, as in `0.17.0-3`. The suffix carries no compatibility
 meaning. [docs/versioning.md](docs/versioning.md) states the full policy.
 
 ## Project status
