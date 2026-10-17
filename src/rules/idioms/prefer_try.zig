@@ -3,7 +3,6 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingOpeningToken = @import("../../syntax/tokens.zig").matchingOpeningToken;
 const callExpressionStart = @import("../../syntax/tokens.zig").callExpressionStart;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
@@ -32,7 +31,7 @@ fn findTryIdioms(context: RuleRun) !void {
             tokens[catch_index + 4].tag != .keyword_return or tokens[catch_index + 5].tag != .identifier) continue;
         const error_name = tokenText(source, tokens[catch_index + 2]);
         if (!tokenIs(source, tokens[catch_index + 5], error_name)) continue;
-        const call_open = matchingOpeningToken(tokens, catch_index - 1, .l_paren, .r_paren) orelse continue;
+        const call_open = context.scopes.matchingToken(catch_index - 1) orelse continue;
         const expression_start = callExpressionStart(tokens, call_open) orelse continue;
         const expression = std.mem.trim(u8, source[tokens[expression_start].loc.start..token.loc.start], " \t\r\n");
         const fixes = try Fix.single(context.allocator, .{

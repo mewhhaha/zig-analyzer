@@ -2,6 +2,8 @@
 //! configuration, compiler facts, and the sink findings go to. It mirrors
 //! `context.RuleRun` for rules that read several files at once.
 const std = @import("std");
+const syntax_scope = @import("../../syntax/scope.zig");
+const configuration_module = @import("../configuration.zig");
 const context = @import("../context.zig");
 const generated_source = @import("../generated_source.zig");
 const types = @import("../types.zig");
@@ -58,12 +60,18 @@ pub const ProjectRun = struct {
     allocator: std.mem.Allocator,
     /// Allocator the reported findings are copied to.
     results: std.mem.Allocator,
+    /// The allocator `allocator` draws from, for scratch a per-file pass
+    /// releases before the analysis ends; as thread-safe as `results`.
+    backing: std.mem.Allocator,
     files: []const File,
     configuration: types.Configuration,
     compiler_facts: CompilerFacts,
     findings: *std.ArrayList(Finding),
     /// Syntax per file, built on first use by `syntax`.
     syntaxes: []?context.Syntax,
+    /// Scope index per file, built on first use by `scopes`; shared across
+    /// threads and with other passes over the same files.
+    file_scopes: *syntax_scope.LazyIndexes,
     /// Lets per-file passes run on several threads; null runs them in order.
     io: ?std.Io = null,
 
@@ -71,11 +79,17 @@ pub const ProjectRun = struct {
         return run.configuration.level(rule);
     }
 
-    /// Records the finding unless its rule is off.
+    /// The rule's level in one file, after the per-path relaxations the
+    /// file-local rules see too (`configuration.forPath`).
+    pub fn levelFor(run: ProjectRun, file_index: usize, rule: types.Rule) types.Level {
+        return configuration_module.forPath(run.configuration, run.files[file_index].path).level(rule);
+    }
+
+    /// Records the finding unless its rule is off in the file.
     pub fn report(run: ProjectRun, found: Report) !void {
         try run.emit(found.file_index, .{
             .rule = found.rule,
-            .level = run.level(found.rule),
+            .level = run.levelFor(found.file_index, found.rule),
             .span = found.span,
             .message = found.message,
             .related = found.related,
@@ -97,6 +111,13 @@ pub const ProjectRun = struct {
             slot.* = try context.Syntax.init(run.allocator, file.source, file.tokens);
         }
         return &slot.*.?;
+    }
+
+    /// The scope index of a file, built on first use and kept until the
+    /// analysis ends; unlike `syntax`, it parses nothing.
+    pub fn scopes(run: ProjectRun, file_index: usize) !*const syntax_scope.Index {
+        const file = run.files[file_index];
+        return run.file_scopes.at(file_index, file.source, file.tokens);
     }
 
     /// A `RuleRun` over one file for the file-local passes project analysis

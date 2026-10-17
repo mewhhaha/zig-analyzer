@@ -71,7 +71,8 @@ pub const Cache = struct {
     /// instead of reading the disk.
     known: ?*const std.StringHashMapUnmanaged(File) = null,
     /// Parsed files shared between lookups; used instead of reading the disk
-    /// when set. The cache holds what it took until `deinit`.
+    /// for files `known` lacks when set. The cache holds what it took until
+    /// `deinit`.
     store: ?*source_store.Store = null,
     held: std.ArrayList(*source_store.Parsed) = .empty,
     /// Records the paths looked up and the build roots consulted, so a caller
@@ -129,6 +130,10 @@ pub const Resolver = struct {
     /// does; the language server leaves discovery to its compiler worker so a
     /// request never waits for it.
     discover_build: bool = false,
+    /// Whether a type function is followed only when it has a single
+    /// `return`. Lint facts must not guess which result its comptime
+    /// arguments select; navigation and completion offer the first.
+    single_type_results: bool = false,
 
     /// The file at `path`, or null when it does not exist. Results of a
     /// cached resolver live as long as the cache; others belong to `allocator`.
@@ -137,14 +142,14 @@ pub const Resolver = struct {
         try cache.touchFile(path);
         if (cache.files.get(path)) |known| return known;
         const stable_path = try cache.arena.allocator().dupe(u8, path);
-        const loaded = if (cache.known) |preloaded|
-            preloaded.get(path) orelse try resolver.load(cache.arena.allocator(), stable_path)
-        else if (cache.store) |store| shared: {
-            const file = try store.acquire(resolver.io, path) orelse break :shared null;
+        const loaded = loaded: {
+            if (cache.known) |preloaded| if (preloaded.get(path)) |file| break :loaded file;
+            const store = cache.store orelse break :loaded try resolver.load(cache.arena.allocator(), stable_path);
+            const file = try store.acquire(resolver.io, path) orelse break :loaded null;
             errdefer file.release();
             try cache.held.append(cache.arena.child_allocator, file);
-            break :shared File{ .path = stable_path, .source = file.source, .tokens = file.tokens };
-        } else try resolver.load(cache.arena.allocator(), stable_path);
+            break :loaded File{ .path = stable_path, .source = file.source, .tokens = file.tokens };
+        };
         try cache.files.put(cache.arena.allocator(), stable_path, loaded);
         return loaded;
     }
@@ -285,7 +290,12 @@ pub const Resolver = struct {
             const declaration = syntax_types.containerDeclarationNamed(file.source, file.tokens, container, target_name) orelse return null;
             const descent = switch (declaration.kind) {
                 .field => return null,
-                .function => syntax_types.typeFunctionResult(file.source, file.tokens, declaration.name_index) orelse return null,
+                .function => syntax_types.typeFunctionResult(
+                    file.source,
+                    file.tokens,
+                    declaration.name_index,
+                    resolver.single_type_results,
+                ) orelse return null,
                 .constant => try syntax_types.constantTarget(allocator, file.source, file.tokens, declaration.name_index) orelse return null,
             };
             switch (descent) {
@@ -380,7 +390,12 @@ pub const Resolver = struct {
                 .function => if (pending.items.len == 0)
                     return last_target
                 else
-                    syntax_types.typeFunctionResult(file.source, file.tokens, declaration.name_index) orelse return last_target,
+                    syntax_types.typeFunctionResult(
+                        file.source,
+                        file.tokens,
+                        declaration.name_index,
+                        resolver.single_type_results,
+                    ) orelse return last_target,
                 .constant => try syntax_types.constantTarget(
                     allocator,
                     file.source,
@@ -533,6 +548,8 @@ pub const Resolver = struct {
         allocator: std.mem.Allocator,
         origin: File,
     ) ![]const analysis.ModuleMembers {
+        var exact = resolver;
+        exact.single_type_results = true;
         var modules: std.ArrayList(analysis.ModuleMembers) = .empty;
         errdefer modules.deinit(allocator);
         var brace_depth: usize = 0;
@@ -546,7 +563,7 @@ pub const Resolver = struct {
             const name_token = origin.tokens[index + 1];
             if (name_token.tag != .identifier or origin.tokens[index + 2].tag != .equal) continue;
             const name = origin.source[name_token.loc.start..name_token.loc.end];
-            const view = (resolver.moduleView(allocator, origin, name) catch |err| switch (err) {
+            const view = (exact.moduleView(allocator, origin, name) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     std.log.warn("module facts for '{s}' unavailable: {t}", .{ name, err });
@@ -554,6 +571,10 @@ pub const Resolver = struct {
                 },
             }) orelse continue;
             if (std.mem.eql(u8, view.file.path, origin.path)) continue;
+            // An empty file is a placeholder, not a module known to declare
+            // nothing: Zig's release archives empty the standard library's
+            // test files.
+            if (view.file.tokens.len <= 1) continue;
             const names = try allocator.alloc([]const u8, view.members.len);
             for (view.members, names) |member, *member_name| member_name.* = member.name;
             try modules.append(allocator, .{ .receiver = name, .members = names });
@@ -561,3 +582,62 @@ pub const Resolver = struct {
         return try modules.toOwnedSlice(allocator);
     }
 };
+
+test "module facts leave out empty files and type functions with several results" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sources = [_]struct { []const u8, [:0]const u8 }{
+        .{
+            "/virtual/main.zig",
+            "const htest = @import(\"stub.zig\");\n" ++
+                "const bits = @import(\"bits.zig\");\n" ++
+                "const Set = bits.Static(80);\n" ++
+                "const Order = @import(\"order.zig\").Order;\n" ++
+                "const GrooveType = @import(\"groove.zig\").GrooveType;\n" ++
+                "const Groove = GrooveType(u8);\n",
+        },
+        .{ "/virtual/stub.zig", "" },
+        .{
+            "/virtual/bits.zig",
+            "pub fn Static(comptime size: usize) type {\n" ++
+                "    if (size <= 64) return Small;\n" ++
+                "    return Large;\n" ++
+                "}\n" ++
+                "pub const Small = struct { pub const empty: Small = .{}; };\n" ++
+                "pub const Large = struct { pub fn initEmpty() Large { return .{}; } };\n",
+        },
+        .{ "/virtual/order.zig", "pub const Order = enum {\n    /// Less.\n    lt,\n    /// Greater.\n    gt,\n};\n" },
+        .{
+            "/virtual/groove.zig",
+            "pub fn GrooveType(comptime T: type) type {\n" ++
+                "    const Helper = struct { fn Inner() type { return struct { pub const Wrong = T; }; } };\n" ++
+                "    _ = Helper;\n" ++
+                "    return struct { pub const Context = struct {}; };\n" ++
+                "}\n",
+        },
+    };
+    var known: std.StringHashMapUnmanaged(File) = .empty;
+    for (sources) |entry| {
+        const path, const source = entry;
+        try known.put(arena, path, .{ .path = path, .source = source, .tokens = try tokens_util.tokenize(arena, source) });
+    }
+    var cache: Cache = .init(std.testing.allocator);
+    defer cache.deinit();
+    cache.known = &known;
+    const resolver: Resolver = .{ .io = std.testing.io, .cache = &cache };
+    const modules = try resolver.fileModules(arena, known.get("/virtual/main.zig").?);
+    var described: std.ArrayList(u8) = .empty;
+    for (modules) |module| {
+        try described.print(arena, "{s}:", .{module.receiver});
+        for (module.members) |member| try described.print(arena, " {s}", .{member});
+        try described.append(arena, '\n');
+    }
+    try std.testing.expectEqualStrings(
+        "bits: Static Small Large\n" ++
+            "Order: lt gt\n" ++
+            "GrooveType: Context\n" ++
+            "Groove: Context\n",
+        described.items,
+    );
+}

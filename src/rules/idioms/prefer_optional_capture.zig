@@ -3,7 +3,6 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
 const isAssignment = @import("../../syntax/tokens.zig").isAssignment;
 const RuleRun = @import("../context.zig").RuleRun;
@@ -44,7 +43,7 @@ fn findOptionalCaptureIdioms(context: RuleRun) !void {
         } else continue;
         const body_start = if_index + 6;
         const body_close = if (tokens[body_start].tag == .l_brace)
-            matchingToken(tokens, body_start, .l_brace, .r_brace) orelse continue
+            context.matchingToken(body_start, .l_brace, .r_brace) orelse continue
         else
             statementEnd(tokens, body_start) orelse continue;
         var unwraps: std.ArrayList(std.zig.Token.Loc) = .empty;

@@ -6,20 +6,26 @@ const support = @import("../test_support.zig");
 const topLevelComma = @import("../../syntax/tokens.zig").topLevelComma;
 const nextTagBefore = @import("../../syntax/tokens.zig").nextTagBefore;
 const lineSpan = @import("../../syntax/tokens.zig").lineSpan;
+const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{.assertion_free_branching};
 
 pub fn run(context: RuleRun) !void {
     const level = context.level(.assertion_free_branching);
     if (level == .off) return;
+    var test_only: ?syntax_scope.TestOnlyBodies = null;
+    defer if (test_only) |*bodies| bodies.deinit(context.allocator);
     for (context.tokens, 0..) |token, fn_index| {
-        if (!context.isNamedFunction(fn_index)) continue;
+        if (!context.isNamedFunction(fn_index) or context.scopes.insideTestBlock(fn_index)) continue;
         const body_open = nextTagBefore(context.tokens, fn_index + 1, .l_brace, .semicolon) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (lineSpan(context.source, token.loc.start, context.tokens[body_end].loc.end) < 9) continue;
         if (hasInvariantCheck(context, body_open + 1, body_end)) continue;
         const bracket = computedBracket(context, body_open + 1, body_end) orelse continue;
-        if (hasDominatingWhileBound(context, bracket) or hasDominatingForBound(context, bracket)) continue;
+        if (hasDominatingWhileBound(context, body_open, bracket) or hasCaptureBound(context, bracket) or
+            hasLengthComparison(context, body_open, bracket)) continue;
+        if (test_only == null) test_only = try syntax_scope.testOnlyBodies(context.allocator, context.source, context.tokens);
+        if (test_only.?.contains(body_open)) continue;
         try context.emit(.{
             .rule = .assertion_free_branching,
             .level = level,
@@ -29,62 +35,192 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
+/// The first `sequence[index]` or `sequence[index..]` whose bound the
+/// compiler does not check itself: indexing in `comptime` code and by an
+/// `inline for` capture is evaluated at compile time.
 fn computedBracket(context: RuleRun, start: usize, end: usize) ?usize {
     for (context.tokens[start..end], start..) |token, index| {
         if (token.tag != .l_bracket or index == 0 or index + 2 >= end or
             !canEndIndexedExpression(context.tokens[index - 1].tag) or
+            context.tokens[index + 1].tag != .identifier or
+            (context.tokens[index + 2].tag != .r_bracket and context.tokens[index + 2].tag != .ellipsis2) or
             insideNestedFunction(context, start, index)) continue;
-        if (context.tokens[index + 1].tag == .identifier and context.tokens[index + 2].tag == .r_bracket) return index;
-        if (context.tokens[index + 1].tag == .identifier and context.tokens[index + 2].tag == .ellipsis2) return index;
+        if (insideComptime(context, start, index)) continue;
+        if (forCapture(context, index + 1)) |capture| if (capture.inline_loop) continue;
+        return index;
     }
     return null;
 }
 
-fn hasDominatingForBound(context: RuleRun, bracket: usize) bool {
-    if (bracket + 2 >= context.tokens.len or context.tokens[bracket + 1].tag != .identifier or
-        context.tokens[bracket + 2].tag != .r_bracket) return false;
-
-    const indexed_sequence_start = context.pathStartBefore(bracket) orelse return false;
-    for (context.tokens[0..bracket], 0..) |token, for_index| {
-        if (token.tag != .keyword_for or for_index + 8 >= bracket or
-            context.tokens[for_index + 1].tag != .l_paren) continue;
-        const range_end = context.matchingToken(for_index + 1, .l_paren, .r_paren) orelse continue;
-        if (range_end + 4 < bracket and range_end >= for_index + 7 and
-            context.tokenIs(for_index + 2, "0") and context.tokens[for_index + 3].tag == .ellipsis2 and
-            context.tokens[range_end - 2].tag == .period and context.tokenIs(range_end - 1, "len") and
-            context.tokens[range_end + 1].tag == .pipe and context.tokens[range_end + 2].tag == .identifier and
-            context.tokenIs(range_end + 2, context.tokenText(bracket + 1)) and
-            context.tokens[range_end + 3].tag == .pipe and context.tokens[range_end + 4].tag == .l_brace)
-        {
-            if (context.dottedPathsEqual(for_index + 4, range_end - 2, indexed_sequence_start, bracket)) {
-                const loop_end = context.matchingToken(range_end + 4, .l_brace, .r_brace) orelse continue;
-                if (bracket < loop_end and !mayMutateBeforeIndex(context, range_end + 5, indexed_sequence_start)) return true;
-            }
-        }
-
-        if (range_end + 6 >= bracket or context.tokens[range_end + 1].tag != .pipe or
-            context.tokens[range_end + 2].tag != .identifier or context.tokens[range_end + 3].tag != .comma or
-            context.tokens[range_end + 4].tag != .identifier or
-            !context.tokenIs(range_end + 4, context.tokenText(bracket + 1)) or
-            context.tokens[range_end + 5].tag != .pipe or context.tokens[range_end + 6].tag != .l_brace) continue;
-        const comma = topLevelComma(context.tokens, for_index + 2, range_end) orelse continue;
-        if (comma + 3 != range_end or !context.tokenIs(comma + 1, "0") or context.tokens[comma + 2].tag != .ellipsis2) continue;
-        const same_sequence = context.dottedPathsEqual(for_index + 2, comma, indexed_sequence_start, bracket);
-        if (!same_sequence and !arrayLengthMatchesPath(context, indexed_sequence_start, bracket, for_index + 2, comma, for_index)) continue;
-
-        const loop_end = context.matchingToken(range_end + 6, .l_brace, .r_brace) orelse continue;
-        if (bracket < loop_end and !mayMutateBeforeIndex(context, range_end + 7, indexed_sequence_start)) return true;
+/// Whether a block between `start` and `index` is a `comptime` block.
+fn insideComptime(context: RuleRun, start: usize, index: usize) bool {
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (opening < start) return false;
+        if (opening >= 1 and context.tokens[opening - 1].tag == .keyword_comptime) return true;
+        if (opening >= 3 and context.tokens[opening - 1].tag == .colon and context.tokens[opening - 2].tag == .identifier and
+            context.tokens[opening - 3].tag == .keyword_comptime) return true;
     }
     return false;
 }
 
-fn hasDominatingWhileBound(context: RuleRun, bracket: usize) bool {
+/// The `for` loop whose capture list declares the identifier `use` refers to.
+const ForCapture = struct {
+    /// The `(` and `)` around the loop's operands.
+    operands_open: usize,
+    operands_close: usize,
+    /// The capture's position in the capture list, which is the position of
+    /// the operand it iterates.
+    position: usize,
+    /// The first token after the capture list.
+    body: usize,
+    inline_loop: bool,
+};
+
+fn forCapture(context: RuleRun, use: usize) ?ForCapture {
+    const binding = context.scopes.findBinding(use) orelse return null;
+    const capture = binding.token_index;
+    var position: usize = 0;
+    var opening = capture;
+    while (opening > 0) {
+        opening -= 1;
+        switch (context.tokens[opening].tag) {
+            .pipe => break,
+            .comma => position += 1,
+            .identifier, .asterisk => {},
+            else => return null,
+        }
+    } else return null;
+    if (opening == 0 or context.tokens[opening - 1].tag != .r_paren) return null;
+    const operands_close = opening - 1;
+    const operands_open = context.scopes.matchingToken(operands_close) orelse return null;
+    if (operands_open == 0 or context.tokens[operands_open - 1].tag != .keyword_for) return null;
+    var closing = capture + 1;
+    while (closing < context.tokens.len and context.tokens[closing].tag != .pipe) : (closing += 1) {}
+    if (closing + 1 >= context.tokens.len) return null;
+    return .{
+        .operands_open = operands_open,
+        .operands_close = operands_close,
+        .position = position,
+        .body = closing + 1,
+        .inline_loop = operands_open >= 2 and context.tokens[operands_open - 2].tag == .keyword_inline,
+    };
+}
+
+/// Whether the index is the capture of a `for` loop that ranges up to the
+/// indexed sequence's length (`for (start..items.len) |index|`) or counts the
+/// elements of that sequence or of an array its length sizes
+/// (`for (items, 0..) |item, index|`).
+fn hasCaptureBound(context: RuleRun, bracket: usize) bool {
+    if (context.tokens[bracket + 2].tag != .r_bracket) return false;
+    const indexed_sequence_start = context.pathStartBefore(bracket) orelse return false;
+    const capture = forCapture(context, bracket + 1) orelse return false;
+    const operand = operandAt(context, capture.operands_open, capture.operands_close, capture.position) orelse return false;
+    const ellipsis = rangeEllipsis(context, operand) orelse return false;
+    if (ellipsis + 1 < operand.end) {
+        // 'start..sequence.len'
+        if (operand.end < ellipsis + 4 or context.tokens[operand.end - 2].tag != .period or !context.tokenIs(operand.end - 1, "len") or
+            !context.dottedPathsEqual(ellipsis + 1, operand.end - 2, indexed_sequence_start, bracket)) return false;
+    } else {
+        // A counter from zero beside the sequence it counts.
+        if (ellipsis != operand.start + 1 or !context.tokenIs(operand.start, "0")) return false;
+        var counted = false;
+        var position: usize = 0;
+        while (operandAt(context, capture.operands_open, capture.operands_close, position)) |other| : (position += 1) {
+            if (position == capture.position or rangeEllipsis(context, other) != null) continue;
+            if (context.dottedPathsEqual(other.start, other.end, indexed_sequence_start, bracket) or
+                arrayLengthMatchesPath(context, indexed_sequence_start, bracket, other.start, other.end, capture.operands_open))
+            {
+                counted = true;
+                break;
+            }
+        }
+        if (!counted) return false;
+    }
+    return !mayMutateBeforeIndex(context, capture.body + @intFromBool(context.tokens[capture.body].tag == .l_brace), indexed_sequence_start);
+}
+
+const OperandRange = struct { start: usize, end: usize };
+
+fn operandAt(context: RuleRun, opening: usize, closing: usize, wanted: usize) ?OperandRange {
+    var start = opening + 1;
+    var position: usize = 0;
+    while (start < closing) : (position += 1) {
+        const comma = topLevelComma(context.tokens, start, closing) orelse closing;
+        if (position == wanted) return if (comma > start) .{ .start = start, .end = comma } else null;
+        if (comma == closing) return null;
+        start = comma + 1;
+    }
+    return null;
+}
+
+/// The `..` of a range operand, when the operand is one.
+fn rangeEllipsis(context: RuleRun, operand: OperandRange) ?usize {
+    var depth: usize = 0;
+    for (context.tokens[operand.start..operand.end], operand.start..) |token, index| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => depth -|= 1,
+        .ellipsis2 => if (depth == 0) return index,
+        else => {},
+    };
+    return null;
+}
+
+/// Whether the function compares the index with the indexed sequence's
+/// length before the access, as `if (index < items.len) items[index]` or
+/// `while (index < items.len and items[index] != 0)` do, or counts the index
+/// down from that length (`var index = items.len;`).
+fn hasLengthComparison(context: RuleRun, body_open: usize, bracket: usize) bool {
+    const indexed_sequence_start = context.pathStartBefore(bracket) orelse return false;
+    const index_name = context.tokenText(bracket + 1);
+    for (context.tokens[body_open + 1 .. bracket], body_open + 1..) |token, use| {
+        if (token.tag != .identifier or !context.tokenIs(use, index_name) or
+            context.tokens[use - 1].tag == .period) continue;
+        var value = use + 1;
+        if (context.tokens[value].tag == .colon and value + 2 < bracket and context.tokens[value + 1].tag == .identifier) value += 2;
+        const assigned = context.tokens[value].tag == .equal;
+        if (isComparison(context.tokens[use + 1].tag) or assigned) {
+            // 'index < items.len' or 'var index = items.len;'
+            const path_start = if (assigned) value + 1 else use + 2;
+            var path_end = path_start;
+            while (path_end + 1 < bracket and context.tokens[path_end].tag == .identifier and
+                context.tokens[path_end + 1].tag == .period) : (path_end += 2)
+            {}
+            if (path_end > path_start + 1 and context.tokenIs(path_end, "len") and
+                (!assigned or context.tokens[path_end + 1].tag == .semicolon) and
+                context.dottedPathsEqual(path_start, path_end - 1, indexed_sequence_start, bracket)) return true;
+        }
+        if (use >= 4 and isComparison(context.tokens[use - 1].tag) and context.tokenIs(use - 2, "len") and
+            context.tokens[use - 3].tag == .period)
+        {
+            // 'items.len > index'
+            const path_start = context.pathStartBefore(use - 3) orelse continue;
+            if (context.dottedPathsEqual(path_start, use - 3, indexed_sequence_start, bracket)) return true;
+        }
+    }
+    return false;
+}
+
+fn isComparison(tag: std.zig.Token.Tag) bool {
+    return switch (tag) {
+        .angle_bracket_left,
+        .angle_bracket_left_equal,
+        .angle_bracket_right,
+        .angle_bracket_right_equal,
+        .equal_equal,
+        .bang_equal,
+        => true,
+        else => false,
+    };
+}
+
+fn hasDominatingWhileBound(context: RuleRun, body_open: usize, bracket: usize) bool {
     if (bracket + 2 >= context.tokens.len or context.tokens[bracket + 1].tag != .identifier or
         context.tokens[bracket + 2].tag != .r_bracket) return false;
 
     const indexed_sequence_start = context.pathStartBefore(bracket) orelse return false;
 
-    for (context.tokens[0..bracket], 0..) |token, while_index| {
+    for (context.tokens[body_open..bracket], body_open..) |token, while_index| {
         if (token.tag != .keyword_while or while_index + 4 >= bracket or
             context.tokens[while_index + 1].tag != .l_paren) continue;
         const condition_end = context.matchingToken(while_index + 1, .l_paren, .r_paren) orelse continue;
@@ -440,6 +576,17 @@ test "nested function indexing is reported once" {
     try std.testing.expectEqual(@as(usize, 1), found.len);
 }
 
+test "helpers inside test blocks are not held to the production bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "test \"inspect\" {\nconst Helper = struct {\nfn inspect(buffer: []u8, index: usize) u8 {\n" ++
+        "const one = 1;\nconst two = 2;\nconst three = 3;\nconst four = 4;\n" ++
+        "const five = 5;\nconst six = 6;\nconst seven = 7;\n_ = one + two + three + four + five + six + seven;\n" ++
+        "return buffer[index];\n}\n};\n_ = Helper;\n}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.assertion_free_branching}, .information));
+    try support.expectRules(found, &.{});
+}
+
 test "unchecked computed indexing reports" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -449,4 +596,43 @@ test "unchecked computed indexing reports" {
         "return buffer[index];\n}\n";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.assertion_free_branching}, .information));
     try support.expectRules(found, &.{.assertion_free_branching});
+}
+
+fn expectBranchingFindings(source: [:0]const u8, expected: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.assertion_free_branching}, .information));
+    try std.testing.expectEqual(expected, found.len);
+}
+
+const filler = "_ = one;\n_ = two;\n_ = three;\n_ = four;\n_ = five;\n_ = six;\n";
+
+test "loop ranges up to the length bound an index from any start and without braces" {
+    try expectBranchingFindings("fn prefix(offsets: []u32) void {\n" ++ filler ++
+        "for (1..offsets.len) |index| offsets[index] += offsets[index - 1];\n}\n", 0);
+    try expectBranchingFindings("fn copy(values: []const u8, out: []u8) void {\n" ++ filler ++
+        "for (values, 0..) |value, index| out[index] = value;\n}\n", 1);
+    // A counter starting past zero overruns the sequence it counts.
+    try expectBranchingFindings("fn shifted(values: []u8) void {\n" ++ filler ++
+        "for (values, 1..) |_, index| values[index] = 0;\n}\n", 1);
+}
+
+test "comparisons with the length state the bound in the same condition" {
+    try expectBranchingFindings("fn get(values: []const u8, index: usize) u8 {\n" ++ filler ++
+        "return if (index < values.len) values[index] else 0;\n}\n", 0);
+    try expectBranchingFindings("fn skip(list: *List, start: usize) usize {\n" ++ filler ++
+        "var index = start;\nwhile (index < list.items.len and list.items[index] == 0) index += 1;\nreturn index;\n}\n", 0);
+    try expectBranchingFindings("fn other(values: []const u8, others: []const u8, index: usize) u8 {\n" ++ filler ++
+        "return if (index < others.len) values[index] else 0;\n}\n", 1);
+    try expectBranchingFindings("fn last(list: *List) u8 {\n" ++ filler ++
+        "var total: u8 = 0;\nvar index: usize = list.items.len;\nwhile (index != 0) {\nindex -= 1;\ntotal +%= list.items[index];\n}\nreturn total;\n}\n", 0);
+}
+
+test "compile-time indexing and helpers only tests call are not production bounds" {
+    try expectBranchingFindings("fn words(value: anytype, out: *[2]u32) void {\n" ++ filler ++
+        "inline for (.{ \"a\", \"b\" }, 0..) |name, index| out[index] = @field(value, name);\n}\n", 0);
+    try expectBranchingFindings("fn table(comptime T: type) [T.len]u8 {\n" ++ filler ++
+        "return comptime table: {\nvar result: [T.len]u8 = undefined;\nfor (T.names, 0..) |_, slot| result[slot] = 0;\nbreak :table result;\n};\n}\n", 0);
+    try expectBranchingFindings("fn scenario(values: []u8, index: usize) u8 {\n" ++ filler ++
+        "return values[index];\n}\ntest \"scenario\" {\n_ = scenario(&.{}, 0);\n}\n", 0);
 }

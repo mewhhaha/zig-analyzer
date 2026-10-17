@@ -29,6 +29,8 @@ pub fn run(context: RuleRun) !void {
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
 
         var previous: ?Prong = null;
+        // A run of identical prongs is one finding: they combine into one prong.
+        var in_run = false;
         var cursor = opening + 1;
         while (cursor < closing) {
             const arrow = topLevelArrow(context.tokens, cursor, closing) orelse break;
@@ -48,24 +50,20 @@ pub fn run(context: RuleRun) !void {
                 ),
                 .is_else = isElseCase(context.tokens, cursor, arrow),
             };
-            if (previous) |prior| {
-                if (!prior.has_capture and !current.has_capture and !prior.is_else and !current.is_else and
+            const combinable = if (previous) |prior|
+                !prior.has_capture and !current.has_capture and !prior.is_else and !current.is_else and
                     std.mem.eql(u8, prior.body, current.body) and
-                    !prior.has_comment and !current.has_comment)
-                {
-                    try context.emit(.{
-                        .rule = .combine_identical_switch_prongs,
-                        .level = level,
-                        .span = current.body_span,
-                        .message = "adjacent switch prongs have identical uncaptured bodies; combine their case values",
-                    });
-                    previous = null;
-                } else {
-                    previous = current;
-                }
-            } else {
-                previous = current;
-            }
+                    !prior.has_comment and !current.has_comment
+            else
+                false;
+            if (combinable and !in_run) try context.emit(.{
+                .rule = .combine_identical_switch_prongs,
+                .level = level,
+                .span = current.body_span,
+                .message = "adjacent switch prongs have identical uncaptured bodies; combine their case values",
+            });
+            in_run = combinable;
+            previous = current;
             cursor = body_end + 1;
             if (cursor < closing and context.tokens[cursor].tag == .comma) cursor += 1;
         }
@@ -149,6 +147,25 @@ test "captured prong does not abort scanning subsequent identical prongs" {
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "a run of identical prongs is reported once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "switch (op) {\n" ++
+        "    .load => 1,\n" ++
+        "    .store => unreachable,\n" ++
+        "    .splat => unreachable,\n" ++
+        "    .add => unreachable,\n" ++
+        "    .sub => unreachable,\n" ++
+        "    .mul => 2,\n" ++
+        "    .div => 2,\n" ++
+        "}";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    try std.testing.expectEqual(std.mem.find(u8, source, "unreachable,\n    .add").?, findings[0].span.start);
 }
 
 test "nested switches report their identical prongs once" {

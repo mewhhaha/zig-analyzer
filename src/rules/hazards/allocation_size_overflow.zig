@@ -202,18 +202,24 @@ fn uncheckedCapacityGrowth(context: RuleRun, argument: ArgumentRange, before: us
     return growth_index;
 }
 
+/// The innermost block around `use_index` that is the first block after a
+/// `fn` or `test` keyword: one whose keyword precedes it with no `{` between.
 fn containingRuntimeBodyStart(context: RuleRun, use_index: usize) ?usize {
-    var candidate: ?usize = null;
-    for (context.tokens[0..use_index], 0..) |token, index| {
-        if (token.tag != .keyword_fn and token.tag != .keyword_test) continue;
-        for (context.tokens[index + 1 .. use_index], index + 1..) |following, body_start| {
-            if (following.tag != .l_brace) continue;
-            const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse break;
-            if (body_end > use_index) candidate = body_start;
-            break;
+    var brace = context.enclosingOpeningBrace(use_index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+        if (closing <= use_index) continue;
+        var cursor = opening;
+        while (cursor > 0) {
+            cursor -= 1;
+            switch (context.tokens[cursor].tag) {
+                .keyword_fn, .keyword_test => return opening,
+                .l_brace => break,
+                else => {},
+            }
         }
     }
-    return candidate;
+    return null;
 }
 
 fn declarationValueIsComptime(context: RuleRun, name_index: usize) bool {
@@ -298,6 +304,43 @@ fn unsignedTypeBits(name: []const u8) ?usize {
     return std.fmt.parseInt(usize, name[1..], 10) catch |err| switch (err) {
         error.InvalidCharacter, error.Overflow => null,
     };
+}
+
+test "the runtime body around a use matches a scan of every earlier function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const source: [:0]const u8 =
+        \\const top = .{ .value = 1 };
+        \\const Outer = struct {
+        \\    fn method(options: struct { flag: bool }, size: usize) void {
+        \\        while (@TypeOf(size) == fn () void) { _ = size * 2; }
+        \\        const Inner = struct { fn deep(count: usize) void { if (count > 0) { _ = count * 4; } } };
+        \\        _ = Inner;
+        \\        _ = options;
+        \\    }
+        \\};
+        \\test "case" { const local: usize = 1; _ = local * 2; }
+        \\fn last(width: usize) usize { return width * 2; }
+        \\
+    ;
+    const tokens = try @import("../../syntax/tokens.zig").tokenize(allocator, source);
+    var syntax = try @import("../context.zig").Syntax.init(allocator, source, tokens);
+    var found: std.ArrayList(types.Finding) = .empty;
+    const context = syntax.ruleRun(allocator, types.Configuration.defaults(), &found);
+    for (0..tokens.len) |use_index| {
+        var expected: ?usize = null;
+        for (tokens[0..use_index], 0..) |token, index| {
+            if (token.tag != .keyword_fn and token.tag != .keyword_test) continue;
+            for (tokens[index + 1 .. use_index], index + 1..) |following, body_start| {
+                if (following.tag != .l_brace) continue;
+                const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse break;
+                if (body_end > use_index) expected = body_start;
+                break;
+            }
+        }
+        try std.testing.expectEqual(expected, containingRuntimeBodyStart(context, use_index));
+    }
 }
 
 test "constant allocation products are not runtime overflow risks" {

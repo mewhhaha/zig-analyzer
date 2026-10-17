@@ -45,7 +45,7 @@ pub fn run(context: RuleRun) !void {
             var receiver_start = call_index - 2;
             while (receiver_start >= 2 and context.tokens[receiver_start - 1].tag == .period and
                 context.tokens[receiver_start - 2].tag == .identifier) receiver_start -= 2;
-            if (!owned_call.printReceiverIsAllocator(context.source, context.tokens, call_index - 2)) continue;
+            if (!owned_call.printReceiverIsAllocatorIndexed(context.scopes, call_index - 2)) continue;
             const receiver = ArgumentRange{ .start = receiver_start, .end = call_index - 1 };
             if (sentinel) {
                 const args = arguments(3, context, call_index + 1, call_end) orelse continue;

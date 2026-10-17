@@ -1,7 +1,9 @@
 const std = @import("std");
+const Ast = std.zig.Ast;
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const containsComment = @import("../../syntax/tokens.zig").containsComment;
 
 pub const rules = [_]types.Rule{
     .unsafe_orelse_unreachable,
@@ -10,9 +12,14 @@ pub const rules = [_]types.Rule{
 pub fn run(context: RuleRun) !void {
     const level = context.level(.unsafe_orelse_unreachable);
     if (level == .off) return;
-    for (context.tokens, 0..) |token, index| {
-        if (token.tag != .keyword_orelse or index + 1 >= context.tokens.len or
-            context.tokens[index + 1].tag != .keyword_unreachable or insideTestBody(context.tokens, index)) continue;
+    const tree = context.tree;
+    for (0..tree.nodes.len) |raw_node| {
+        const node: Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        if (tree.nodeTag(node) != .@"orelse") continue;
+        const subject, const fallback = tree.nodeData(node).node_and_node;
+        if (tree.nodeTag(fallback) != .unreachable_literal) continue;
+        const index = tree.nodeMainToken(node);
+        if (insideTestBody(context.tokens, index)) continue;
         if (subjectSpan(context.tokens, index)) |span| {
             const subject_text = context.source[context.tokens[span.start].loc.start..context.tokens[span.end - 1].loc.end];
             if (isGuardedByNullAssertion(context, subject_text, span.start)) continue;
@@ -26,8 +33,48 @@ pub fn run(context: RuleRun) !void {
                 u8,
                 "orelse unreachable turns an absent optional into a panic; handle null or document the invariant with an assertion",
             ),
+            .fixes = try unwrapFix(context, node, subject),
         });
     }
+}
+
+/// `x orelse unreachable` spelled `x.?`, which is the same unwrap. The subject
+/// is parenthesized unless it is already a suffix expression. Declined under
+/// `&`, where `&x.?` points into `x` rather than at a copy of its payload.
+fn unwrapFix(context: RuleRun, node: Ast.Node.Index, subject: Ast.Node.Index) ![]const types.Fix {
+    const tree = context.tree;
+    const first = tree.firstToken(node);
+    if (first >= 2 and context.tokens[first - 1].tag == .l_paren and context.tokens[first - 2].tag == .ampersand) return &.{};
+    const subject_end = context.tokens[tree.lastToken(subject)].loc.end;
+    const end = context.tokens[tree.lastToken(node)].loc.end;
+    if (containsComment(context.source[subject_end..end])) return &.{};
+    const suffixable = switch (tree.nodeTag(subject)) {
+        .identifier,
+        .field_access,
+        .call_one,
+        .call_one_comma,
+        .call,
+        .call_comma,
+        .array_access,
+        .deref,
+        .unwrap_optional,
+        .grouped_expression,
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        .builtin_call,
+        .builtin_call_comma,
+        => true,
+        else => false,
+    };
+    const start = context.tokens[first].loc.start;
+    return context.singleFix(.{
+        .title = "Unwrap with '.?'",
+        .span = if (suffixable) .{ .start = subject_end, .end = end } else .{ .start = start, .end = end },
+        .replacement = if (suffixable)
+            ".?"
+        else
+            try context.allocator.print("({s}).?", .{context.source[start..subject_end]}),
+    });
 }
 
 fn subjectSpan(tokens: []const std.zig.Token, orelse_index: usize) ?struct { start: usize, end: usize } {
@@ -174,6 +221,50 @@ test "orelse unreachable warns only when the idiomatic rule is enabled" {
     const configuration = support.only(&.{.unsafe_orelse_unreachable}, .information);
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
+}
+
+test "the unwrap fix respects precedence and declines under address-of" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn use(maybe: ?u32, s: S, a: ?u32, b: ?u32) void {\n" ++
+        "    _ = maybe orelse unreachable;\n" ++
+        "    _ = get() orelse unreachable;\n" ++
+        "    _ = s.opt orelse unreachable;\n" ++
+        "    _ = (maybe orelse unreachable) + 1;\n" ++
+        "    _ = a orelse b orelse unreachable;\n" ++
+        "    _ = try fetch() orelse unreachable;\n" ++
+        "    _ = &(maybe orelse unreachable);\n" ++
+        "    _ = maybe // why\n" ++
+        "        orelse unreachable;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.unsafe_orelse_unreachable}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 8), findings.len);
+    const expected = [_]?[]const u8{
+        "maybe.?",
+        "get().?",
+        "s.opt.?",
+        "maybe.?",
+        "(a orelse b).?",
+        "(try fetch()).?",
+        null,
+        null,
+    };
+    for (findings, expected) |finding, fixed| {
+        const want = fixed orelse {
+            try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
+            continue;
+        };
+        const edit = finding.fixes[0].edits[0];
+        const statement_start = std.mem.findScalarLast(u8, source[0..edit.span.start], '=').? + 2;
+        const result = try std.mem.concat(arena.allocator(), u8, &.{
+            source[statement_start..edit.span.start],
+            edit.replacement,
+        });
+        try std.testing.expect(std.mem.endsWith(u8, result, want));
+        try std.testing.expect(!finding.fixes[0].fix_all);
+    }
 }
 
 test "test fixtures may use orelse unreachable as an assertion" {

@@ -116,6 +116,7 @@ fn findManualSentinels(context: RuleRun) !void {
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
         const write = zeroTerminatorWrite(context, binding_name, allocation.length_text, declaration_end + 1, scope_end) orelse continue;
+        if (usedWhole(context, binding_name, declaration_end + 1, scope_end)) continue;
         const fixes: []const types.Fix = if (allocation.rewritable and write.exact_index and write.whole_statement) fixes: {
             var delete_start = context.tokens[write.use_index].loc.start;
             while (delete_start > 0 and (context.source[delete_start - 1] == ' ' or context.source[delete_start - 1] == '\t')) delete_start -= 1;
@@ -237,6 +238,24 @@ fn zeroTerminatorWrite(
     return null;
 }
 
+/// Whether the buffer is used as a whole, as an argument, a stored or returned
+/// value, or through `.len`, rather than only indexed, sliced, reached
+/// through `.ptr` or freed. Then the zero is a counted element, not a
+/// terminator, and `allocSentinel` would drop it from the length.
+fn usedWhole(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, name) or
+            (index > 0 and context.tokens[index - 1].tag == .period)) continue;
+        const next = context.tokens[index + 1].tag;
+        if (next == .l_bracket) continue;
+        if (next == .period and context.tokenIs(index + 2, "ptr")) continue;
+        if (next == .r_paren and index >= 2 and context.tokens[index - 1].tag == .l_paren and
+            (context.tokenIs(index - 2, "free") or context.tokenIs(index - 2, "destroy"))) continue;
+        return true;
+    }
+    return false;
+}
+
 fn oneFix(context: RuleRun, title: []const u8, edits: []const types.Edit) ![]const types.Fix {
     const fixes = try context.allocator.alloc(types.Fix, 1);
     fixes[0] = .{ .title = title, .kind = .quickfix, .edits = edits, .preferred = true, .fix_all = true };
@@ -333,6 +352,25 @@ test "sentinel writes that cannot be rewritten mechanically keep the diagnostic 
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqual(@as(usize, 0), findings[0].fixes.len);
+}
+
+test "a zero stored as a counted element is not a terminator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn grown(a: Allocator, old: []const u32, copy: *Evidence) !usize {\n" ++
+        "    const extra = try a.alloc(u32, old.len + 1);\n" ++
+        "    @memcpy(extra[0..old.len], old);\n" ++
+        "    extra[old.len] = 0;\n" ++
+        "    copy.extra = extra;\n" ++
+        "    const counted = try a.alloc(u8, old.len + 1);\n" ++
+        "    defer a.free(counted);\n" ++
+        "    counted[old.len] = 0;\n" ++
+        "    return counted.len;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.prefer_sentinel_termination}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
 }
 
 test "unused switch else captures are removable" {

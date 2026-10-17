@@ -4,19 +4,25 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const nextTagBefore = @import("../../syntax/tokens.zig").nextTagBefore;
+const syntax_scope = @import("../../syntax/scope.zig");
 
 pub const rules = [_]types.Rule{.unbounded_loop};
 
 pub fn run(context: RuleRun) !void {
     const level = context.level(.unbounded_loop);
     if (level == .off) return;
+    var test_only: ?syntax_scope.TestOnlyBodies = null;
+    defer if (test_only) |*bodies| bodies.deinit(context.allocator);
     for (context.tokens, 0..) |token, while_index| {
         if (token.tag != .keyword_while or while_index + 2 >= context.tokens.len or context.tokens[while_index + 1].tag != .l_paren) continue;
+        if (context.scopes.insideTestBlock(while_index)) continue;
         const condition_end = context.matchingToken(while_index + 1, .l_paren, .r_paren) orelse continue;
         const condition = context.source[context.tokens[while_index + 2].loc.start..context.tokens[condition_end - 1].loc.end];
         const body_open = context.whileBodyOpening(condition_end) orelse continue;
         const body_end = context.matchingToken(body_open, .l_brace, .r_brace) orelse continue;
         if (std.mem.findAny(u8, condition, "<>") != null or
+            conditionDrainsLength(context, while_index + 2, condition_end) or
+            conditionAwaitsEnd(context, while_index + 2, condition_end) or
             conditionStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             optionalCaptureStatesExhaustion(context, while_index + 2, condition_end, body_open, body_end) or
             equalityConditionHasUpdate(context, while_index + 2, condition_end, body_open, body_end) or
@@ -29,6 +35,8 @@ pub fn run(context: RuleRun) !void {
         if (eventLoopHasBlockingDispatch(context, body_open + 1, body_end)) continue;
         if (bodyHasCounterGuard(context, body_open + 1, body_end) or
             bodyHasDerivedCounterGuard(context, body_open + 1, body_end)) continue;
+        if (test_only == null) test_only = try syntax_scope.testOnlyBodies(context.allocator, context.source, context.tokens);
+        if (test_only.?.contains(while_index)) continue;
         try context.emit(.{
             .rule = .unbounded_loop,
             .level = level,
@@ -36,6 +44,32 @@ pub fn run(context: RuleRun) !void {
             .message = "loop has no statically visible iteration bound; state a maximum and handle exhaustion explicitly",
         });
     }
+}
+
+/// `while (queue.items.len != 0)` drains a collection as `> 0` does.
+fn conditionDrainsLength(context: RuleRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .bang_equal or index < start + 2 or index + 1 >= end) continue;
+        if (context.tokenIs(index - 1, "len") and context.tokens[index - 2].tag == .period and
+            context.tokenIs(index + 1, "0")) return true;
+        if (index + 3 < end and context.tokenIs(index - 1, "0") and context.tokens[index + 2].tag == .period and
+            context.tokenIs(index + 3, "len")) return true;
+    }
+    return false;
+}
+
+/// A condition naming the `.eof` tag consumes a token or byte stream until
+/// it is exhausted, as `while (!parser.at(.eof))` does.
+fn conditionAwaitsEnd(context: RuleRun, start: usize, end: usize) bool {
+    for (context.tokens[start..end], start..) |token, index| {
+        if (token.tag != .period or index + 1 >= end or !context.tokenIs(index + 1, "eof")) continue;
+        if (index == start) return true;
+        switch (context.tokens[index - 1].tag) {
+            .identifier, .r_paren, .r_bracket => {},
+            else => return true,
+        }
+    }
+    return false;
 }
 
 fn bodyDrainsCollection(context: RuleRun, start: usize, end: usize) bool {
@@ -503,10 +537,43 @@ test "derived bounds readers and interrupted calls state loop termination" {
     try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
+test "loops inside test blocks are not held to the production bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn poll() bool { return false; }\n" ++
+        "fn production(flag: *bool) void { while (flag.*) { flag.* = poll(); } }\n" ++
+        "test \"drain\" {\n" ++
+        "    var flag = true;\n" ++
+        "    while (flag) { flag = poll(); }\n" ++
+        "}\n" ++
+        "test {\n" ++
+        "    const Spin = struct { fn spin(flag: *bool) void { while (flag.*) { flag.* = poll(); } } };\n" ++
+        "    _ = Spin;\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try support.expectRules(found, &.{.unbounded_loop});
+    try std.testing.expect(found[0].span.start < std.mem.find(u8, source, "test").?);
+}
+
 test "a loop on an unchanged flag reports" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "fn spin(flag: bool) void { while (flag) {} }\n";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
     try support.expectRules(found, &.{.unbounded_loop});
+}
+
+test "length drains, end-of-input scans and helpers only tests call state termination" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn walk(stack: *Stack) void { while (stack.items.len != 0) { visit(stack.pop().?); } }\n" ++
+        "fn parse(parser: *Parser) void { while (!parser.at(.eof)) { parser.statement(); } }\n" ++
+        "fn scenario(flag: *bool) void { while (flag.*) { flag.* = poll(); } }\n" ++
+        "fn spin(flag: *bool) void { while (flag.*) { flag.* = poll(); } }\n" ++
+        "test \"scenario\" { var flag = true; scenario(&flag); }\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.unbounded_loop}, .information));
+    try support.expectRules(found, &.{.unbounded_loop});
+    try std.testing.expect(found[0].span.start > std.mem.find(u8, source, "fn spin").?);
 }

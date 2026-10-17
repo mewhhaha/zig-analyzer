@@ -2,7 +2,8 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const rule_types = @import("../types.zig");
 const support = @import("../test_support.zig");
-const TokenRange = @import("../../syntax/tokens.zig").Range;
+const tokens_util = @import("../../syntax/tokens.zig");
+const TokenRange = tokens_util.Range;
 const container_types = @import("../container_types.zig");
 const reach = @import("reach.zig");
 
@@ -121,12 +122,14 @@ fn checkContainerViews(
 }
 
 fn findArenaResetViews(context: RuleRun, level: rule_types.Level) !void {
+    var aliases: AllocatorAliases = .{};
+    defer aliases.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const allocator = allocationReceiver(context, declaration_index + 2, declaration_end) orelse continue;
-        const arena = arenaForAllocatorAlias(context, allocator, declaration_index) orelse continue;
+        const arena = try arenaForAllocatorAlias(context, &aliases, allocator, declaration_index) orelse continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const reset_index = arenaResetAfter(context, arena, declaration_end + 1, scope_end, scope_opening) orelse continue;
@@ -168,15 +171,50 @@ pub fn allocationReceiver(context: RuleRun, start: usize, end: usize) ?[]const u
     return null;
 }
 
-pub fn arenaForAllocatorAlias(context: RuleRun, allocator: []const u8, before: usize) ?[]const u8 {
-    var index = before;
-    while (index > 1) {
-        index -= 1;
-        if (!context.tokenIs(index, allocator) or
-            (context.tokens[index - 1].tag != .keyword_const and context.tokens[index - 1].tag != .keyword_var) or
-            index + 5 >= before or context.tokens[index + 1].tag != .equal or
-            context.tokens[index + 2].tag != .identifier or context.tokens[index + 3].tag != .period or
-            !context.tokenIs(index + 4, "allocator") or context.tokens[index + 5].tag != .l_paren) continue;
+/// The `const name = arena.allocator(` declarations of a file by name (the
+/// name), found in one pass the first time `arenaForAllocatorAlias` asks.
+pub const AllocatorAliases = struct {
+    declarations: ?std.StringHashMapUnmanaged(std.ArrayList(u32)) = null,
+
+    pub fn deinit(aliases: *AllocatorAliases, allocator: std.mem.Allocator) void {
+        var declarations = aliases.declarations orelse return;
+        var lists = declarations.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        declarations.deinit(allocator);
+    }
+
+    fn named(aliases: *AllocatorAliases, context: RuleRun, name: []const u8) ![]const u32 {
+        if (aliases.declarations == null) {
+            var declarations: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+            errdefer {
+                var lists = declarations.valueIterator();
+                while (lists.next()) |list| list.deinit(context.allocator);
+                declarations.deinit(context.allocator);
+            }
+            const tokens = context.tokens;
+            for (1..tokens.len -| 5) |index| {
+                if ((tokens[index - 1].tag != .keyword_const and tokens[index - 1].tag != .keyword_var) or
+                    tokens[index + 1].tag != .equal or tokens[index + 2].tag != .identifier or tokens[index + 3].tag != .period or
+                    !context.tokenIs(index + 4, "allocator") or tokens[index + 5].tag != .l_paren) continue;
+                const entry = try declarations.getOrPut(context.allocator, context.tokenText(index));
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(context.allocator, @intCast(index));
+            }
+            aliases.declarations = declarations;
+        }
+        return if (aliases.declarations.?.get(name)) |list| list.items else &.{};
+    }
+};
+
+/// The arena whose allocator the alias `allocator` declared nearest before
+/// `before` comes from, when the arena is a local `ArenaAllocator`.
+pub fn arenaForAllocatorAlias(context: RuleRun, aliases: *AllocatorAliases, allocator: []const u8, before: usize) !?[]const u8 {
+    const declarations = try aliases.named(context, allocator);
+    var position = declarations.len;
+    while (position > 0) {
+        position -= 1;
+        const index: usize = declarations[position];
+        if (index + 5 >= before) continue;
         const alias_scope_end = context.enclosingScopeEnd(index) orelse continue;
         if (alias_scope_end < before) continue;
         const arena = context.tokenText(index + 2);
@@ -424,6 +462,7 @@ fn rangeContainsBorrowingPath(context: RuleRun, start: usize, end: usize, path: 
             const after_path = candidate + path_length;
             if (after_path + 1 < end and context.tokens[after_path].tag == .period and
                 context.tokenIs(after_path + 1, "len")) continue;
+            var operand_end = after_path;
             if (after_path < end and context.tokens[after_path].tag == .l_bracket) {
                 const bracket_end = context.matchingToken(after_path, .l_bracket, .r_bracket) orelse continue;
                 var is_slice = false;
@@ -435,11 +474,44 @@ fn rangeContainsBorrowingPath(context: RuleRun, start: usize, end: usize, path: 
                 }
                 const address_taken = candidate > start and context.tokens[candidate - 1].tag == .ampersand;
                 if (!is_slice and !address_taken) continue;
+                operand_end = bracket_end + 1;
             }
+            if (candidate > start and byValueLoopOperand(context, candidate, operand_end)) continue;
             return true;
         }
     }
     return false;
+}
+
+/// Whether `[start, end)` is an operand of a `for` that captures its elements
+/// by value, `for (items) |item|`: the loop copies each element, so neither
+/// the copy nor an index it yields points into the operand's storage.
+fn byValueLoopOperand(context: RuleRun, start: usize, end: usize) bool {
+    const tokens = context.tokens;
+    if (end >= tokens.len or (tokens[end].tag != .comma and tokens[end].tag != .r_paren) or
+        (tokens[start - 1].tag != .comma and tokens[start - 1].tag != .l_paren)) return false;
+    // The `(` of the operand list, counting the operands before this one.
+    var position: usize = 0;
+    var cursor = start - 1;
+    while (tokens[cursor].tag != .l_paren) {
+        switch (tokens[cursor].tag) {
+            .comma => position += 1,
+            .r_paren, .r_bracket, .r_brace => cursor = context.scopes.matchingToken(cursor) orelse return false,
+            .l_bracket, .l_brace, .semicolon => return false,
+            else => {},
+        }
+        if (cursor == 0) return false;
+        cursor -= 1;
+    }
+    if (cursor == 0 or tokens[cursor - 1].tag != .keyword_for) return false;
+    const closing = context.scopes.matchingToken(cursor) orelse return false;
+    if (closing + 2 >= tokens.len or tokens[closing + 1].tag != .pipe) return false;
+    var capture = closing + 2;
+    while (position > 0) : (position -= 1) {
+        capture = (tokens_util.nextTagBefore(tokens, capture, .comma, .pipe) orelse return false) + 1;
+    }
+    // `|*item|` captures a pointer into the operand.
+    return capture < tokens.len and tokens[capture].tag == .identifier;
 }
 
 fn viewDeclaration(context: RuleRun, container_name: []const u8, index: usize, scope_end: usize) ?View {
@@ -733,4 +805,19 @@ test "views of a container passed by pointer are tracked" {
     try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { const v = l.items; try l.append(g, 1); return v[0]; }", 1);
     try expectViews("fn f(g: A, l: *std.ArrayList(u8)) !u8 { const v = l.items; return v[0]; }", 0);
     try expectViews("fn f(self: *const Page, y: usize) *Row { return &self.rows.ptr(m)[y]; }", 0);
+}
+
+test "values and indices a by-value for capture yields are not views of a reallocated slice" {
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (g.nodes) |node| { if (node.t) break node; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); g.nodes[3] = n; }", 0);
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const i = for (g.nodes, 0..) |node, id| { if (node.t) break id; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); g.nodes[3].a = i; }", 0);
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (g.nodes[1..]) |node| { if (node.t) break node; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); g.nodes[3] = n; }", 0);
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (g.nodes) |*node| { if (node.t) break node; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); n.t = false; }", 1);
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (0.., g.nodes) |i, *node| { if (i == 1) break node; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); n.t = false; }", 1);
+    try expectViews("fn f(gpa: Allocator, g: *G) !void { const n = for (g.nodes, 0..) |node, i| { if (node.t) break &g.nodes[i]; } else return; " ++
+        "g.nodes = try gpa.realloc(g.nodes, 4); n.t = false; }", 1);
 }

@@ -86,6 +86,11 @@ pub const Store = struct {
         defer store.mutex.unlock(io);
         const entry = try store.files.getOrPut(store.allocator, path);
         if (entry.found_existing) {
+            // Another caller parsed the same contents meanwhile; share theirs.
+            if (std.meta.eql(entry.value_ptr.*.stamp, stamp)) {
+                parsed.release();
+                return entry.value_ptr.*.retain();
+            }
             store.retained_bytes -|= entry.value_ptr.*.source.len;
             entry.value_ptr.*.release();
         } else {

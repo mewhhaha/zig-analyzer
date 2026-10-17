@@ -5,15 +5,38 @@ const std = @import("std");
 const analysis = @import("../analysis.zig");
 const declarations = analysis.deprecated_declarations;
 const zig_environment = @import("../compiler/zig_environment.zig");
+const syntax_scope = @import("../syntax/scope.zig");
 const source_store = @import("source_store.zig");
 
 pub const Source = declarations.Source;
+
+/// Whether `check` reports anything under `configuration`.
+pub const enabled = declarations.enabled;
+
+/// Whether `finding` is a bare `unresolved-member` report at a member that a
+/// `removed-std-api` finding in `imported` already names, with its replacement.
+pub fn explains(imported: []const analysis.Finding, finding: analysis.Finding) bool {
+    if (finding.rule != .unresolved_member) return false;
+    for (imported) |candidate| {
+        if (candidate.rule == .removed_std_api and std.meta.eql(candidate.span, finding.span)) return true;
+    }
+    return false;
+}
 
 /// A file whose imports are checked.
 pub const File = struct {
     path: []const u8,
     source: [:0]const u8,
     tokens: []const std.zig.Token,
+    /// Scope index of `source` when the caller already has one.
+    scopes: ?*const syntax_scope.Index = null,
+};
+
+/// Supplies the scope index of a known source by path, so callers that check
+/// many files with several indexes build each file's scopes once.
+pub const ScopeProvider = struct {
+    context: *anyopaque,
+    scopes: *const fn (context: *anyopaque, path: []const u8) anyerror!?*const syntax_scope.Index,
 };
 
 pub const ImportedDeprecations = struct {
@@ -49,26 +72,35 @@ pub const ImportedDeprecations = struct {
         imported.resolver.known = known;
     }
 
+    /// Takes the scope index of each known source from `provider` instead of
+    /// building one.
+    pub fn useKnownScopes(imported: *ImportedDeprecations, provider: ScopeProvider) void {
+        imported.resolver.known_scopes = provider;
+    }
+
     /// Registers a file's current contents; they take precedence over disk, so
     /// unsaved dependencies are seen as the user sees them.
     pub fn addSource(imported: *ImportedDeprecations, source: Source) !void {
         try imported.index.addSource(source);
     }
 
-    /// Appends the deprecated-declaration findings of `file`. Translate-c
-    /// output is skipped and suppression comments are honoured.
+    /// Appends the deprecated-declaration and removed-std-api findings of
+    /// `file`. Translate-c output is skipped and suppression comments are
+    /// honoured. An `unresolved-member` finding already in `findings` that a
+    /// new removed-std-api finding explains is dropped.
     pub fn check(
         imported: *ImportedDeprecations,
         file: File,
         configuration: analysis.Configuration,
         findings: *std.ArrayList(analysis.Finding),
     ) !void {
-        if (configuration.level(.deprecated_declaration) == .off or analysis.isTranslateCOutput(file.source)) return;
+        if (!enabled(configuration) or analysis.isTranslateCOutput(file.source)) return;
         const first_new = findings.items.len;
         try imported.index.run(.{
             .allocator = imported.allocator,
             .source = file.source,
             .tokens = file.tokens,
+            .scopes = file.scopes,
             .configuration = configuration,
             .findings = findings,
         }, file.path, true);
@@ -83,6 +115,15 @@ pub const ImportedDeprecations = struct {
             kept += 1;
         }
         findings.shrinkRetainingCapacity(first_new + kept);
+        if (first_new == 0 or kept == 0) return;
+        const new = findings.items[first_new..];
+        var write: usize = 0;
+        for (findings.items, 0..) |finding, position| {
+            if (position < first_new and explains(new, finding)) continue;
+            findings.items[write] = finding;
+            write += 1;
+        }
+        findings.shrinkRetainingCapacity(write);
     }
 
     /// Paths of the files the last `check` read through imports. The caller
@@ -100,6 +141,7 @@ const Resolver = struct {
     /// Files whose contents the caller already holds, by path; they are used
     /// instead of reading the disk.
     known: ?*const std.StringHashMapUnmanaged(Source) = null,
+    known_scopes: ?ScopeProvider = null,
     /// Parsed files shared between runs; dependencies are taken from here
     /// instead of being read each time.
     store: ?*source_store.Store = null,
@@ -131,7 +173,12 @@ const Resolver = struct {
 
     fn load(raw_context: *anyopaque, allocator: std.mem.Allocator, path: []const u8) !?declarations.Source {
         const resolver: *Resolver = @ptrCast(@alignCast(raw_context));
-        if (resolver.known) |known| if (known.get(path)) |source| return source;
+        if (resolver.known) |known| if (known.get(path)) |source| {
+            const provider = resolver.known_scopes orelse return source;
+            var shared = source;
+            shared.scopes = try provider.scopes(provider.context, path);
+            return shared;
+        };
         if (resolver.store) |store| {
             const file = try store.acquire(resolver.io, path) orelse return null;
             errdefer file.release();
@@ -184,4 +231,37 @@ test "imported deprecations see unsaved dependencies and honour suppressions" {
         .tokens = suppressed_tokens,
     }, configuration, &suppressed);
     try std.testing.expectEqual(@as(usize, 0), suppressed.items.len);
+}
+
+test "removed std paths replace the bare unresolved member already reported there" {
+    _ = zig_environment.libDirectory(std.testing.io) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ZigEnvironmentUnavailable, error.ZigEnvironmentMalformed => return error.SkipZigTest,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    var imported: ImportedDeprecations = undefined;
+    imported.init(std.testing.io, allocator);
+    defer imported.deinit();
+
+    const source: [:0]const u8 = "const std = @import(\"std\");\nconst fs = std.fs;\npub fn run() void { _ = fs.cwd(); }\n";
+    const tokens = try @import("../syntax/tokens.zig").tokenize(allocator, source);
+    const run = std.mem.find(u8, source, "run").?;
+    const cwd = std.mem.find(u8, source, "cwd").?;
+    var findings: std.ArrayList(analysis.Finding) = .empty;
+    // As the language server's module pass would have reported them first.
+    for ([_]usize{ run, cwd }) |start| try findings.append(allocator, .{
+        .rule = .unresolved_member,
+        .level = .@"error",
+        .span = .{ .start = start, .end = start + 3 },
+        .message = "module 'fs' has no public member",
+    });
+    try imported.check(.{ .path = "/tmp/zig-analyzer-removed-std-test/main.zig", .source = source, .tokens = tokens }, .defaults(), &findings);
+    try std.testing.expectEqual(@as(usize, 2), findings.items.len);
+    try std.testing.expectEqual(analysis.Rule.unresolved_member, findings.items[0].rule);
+    try std.testing.expectEqual(run, findings.items[0].span.start);
+    try std.testing.expectEqual(analysis.Rule.removed_std_api, findings.items[1].rule);
+    try std.testing.expectEqual(cwd, findings.items[1].span.start);
 }

@@ -1,5 +1,4 @@
 const std = @import("std");
-const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -204,7 +203,7 @@ fn bindingHasStandardMapType(context: RuleRun, use_index: usize) bool {
 }
 
 fn explicitBindingType(context: RuleRun, use_index: usize) ?[]const u8 {
-    const binding = syntax_scope.findBinding(context.source, context.tokens, use_index) orelse return null;
+    const binding = context.scopes.findBinding(use_index) orelse return null;
     const name_index = binding.token_index;
     if (name_index + 2 >= context.tokens.len or context.tokens[name_index + 1].tag != .colon) return null;
     const type_start = name_index + 2;

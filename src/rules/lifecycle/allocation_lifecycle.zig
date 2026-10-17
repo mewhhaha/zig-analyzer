@@ -12,8 +12,6 @@ const types = @import("../types.zig");
 const tokenRefersToBinding = @import("../context.zig").tokenRefersToBinding;
 const tokenize = @import("../../syntax/tokens.zig").tokenize;
 const tokens_util = @import("../../syntax/tokens.zig");
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
-const fallibleOperationBetween = @import("../../syntax/tokens.zig").fallibleOperationBetween;
 const TokenRange = @import("../../syntax/tokens.zig").Range;
 
 /// Every ownership finding of a file. Besides the binding-identity engine in
@@ -99,6 +97,8 @@ pub fn findingsWithSummaries(
         for (found.items) |finding| freeFinding(allocator, finding);
         found.deinit(allocator);
     }
+    var declarations: DeclarationsByName = .{ .allocator = allocator, .source = source, .tokens = tokens };
+    defer declarations.deinit();
 
     for (0..tree.nodes.len) |raw_node| {
         const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
@@ -111,12 +111,12 @@ pub fn findingsWithSummaries(
         const binding_name = source[tokens[binding_index].loc.start..tokens[binding_index].loc.end];
         if (std.mem.eql(u8, binding_name, "_")) continue;
         const statement_end = scope_index.statementEnd(declaration_index) orelse continue;
-        const allocation = allocationFromValue(source, tree, tokens, initializer, summary_index) orelse continue;
+        var allocation = allocationFromValue(source, tree, tokens, scope_index, initializer, summary_index) orelse continue;
         const arena_backed = valueReceivesBuildArena(tree, tokens, scope_index, initializer) or if (allocation.allocator_source) |allocator_name|
             std.ascii.findIgnoreCase(allocator_name, "arena") != null or
                 (allocation.allocator_member != null and
                     std.ascii.findIgnoreCase(allocation.allocator_member.?, "arena") != null) or
-                allocatorIsArenaBacked(source, tokens, allocator_name) or
+                try allocatorIsArenaBacked(&declarations, allocator_name) or
                 allocatorMatchesArenaContract(
                     source,
                     tokens,
@@ -126,9 +126,11 @@ pub fn findingsWithSummaries(
                     allocation.allocator_member,
                     summary_index.arena_allocator_contracts,
                 ) or
-                allocatorParameterIsAlwaysArenaBacked(
+                try allocatorParameterIsAlwaysArenaBacked(
                     source,
                     tokens,
+                    scope_index,
+                    &declarations,
                     declaration_index,
                     allocator_name,
                     summary_index,
@@ -137,6 +139,11 @@ pub fn findingsWithSummaries(
             false;
         const scope_end = scope_index.enclosingScopeEnd(declaration_index) orelse continue;
         if (statement_end >= scope_end) continue;
+        if (allocation.array_pointer and std.mem.eql(u8, allocation.release, "free") and
+            bindingReleasedWith(source, tokens, scope_index, binding_name, binding_index, statement_end + 1, scope_end, "destroy"))
+        {
+            allocation.release = "destroy";
+        }
         const mismatched_release = try findMismatchedRelease(
             allocator,
             source,
@@ -151,6 +158,8 @@ pub fn findingsWithSummaries(
             &found,
         );
         if (arena_backed) continue;
+        // A leak in a test is reported by `std.testing.allocator` itself.
+        const report_leaks = !scope_index.insideTestBlock(declaration_index);
         const cleanup_registered_after_fallible_operation = try findReleaseOrderingIssues(
             allocator,
             source,
@@ -164,8 +173,10 @@ pub fn findingsWithSummaries(
             allocation,
             summary_index,
             configuration,
+            report_leaks,
             &found,
         );
+        if (!report_leaks) continue;
         const lexical_cleanup = ownershipLeavesScope(
             source,
             tokens,
@@ -203,6 +214,10 @@ pub fn findingsWithSummaries(
         // 'defer pool.deinit(...)' reclaims everything the pool handed out.
         if (allocation.receiver) |receiver_name| {
             if (deferDeinitializesReceiver(source, tokens, scope_index, receiver_name, declaration_index, scope_end)) continue;
+        }
+        // The build graph frees whatever `b.allocator` hands out.
+        if (allocation.allocator_source) |allocator_name| {
+            if (resources.buildGraphAllocator(source, tokens, scope_index, allocator_name, declaration_index)) continue;
         }
 
         const message = switch (cleanup) {
@@ -352,12 +367,12 @@ fn typeDeinitReleasesField(
     if (type_name == 0 or tokens[type_name - 1].tag != .keyword_const or type_name + 3 >= tokens.len or
         tokens[type_name + 1].tag != .equal or tokens[type_name + 2].tag != .keyword_struct or
         tokens[type_name + 3].tag != .l_brace) return false;
-    const type_end = matchingToken(tokens, type_name + 3, .l_brace, .r_brace) orelse return false;
+    const type_end = scope_index.matchingToken(type_name + 3) orelse return false;
     for (tokens[type_name + 4 .. type_end], type_name + 4..) |candidate, function_index| {
         if (candidate.tag != .keyword_fn or function_index + 3 >= type_end or
             !tokenIsIdentifier(source, tokens[function_index + 1], "deinit") or
             tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = scope_index.matchingToken(function_index + 2) orelse continue;
         var receiver: ?[]const u8 = null;
         for (tokens[function_index + 3 .. parameters_end], function_index + 3..) |parameter, parameter_index| {
             if (parameter.tag == .identifier and parameter_index + 1 < parameters_end and
@@ -371,12 +386,12 @@ fn typeDeinitReleasesField(
         var body_start = parameters_end + 1;
         while (body_start < type_end and tokens[body_start].tag != .l_brace) : (body_start += 1) {}
         if (body_start == type_end) continue;
-        const body_end = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = scope_index.matchingToken(body_start) orelse continue;
         for (tokens[body_start + 1 .. body_end], body_start + 1..) |body_token, method_index| {
             if ((!tokenIsIdentifier(source, body_token, "free") and
                 !tokenIsIdentifier(source, body_token, "destroy")) or method_index + 1 >= body_end or
                 tokens[method_index + 1].tag != .l_paren) continue;
-            const call_end = matchingToken(tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+            const call_end = scope_index.matchingToken(method_index + 1) orelse continue;
             var index = method_index + 2;
             while (index + 2 < call_end) : (index += 1) {
                 if (tokenIsIdentifier(source, tokens[index], receiver_name) and tokens[index + 1].tag == .period and
@@ -445,23 +460,26 @@ const Allocation = struct {
     receiver: ?[]const u8,
     allocator_source: ?[]const u8,
     allocator_member: ?[]const u8 = null,
+    /// A single-item pointer to an array, which `destroy` releases as well as `free`.
+    array_pointer: bool = false,
 };
 
 fn allocationFromValue(
     source: []const u8,
     tree: *const std.zig.Ast,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     value: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
     return switch (tree.nodeTag(value)) {
-        .@"try", .@"nosuspend", .@"comptime" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node, summary_index),
-        .grouped_expression => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_token[0], summary_index),
-        .@"catch" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[0], summary_index),
-        .@"orelse" => allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[0], summary_index) orelse
-            allocationFromValue(source, tree, tokens, tree.nodeData(value).node_and_node[1], summary_index),
-        .block_two, .block_two_semicolon, .block, .block_semicolon => allocationFromBlock(source, tree, tokens, value, summary_index),
-        .call, .call_comma, .call_one, .call_one_comma => allocationFromCall(source, tree, tokens, value, summary_index),
+        .@"try", .@"nosuspend", .@"comptime" => allocationFromValue(source, tree, tokens, scope_index, tree.nodeData(value).node, summary_index),
+        .grouped_expression => allocationFromValue(source, tree, tokens, scope_index, tree.nodeData(value).node_and_token[0], summary_index),
+        .@"catch" => allocationFromValue(source, tree, tokens, scope_index, tree.nodeData(value).node_and_node[0], summary_index),
+        .@"orelse" => allocationFromValue(source, tree, tokens, scope_index, tree.nodeData(value).node_and_node[0], summary_index) orelse
+            allocationFromValue(source, tree, tokens, scope_index, tree.nodeData(value).node_and_node[1], summary_index),
+        .block_two, .block_two_semicolon, .block, .block_semicolon => allocationFromBlock(source, tree, tokens, scope_index, value, summary_index),
+        .call, .call_comma, .call_one, .call_one_comma => allocationFromCall(source, tree, tokens, scope_index, value, summary_index),
         else => null,
     };
 }
@@ -470,6 +488,7 @@ fn allocationFromBlock(
     source: []const u8,
     tree: *const std.zig.Ast,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     block: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
@@ -478,7 +497,7 @@ fn allocationFromBlock(
     for (statements) |statement| {
         if (tree.nodeTag(statement) != .@"break") continue;
         const break_value = tree.nodeData(statement).opt_token_and_opt_node[1].unwrap() orelse continue;
-        if (allocationFromValue(source, tree, tokens, break_value, summary_index)) |allocation| return allocation;
+        if (allocationFromValue(source, tree, tokens, scope_index, break_value, summary_index)) |allocation| return allocation;
     }
     return null;
 }
@@ -487,6 +506,7 @@ fn allocationFromCall(
     source: []const u8,
     tree: *const std.zig.Ast,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
     node: std.zig.Ast.Node.Index,
     summary_index: summaries.Index,
 ) ?Allocation {
@@ -511,6 +531,7 @@ fn allocationFromCall(
                 null,
             .allocator_source = if (allocator_argument) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
             .allocator_member = owned.allocator_parameter_member,
+            .array_pointer = owned.array_pointer,
         };
     }
     if (tree.nodeTag(call.ast.fn_expr) != .field_access) return null;
@@ -518,7 +539,7 @@ fn allocationFromCall(
     const method = tree.tokenSlice(method_token);
     const receiver_name = if (tree.nodeTag(receiver) == .identifier) tree.tokenSlice(tree.nodeMainToken(receiver)) else null;
     if ((std.mem.eql(u8, method, "print") or std.mem.eql(u8, method, "printSentinel")) and
-        !owned_call.printReceiverIsAllocator(source, tokens, tree.lastToken(receiver))) return null;
+        !owned_call.printReceiverIsAllocatorIndexed(scope_index, tree.lastToken(receiver))) return null;
     const callable = source[tokens[tree.firstToken(call.ast.fn_expr)].loc.start..tokens[tree.lastToken(call.ast.fn_expr)].loc.end];
     if (owned_call.standardAllocatorArgument(callable)) |parameter| {
         if (parameter >= call.ast.params.len) return null;
@@ -564,6 +585,7 @@ fn allocationFromCall(
             null,
         .allocator_source = if (allocator_expression) |argument| allocatorSourceName(source, tokens, tree, argument) else null,
         .allocator_member = owned.allocator_parameter_member,
+        .array_pointer = owned.array_pointer,
     };
 }
 
@@ -658,14 +680,16 @@ fn allocatorSourceName(
 
 const arena_backed_types = [_][]const u8{ "ArenaAllocator", "FixedBufferAllocator" };
 
-fn allocatorIsArenaBacked(source: []const u8, tokens: []const std.zig.Token, allocator_name: []const u8) bool {
+fn allocatorIsArenaBacked(declarations: *DeclarationsByName, allocator_name: []const u8) !bool {
+    const source = declarations.source;
+    const tokens = declarations.tokens;
     const allocator_method = ".allocator()";
     var name = if (std.mem.endsWith(u8, allocator_name, allocator_method))
         allocator_name[0 .. allocator_name.len - allocator_method.len]
     else
         allocator_name;
     for (0..4) |_| {
-        const declaration = bindingDeclarationValue(source, tokens, name) orelse return false;
+        const declaration = try declarations.firstValue(name) orelse return false;
         for (tokens[declaration.start..declaration.end]) |token| {
             if (token.tag != .identifier) continue;
             const text = source[token.loc.start..token.loc.end];
@@ -733,10 +757,12 @@ fn declaredBindingTypeName(
 fn allocatorParameterIsAlwaysArenaBacked(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    declarations: *DeclarationsByName,
     declaration_index: usize,
     allocator_name: []const u8,
     summary_index: summaries.Index,
-) bool {
+) !bool {
     const function = summary_index.functionContaining(source, declaration_index) orelse return false;
     const parameter_index = for (function.parameter_names, 0..) |parameter, index| {
         if (std.mem.eql(u8, parameter, allocator_name)) break index;
@@ -746,6 +772,8 @@ fn allocatorParameterIsAlwaysArenaBacked(
     return parameterIsAlwaysArenaBacked(
         source,
         tokens,
+        scope_index,
+        declarations,
         function,
         parameter_index,
         summary_index,
@@ -757,12 +785,14 @@ fn allocatorParameterIsAlwaysArenaBacked(
 fn parameterIsAlwaysArenaBacked(
     source: []const u8,
     tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    declarations: *DeclarationsByName,
     function: summaries.FunctionSummary,
     parameter_index: usize,
     summary_index: summaries.Index,
     call_chain: *[16]usize,
     call_depth: usize,
-) bool {
+) !bool {
     if (summaries.parameterDocumentsArena(function, function.parameter_names[parameter_index])) return true;
     if (functionParameterMatchesArenaContract(
         function,
@@ -779,7 +809,7 @@ fn parameterIsAlwaysArenaBacked(
         if (index > 0 and tokens[index - 1].tag == .keyword_fn) continue;
         if (index > 0 and tokens[index - 1].tag == .period) continue;
         if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) return false;
-        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse return false;
+        const closing = scope_index.matchingToken(index + 1) orelse return false;
         const argument = argument: {
             var argument_index: usize = 0;
             var argument_start = index + 2;
@@ -807,14 +837,14 @@ fn parameterIsAlwaysArenaBacked(
             {
                 const receiver = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
                 break :arena_backed std.ascii.findIgnoreCase(receiver, "arena") != null or
-                    allocatorIsArenaBacked(source, tokens, receiver);
+                    try allocatorIsArenaBacked(declarations, receiver);
             }
             if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) {
                 break :arena_backed false;
             }
             const argument_name = source[tokens[argument.start].loc.start..tokens[argument.start].loc.end];
             break :arena_backed std.ascii.findIgnoreCase(argument_name, "arena") != null or
-                allocatorIsArenaBacked(source, tokens, argument_name);
+                try allocatorIsArenaBacked(declarations, argument_name);
         };
         if (!arena_backed) {
             if (argument.start + 1 != argument.end or tokens[argument.start].tag != .identifier) return false;
@@ -823,9 +853,11 @@ fn parameterIsAlwaysArenaBacked(
             const caller_parameter = for (caller.parameter_names, 0..) |parameter, caller_index| {
                 if (std.mem.eql(u8, parameter, argument_name)) break caller_index;
             } else return false;
-            if (!parameterIsAlwaysArenaBacked(
+            if (!try parameterIsAlwaysArenaBacked(
                 source,
                 tokens,
+                scope_index,
+                declarations,
                 caller,
                 caller_parameter,
                 summary_index,
@@ -852,15 +884,50 @@ fn functionParameterMatchesArenaContract(
     return false;
 }
 
-fn bindingDeclarationValue(source: []const u8, tokens: []const std.zig.Token, name: []const u8) ?TokenRange {
-    for (tokens, 0..) |token, index| {
-        if ((token.tag != .keyword_const and token.tag != .keyword_var) or index + 2 >= tokens.len or
-            !tokenIsIdentifier(source, tokens[index + 1], name)) continue;
-        const end = findStatementEnd(tokens, index) orelse continue;
-        return .{ .start = index + 2, .end = end };
+/// The `const` and `var` declarations of a file by name, found in one pass
+/// the first time an allocator's declaration is looked up.
+const DeclarationsByName = struct {
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    /// The `const`/`var` keyword of each declaration, in order.
+    positions: ?std.StringHashMapUnmanaged(std.ArrayList(u32)) = null,
+
+    fn deinit(declarations: *DeclarationsByName) void {
+        var positions = declarations.positions orelse return;
+        var lists = positions.valueIterator();
+        while (lists.next()) |list| list.deinit(declarations.allocator);
+        positions.deinit(declarations.allocator);
     }
-    return null;
-}
+
+    /// The value of the first declaration of `name` in the file that ends.
+    fn firstValue(declarations: *DeclarationsByName, name: []const u8) !?TokenRange {
+        const tokens = declarations.tokens;
+        if (declarations.positions == null) {
+            var positions: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty;
+            errdefer {
+                var lists = positions.valueIterator();
+                while (lists.next()) |list| list.deinit(declarations.allocator);
+                positions.deinit(declarations.allocator);
+            }
+            for (tokens, 0..) |token, index| {
+                if ((token.tag != .keyword_const and token.tag != .keyword_var) or index + 2 >= tokens.len or
+                    tokens[index + 1].tag != .identifier) continue;
+                const entry = try positions.getOrPut(declarations.allocator, declarations.source[tokens[index + 1].loc.start..tokens[index + 1].loc.end]);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(declarations.allocator, @intCast(index));
+            }
+            declarations.positions = positions;
+        }
+        const list = declarations.positions.?.get(name) orelse return null;
+        for (list.items) |position| {
+            const index: usize = position;
+            const end = findStatementEnd(tokens, index) orelse continue;
+            return .{ .start = index + 2, .end = end };
+        }
+        return null;
+    }
+};
 
 fn allocatorCallReceiver(source: []const u8, tokens: []const std.zig.Token, range: TokenRange) ?[]const u8 {
     var index = range.start;
@@ -928,6 +995,24 @@ fn findMismatchedRelease(
     return mismatched;
 }
 
+/// Whether a `release` call in `[start, end)` releases the binding.
+fn bindingReleasedWith(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scope_index: *const syntax_scope.Index,
+    binding_name: []const u8,
+    binding_index: usize,
+    start: usize,
+    end: usize,
+    release: []const u8,
+) bool {
+    for (tokens[start..end], start..) |token, method_index| {
+        if (tokenIsIdentifier(source, token, release) and
+            releaseCallContainsBinding(source, tokens, scope_index, binding_name, binding_index, method_index, end)) return true;
+    }
+    return false;
+}
+
 fn allocatorPathMatches(base: []const u8, member: ?[]const u8, actual: []const u8) bool {
     const field = member orelse return std.mem.eql(u8, base, actual);
     return actual.len == base.len + 1 + field.len and
@@ -956,6 +1041,7 @@ fn findReleaseOrderingIssues(
     allocation: Allocation,
     summary_index: summaries.Index,
     configuration: types.Configuration,
+    report_leaks: bool,
     found: *std.ArrayList(types.Finding),
 ) !bool {
     const declaration_scope = enclosingScope(scope_index, declaration_index) orelse return false;
@@ -986,10 +1072,10 @@ fn findReleaseOrderingIssues(
     if (releases.items.len != 0) {
         const first_release = releases.items[0];
         if (statementStartsWith(tokens, first_release, .keyword_defer) and
-            fallibleOperationBetween(tokens, declaration_end + 1, first_release, declaration_scope.opening))
+            scope_index.fallibleOperationBetween(declaration_end + 1, first_release, declaration_scope.opening))
         {
             cleanup_registered_after_fallible_operation = true;
-            try found.append(allocator, .{
+            if (report_leaks) try found.append(allocator, .{
                 .rule = .cleanup_after_fallible_operation,
                 .level = configuration.level(.cleanup_after_fallible_operation),
                 .span = tokens[binding_index].loc,
@@ -4498,6 +4584,52 @@ test "destroy through a pool is not a double release of a recycled item" {
     try std.testing.expectEqual(@as(usize, 1), try countRule(
         "fn run(allocator: std.mem.Allocator) !void { const a = try allocator.create(u8); allocator.destroy(a); allocator.destroy(a); }",
         .double_release,
+    ));
+}
+
+test "a pointer to an array from a slice allocation is released by destroy or free" {
+    const helper =
+        "fn block(allocator: std.mem.Allocator) error{OutOfMemory}!*align(64) [64]u8 {" ++
+        "const bytes = try allocator.alignedAlloc(u8, .fromByteUnits(64), 64); return bytes[0..64]; }";
+    for ([_][:0]const u8{
+        helper ++ "fn run(a: std.mem.Allocator) !void { const b = try block(a); defer a.destroy(b); b[0] = 1; }",
+        helper ++ "fn run(a: std.mem.Allocator) !void { const b = try block(a); defer a.free(b); b[0] = 1; }",
+    }) |source| {
+        const found = try findings(std.testing.allocator, source);
+        defer freeFindings(std.testing.allocator, found);
+        try std.testing.expectEqual(@as(usize, 0), found.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        helper ++ "fn run(a: std.mem.Allocator) !void { const b = try block(a); b[0] = 1; }",
+        .unreleased_allocation,
+    ));
+    // A slice return still needs `free`.
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        "fn bytes(a: std.mem.Allocator) ![]u8 { return a.alloc(u8, 4); }" ++
+            "fn run(a: std.mem.Allocator) !void { const b = try bytes(a); defer a.destroy(b); }",
+        .mismatched_allocation_release,
+    ));
+}
+
+test "leaks in tests and through the build graph allocator are not reported" {
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "test \"scratch\" { const a = std.testing.allocator; const b = try a.alloc(u8, 4); try check(); a.free(b); }" ++
+            "test \"late\" { const a = std.testing.allocator; const b = try a.alloc(u8, 4); try check(); defer a.free(b); }",
+        .unreleased_allocation,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "test \"late\" { const a = std.testing.allocator; const b = try a.alloc(u8, 4); try check(); defer a.free(b); }",
+        .cleanup_after_fallible_operation,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), try countRule(
+        "pub fn build(b: *std.Build) void { const exes = b.allocator.alloc(u8, 6) catch @panic(\"OOM\"); _ = exes; }" ++
+            "const Lib = struct { builder: *std.Build, fn name(self: Lib) ![]u8 { const text = try std.fmt.allocPrint(self.builder.allocator, \"x\", .{}); _ = text; } };" ++
+            "fn step(b: *std.Build) !void { const gpa = b.allocator; const node = try gpa.create(u8); _ = node; }",
+        .unreleased_allocation,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), try countRule(
+        "fn leak(a: std.mem.Allocator) !void { const b = try a.alloc(u8, 4); try check(); a.free(b); }",
+        .unreleased_allocation,
     ));
 }
 

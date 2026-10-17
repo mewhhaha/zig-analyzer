@@ -185,6 +185,11 @@ pub const Index = struct {
         return null;
     }
 
+    /// `isContainerFieldDeclaration` with the enclosing block looked up in the index.
+    pub fn isContainerFieldDeclaration(index: *const Index, identifier_index: usize) bool {
+        return isContainerFieldDeclarationWithIndex(index.tokens, identifier_index, index);
+    }
+
     pub fn usingnamespaceMayProvideName(index: *const Index, use_index: usize) bool {
         if (use_index >= index.tokens.len) return false;
         for (index.usingnamespace_scopes.items) |scope| {
@@ -240,6 +245,20 @@ pub const Index = struct {
         return false;
     }
 
+    /// Whether `token_index` is inside a `test` block, looking through nested
+    /// blocks, functions and containers.
+    pub fn insideTestBlock(index: *const Index, token_index: usize) bool {
+        var brace = index.enclosingOpeningBrace(token_index);
+        while (brace) |opening| : (brace = index.enclosingOpeningBrace(opening)) {
+            if (opening == 0) break;
+            const before = index.tokens[opening - 1].tag;
+            if (before == .keyword_test) return true;
+            if (opening >= 2 and index.tokens[opening - 2].tag == .keyword_test and
+                (before == .string_literal or before == .identifier)) return true;
+        }
+        return false;
+    }
+
     const BraceKind = enum { function, container, block };
 
     /// What the signature before the `{` at `opening` introduces.
@@ -257,9 +276,27 @@ pub const Index = struct {
         return .block;
     }
 
+    /// `tokens.fallibleOperationBetween` with the enclosing blocks looked up
+    /// in the index.
+    pub fn fallibleOperationBetween(index: *const Index, start: usize, end: usize, scope_opening: usize) bool {
+        for (index.tokens[start..end], start..) |token, token_index| {
+            const fallible = token.tag == .keyword_try or
+                (token.tag == .keyword_return and token_index + 1 < end and index.tokens[token_index + 1].tag == .keyword_error);
+            if (!fallible) continue;
+            const enclosing = index.enclosingOpeningBrace(token_index) orelse continue;
+            if (enclosing == scope_opening) return true;
+            if (index.enclosingOpeningBrace(enclosing) == scope_opening) return true;
+        }
+        return false;
+    }
+
+    /// The `;` ending the statement that starts at `start`, or null when none
+    /// ends inside the block holding `start` (on unbalanced input a group's
+    /// closer can lie past the end of that block).
     pub fn statementEnd(index: *const Index, start: usize) ?usize {
+        const limit = index.enclosingScopeEnd(start) orelse index.tokens.len;
         var cursor = start;
-        while (cursor < index.tokens.len) {
+        while (cursor < limit) {
             switch (index.tokens[cursor].tag) {
                 .l_paren, .l_bracket, .l_brace => cursor = index.matchingToken(cursor) orelse return null,
                 .r_brace => return null,
@@ -269,6 +306,43 @@ pub const Index = struct {
             cursor += 1;
         }
         return null;
+    }
+};
+
+/// Scope indexes of a fixed list of files, each built by the first pass that
+/// needs it and then shared by every pass and thread that asks for it.
+pub const LazyIndexes = struct {
+    allocator: std.mem.Allocator,
+    /// Guards each slot when several threads share the indexes; null when
+    /// only one thread does.
+    io: ?std.Io,
+    slots: []Slot,
+
+    const Slot = struct {
+        mutex: std.Io.Mutex = .init,
+        index: ?Index = null,
+    };
+
+    /// `allocator` must be thread-safe when `io` is given.
+    pub fn init(allocator: std.mem.Allocator, io: ?std.Io, count: usize) !LazyIndexes {
+        const slots = try allocator.alloc(Slot, count);
+        @memset(slots, .{});
+        return .{ .allocator = allocator, .io = io, .slots = slots };
+    }
+
+    pub fn deinit(indexes: *LazyIndexes) void {
+        for (indexes.slots) |*slot| if (slot.index) |*built| built.deinit();
+        indexes.allocator.free(indexes.slots);
+    }
+
+    /// The index of file `position`, built over `source` and `tokens` on
+    /// first use; every caller passes the same file for a position.
+    pub fn at(indexes: *LazyIndexes, position: usize, source: []const u8, tokens: []const std.zig.Token) !*const Index {
+        const slot = &indexes.slots[position];
+        if (indexes.io) |io| try slot.mutex.lock(io);
+        defer if (indexes.io) |io| slot.mutex.unlock(io);
+        if (slot.index == null) slot.index = try Index.init(indexes.allocator, source, tokens);
+        return &slot.index.?;
     }
 };
 
@@ -301,13 +375,17 @@ pub fn findBinding(
 }
 
 pub fn isContainerFieldDeclaration(tokens: []const std.zig.Token, identifier_index: usize) bool {
+    return isContainerFieldDeclarationWithIndex(tokens, identifier_index, null);
+}
+
+fn isContainerFieldDeclarationWithIndex(tokens: []const std.zig.Token, identifier_index: usize, opt_idx: ?*const Index) bool {
     if (identifier_index == 0 or identifier_index >= tokens.len or tokens[identifier_index].tag != .identifier or
         identifier_index + 1 >= tokens.len) return false;
     switch (tokens[identifier_index - 1].tag) {
         .l_brace, .r_brace, .comma, .semicolon, .doc_comment, .container_doc_comment => {},
         else => return false,
     }
-    const opening = enclosingOpeningBrace(tokens, identifier_index) orelse return false;
+    const opening = enclosingOpeningBraceWithIndex(tokens, identifier_index, opt_idx) orelse return false;
     if (!braceStartsContainer(tokens, opening)) return false;
     return switch (tokens[identifier_index + 1].tag) {
         .colon, .comma, .equal, .r_brace => true,
@@ -535,6 +613,206 @@ fn braceStartsReturnType(tokens: []const std.zig.Token, opening: usize, return_t
         }
     }
     return false;
+}
+
+/// The bodies of private functions that only test code reaches: each
+/// reference to the function's name lies in a `test` block or in the body of
+/// another such function. Another file cannot name a private declaration, so
+/// the file alone decides. Rules that hold production code to a policy skip
+/// these bodies as they skip `test` blocks.
+pub const TestOnlyBodies = struct {
+    /// `{` and `}` token indices, sorted and without nesting.
+    ranges: []const Range = &.{},
+
+    pub const Range = struct { opening: usize, closing: usize };
+
+    pub fn deinit(bodies: *TestOnlyBodies, allocator: std.mem.Allocator) void {
+        allocator.free(bodies.ranges);
+        bodies.* = undefined;
+    }
+
+    /// Whether `token_index` lies inside one of the bodies, braces included.
+    pub fn contains(bodies: TestOnlyBodies, token_index: usize) bool {
+        var low: usize = 0;
+        var high = bodies.ranges.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const range = bodies.ranges[middle];
+            if (token_index < range.opening) {
+                high = middle;
+            } else if (token_index > range.closing) {
+                low = middle + 1;
+            } else return true;
+        }
+        return false;
+    }
+};
+
+pub fn testOnlyBodies(allocator: std.mem.Allocator, source: []const u8, tokens: []const std.zig.Token) !TestOnlyBodies {
+    const Function = struct {
+        opening: usize,
+        closing: ?usize = null,
+        private: bool,
+        text: []const u8,
+        /// Index into `names` when a private function has this name.
+        name: ?u32 = null,
+    };
+    // Where a reference to a private function's name appears.
+    const Site = union(enum) { testing, production, function: usize };
+    const Reference = struct { name: u32, site: Site };
+    const Frame = struct { function: ?usize, testing: bool };
+    // Same-named functions in different containers share their references,
+    // so a verdict belongs to a name: either all of them are test-only or none.
+    const Name = struct { eligible: bool = true, kept: bool = false, reached: bool = false };
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var functions: std.ArrayList(Function) = .empty;
+    // Function bodies by opening brace, filled in as signatures are passed.
+    var body_owner: std.AutoHashMapUnmanaged(usize, usize) = .empty;
+    var name_ids: std.StringHashMapUnmanaged(u32) = .empty;
+    var names: std.ArrayList(Name) = .empty;
+    var references: std.ArrayList(Reference) = .empty;
+    var frames: std.ArrayList(Frame) = .empty;
+    var test_frames: usize = 0;
+
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .keyword_fn or index + 2 >= tokens.len or tokens[index + 1].tag != .identifier or
+            tokens[index + 2].tag != .l_paren) continue;
+        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
+        const opening = functionBodyAfterParameters(tokens, parameters_end) orelse continue;
+        try body_owner.put(arena, opening, functions.items.len);
+        try functions.append(arena, .{
+            .opening = opening,
+            .private = functionIsPrivate(tokens, index),
+            .text = tokenText(source, tokens[index + 1]),
+        });
+    }
+    for (functions.items) |*function| {
+        if (!function.private) continue;
+        const entry = try name_ids.getOrPut(arena, function.text);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = @intCast(names.items.len);
+            try names.append(arena, .{});
+        }
+        function.name = entry.value_ptr.*;
+    }
+    // A public function sharing a private one's name makes every reference
+    // to the name ambiguous.
+    for (functions.items) |function| {
+        if (function.private) continue;
+        if (name_ids.get(function.text)) |id| names.items[id].eligible = false;
+    }
+
+    for (tokens, 0..) |token, index| switch (token.tag) {
+        .l_brace => {
+            const testing = index > 0 and (tokens[index - 1].tag == .keyword_test or
+                (index > 1 and tokens[index - 2].tag == .keyword_test and
+                    (tokens[index - 1].tag == .string_literal or tokens[index - 1].tag == .identifier)));
+            if (testing) test_frames += 1;
+            try frames.append(arena, .{ .function = body_owner.get(index), .testing = testing });
+        },
+        .r_brace => if (frames.pop()) |frame| {
+            if (frame.testing) test_frames -= 1;
+            if (frame.function) |function| functions.items[function].closing = index;
+        },
+        .identifier => {
+            if (index > 0 and tokens[index - 1].tag == .keyword_fn) continue;
+            const name = name_ids.get(tokenText(source, token)) orelse continue;
+            const site: Site = site: {
+                if (test_frames != 0) break :site .testing;
+                var frame_index = frames.items.len;
+                while (frame_index > 0) {
+                    frame_index -= 1;
+                    if (frames.items[frame_index].function) |function| break :site .{ .function = function };
+                }
+                break :site .production;
+            };
+            try references.append(arena, .{ .name = name, .site = site });
+        },
+        else => {},
+    };
+    for (functions.items) |function| {
+        if (function.closing == null) if (function.name) |name| {
+            names.items[name].eligible = false;
+        };
+    }
+
+    // Start from every eligible referenced name and drop those that
+    // production code or a function not kept reaches, until stable.
+    for (references.items) |reference| names.items[reference.name].kept = names.items[reference.name].eligible;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (references.items) |reference| {
+            if (!names.items[reference.name].kept) continue;
+            const from_production = switch (reference.site) {
+                .testing => false,
+                .production => true,
+                .function => |function| if (functions.items[function].name) |caller|
+                    caller != reference.name and !names.items[caller].kept
+                else
+                    true,
+            };
+            if (!from_production) continue;
+            names.items[reference.name].kept = false;
+            changed = true;
+        }
+    }
+    // Of those, keep the ones a test reaches; the rest only reach each other.
+    changed = true;
+    while (changed) {
+        changed = false;
+        for (references.items) |reference| {
+            const name = &names.items[reference.name];
+            if (!name.kept or name.reached) continue;
+            const from_test = switch (reference.site) {
+                .testing => true,
+                .production => false,
+                .function => |function| if (functions.items[function].name) |caller| names.items[caller].reached else false,
+            };
+            if (!from_test) continue;
+            name.reached = true;
+            changed = true;
+        }
+    }
+
+    var ranges: std.ArrayList(TestOnlyBodies.Range) = .empty;
+    errdefer ranges.deinit(allocator);
+    for (functions.items) |function| {
+        const name = function.name orelse continue;
+        if (names.items[name].reached) try ranges.append(allocator, .{ .opening = function.opening, .closing = function.closing.? });
+    }
+    std.mem.sort(TestOnlyBodies.Range, ranges.items, {}, struct {
+        fn lessThan(_: void, left: TestOnlyBodies.Range, right: TestOnlyBodies.Range) bool {
+            return left.opening < right.opening;
+        }
+    }.lessThan);
+    // A nested body follows the body enclosing it and is covered by it.
+    var kept_count: usize = 0;
+    for (ranges.items) |range| {
+        if (kept_count != 0 and range.opening <= ranges.items[kept_count - 1].closing) continue;
+        ranges.items[kept_count] = range;
+        kept_count += 1;
+    }
+    ranges.shrinkRetainingCapacity(kept_count);
+    return .{ .ranges = try ranges.toOwnedSlice(allocator) };
+}
+
+/// Whether the `fn` at `fn_index` is neither `pub` nor exported, looking past
+/// `inline`, `noinline` and calling-convention-free modifiers.
+fn functionIsPrivate(tokens: []const std.zig.Token, fn_index: usize) bool {
+    var cursor = fn_index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].tag) {
+            .keyword_inline, .keyword_noinline => {},
+            .keyword_pub, .keyword_export, .keyword_extern => return false,
+            else => return true,
+        }
+    }
+    return true;
 }
 
 fn identifierIsCapture(tokens: []const std.zig.Token, index: usize) bool {
@@ -809,6 +1087,7 @@ test "index scans agree with the token scans at every token" {
     for (tokens, 0..) |token, token_index| {
         try std.testing.expectEqual(enclosingOpeningBrace(tokens, token_index), index.enclosingOpeningBrace(token_index));
         try std.testing.expectEqual(@import("tokens.zig").enclosingScopeEnd(tokens, token_index), index.enclosingScopeEnd(token_index));
+        try std.testing.expectEqual(isContainerFieldDeclaration(tokens, token_index), index.isContainerFieldDeclaration(token_index));
         switch (token.tag) {
             .keyword_const, .keyword_var, .keyword_return => try std.testing.expectEqual(
                 @import("tokens.zig").statementEnd(tokens, token_index),
@@ -818,9 +1097,48 @@ test "index scans agree with the token scans at every token" {
                 @import("tokens.zig").matchingDelimiter(tokens, token_index),
                 index.matchingToken(token_index),
             ),
+            .r_paren, .r_bracket, .r_brace => {
+                const opening_tag: std.zig.Token.Tag = switch (token.tag) {
+                    .r_paren => .l_paren,
+                    .r_bracket => .l_bracket,
+                    else => .l_brace,
+                };
+                try std.testing.expectEqual(
+                    @import("tokens.zig").matchingOpeningToken(tokens, token_index, opening_tag, token.tag),
+                    index.matchingToken(token_index),
+                );
+            },
             else => {},
         }
     }
+}
+
+test "fallible operations between two tokens agree with the token scan" {
+    const source: [:0]const u8 =
+        \\fn run(allocator: Allocator) !void {
+        \\    const first = try allocator.alloc(u8, 1);
+        \\    if (first.len == 0) {
+        \\        try check(first);
+        \\        if (ready) { return error.Busy; }
+        \\    }
+        \\    defer allocator.free(first);
+        \\}
+        \\
+    ;
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    var openings: usize = 0;
+    for (tokens, 0..) |token, scope_opening| {
+        if (token.tag != .l_brace) continue;
+        openings += 1;
+        for (0..tokens.len) |start| for (start..tokens.len) |end| try std.testing.expectEqual(
+            @import("tokens.zig").fallibleOperationBetween(tokens, start, end, scope_opening),
+            index.fallibleOperationBetween(start, end, scope_opening),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 3), openings);
 }
 
 test "a closing brace belongs to the block it closes" {
@@ -868,6 +1186,23 @@ test "function bodies are found through nested blocks and stop at containers" {
     const test_variable = indexOfText(source, tokens, "x", 0);
     try std.testing.expectEqual(@as(?usize, test_body), index.enclosingFunctionBody(test_variable));
     try std.testing.expect(index.insideFunctionOrTestBody(test_variable));
+}
+
+test "test blocks are found through the blocks and containers declared in them" {
+    const source: [:0]const u8 =
+        "fn run() void { const plain = 1; }\n" ++
+        "test \"named\" { const T = struct { fn helper() void { const nested = 2; } }; }\n" ++
+        "test decl { { const block = 3; } }\n" ++
+        "test { const anonymous = 4; }\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var index = try Index.init(std.testing.allocator, source, tokens);
+    defer index.deinit();
+    try std.testing.expect(!index.insideTestBlock(indexOfText(source, tokens, "plain", 0)));
+    try std.testing.expect(!index.insideTestBlock(indexOfText(source, tokens, "run", 0)));
+    try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "nested", 0)));
+    try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "block", 0)));
+    try std.testing.expect(index.insideTestBlock(indexOfText(source, tokens, "anonymous", 0)));
 }
 
 test "usingnamespace uncertainty is limited to its container" {
@@ -1036,4 +1371,31 @@ test "captures span an unbraced destructuring assignment" {
         if (token.loc.start >= use_start and std.mem.eql(u8, tokenText(source, token), "pair")) pair_use = index;
     }
     try std.testing.expect(findBinding(source, tokens, pair_use.?) != null);
+}
+
+test "test-only bodies are private functions only tests and other test-only functions reach" {
+    const source: [:0]const u8 =
+        "fn scenario() void { fixture(); }\n" ++
+        "fn fixture() void {}\n" ++
+        "fn shared() void {}\n" ++
+        "pub fn exported() void { shared(); }\n" ++
+        "fn unused() void {}\n" ++
+        "fn spin() void { spin(); }\n" ++
+        "fn left() void { right(); }\n" ++
+        "fn right() void { left(); }\n" ++
+        "const Wrapper = struct { fn method() void {} };\n" ++
+        "test \"a\" { scenario(); shared(); left(); Wrapper.method(); }\n";
+    const tokens = try tokenize(std.testing.allocator, source);
+    defer std.testing.allocator.free(tokens);
+    var bodies = try testOnlyBodies(std.testing.allocator, source, tokens);
+    defer bodies.deinit(std.testing.allocator);
+    var inside: std.ArrayList([]const u8) = .empty;
+    defer inside.deinit(std.testing.allocator);
+    for (tokens, 0..) |token, index| {
+        if (token.tag != .keyword_fn or !bodies.contains(functionBodyAfterParameters(tokens, matchingToken(tokens, index + 2, .l_paren, .r_paren).?).?)) continue;
+        try inside.append(std.testing.allocator, tokenText(source, tokens[index + 1]));
+    }
+    const expected = [_][]const u8{ "scenario", "fixture", "left", "right", "method" };
+    try std.testing.expectEqual(expected.len, inside.items.len);
+    for (expected, inside.items) |name, found| try std.testing.expectEqualStrings(name, found);
 }

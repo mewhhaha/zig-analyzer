@@ -3,7 +3,6 @@ const RuleRun = @import("../context.zig").RuleRun;
 const resources = @import("../resources.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
-const fallibleOperationBetween = @import("../../syntax/tokens.zig").fallibleOperationBetween;
 
 pub fn run(context: RuleRun) !void {
     const level = context.level(.cleanup_after_fallible_operation);
@@ -15,6 +14,7 @@ pub fn run(context: RuleRun) !void {
             context.tokens[declaration_index + 2].tag != .equal) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const resource = resources.acquiredIn(context, declaration_index + 3, declaration_end) orelse continue;
+        if (managedMemoryInTest(context, resource, declaration_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
@@ -26,7 +26,7 @@ pub fn run(context: RuleRun) !void {
             scope_end,
             scope_opening,
         ) orelse continue;
-        if (!fallibleOperationBetween(context.tokens, declaration_end + 1, cleanup_index, scope_opening)) continue;
+        if (!context.fallibleOperationBetween(declaration_end + 1, cleanup_index, scope_opening)) continue;
         if (bindingAddressEscapesBeforeFallible(context, binding_name, declaration_end + 1, cleanup_index)) continue;
         try context.emit(.{
             .rule = .cleanup_after_fallible_operation,
@@ -166,11 +166,12 @@ fn findLateDirectCleanup(context: RuleRun, level: types.Level) !void {
             context.tokens[declaration_index + 1].tag != .identifier or context.tokens[declaration_index + 2].tag != .equal) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const resource = resources.acquiredIn(context, declaration_index + 3, declaration_end) orelse continue;
+        if (managedMemoryInTest(context, resource, declaration_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const binding_name = context.tokenText(declaration_index + 1);
         const cleanup_index = directCleanup(context, binding_name, resource.release, declaration_end + 1, scope_end) orelse continue;
-        if (!fallibleOperationBetween(context.tokens, declaration_end + 1, cleanup_index, scope_opening)) continue;
+        if (!context.fallibleOperationBetween(declaration_end + 1, cleanup_index, scope_opening)) continue;
         try context.emit(.{
             .rule = .cleanup_after_fallible_operation,
             .level = level,
@@ -181,6 +182,12 @@ fn findLateDirectCleanup(context: RuleRun, level: types.Level) !void {
             ),
         });
     }
+}
+
+/// Memory a test leaks on an error path is reported by `std.testing.allocator`
+/// itself; files, threads and other handles still need their cleanup proven.
+fn managedMemoryInTest(context: RuleRun, resource: resources.Pair, declaration_index: usize) bool {
+    return resource.kind == .managed and context.scopes.insideTestBlock(declaration_index);
 }
 
 fn bindingAddressEscapesBeforeFallible(context: RuleRun, binding_name: []const u8, start: usize, end: usize) bool {

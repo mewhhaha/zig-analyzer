@@ -2,6 +2,9 @@ const std = @import("std");
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
+const lineEnd = @import("../../syntax/tokens.zig").lineEnd;
+const lineStart = @import("../../syntax/tokens.zig").lineStart;
+const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
 
 pub const rules = [_]types.Rule{
     .redundant_optional_unwrap,
@@ -37,14 +40,25 @@ pub fn run(context: RuleRun) !void {
             });
         }
         if (edits.items.len == 0) continue;
-        const fixes = try context.allocator.alloc(types.Fix, 1);
-        fixes[0] = .{
-            .title = "Use the optional capture",
-            .kind = .quickfix,
-            .edits = try edits.toOwnedSlice(context.allocator),
-            .preferred = true,
-            .fix_all = true,
-        };
+        // Once the capture is used, a `_ = capture;` that kept it alive is a
+        // pointless discard, which does not compile.
+        const removable = try appendCaptureDiscardRemovals(context, &edits, capture_name, condition_index + 8, body_end);
+        std.mem.sort(types.Edit, edits.items, {}, struct {
+            fn lessThan(_: void, left: types.Edit, right: types.Edit) bool {
+                return left.span.start < right.span.start;
+            }
+        }.lessThan);
+        const fixes: []const types.Fix = if (removable) fixes: {
+            const allocated = try context.allocator.alloc(types.Fix, 1);
+            allocated[0] = .{
+                .title = "Use the optional capture",
+                .kind = .quickfix,
+                .edits = try edits.toOwnedSlice(context.allocator),
+                .preferred = true,
+                .fix_all = true,
+            };
+            break :fixes allocated;
+        } else &.{};
         try context.emit(.{
             .rule = .redundant_optional_unwrap,
             .level = level,
@@ -56,6 +70,37 @@ pub fn run(context: RuleRun) !void {
             .fixes = fixes,
         });
     }
+}
+
+/// Appends edits deleting each `_ = capture;` statement in `[start, end)`.
+/// False when one is not a block statement that can be deleted.
+fn appendCaptureDiscardRemovals(
+    context: RuleRun,
+    edits: *std.ArrayList(types.Edit),
+    capture_name: []const u8,
+    start: usize,
+    end: usize,
+) !bool {
+    const source = context.source;
+    var index = start;
+    while (index + 3 < end) : (index += 1) {
+        if (context.tokens[index].tag != .identifier or !context.tokenIs(index, "_") or
+            context.tokens[index + 1].tag != .equal or !context.refersToBinding(index + 2, capture_name) or
+            context.tokens[index + 3].tag != .semicolon) continue;
+        switch (context.tokens[index - 1].tag) {
+            .l_brace, .r_brace, .semicolon => {},
+            else => return false,
+        }
+        const span: std.zig.Token.Loc = .{ .start = context.tokens[index].loc.start, .end = context.tokens[index + 3].loc.end };
+        // A discard alone on its line goes with the line, so no blank one is left behind.
+        const alone = std.mem.trim(u8, source[lineStart(source, span.start)..span.start], " \t").len == 0 and
+            std.mem.trim(u8, source[span.end..lineEnd(source, span.end)], " \t\r\n").len == 0;
+        try edits.append(context.allocator, .{
+            .span = if (alone) removedLinesSpan(source, span.start, span.end) else span,
+            .replacement = "",
+        });
+    }
+    return true;
 }
 
 fn bindingChangesOrIsShadowed(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
@@ -111,6 +156,36 @@ test "optional captures replace repeated force unwraps" {
     const findings = try support.findings(arena.allocator(), run, source, configuration);
     try std.testing.expectEqual(@as(usize, 1), findings.len);
     try std.testing.expectEqualStrings("value", findings[0].fixes[0].edits[0].replacement);
+}
+
+test "the capture rewrite deletes a discard that kept the capture alive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn use(optional: ?u32) void {\n" ++
+        "    if (optional) |value| {\n" ++
+        "        consume(optional.?);\n" ++
+        "        _ = value;\n" ++
+        "    }\n" ++
+        "}\n";
+    const configuration = support.only(&.{.redundant_optional_unwrap}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    const edits = findings[0].fixes[0].edits;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqualStrings("value", edits[0].replacement);
+    try std.testing.expectEqualStrings("        _ = value;\n", source[edits[1].span.start..edits[1].span.end]);
+    try std.testing.expectEqualStrings("", edits[1].replacement);
+}
+
+test "a discard outside a block statement withholds the capture rewrite" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 = "if (optional) |value| { consume(optional.?); if (ready) _ = value; }";
+    const configuration = support.only(&.{.redundant_optional_unwrap}, .information);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), findings.len);
+    try std.testing.expectEqual(@as(usize, 0), findings[0].fixes.len);
 }
 
 test "reassigned optionals do not produce capture rewrites" {

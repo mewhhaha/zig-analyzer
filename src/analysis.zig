@@ -17,6 +17,7 @@ pub const ModuleMembers = types.ModuleMembers;
 pub const declarationBaseName = types.declarationBaseName;
 
 pub const parseConfiguration = configuration.parse;
+pub const configurationForPath = configuration.forPath;
 pub const suppressionWarning = configuration.suppressionWarning;
 pub const suppressionEdits = configuration.suppressionEdits;
 pub const Suppressions = configuration.Suppressions;

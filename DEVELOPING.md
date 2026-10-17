@@ -81,6 +81,43 @@ engine (the allocating templates are exempt from `allocation-after-init` only),
 that findings survive formatting, comments and renames, and that no input crashes
 a rule. Add a template there when a false positive is fixed.
 
+### Corpus checks
+
+Unit tests do not show how a rule behaves on real code, so a rule change also
+needs:
+
+- **probes:** small files proving the new true positives and the fixed false
+  positives, checked against the previous build first;
+- **a corpus delta:** per-rule finding counts on real projects, compared with
+  the previous build, with new findings read and confirmed; and
+- **a performance check:** the previous release build and the candidate run
+  back to back. A whole-file scan per declaration once slowed `Sema.zig` from
+  0.9 s to 4.2 s.
+
+The usual corpora are the installed std lib, the Zig compiler's `Sema.zig` and
+x86_64 `CodeGen.zig` (both in `.zig-analyzer/zig-<version>/src/`), ghostty,
+tigerbeetle and zls. Keep them outside the repository, so the self-check
+does not lint them, and treat them as data; never build or run them. From the
+repository root:
+
+```sh
+mkdir -p ../zig-analyzer-corpus && cd ../zig-analyzer-corpus
+cp -r "$(zig env | sed -n 's/.*\.std_dir = "\(.*\)",/\1/p')" std
+mkdir sema codegen
+cp ../zig-analyzer/.zig-analyzer/zig-0.17.0/src/Sema.zig sema/
+cp ../zig-analyzer/.zig-analyzer/zig-0.17.0/src/codegen/x86_64/CodeGen.zig codegen/
+for r in ghostty-org/ghostty tigerbeetle/tigerbeetle zigtools/zls; do
+  git clone --depth 1 "https://github.com/$r.git" "$(basename "$r")"
+done
+```
+
+Build each binary with `zig build -Doptimize=fast --prefix <dir>`, write
+`{"lints":{"correctness":"warning","style":"warning"}}` to each corpus's
+`zig-analyzer.json`, run `<dir>/bin/zig-analyzer check --no-cache .` in it,
+and compare per-rule counts with
+`grep -oE '\[[a-z-]+\]' <output> | sort | uniq -c`. On a loaded machine,
+compare user+sys CPU time from interleaved runs rather than wall time.
+
 ## The compiler backend
 
 `zig build backend` builds the patched compiler into `zig-out/backend`. Editing

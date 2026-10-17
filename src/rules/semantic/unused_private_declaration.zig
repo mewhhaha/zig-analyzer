@@ -3,12 +3,12 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
 const lineStart = @import("../../syntax/tokens.zig").lineStart;
 const removedLinesSpan = @import("../../syntax/tokens.zig").removedLinesSpan;
 const attachedCommentStart = @import("../../syntax/tokens.zig").attachedCommentStart;
 const rule_context = @import("../context.zig");
+const syntax_scope = @import("../../syntax/scope.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -66,7 +66,7 @@ fn findUnusedPrivateDeclarations(context: RuleRun) !void {
         const entry = try occurrence_counts.getOrPutValue(context.allocator, tokenText(source, token), 0);
         entry.value_ptr.* += 1;
     }
-    var reflected_names = try collectReflectedNames(context.allocator, source, tokens);
+    var reflected_names = try collectReflectedNames(context.allocator, context.scopes);
     defer reflected_names.names.deinit(context.allocator);
     if (reflected_names.wildcard) return;
     for (declarations.items) |declaration| {
@@ -168,9 +168,10 @@ const ReflectedNames = struct {
 
 fn collectReflectedNames(
     allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []const std.zig.Token,
+    scopes: *const syntax_scope.Index,
 ) !ReflectedNames {
+    const source = scopes.source;
+    const tokens = scopes.tokens;
     var collected: ReflectedNames = .{ .wildcard = false, .names = .empty };
     for (tokens, 0..) |token, index| {
         if (token.tag != .builtin or
@@ -180,7 +181,7 @@ fn collectReflectedNames(
             collected.wildcard = true;
             return collected;
         }
-        const closing = matchingToken(tokens, index + 1, .l_paren, .r_paren) orelse {
+        const closing = scopes.matchingToken(index + 1) orelse {
             collected.wildcard = true;
             return collected;
         };

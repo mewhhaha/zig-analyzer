@@ -8,6 +8,9 @@ const support = @import("../test_support.zig");
 
 pub const rules = [_]types.Rule{
     .deprecated_declaration,
+    // Reported by the same deprecation index once a host resolves
+    // `@import("std")` to the installed standard library; never file-locally.
+    .removed_std_api,
     .useless_error_return,
     .exposed_private_type,
     .exposed_private_error_set,

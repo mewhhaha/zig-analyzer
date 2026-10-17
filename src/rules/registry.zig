@@ -24,6 +24,7 @@ const rule_modules = .{
     @import("hazards/unchecked_first_element.zig"),
     @import("hazards/unchecked_slice_reinterpretation.zig"),
     @import("hazards/unconditional_busy_loop.zig"),
+    @import("hazards/unconsumed_delimiter.zig"),
     @import("hazards/undefined_readvec_destination.zig"),
     @import("hazards/unsafe_orelse_unreachable.zig"),
     @import("hazards/unsequenced_state_access.zig"),
@@ -75,6 +76,7 @@ const rule_modules = .{
     @import("idioms/prefer_testing_expect_equal.zig"),
     @import("idioms/prefer_testing_expect_equal_strings.zig"),
     @import("idioms/prefer_try.zig"),
+    @import("idioms/prefer_typed_io_parameter.zig"),
     @import("idioms/prefer_vector_reduce.zig"),
     @import("idioms/prefer_write_byte.zig"),
     @import("idioms/redundant_boolean_if.zig"),
@@ -101,6 +103,8 @@ const rule_modules = .{
     @import("lifecycle/missing_resource_cleanup.zig"),
     @import("lifecycle/returning_local_slice.zig"),
     @import("lifecycle/returning_released_value.zig"),
+    @import("lifecycle/unawaited_async.zig"),
+    @import("lifecycle/unflushed_writer.zig"),
 
     // modernize/: Zig version migration
     @import("modernize/modernize.zig"),

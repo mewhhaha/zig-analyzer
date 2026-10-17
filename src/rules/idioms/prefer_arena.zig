@@ -9,6 +9,8 @@ pub const rules = [_]types.Rule{.prefer_arena};
 pub fn run(context: RuleRun) !void {
     const level = context.level(.prefer_arena);
     if (level == .off) return;
+    var scenarios = try failureScenarios(context);
+    defer scenarios.deinit(context.allocator);
     for (context.tokens, 0..) |token, opening| {
         if (token.tag != .l_brace) continue;
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
@@ -36,11 +38,15 @@ pub fn run(context: RuleRun) !void {
                 if (allocator_name == null) allocator_name = candidate;
                 if (std.mem.eql(u8, allocator_name.?, candidate)) allocation_count += 1;
             }
+            // An errdefer release keeps the allocation alive on success, which an arena would not.
             if ((std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy")) and
                 allocator_name != null and context.tokenIs(index, allocator_name.?) and index > opening + 1 and
-                (context.tokens[index - 1].tag == .keyword_defer or context.tokens[index - 1].tag == .keyword_errdefer)) cleanup_count += 1;
+                context.tokens[index - 1].tag == .keyword_defer) cleanup_count += 1;
         }
         if (allocation_count < 3 or cleanup_count < allocation_count or has_direct_return) continue;
+        if (scenarios.count() != 0) if (enclosingFunctionName(context, opening)) |name| {
+            if (scenarios.contains(name)) continue;
+        };
         try context.emit(.{
             .rule = .prefer_arena,
             .level = level,
@@ -48,6 +54,37 @@ pub fn run(context: RuleRun) !void {
             .message = try context.allocator.print("scope makes {d} allocations from '{s}' and releases all at exit; an ArenaAllocator can make that lifetime structural", .{ allocation_count, allocator_name.? }),
         });
     }
+}
+
+/// Names passed to `checkAllAllocationFailures`: those functions exist to fail
+/// and release each allocation in turn, which one arena would hide.
+fn failureScenarios(context: RuleRun) !std.StringHashMapUnmanaged(void) {
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer names.deinit(context.allocator);
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .identifier or !context.tokenIs(index, "checkAllAllocationFailures") or
+            context.tokens[index + 1].tag != .l_paren) continue;
+        const closing = context.scopes.matchingToken(index + 1) orelse continue;
+        for (context.tokens[index + 2 .. closing], index + 2..) |argument, argument_index| {
+            if (argument.tag == .identifier) try names.put(context.allocator, context.tokenText(argument_index), {});
+        }
+    }
+    return names;
+}
+
+/// The name of the function whose body is or encloses the block at `opening`.
+fn enclosingFunctionName(context: RuleRun, opening: usize) ?[]const u8 {
+    const body = context.scopes.enclosingFunctionBody(opening + 1) orelse return null;
+    var cursor = body;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .keyword_fn => return if (context.tokens[cursor + 1].tag == .identifier) context.tokenText(cursor + 1) else null,
+            .keyword_test, .semicolon, .l_brace, .r_brace => return null,
+            else => {},
+        }
+    }
+    return null;
 }
 
 test "repeated allocations with identical defers report" {
@@ -60,4 +97,25 @@ test "repeated allocations with identical defers report" {
         "const c = try allocator.alloc(u8, 1); defer allocator.free(c); }";
     const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_arena}, .information));
     try support.expectRules(found, &.{.prefer_arena});
+}
+
+test "failure-sweep scenarios and errdefer-released allocations are not arena candidates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn scenario(allocator: std.mem.Allocator) !void {\n" ++
+        "    const a = try allocator.alloc(u8, 1); defer allocator.free(a);\n" ++
+        "    const b = try allocator.alloc(u8, 1); defer allocator.free(b);\n" ++
+        "    const c = try allocator.alloc(u8, 1); defer allocator.free(c);\n" ++
+        "}\n" ++
+        "fn fill(owner: *Owner, allocator: std.mem.Allocator) !void {\n" ++
+        "    owner.a = try allocator.alloc(u8, 1); errdefer allocator.free(owner.a);\n" ++
+        "    owner.b = try allocator.alloc(u8, 1); errdefer allocator.free(owner.b);\n" ++
+        "    owner.c = try allocator.alloc(u8, 1); errdefer allocator.free(owner.c);\n" ++
+        "}\n" ++
+        "test {\n" ++
+        "    try std.testing.checkAllAllocationFailures(std.testing.allocator, scenario, .{});\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, support.only(&.{.prefer_arena}, .information));
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }

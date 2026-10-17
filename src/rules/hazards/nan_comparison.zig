@@ -91,7 +91,7 @@ fn parseNanCall(context: RuleRun, start: usize) ?NanCall {
 
 fn parseNanCallEndingAt(context: RuleRun, end: usize) ?NanCall {
     if (end < 4 or context.tokens[end - 1].tag != .r_paren) return null;
-    const open_paren = matchingOpeningToken(context.tokens, end - 1, .l_paren, .r_paren) orelse return null;
+    const open_paren = context.scopes.matchingToken(end - 1) orelse return null;
     if (open_paren < 2) return null;
     if (context.tokens[open_paren - 1].tag != .identifier) return null;
     if (!context.tokenIs(open_paren - 1, "nan") and !context.tokenIs(open_paren - 1, "snan")) return null;
@@ -110,27 +110,6 @@ fn parseNanCallEndingAt(context: RuleRun, end: usize) ?NanCall {
             .span = .{ .start = open_paren - 3, .end = end },
             .prefix = "math.isNan",
         };
-    }
-    return null;
-}
-
-fn matchingOpeningToken(
-    tokens: []const std.zig.Token,
-    closing_index: usize,
-    opening_tag: std.zig.Token.Tag,
-    closing_tag: std.zig.Token.Tag,
-) ?usize {
-    var depth: usize = 0;
-    var cursor = closing_index;
-    while (true) {
-        const token = tokens[cursor];
-        if (token.tag == closing_tag) depth += 1;
-        if (token.tag == opening_tag) {
-            depth -= 1;
-            if (depth == 0) return cursor;
-        }
-        if (cursor == 0) break;
-        cursor -= 1;
     }
     return null;
 }

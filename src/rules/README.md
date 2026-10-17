@@ -86,8 +86,9 @@ finding types.
 
 `resources.zig` is the single table of resource acquisition and release
 knowledge (file and directory handles, threads, managed containers, allocator
-methods). It merges the declared `contracts.resources` pairs with the built-in
-ones, so every cleanup rule honours both.
+methods, `std.Io` tasks, buffered writers). It merges the declared
+`contracts.resources` pairs with the built-in ones, so every cleanup rule
+honours both.
 
 A module may run helper passes that share its codes (`lifecycle/allocation_lifecycle.zig`
 also runs the token-pattern ownership and late-cleanup passes), but the module

@@ -468,6 +468,16 @@ fn applySetting(
             };
             configuration.todo_markers = markers;
         },
+        .function_case => {
+            const expected = "\"camelCase\" or \"snake_case\"";
+            const text = switch (value) {
+                .string => |string| string,
+                else => return try settingTypeWarning(allocator, rule, key, expected),
+            };
+            configuration.function_case = for (std.enums.values(rule_types.FunctionCase)) |case| {
+                if (std.mem.eql(u8, text, case.text())) break case;
+            } else return try settingTypeWarning(allocator, rule, key, expected);
+        },
     }
     return null;
 }
@@ -865,6 +875,82 @@ fn profileIncludes(selected: LintProfile, required: LintProfile) bool {
     };
 }
 
+/// `configuration` relaxed for the source at `path`, which the CLI and the
+/// language server apply alike. Test sources and `build.zig` may print rather
+/// than log. Test, fuzz and script sources are not production code, so the
+/// rules the `disciplined` profile enables do not apply to them, and their
+/// `pub` declarations (shared fixtures, script helpers) are no library API.
+/// A `build.zig` exports its declarations to dependent build scripts, and a
+/// `testing/` directory may be a library's testing API (`std.testing`).
+pub fn forPath(configuration: Configuration, path: []const u8) Configuration {
+    const role = sourceRole(path);
+    if (role == .production) return configuration;
+    var file_configuration = configuration;
+    const build_script = std.mem.eql(u8, std.Io.Dir.path.basename(path), "build.zig");
+    if (role == .testing or build_script) {
+        file_configuration.levels[@backingInt(Rule.prefer_log_over_print)] = .off;
+    }
+    if (!build_script and !testingLibrary(path)) {
+        file_configuration.levels[@backingInt(Rule.public_declaration_docs)] = .off;
+    }
+    for (discipline_rules) |rule| file_configuration.levels[@backingInt(rule)] = .off;
+    return file_configuration;
+}
+
+/// The rules whose lowest profile is `disciplined`.
+const discipline_rules = rules: {
+    @setEvalBranchQuota(100_000);
+    var found: []const Rule = &.{};
+    for (std.enums.values(Rule)) |rule| {
+        if (catalog.entry(rule).profile == .disciplined) found = found ++ .{rule};
+    }
+    break :rules found;
+};
+
+const SourceRole = enum { production, testing, fuzzing, script };
+
+/// What the source at `path` is for, judged by the conventions Zig projects
+/// name these files with: `*_test.zig`, `*_tests.zig` and `test/`, `tests/`
+/// or `testing/` directories hold tests; a `fuzz` anywhere in a component
+/// marks a fuzzer (`forest_fuzz.zig`, `fuzz/`); `build.zig` and the
+/// `build/`, `scripts/` and `tools/` directories hold build and maintenance
+/// scripts.
+fn sourceRole(path: []const u8) SourceRole {
+    const basename = std.Io.Dir.path.basename(path);
+    if (std.mem.endsWith(u8, basename, "_test.zig") or std.mem.endsWith(u8, basename, "_tests.zig")) return .testing;
+    if (std.mem.eql(u8, basename, "build.zig")) return .script;
+    var role: SourceRole = .production;
+    var components = std.mem.splitAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "test") or std.mem.eql(u8, component, "tests") or
+            std.mem.eql(u8, component, "testing")) return .testing;
+        if (role != .production) continue;
+        if (std.mem.find(u8, component, "fuzz") != null) {
+            role = .fuzzing;
+        } else if (components.peek() != null and (std.mem.eql(u8, component, "build") or
+            std.mem.eql(u8, component, "scripts") or std.mem.eql(u8, component, "tools")))
+        {
+            role = .script;
+        }
+    }
+    return role;
+}
+
+/// Whether `path` is a test source only by lying under a `testing/`
+/// directory, which libraries also use for the helpers they publish.
+fn testingLibrary(path: []const u8) bool {
+    const basename = std.Io.Dir.path.basename(path);
+    if (std.mem.endsWith(u8, basename, "_test.zig") or std.mem.endsWith(u8, basename, "_tests.zig")) return false;
+    var testing = false;
+    var components = std.mem.splitAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "test") or std.mem.eql(u8, component, "tests") or
+            std.mem.find(u8, component, "fuzz") != null) return false;
+        if (std.mem.eql(u8, component, "testing")) testing = true;
+    }
+    return testing;
+}
+
 fn validBannedPath(path: []const u8) bool {
     var segments = std.mem.splitScalar(u8, path, '.');
     while (segments.next()) |segment| {
@@ -963,6 +1049,68 @@ test "threshold and marker rules parse typed settings" {
     try std.testing.expectEqual(Level.warning, configuration.level(.function_length));
     try std.testing.expectEqual(Level.information, configuration.level(.line_length));
     try std.testing.expectEqual(Level.hint, configuration.level(.todo_comment));
+}
+
+test "test, fuzz and script paths are not held to the discipline rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"profile":"disciplined","rules":{"prefer-log-over-print":"warning"}}}
+    );
+    const relaxed_paths = [_][]const u8{
+        "tests/walk.zig",           "src/parser_test.zig", "src/testing/storage.zig", "src/lsm/forest_fuzz.zig",
+        "src/fuzz/terminal.zig",    "build.zig",           "src/scripts/release.zig", "tools/update_cpu.zig",
+        "src/build/SharedDeps.zig",
+    };
+    for (relaxed_paths) |path| {
+        errdefer std.debug.print("path {s} was not relaxed\n", .{path});
+        const relaxed = forPath(configuration, path);
+        try std.testing.expectEqual(Level.off, relaxed.level(.function_length));
+        try std.testing.expectEqual(Level.off, relaxed.level(.allocation_after_init));
+        try std.testing.expectEqual(Level.off, relaxed.level(.recursive_call));
+        try std.testing.expectEqual(Level.off, relaxed.level(.unbounded_loop));
+    }
+    const production_paths = [_][]const u8{ "src/main.zig", "src/build.zig.zon.zig", "src/tools.zig", "Build/Step.zig", "src/contest.zig" };
+    for (production_paths) |path| {
+        errdefer std.debug.print("path {s} was relaxed\n", .{path});
+        try std.testing.expectEqual(Level.information, forPath(configuration, path).level(.function_length));
+    }
+    // Printing stays a production-only concern for tests and build.zig.
+    try std.testing.expectEqual(Level.off, forPath(configuration, "tests/walk.zig").level(.prefer_log_over_print));
+    try std.testing.expectEqual(Level.warning, forPath(configuration, "tools/update_cpu.zig").level(.prefer_log_over_print));
+}
+
+test "only production sources and build.zig publish documented API" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"rules":{"public-declaration-docs":"warning"}}}
+    );
+    for ([_][]const u8{ "src/check_tests.zig", "tests/fixtures.zig", "src/lsm/forest_fuzz.zig", "tools/release.zig" }) |path| {
+        try std.testing.expectEqual(Level.off, forPath(configuration, path).level(.public_declaration_docs));
+    }
+    for ([_][]const u8{ "src/main.zig", "build.zig", "lib/std/testing/FailingAllocator.zig" }) |path| {
+        try std.testing.expectEqual(Level.warning, forPath(configuration, path).level(.public_declaration_docs));
+    }
+}
+
+test "naming rule parses its function case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const configuration = try parse(arena.allocator(),
+        \\{"lints":{"rules":{"non-idiomatic-name":{"level":"warning","function-case":"snake_case"}}}}
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), configuration.warning);
+    try std.testing.expectEqual(rule_types.FunctionCase.snake_case, configuration.function_case);
+    try std.testing.expectEqual(Level.warning, configuration.level(.non_idiomatic_name));
+    const rejected = try parse(arena.allocator(),
+        \\{"lints":{"rules":{"non-idiomatic-name":{"function-case":"kebab-case"}}}}
+    );
+    try std.testing.expectEqualStrings(
+        "zig-analyzer.json rule 'non-idiomatic-name' setting 'function-case' must be \"camelCase\" or \"snake_case\"",
+        rejected.warning.?,
+    );
+    try std.testing.expectEqual(rule_types.FunctionCase.camel_case, rejected.function_case);
 }
 
 test "rule setting errors name the offending rule and setting" {

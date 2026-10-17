@@ -241,6 +241,10 @@ pub fn findInconsistentImportAliases(
         const current_alias = current.alias orelse continue;
         const group = aliases.lookup(current.resolved_path);
         if (!group.isMinority(current_alias)) continue;
+        // The file already declares the majority alias, as a function, a
+        // local or a parameter; the import cannot take that name.
+        const scopes = try run.scopes(current.file_index);
+        if (scopes.bindings.contains(group.dominant.?)) continue;
         try run.report(.{
             .file_index = current.file_index,
             .rule = .inconsistent_import_alias,

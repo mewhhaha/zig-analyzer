@@ -11,11 +11,15 @@ pub fn run(context: RuleRun) !void {
     const level = context.level(.undefined_readvec_destination);
     if (level == .off) return;
 
+    // Whether a descriptor type holds a slice is a whole-file lookup by name,
+    // so each name is looked up once.
+    var slice_types: std.StringHashMapUnmanaged(bool) = .empty;
+    defer slice_types.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_var or declaration_index + 5 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const descriptor_count = undefinedSliceDescriptorCount(context, declaration_index, declaration_end) orelse continue;
+        const descriptor_count = try undefinedSliceDescriptorCount(context, &slice_types, declaration_index, declaration_end) orelse continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         const call_index = readVecCallWithDestination(context, binding, declaration_end + 1, scope_end) orelse continue;
@@ -32,7 +36,12 @@ pub fn run(context: RuleRun) !void {
     }
 }
 
-fn undefinedSliceDescriptorCount(context: RuleRun, start: usize, end: usize) ?usize {
+fn undefinedSliceDescriptorCount(
+    context: RuleRun,
+    slice_types: *std.StringHashMapUnmanaged(bool),
+    start: usize,
+    end: usize,
+) !?usize {
     var equal_index: ?usize = null;
     var descriptor_count: ?usize = null;
     var descriptor_type: ?[]const u8 = null;
@@ -57,13 +66,12 @@ fn undefinedSliceDescriptorCount(context: RuleRun, start: usize, end: usize) ?us
         }
     }
     const equal = equal_index orelse return null;
-    const contains_slice = bracket_pairs >= 2 or if (descriptor_type) |type_name|
-        descriptorTypeContainsSlice(context, type_name)
-    else
-        false;
-    if (!contains_slice or equal + 1 >= end or
-        context.tokens[equal + 1].tag != .identifier or !context.tokenIs(equal + 1, "undefined")) return null;
-    return descriptor_count;
+    if (equal + 1 >= end or context.tokens[equal + 1].tag != .identifier or !context.tokenIs(equal + 1, "undefined")) return null;
+    if (bracket_pairs >= 2) return descriptor_count;
+    const type_name = descriptor_type orelse return null;
+    const known = try slice_types.getOrPut(context.allocator, type_name);
+    if (!known.found_existing) known.value_ptr.* = descriptorTypeContainsSlice(context, type_name);
+    return if (known.value_ptr.*) descriptor_count else null;
 }
 
 fn descriptorTypeContainsSlice(context: RuleRun, type_name: []const u8) bool {

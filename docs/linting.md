@@ -40,14 +40,18 @@ A profile enables a curated set of style rules:
 - `official`, `idiomatic`, and `strict` progressively add style guidance.
 - `modernize` targets migrations between pinned Zig releases.
 - `disciplined` enables the bounded-loop, allocation, recursion, assertion,
-  and function-size policies as an independent set.
+  and function-size policies as an independent set. They hold production
+  code only: `test` blocks are exempt, and so are test files (`*_test.zig`,
+  `*_tests.zig`, `test/`, `tests/`, `testing/`), fuzzers (a path component
+  containing `fuzz`), and scripts (`build.zig` and the `build/`, `scripts/`,
+  and `tools/` directories).
 
 ## Configuration
 
 Configuration is read from the nearest `zig-analyzer.json` at or above the
 directory being checked (for the CLI) or above each open file (for the language
-server); both apply the same per-path relaxations, such as allowing debug
-printing in tests and `build.zig`. The language server notices edits to the file
+server); both apply the same per-path relaxations, judged by the path inside
+the project, such as allowing debug printing in tests and `build.zig`. The language server notices edits to the file
 on the next request. Configuration errors are reported with the offending key
 rather than silently ignored, once per change.
 

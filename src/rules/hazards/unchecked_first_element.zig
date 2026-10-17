@@ -127,6 +127,7 @@ fn hasNonEmptyProof(context: RuleRun, name: []const u8, declaration_index: usize
     if (shortCircuitProvesNonEmpty(context, name, declaration_index, use_index)) return true;
     if (guardHelperShortCircuitProvesNonEmpty(context, name, declaration_index, use_index)) return true;
     if (inlineConditionalProvesNonEmpty(context, name, declaration_index, use_index)) return true;
+    if (unbracedThenBranchProvesNonEmpty(context, name, declaration_index, use_index)) return true;
     if (switchProvesNonEmpty(context, name, declaration_index, use_index)) return true;
     var opening = context.enclosingOpeningBrace(use_index);
     while (opening) |brace| {
@@ -258,6 +259,53 @@ fn inlineConditionalProvesNonEmpty(context: RuleRun, name: []const u8, start: us
             if (branch_token.tag == .keyword_else) return true;
         }
     }
+    return false;
+}
+
+/// `if (s.len == 1) return f(s[0]);`: the use sits in the unbraced then-branch
+/// of a condition that proves the slice non-empty when true.
+fn unbracedThenBranchProvesNonEmpty(context: RuleRun, name: []const u8, start: usize, use_index: usize) bool {
+    const search_start = @max(start, use_index -| proof_window_tokens);
+    for (context.tokens[search_start..use_index], search_start..) |token, if_index| {
+        if (token.tag != .keyword_if or if_index + 1 >= use_index or context.tokens[if_index + 1].tag != .l_paren) continue;
+        const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
+        if (condition_end >= use_index or hasTopLevelOr(context, if_index + 2, condition_end) or
+            !conditionProvesNonEmpty(context, name, if_index + 2, condition_end)) continue;
+        if (insideThenBranch(context, condition_end + 1, use_index)) return true;
+    }
+    return false;
+}
+
+/// Whether `use_index` is reached from `branch_start` without leaving the
+/// branch: no closer of an enclosing group, no block ending the branch, and no
+/// `else`, `,` or `;` outside nested groups.
+fn insideThenBranch(context: RuleRun, branch_start: usize, use_index: usize) bool {
+    var depth: usize = 0;
+    for (context.tokens[branch_start..use_index]) |token| switch (token.tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket => {
+            if (depth == 0) return false;
+            depth -= 1;
+        },
+        .r_brace => {
+            if (depth <= 1) return false;
+            depth -= 1;
+        },
+        .keyword_else => return false,
+        .comma, .semicolon => if (depth == 0) return false,
+        else => {},
+    };
+    return true;
+}
+
+fn hasTopLevelOr(context: RuleRun, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    for (context.tokens[start..end]) |token| switch (token.tag) {
+        .l_paren => depth += 1,
+        .r_paren => depth -|= 1,
+        .keyword_or => if (depth == 0) return true,
+        else => {},
+    };
     return false;
 }
 
@@ -552,6 +600,24 @@ test "short circuit inline conditionals and switch guards prove a first element"
         "pub fn switched(bytes: []const u8) u8 { switch (bytes.len) { 0 => return 0, 1 => return bytes[0], else => {} } return bytes[0]; }";
     const findings = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "an unbraced then-branch of a length test proves a first element" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub fn count(haystack: []const u8, needle: []const u8) usize {\n" ++
+        "    if (needle.len == 1) return countScalar(haystack, needle[0]);\n" ++
+        "    if (needle.len != 0 and ready()) return needle[0];\n" ++
+        "    return 0;\n" ++
+        "}\n" ++
+        "pub fn after(needle: []const u8) u8 { if (needle.len == 1) log(); return needle[0]; }\n" ++
+        "pub fn other(needle: []const u8) u8 { if (needle.len == 1) log() else use(needle[0]); return 0; }\n" ++
+        "pub fn either(needle: []const u8, x: bool) u8 { if (needle.len == 1 or x) return needle[0]; return 0; }\n" ++
+        "pub fn block(path: []const u8) bool { if (path.len >= 2) { return true; } return (path[1] == 0 or path[0] == 0); }\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try std.testing.expectEqual(@as(usize, 4), findings.len);
+    for (findings) |finding| try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn after").?);
 }
 
 test "entry guards remain valid in long functions and fields do not alias parameters" {

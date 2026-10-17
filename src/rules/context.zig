@@ -78,6 +78,10 @@ pub const RuleRun = struct {
         return context.scopes.enclosingScopeEnd(index);
     }
 
+    pub fn fallibleOperationBetween(context: RuleRun, start: usize, end: usize, scope_opening: usize) bool {
+        return context.scopes.fallibleOperationBetween(start, end, scope_opening);
+    }
+
     pub fn topLevelComma(context: RuleRun, start: usize, end: usize) ?usize {
         return tokens_util.topLevelComma(context.tokens, start, end);
     }
@@ -191,6 +195,45 @@ pub const RuleRun = struct {
             cursor = (context.matchingToken(cursor, .l_paren, .r_paren) orelse return null) + 1;
         }
         return if (cursor < context.tokens.len and context.tokens[cursor].tag == .l_brace) cursor else null;
+    }
+
+    /// Whether the identifier at `index` names an `std.Io` instance, by the
+    /// usual spelling (`io`, `init.io`, `test_io`) or a declared `Io` type.
+    pub fn namesIo(context: RuleRun, index: usize) bool {
+        if (context.tokens[index].tag != .identifier) return false;
+        const name = context.tokenText(index);
+        if (std.mem.eql(u8, name, "io") or std.mem.endsWith(u8, name, "_io") or std.mem.startsWith(u8, name, "io_")) return true;
+        if (index > 0 and context.tokens[index - 1].tag == .period) return false;
+        const binding = context.scopes.findBinding(index) orelse return false;
+        var type_start = binding.token_index + 2;
+        if (type_start >= context.tokens.len or context.tokens[type_start - 1].tag != .colon) return false;
+        if (context.tokenIs(type_start, "std") and context.tokens[type_start + 1].tag == .period) type_start += 2;
+        return context.tokenIs(type_start, "Io") and context.tokens[type_start + 1].tag != .period;
+    }
+
+    /// The `while` or `for` keyword whose body the `{` at `opening` starts,
+    /// looking back over any payload capture and continue expression.
+    pub fn loopKeyword(context: RuleRun, opening: usize) ?usize {
+        var cursor = opening;
+        while (cursor > 0) switch (context.tokens[cursor - 1].tag) {
+            .pipe => {
+                cursor -= 1;
+                while (cursor > 0 and context.tokens[cursor - 1].tag != .pipe) cursor -= 1;
+                if (cursor == 0) return null;
+                cursor -= 1;
+            },
+            .r_paren => {
+                const condition = context.scopes.matchingToken(cursor - 1) orelse return null;
+                if (condition == 0) return null;
+                switch (context.tokens[condition - 1].tag) {
+                    .colon => cursor = condition - 1,
+                    .keyword_while, .keyword_for => return condition - 1,
+                    else => return null,
+                }
+            },
+            else => return null,
+        };
+        return null;
     }
 
     pub fn argumentSource(context: RuleRun, range: tokens_util.Range) []const u8 {
@@ -355,6 +398,47 @@ test "refersToBinding skips member names" {
     try std.testing.expect(context.refersToBinding(3, "x"));
     try std.testing.expect(!context.refersToBinding(3, "y"));
     try std.testing.expect(!context.refersToBinding(7, "x"));
+}
+
+test "namesIo accepts the usual spellings and declared Io types" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fixture = try Fixture.init(arena.allocator(), "fn f(init: Init, loop: std.Io, other: Io, count: u8) void { _ = .{ init.io, loop, other, count }; }");
+    const context = fixture.run(arena.allocator());
+    // The identifiers inside the tuple, which starts at token 27.
+    var named: [4]bool = undefined;
+    var count: usize = 0;
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .identifier or index < 27 or count == named.len) continue;
+        if (context.tokens[index + 1].tag == .period) continue;
+        named[count] = context.namesIo(index);
+        count += 1;
+    }
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false }, &named);
+}
+
+test "loopKeyword finds the loop a body brace belongs to" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fixture = try Fixture.init(arena.allocator(), "fn f(it: anytype) void { var i: u8 = 0; while (it.next()) |x| : (i += 1) { _ = x; } if (i > 0) { for (0..2) |_| {} } }");
+    const context = fixture.run(arena.allocator());
+    // The braces after the function body: the while body, the if block and the for body.
+    var found: [3]?usize = undefined;
+    var count: usize = 0;
+    var body_seen = false;
+    for (context.tokens, 0..) |token, index| {
+        if (token.tag != .l_brace) continue;
+        if (!body_seen) {
+            body_seen = true;
+            continue;
+        }
+        found[count] = context.loopKeyword(index);
+        count += 1;
+        if (count == found.len) break;
+    }
+    try std.testing.expectEqual(std.zig.Token.Tag.keyword_while, context.tokens[found[0].?].tag);
+    try std.testing.expectEqual(@as(?usize, null), found[1]);
+    try std.testing.expectEqual(std.zig.Token.Tag.keyword_for, context.tokens[found[2].?].tag);
 }
 
 test "run hands the rule a tree and scope index of its source" {

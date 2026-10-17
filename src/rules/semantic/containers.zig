@@ -50,6 +50,7 @@ pub fn run(context: RuleRun) !void {
             },
             .fields = fields,
             .scope = .{ .opening = null, .closing = context.tokens.len },
+            .body = null,
             .resolved = true,
             .has_usingnamespace = false,
         });
@@ -65,16 +66,32 @@ pub fn run(context: RuleRun) !void {
 
 const ContainerKind = enum { enumeration, tagged_union, structure, error_set };
 
-const Field = struct {
+pub const Field = struct {
     name: []const u8,
     required: bool,
 };
+
+/// The fields the `struct` body between `opening` and `closing` declares, in
+/// order. Tuple fields are named `@"0"`, `@"1"`, and so on.
+pub fn structFields(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    opening: usize,
+    closing: usize,
+) ![]Field {
+    return collectContainerFields(allocator, source, tokens, opening, closing, .structure);
+}
 
 const Container = struct {
     name: []const u8,
     kind: ContainerKind,
     fields: []const Field,
+    /// The block the declaration is visible in.
     scope: TokenScope,
+    /// The opening brace of the container's own body, where its nested
+    /// containers are declared; null for compiler-resolved shapes.
+    body: ?usize,
     resolved: bool,
     has_usingnamespace: bool,
 };
@@ -93,16 +110,20 @@ fn findUnresolvedMembers(
     const tokens = context.tokens;
     const level = context.level(.unresolved_member);
     if (level == .off) return;
+    var guards: ReflectionGuards = .{};
+    defer guards.deinit(context.allocator);
     for (tokens, 0..) |member_token, member_index| {
         if (member_token.tag != .identifier or member_index < 2 or tokens[member_index - 1].tag != .period or
             tokens[member_index - 2].tag != .identifier) continue;
         if (member_index >= 3 and tokens[member_index - 3].tag == .period) continue;
         const receiver_name = tokenText(source, tokens[member_index - 2]);
-        const container = containerForReceiver(source, tokens, containers, context.scopes, receiver_name, member_index - 2) orelse continue;
+        const container = containerForReceiver(context, containers, receiver_name, member_index - 2) orelse continue;
         if (container.has_usingnamespace or container.resolved) continue;
         const member_name = tokenText(source, member_token);
         if (containerHasField(container, member_name) or
-            try declarations.has(context, container.name, member_name, false)) continue;
+            try declarations.has(context, container.name, member_name, false) or
+            try guards.tests(context, receiver_name, member_name) or
+            try guards.tests(context, container.name, member_name)) continue;
         try context.emit(.{
             .rule = .unresolved_member,
             .level = level,
@@ -121,6 +142,8 @@ pub fn findUnresolvedModuleMembers(context: RuleRun) !void {
     const level = context.level(.unresolved_member);
     if (level == .off or context.module_members.len == 0) return;
     const tokens = context.tokens;
+    var guards: ReflectionGuards = .{};
+    defer guards.deinit(context.allocator);
     for (tokens, 0..) |member_token, member_index| {
         if (member_token.tag != .identifier or member_index < 2 or
             tokens[member_index - 1].tag != .period or tokens[member_index - 2].tag != .identifier) continue;
@@ -133,7 +156,7 @@ pub fn findUnresolvedModuleMembers(context: RuleRun) !void {
         const exists = for (module.members) |name| {
             if (std.mem.eql(u8, name, member_name)) break true;
         } else false;
-        if (exists) continue;
+        if (exists or try guards.tests(context, receiver, member_name)) continue;
         try context.emit(.{
             .rule = .unresolved_member,
             .level = level,
@@ -147,31 +170,102 @@ pub fn findUnresolvedModuleMembers(context: RuleRun) !void {
 }
 
 fn containerForReceiver(
-    source: []const u8,
-    tokens: []const std.zig.Token,
+    context: RuleRun,
     containers: []const Container,
-    scope_index: *const syntax_scope.Index,
     receiver_name: []const u8,
     receiver_index: usize,
 ) ?Container {
-    if (containerNamed(containers, scope_index, receiver_name, receiver_index)) |container| return container;
-    const type_name = indexedBindingTypeName(source, tokens, scope_index, receiver_index) orelse return null;
-    return containerNamed(containers, scope_index, type_name, receiver_index);
+    if (containerNamed(containers, context.scopes, receiver_name, receiver_index)) |container| return container;
+    return bindingContainer(context, containers, receiver_index);
 }
 
-fn indexedBindingTypeName(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    scope_index: *const syntax_scope.Index,
-    receiver_index: usize,
-) ?[]const u8 {
-    const visible_binding = scope_index.findBinding(receiver_index) orelse return null;
-    const index = visible_binding.token_index;
-    if (index + 2 < tokens.len and tokens[index + 1].tag == .colon and tokens[index + 2].tag == .identifier and
-        (index + 3 >= tokens.len or tokens[index + 3].tag != .period)) return tokenText(source, tokens[index + 2]);
-    if (index + 3 < tokens.len and tokens[index + 1].tag == .equal and tokens[index + 2].tag == .identifier and
-        tokens[index + 3].tag == .l_brace) return tokenText(source, tokens[index + 2]);
-    return null;
+/// The container the binding visible at `use_index` holds when its
+/// declaration says so: `name: T`, `name = T{ ... };`, or `name = f(...);`
+/// (with `catch`) for a function declared to return `T` or `E!T`.
+fn bindingContainer(context: RuleRun, containers: []const Container, use_index: usize) ?Container {
+    const tokens = context.tokens;
+    const binding = context.scopes.findBinding(use_index) orelse return null;
+    const index = binding.token_index;
+    if (index + 3 >= tokens.len) return null;
+    switch (tokens[index + 1].tag) {
+        .colon => {
+            const last = typePathEnd(tokens, index + 2) orelse return null;
+            return containerAtPath(context, containers, index + 2, last);
+        },
+        .equal => {
+            const value = index + 2;
+            if (typePathEnd(tokens, value)) |last| {
+                if (tokens[last + 1].tag != .l_brace) return null;
+                const closing = context.matchingToken(last + 1, .l_brace, .r_brace) orelse return null;
+                if (tokens[closing + 1].tag != .semicolon) return null;
+                return containerAtPath(context, containers, value, last);
+            }
+            if (tokens[value].tag != .identifier or tokens[value + 1].tag != .l_paren) return null;
+            const arguments_end = context.matchingToken(value + 1, .l_paren, .r_paren) orelse return null;
+            switch (tokens[arguments_end + 1].tag) {
+                .semicolon, .keyword_catch => return callResultContainer(context, containers, value),
+                else => return null,
+            }
+        },
+        else => return null,
+    }
+}
+
+/// The container returned by the function a bare call at `callee_index`
+/// names.
+fn callResultContainer(context: RuleRun, containers: []const Container, callee_index: usize) ?Container {
+    const binding = context.scopes.findBinding(callee_index) orelse return null;
+    const name_index = binding.token_index;
+    if (name_index == 0 or context.tokens[name_index - 1].tag != .keyword_fn) return null;
+    return returnContainer(context, containers, name_index);
+}
+
+/// The container the function named at `name_index` is declared to return,
+/// or the payload of its error union, resolved where the function is
+/// declared.
+fn returnContainer(context: RuleRun, containers: []const Container, name_index: usize) ?Container {
+    const tokens = context.tokens;
+    if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return null;
+    const parameters_end = context.matchingToken(name_index + 1, .l_paren, .r_paren) orelse return null;
+    var start = parameters_end + 1;
+    if (start < tokens.len and tokens[start].tag == .bang) start += 1;
+    var last = typePathEnd(tokens, start) orelse return null;
+    if (tokens[last + 1].tag == .bang) {
+        start = last + 2;
+        last = typePathEnd(tokens, start) orelse return null;
+    }
+    return containerAtPath(context, containers, start, last);
+}
+
+/// The last identifier of the dotted type path (`T`, `Outer.Inner`) that
+/// starts at `start`, or null when the path is called, as a type function's
+/// result is (`std.ArrayList(u8)`).
+fn typePathEnd(tokens: []const std.zig.Token, start: usize) ?usize {
+    if (start >= tokens.len or tokens[start].tag != .identifier) return null;
+    var last = start;
+    while (last + 2 < tokens.len and tokens[last + 1].tag == .period and tokens[last + 2].tag == .identifier) last += 2;
+    if (last + 1 >= tokens.len or tokens[last + 1].tag == .l_paren) return null;
+    return last;
+}
+
+/// The container the type path `first..last` names where it is written: its
+/// first segment is resolved lexically, and every later one must be a
+/// container declared directly in the one before. A path that leaves the
+/// file's containers (`std.lang.Signedness`) names none.
+fn containerAtPath(context: RuleRun, containers: []const Container, first: usize, last: usize) ?Container {
+    const source = context.source;
+    const tokens = context.tokens;
+    var container = containerNamed(containers, context.scopes, tokenText(source, tokens[first]), first) orelse return null;
+    var segment = first + 2;
+    while (segment <= last) : (segment += 2) {
+        const body = container.body orelse return null;
+        const name = tokenText(source, tokens[segment]);
+        container = for (containers) |candidate| {
+            const opening = candidate.scope.opening orelse continue;
+            if (opening == body and identifierNamesEqual(candidate.name, name)) break candidate;
+        } else return null;
+    }
+    return container;
 }
 
 fn tokensBeforeContain(
@@ -219,6 +313,8 @@ fn collectContainers(context: RuleRun) ![]Container {
         }
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+        // `error{A} || Other` has members this file does not list.
+        if (closing + 1 >= tokens.len or tokens[closing + 1].tag != .semicolon) continue;
         const fields = try collectContainerFields(allocator, source, tokens, opening, closing, kind);
         errdefer allocator.free(fields);
         try containers.append(allocator, .{
@@ -226,6 +322,7 @@ fn collectContainers(context: RuleRun) ![]Container {
             .kind = kind,
             .fields = fields,
             .scope = enclosingTokenScope(context, index),
+            .body = opening,
             .resolved = false,
             .has_usingnamespace = tokensBeforeContain(source, tokens, opening + 1, closing, "usingnamespace"),
         });
@@ -258,7 +355,7 @@ fn collectContainerFields(
             .identifier => {
                 if (brace_depth != 1 or parenthesis_depth != 0 or bracket_depth != 0 or
                     index > opening + 1 and switch (tokens[index - 1].tag) {
-                        .r_brace, .comma, .semicolon, .doc_comment, .container_doc_comment => false,
+                        .r_brace, .comma, .semicolon, .doc_comment, .container_doc_comment, .keyword_comptime => false,
                         else => true,
                     }) continue;
                 if (kind == .structure and index + 1 < closing and tokens[index + 1].tag == .comma) {
@@ -311,7 +408,7 @@ fn findComptimeReflectionIssues(
             tokens[builtin_index + 2].tag != .identifier or tokens[builtin_index + 3].tag != .comma or
             tokens[builtin_index + 4].tag != .string_literal or tokens[builtin_index + 5].tag != .r_paren) continue;
         const type_name = tokenText(source, tokens[builtin_index + 2]);
-        const container = containerForReceiver(source, tokens, containers, context.scopes, type_name, builtin_index + 2) orelse continue;
+        const container = containerForReceiver(context, containers, type_name, builtin_index + 2) orelse continue;
         const literal = tokenText(source, tokens[builtin_index + 4]);
         if (literal.len < 2) continue;
         const member_name = literal[1 .. literal.len - 1];
@@ -420,6 +517,51 @@ const Declarations = struct {
     }
 };
 
+/// The `@hasDecl(T, "name")` and `@hasField(T, "name")` tests of the file,
+/// collected the first time a lookup needs them. An access to a member the
+/// file tests for may sit in a branch comptime never analyzes.
+const ReflectionGuards = struct {
+    tested: std.ArrayList(Tested) = .empty,
+    built: bool = false,
+
+    const Tested = struct {
+        receiver: []const u8,
+        member: []const u8,
+    };
+
+    fn deinit(guards: *ReflectionGuards, allocator: std.mem.Allocator) void {
+        guards.tested.deinit(allocator);
+    }
+
+    fn tests(guards: *ReflectionGuards, context: RuleRun, receiver: []const u8, member: []const u8) !bool {
+        if (!guards.built) {
+            try guards.collect(context);
+            guards.built = true;
+        }
+        for (guards.tested.items) |tested| {
+            if (identifierNamesEqual(tested.receiver, receiver) and identifierNamesEqual(tested.member, member)) return true;
+        }
+        return false;
+    }
+
+    fn collect(guards: *ReflectionGuards, context: RuleRun) !void {
+        const source = context.source;
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, index| {
+            if (token.tag != .builtin or index + 4 >= tokens.len or
+                (!tokenIs(source, token, "@hasDecl") and !tokenIs(source, token, "@hasField")) or
+                tokens[index + 1].tag != .l_paren or tokens[index + 2].tag != .identifier or
+                tokens[index + 3].tag != .comma or tokens[index + 4].tag != .string_literal) continue;
+            const literal = tokenText(source, tokens[index + 4]);
+            if (literal.len < 2) continue;
+            try guards.tested.append(context.allocator, .{
+                .receiver = tokenText(source, tokens[index + 2]),
+                .member = literal[1 .. literal.len - 1],
+            });
+        }
+    }
+};
+
 /// Whether `pub` precedes the declaration keyword at `member_index`, possibly
 /// after other modifiers.
 fn isPublicMember(tokens: []const std.zig.Token, first: usize, member_index: usize) bool {
@@ -444,14 +586,6 @@ fn findSwitches(
     if (context.level(.missing_switch_prong) == .off and
         context.level(.non_exhaustive_switch_else) == .off and
         context.level(.non_exhaustive_error_switch) == .off) return;
-    var declaration_sites = try collectBindingDeclarationSites(context.allocator, source, tokens);
-    defer {
-        var site_lists = declaration_sites.valueIterator();
-        while (site_lists.next()) |list| list.deinit(context.allocator);
-        declaration_sites.deinit(context.allocator);
-    }
-    var return_types = try collectFunctionReturnTypes(context);
-    defer return_types.deinit(context.allocator);
     for (tokens, 0..) |token, switch_index| {
         if (token.tag != .keyword_switch or switch_index + 4 >= tokens.len or tokens[switch_index + 1].tag != .l_paren) continue;
         const operand_end = context.matchingToken(switch_index + 1, .l_paren, .r_paren) orelse continue;
@@ -459,27 +593,25 @@ fn findSwitches(
         const opening = operand_end + 1;
         if (opening >= tokens.len or tokens[opening].tag != .l_brace) continue;
         const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
-        const operand_name = tokenText(source, tokens[switch_index + 2]);
-        const type_name = if (operand_end == switch_index + 3)
-            bindingTypeName(context, &declaration_sites, &return_types, operand_name, switch_index) orelse continue
+        const operand = switch_index + 2;
+        const container = (if (operand_end == switch_index + 3)
+            bindingContainer(context, containers, operand)
         else if (operand_end == switch_index + 5 and tokens[switch_index + 3].tag == .l_paren and
             tokens[switch_index + 4].tag == .r_paren)
-            return_types.get(operand_name) orelse continue
+            callResultContainer(context, containers, operand)
         else
-            continue;
-        const container = containerNamed(containers, context.scopes, type_name, switch_index) orelse continue;
+            null) orelse continue;
         if (container.kind == .structure) continue;
 
+        var cases = try switchCases(context, opening, closing, container.name) orelse continue;
+        defer cases.deinit(context.allocator);
+        const else_index = cases.else_index;
         var missing: std.ArrayList([]const u8) = .empty;
-        var else_index: ?usize = null;
+        defer missing.deinit(context.allocator);
         for (container.fields) |field| {
             // '_' marks a non-exhaustive enum, not a nameable case; '._ =>' does not compile.
             if (std.mem.eql(u8, field.name, "_")) continue;
-            if (!switchContainsCase(source, tokens, opening, closing, field.name)) try missing.append(context.allocator, field.name);
-        }
-        var cursor = opening + 1;
-        while (cursor < closing) : (cursor += 1) {
-            if (tokens[cursor].tag == .keyword_else) else_index = cursor;
+            if (!cases.has(field.name)) try missing.append(context.allocator, field.name);
         }
         if (missing.items.len == 0) continue;
         // 'inline else' expands into every remaining case at comptime; the switch
@@ -557,136 +689,6 @@ fn findSwitches(
 
 const maximum_named_else_cases = 8;
 
-const BindingDeclarationSites = std.StringHashMapUnmanaged(std.ArrayList(usize));
-
-const FunctionReturnTypes = std.StringHashMapUnmanaged([]const u8);
-
-/// Indexes every 'name:' and 'const/var name' site so switch analysis can find
-/// a binding's declaration without rescanning the file per switch.
-fn collectBindingDeclarationSites(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    tokens: []const std.zig.Token,
-) !BindingDeclarationSites {
-    var sites: BindingDeclarationSites = .empty;
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .identifier) continue;
-        const is_typed_declaration = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
-        const is_local_declaration = index > 0 and
-            (tokens[index - 1].tag == .keyword_const or tokens[index - 1].tag == .keyword_var);
-        if (!is_typed_declaration and !is_local_declaration) continue;
-        const entry = try sites.getOrPutValue(allocator, tokenText(source, token), .empty);
-        try entry.value_ptr.append(allocator, index);
-    }
-    return sites;
-}
-
-fn collectFunctionReturnTypes(context: RuleRun) !FunctionReturnTypes {
-    const allocator = context.allocator;
-    const source = context.source;
-    const tokens = context.tokens;
-    var return_types: FunctionReturnTypes = .empty;
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_fn or index + 3 >= tokens.len or tokens[index + 1].tag != .identifier or
-            tokens[index + 2].tag != .l_paren) continue;
-        const parameters_end = context.matchingToken(index + 2, .l_paren, .r_paren) orelse continue;
-        // A switch on the call's result sees the error union's payload type.
-        var return_start = parameters_end + 1;
-        if (return_start < tokens.len and tokens[return_start].tag == .bang) return_start += 1;
-        if (return_start >= tokens.len or tokens[return_start].tag != .identifier) continue;
-        var type_index = return_start;
-        while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
-            tokens[type_index + 2].tag == .identifier)
-        {
-            type_index += 2;
-        }
-        if (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .bang and
-            tokens[type_index + 2].tag == .identifier)
-        {
-            type_index += 2;
-            while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
-                tokens[type_index + 2].tag == .identifier)
-            {
-                type_index += 2;
-            }
-        }
-        const entry = try return_types.getOrPut(allocator, tokenText(source, tokens[index + 1]));
-        if (!entry.found_existing) entry.value_ptr.* = tokenText(source, tokens[type_index]);
-    }
-    return return_types;
-}
-
-fn bindingTypeName(
-    context: RuleRun,
-    declaration_sites: *const BindingDeclarationSites,
-    return_types: *const FunctionReturnTypes,
-    binding_name: []const u8,
-    before: usize,
-) ?[]const u8 {
-    const source = context.source;
-    const tokens = context.tokens;
-    const site_list = declaration_sites.get(binding_name) orelse return null;
-    var remaining = site_list.items.len;
-    while (remaining > 0) {
-        remaining -= 1;
-        const index = site_list.items[remaining];
-        if (index >= before) continue;
-        const is_typed_declaration = index + 1 < tokens.len and tokens[index + 1].tag == .colon;
-        if (!bindingDeclarationContainsUse(context, index, before)) continue;
-        if (is_typed_declaration) {
-            if (index + 2 >= tokens.len or tokens[index + 2].tag != .identifier) return null;
-            var type_index = index + 2;
-            while (type_index + 2 < tokens.len and tokens[type_index + 1].tag == .period and
-                tokens[type_index + 2].tag == .identifier)
-            {
-                type_index += 2;
-            }
-            return tokenText(source, tokens[type_index]);
-        }
-        if (index + 3 < tokens.len and tokens[index + 1].tag == .equal and tokens[index + 2].tag == .identifier and
-            tokens[index + 3].tag == .l_paren and context.matchingToken(index + 3, .l_paren, .r_paren) != null)
-        {
-            return return_types.get(tokenText(source, tokens[index + 2]));
-        }
-        return null;
-    }
-    return null;
-}
-
-fn bindingDeclarationContainsUse(context: RuleRun, declaration_index: usize, use_index: usize) bool {
-    const tokens = context.tokens;
-    if (declaration_index > 0 and
-        (tokens[declaration_index - 1].tag == .keyword_const or tokens[declaration_index - 1].tag == .keyword_var))
-    {
-        return scopeContains(enclosingTokenScope(context, declaration_index), use_index);
-    }
-    const opening_parenthesis = enclosingOpeningParenthesis(tokens, declaration_index) orelse return false;
-    const closing_parenthesis = context.matchingToken(opening_parenthesis, .l_paren, .r_paren) orelse return false;
-    var body_opening = closing_parenthesis + 1;
-    while (body_opening < tokens.len and tokens[body_opening].tag != .l_brace) : (body_opening += 1) {}
-    if (body_opening == tokens.len) return false;
-    const body_closing = context.matchingToken(body_opening, .l_brace, .r_brace) orelse return false;
-    return use_index > body_opening and use_index < body_closing;
-}
-
-fn enclosingOpeningParenthesis(tokens: []const std.zig.Token, index: usize) ?usize {
-    var depth: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_paren => depth += 1,
-            .l_paren => {
-                if (depth == 0) return cursor;
-                depth -= 1;
-            },
-            .l_brace, .semicolon => return null,
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn containerNamed(
     containers: []const Container,
     scope_index: *const syntax_scope.Index,
@@ -731,25 +733,69 @@ fn scopeDepth(scope: TokenScope) usize {
     return if (scope.opening) |opening| opening + 1 else 0;
 }
 
-fn switchContainsCase(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    opening: usize,
-    closing: usize,
-    name: []const u8,
-) bool {
-    for (tokens[opening + 1 .. closing], opening + 1..) |token, index| {
-        if (token.tag != .period or index + 2 >= closing or !tokenIs(source, tokens[index + 1], name)) continue;
-        var cursor = index + 2;
-        while (cursor < closing) : (cursor += 1) {
+/// The cases a switch body names by tag, and its `else` prong.
+const SwitchCases = struct {
+    named: std.ArrayList([]const u8) = .empty,
+    else_index: ?usize = null,
+
+    fn deinit(cases: *SwitchCases, allocator: std.mem.Allocator) void {
+        cases.named.deinit(allocator);
+    }
+
+    fn has(cases: SwitchCases, name: []const u8) bool {
+        for (cases.named.items) |case| if (identifierNamesEqual(case, name)) return true;
+        return false;
+    }
+};
+
+/// The prong items of the switch body between `opening` and `closing`, which
+/// switches on `type_name`. Items may be tags (`.name`, `error.Name`, or
+/// `T.name` with `T` the switched type), `else` and `_`; for any other item,
+/// such as a comptime constant or a range, only evaluating it tells which
+/// cases it covers, so there is no answer.
+fn switchCases(context: RuleRun, opening: usize, closing: usize, type_name: []const u8) !?SwitchCases {
+    const source = context.source;
+    const tokens = context.tokens;
+    var cases: SwitchCases = .{};
+    errdefer cases.deinit(context.allocator);
+    var cursor = opening + 1;
+    while (cursor < closing) {
+        // The prong's items, up to its `=>`.
+        while (true) {
+            if (tokens[cursor].tag == .keyword_inline) cursor += 1;
             switch (tokens[cursor].tag) {
-                .equal_angle_bracket_right => return true,
-                .comma, .period, .identifier => {},
-                else => break,
+                .keyword_else => cases.else_index = cursor,
+                .period => {
+                    cursor += 1;
+                    if (tokens[cursor].tag != .identifier) return null;
+                    try cases.named.append(context.allocator, tokenText(source, tokens[cursor]));
+                },
+                .identifier, .keyword_error => if (!tokenIs(source, tokens[cursor], "_")) {
+                    if (tokens[cursor].tag == .identifier and
+                        !identifierNamesEqual(tokenText(source, tokens[cursor]), type_name)) return null;
+                    if (tokens[cursor + 1].tag != .period or tokens[cursor + 2].tag != .identifier) return null;
+                    cursor += 2;
+                    try cases.named.append(context.allocator, tokenText(source, tokens[cursor]));
+                },
+                else => return null,
+            }
+            cursor += 1;
+            if (cursor < closing and tokens[cursor].tag == .comma) cursor += 1;
+            if (cursor >= closing) return null;
+            if (tokens[cursor].tag == .equal_angle_bracket_right) break;
+            if (tokens[cursor - 1].tag != .comma) return null;
+        }
+        // The prong's body, up to the comma that ends it.
+        cursor += 1;
+        while (cursor < closing and tokens[cursor].tag != .comma) : (cursor += 1) {
+            switch (tokens[cursor].tag) {
+                .l_paren, .l_bracket, .l_brace => cursor = context.scopes.matchingToken(cursor) orelse return null,
+                else => {},
             }
         }
+        cursor += 1;
     }
-    return false;
+    return cases;
 }
 
 fn elseCaptureCanBePreserved(tokens: []const std.zig.Token, else_index: usize, closing: usize) bool {
@@ -1126,6 +1172,107 @@ test "a switch on a fallible call's result sees the error union payload" {
         "}\n";
     const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .missing_switch_prong);
+}
+
+test "switch types follow qualified paths from where they are written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const Cast = struct {\n" ++
+        "    const Signedness = enum { unsigned, signed, unneeded };\n" ++
+        "    fn fromStd(signedness: std.lang.Signedness) Signedness {\n" ++
+        "        return switch (signedness) { .unsigned => .unsigned, .signed => .signed };\n" ++
+        "    }\n" ++
+        "};\n" ++
+        "const Wrapper = struct {\n" ++
+        "    const Signedness = enum { a, b, c };\n" ++
+        "    fn standard() std.lang.Signedness { return .signed; }\n" ++
+        "    fn viaReturn() u8 { return switch (standard()) { .unsigned => 0, .signed => 1 }; }\n" ++
+        "};\n" ++
+        "fn qualified(signedness: Cast.Signedness) u8 {\n" ++
+        "    return switch (signedness) { .unsigned => 0, .signed => 1 };\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    var missing_switch_count: usize = 0;
+    for (found) |finding| if (finding.rule == .missing_switch_prong) {
+        missing_switch_count += 1;
+        try std.testing.expect(std.mem.find(u8, finding.message, ".unneeded") != null);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn qualified").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
+}
+
+test "a bare call's result type comes from the function visible at the call" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Kind = enum { a, b, c };\n" ++
+        "const First = struct { fn kind() Kind { return .a; } };\n" ++
+        "const Second = struct {\n" ++
+        "    const Other = enum { x, y };\n" ++
+        "    fn kind() Other { return .x; }\n" ++
+        "    fn direct() u8 { return switch (kind()) { .x => 0, .y => 1 }; }\n" ++
+        "    fn stored() u8 { const value = kind(); return switch (value) { .x => 0, .y => 1 }; }\n" ++
+        "};\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .missing_switch_prong);
+}
+
+test "switches with prong items other than tags are not judged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Mode = enum { fast, safe, slow };\n" ++
+        "const default_mode: Mode = .fast;\n" ++
+        "fn constant(mode: Mode) u8 { return switch (mode) { default_mode => 0, .safe, .slow => 1 }; }\n" ++
+        "fn qualified(mode: Mode) u8 { return switch (mode) { Mode.fast => 0, .safe => 1, Mode.slow => 2 }; }\n" ++
+        "fn nested(mode: Mode, flag: bool) u8 { return switch (mode) { .fast => if (flag) 0 else 1, .safe => 2 }; }\n";
+    const configuration = support.only(&.{.non_exhaustive_switch_else}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var missing_switch_count: usize = 0;
+    for (found) |finding| {
+        try std.testing.expect(finding.rule != .non_exhaustive_switch_else);
+        if (finding.rule != .missing_switch_prong) continue;
+        missing_switch_count += 1;
+        // The `else` in a prong body is not an else prong.
+        try std.testing.expect(std.mem.find(u8, finding.message, ".slow") != null);
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn nested").?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missing_switch_count);
+}
+
+test "members of merged error sets and comptime fields are not unresolved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const ConnectError = error{Timeout} || std.Io.Cancelable;\n" ++
+        "fn canceled() ConnectError!void { return ConnectError.Canceled; }\n" ++
+        "const Tagged = struct { comptime tag: u8 = 1, value: u8 };\n" ++
+        "fn tag(tagged: Tagged) u8 { return tagged.tag + tagged.value; }\n";
+    const found = try support.findings(arena.allocator(), run, source, Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unresolved_member);
+}
+
+test "members the file tests for with hasDecl or hasField are not judged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const options = @import(\"options.zig\");\n" ++
+        "const Config = struct { enabled: bool };\n" ++
+        "fn limit() u32 { if (@hasDecl(options, \"limit\")) return options.limit; return 0; }\n" ++
+        "fn local(config: Config) u32 { if (@hasField(Config, \"count\")) return config.count; return 0; }\n" ++
+        "fn missing() u32 { return options.absent; }\n";
+    const modules = [_]types.ModuleMembers{.{ .receiver = "options", .members = &.{"enabled"} }};
+    const found = try support.findingsWith(arena.allocator(), runWithModules, @as([]const types.ModuleMembers, &modules), source, Configuration.defaults());
+    var unresolved_count: usize = 0;
+    for (found) |finding| {
+        if (finding.rule != .unresolved_member) continue;
+        unresolved_count += 1;
+        try std.testing.expectEqualStrings("absent", source[finding.span.start..finding.span.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unresolved_count);
 }
 
 test "hasDecl only sees public declarations while field lookup sees local declarations" {

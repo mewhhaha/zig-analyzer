@@ -19,6 +19,8 @@ pub fn run(context: RuleRun) !void {
     if (use_level == .off and double_level == .off) return;
     var owners = try ownerTypes(context);
     defer owners.deinit(context.allocator);
+    var aliases: views.AllocatorAliases = .{};
+    defer aliases.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration + 3 >= context.tokens.len or
             context.tokens[declaration + 1].tag != .identifier or
@@ -28,7 +30,7 @@ pub fn run(context: RuleRun) !void {
         const scope_opening = context.enclosingOpeningBrace(declaration) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         try checkReleases(context, declaration + 1, declaration_end + 1, scope_end, subject, use_level, double_level);
-        if (subject == .arena) try checkArenaAllocations(context, declaration + 1, declaration_end + 1, scope_end, use_level);
+        if (subject == .arena) try checkArenaAllocations(context, &aliases, declaration + 1, declaration_end + 1, scope_end, use_level);
         if (subject != .arena) try checkCopies(context, declaration + 1, declaration_end + 1, scope_end, double_level);
     }
 }
@@ -169,10 +171,16 @@ fn checkReleases(
                 .rule = .double_release,
                 .level = double_level,
                 .span = context.tokens[index].loc,
-                .message = try context.allocator.print(
-                    "{s} '{s}' is deinitialized here and again by the deferred deinit at line {d}",
-                    .{ subjectNoun(subject), name, lineOf(context, deferred) },
-                ),
+                .message = if (deferred.late_flag) |flag|
+                    try context.allocator.print(
+                        "{s} '{s}' is deinitialized here, and the deferred deinit at line {d} releases it again when an exit comes before '{s}' is cleared",
+                        .{ subjectNoun(subject), name, lineOf(context, deferred.index), context.tokenText(flag) },
+                    )
+                else
+                    try context.allocator.print(
+                        "{s} '{s}' is deinitialized here and again by the deferred deinit at line {d}",
+                        .{ subjectNoun(subject), name, lineOf(context, deferred.index) },
+                    ),
             });
         }
     }
@@ -190,7 +198,15 @@ fn statementKeyword(context: RuleRun, index: usize) ?std.zig.Token.Tag {
     return context.tokens[keyword].tag;
 }
 
-fn deferredReleaseAfter(context: RuleRun, name: []const u8, declaration: usize, release: usize, scope_end: usize) ?usize {
+const DeferredRelease = struct {
+    /// The subject token of the deferred `name.deinit(`.
+    index: usize,
+    /// The flag guarding it, when the explicit release clears that flag only
+    /// after a `try` or another exit that runs the deferred release first.
+    late_flag: ?usize = null,
+};
+
+fn deferredReleaseAfter(context: RuleRun, name: []const u8, declaration: usize, release: usize, scope_end: usize) ?DeferredRelease {
     for (context.tokens[declaration..scope_end], declaration..) |token, index| {
         if (token.tag != .identifier or !context.tokenIs(index, name) or index == release or
             context.tokens[index - 1].tag == .period or releaseCall(context, index, scope_end) == null) continue;
@@ -200,12 +216,77 @@ fn deferredReleaseAfter(context: RuleRun, name: []const u8, declaration: usize, 
             // Registered earlier: runs on every exit from its own scope, which encloses the release.
             const defer_scope = context.enclosingOpeningBrace(keyword) orelse continue;
             const defer_end = context.matchingToken(defer_scope, .l_brace, .r_brace) orelse continue;
-            if (release < defer_end and release > defer_scope and !reassignedBetween(context, name, release, defer_end)) return index;
-        } else if (reach.mutationReaches(context, release, keyword) and !reassignedBetween(context, name, release, keyword)) {
-            return index;
+            if (release >= defer_end or release <= defer_scope or reassignedBetween(context, name, release, defer_end)) continue;
+        } else if (!reach.mutationReaches(context, release, keyword) or reassignedBetween(context, name, release, keyword)) {
+            continue;
+        }
+        switch (releaseGuard(context, keyword, index, release)) {
+            .none => return .{ .index = index },
+            .cleared => continue,
+            .late => |flag| return .{ .index = index, .late_flag = flag },
         }
     }
     return null;
+}
+
+/// How the flag of a guarded deferred release, `defer if (alive) x.deinit();`
+/// or `defer if (!released) x.deinit();`, is cleared around the explicit
+/// release at `release`.
+const Guard = union(enum) {
+    /// Unguarded, or the flag is not cleared in the release's block.
+    none,
+    /// Cleared before the release, or after it with no exit in between: the
+    /// deferred release no longer runs.
+    cleared,
+    /// Cleared after an exit (`try`, `return`, `break`, `continue`) that runs
+    /// the deferred release with the flag still set; holds the flag token.
+    late: usize,
+};
+
+fn releaseGuard(context: RuleRun, keyword: usize, deferred: usize, release: usize) Guard {
+    const tokens = context.tokens;
+    if (keyword + 5 >= tokens.len or tokens[keyword + 1].tag != .keyword_if or tokens[keyword + 2].tag != .l_paren) return .none;
+    const negated = tokens[keyword + 3].tag == .bang;
+    const flag = keyword + 3 + @intFromBool(negated);
+    if (tokens[flag].tag != .identifier or tokens[flag + 1].tag != .r_paren) return .none;
+    // The release must be the guarded branch itself, not an `else`.
+    const body = flag + 2;
+    if (tokens[body].tag == .l_brace) {
+        const body_end = context.matchingToken(body, .l_brace, .r_brace) orelse return .none;
+        if (deferred > body_end) return .none;
+    } else if (deferred != body) return .none;
+    const flag_name = context.tokenText(flag);
+    const cleared_value = if (negated) "true" else "false";
+    const block = context.enclosingOpeningBrace(release) orelse return .none;
+    const block_end = context.matchingToken(block, .l_brace, .r_brace) orelse return .none;
+    const release_end = context.statementEnd(release) orelse return .none;
+    // `alive = false; x.deinit();`: cleared first.
+    const search_start = @max(block + 1, (context.statementEnd(keyword) orelse keyword) + 1);
+    if (search_start < release) {
+        for (context.tokens[search_start..release], search_start..) |token, index| {
+            if (token.tag == .identifier and flagAssignment(context, index, flag_name, cleared_value, block)) return .cleared;
+        }
+    }
+    // `x.deinit(); alive = false;`: cleared after, unless an exit comes first.
+    var exit = false;
+    for (context.tokens[release_end + 1 .. block_end], release_end + 1..) |token, index| switch (token.tag) {
+        .keyword_try, .keyword_return, .keyword_break, .keyword_continue => exit = true,
+        .identifier => if (flagAssignment(context, index, flag_name, cleared_value, block)) return if (exit) .{ .late = flag } else .cleared,
+        else => {},
+    };
+    return .none;
+}
+
+/// The statement `flag = value;` at `index`, directly in the block opening at `block`.
+fn flagAssignment(context: RuleRun, index: usize, flag: []const u8, value: []const u8, block: usize) bool {
+    const tokens = context.tokens;
+    if (index + 3 >= tokens.len or !context.tokenIs(index, flag) or tokens[index + 1].tag != .equal or
+        !context.tokenIs(index + 2, value) or tokens[index + 3].tag != .semicolon) return false;
+    switch (tokens[index - 1].tag) {
+        .semicolon, .l_brace, .r_brace => {},
+        else => return false,
+    }
+    return context.enclosingOpeningBrace(index) == block;
 }
 
 fn reassignedBetween(context: RuleRun, name: []const u8, start: usize, end: usize) bool {
@@ -266,6 +347,7 @@ fn firstPlainRelease(context: RuleRun, name: []const u8, start: usize, end: usiz
 /// Allocations from an arena's allocator that are read after `arena.deinit()`.
 fn checkArenaAllocations(
     context: RuleRun,
+    aliases: *views.AllocatorAliases,
     arena_index: usize,
     start: usize,
     scope_end: usize,
@@ -286,7 +368,7 @@ fn checkArenaAllocations(
         const declaration_end = context.statementEnd(declaration) orelse continue;
         if (declaration_end >= release_index) continue;
         const allocator = views.allocationReceiver(context, declaration + 2, declaration_end) orelse continue;
-        const owner = views.arenaForAllocatorAlias(context, allocator, declaration) orelse continue;
+        const owner = try views.arenaForAllocatorAlias(context, aliases, allocator, declaration) orelse continue;
         if (!std.mem.eql(u8, owner, arena)) continue;
         const binding = context.tokenText(declaration + 1);
         const use = firstUse(context, binding, release_index, release_end + 1, scope_end) orelse continue;
@@ -415,4 +497,32 @@ test "deinit inside a conditional defer is not an explicit release" {
         "fn f(gpa: std.mem.Allocator, keep: bool) !void { var l: std.ArrayList(u8) = .empty; var done = keep; defer if (!done) { l.deinit(gpa); }; try l.append(gpa, 1); done = true; }",
         &.{},
     );
+}
+
+test "a guarded deferred deinit whose flag the release clears is not a double release" {
+    const owner = "const Owner = struct { n: u8, fn deinit(o: *Owner) void { _ = o; } };\n";
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) a.deinit(); a.deinit(); alive = false; }", &.{});
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; var done = false; defer if (!done) a.deinit(); a.deinit(); done = true; }", &.{});
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) { a.deinit(); }; alive = false; a.deinit(); }", &.{});
+    try expectRules(owner ++ "fn f(c: bool) void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) a.deinit(); if (c) { a.deinit(); alive = false; } }", &.{});
+    try expectRules(owner ++ "fn f() !void { var a: Owner = .{ .n = 0 }; var alive = true; errdefer if (alive) a.deinit(); try g(); a.deinit(); alive = false; }", &.{});
+}
+
+test "a guarded deferred deinit whose flag stays set at an exit is a double release" {
+    const owner = "const Owner = struct { n: u8, fn deinit(o: *Owner) void { _ = o; } };\n";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const late = try support.findings(
+        arena.allocator(),
+        run,
+        owner ++ "fn f() !void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) a.deinit(); a.deinit(); try g(); alive = false; }",
+        types.Configuration.defaults(),
+    );
+    try support.expectRules(late, &.{.double_release});
+    try std.testing.expect(std.mem.find(u8, late[0].message, "before 'alive' is cleared") != null);
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; const alive = true; defer if (alive) a.deinit(); a.deinit(); }", &.{.double_release});
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) a.deinit(); a.deinit(); alive = true; }", &.{.double_release});
+    try expectRules(owner ++ "fn f(c: bool) void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) a.deinit(); a.deinit(); if (c) alive = false; }", &.{.double_release});
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; var alive = true; defer if (alive) {} else a.deinit(); a.deinit(); alive = false; }", &.{.double_release});
+    try expectRules(owner ++ "fn f() void { var a: Owner = .{ .n = 0 }; defer a.deinit(); a.deinit(); }", &.{.double_release});
 }

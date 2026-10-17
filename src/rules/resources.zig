@@ -1,10 +1,12 @@
 //! The one table of resource acquire/release knowledge: which calls hand out a
 //! resource, which call gives it back, and how the declared `contracts.resources`
 //! pairs join the built-in ones. Rules that reason about cleanup (missing,
-//! discarded, error-only, late) ask here instead of keeping their own list.
+//! discarded, error-only, late, unawaited tasks, unflushed writers) ask here
+//! instead of keeping their own list.
 const std = @import("std");
 const RuleRun = @import("context.zig").RuleRun;
 const Syntax = @import("context.zig").Syntax;
+const syntax_scope = @import("../syntax/scope.zig");
 const tokens_util = @import("../syntax/tokens.zig");
 const types = @import("types.zig");
 
@@ -72,6 +74,70 @@ pub const os_handle_acquisitions = [_][]const u8{
 /// Method names whose call ends the life of the value they act on.
 pub const release_methods = [_][]const u8{ "free", "destroy", "close", "deinit", "join", "detach", "unlock" };
 
+/// What owns an `std.Io` task: the `Future` that `io.async` and
+/// `io.concurrent` return, or a `Group` or `Select` that spawns tasks itself.
+pub const TaskOwner = enum { future, group, select };
+
+/// Whether calling `name` on a `Group` or `Select` spawns a task into it.
+pub fn spawnsTask(name: []const u8) bool {
+    return std.mem.eql(u8, name, "async") or std.mem.eql(u8, name, "concurrent");
+}
+
+/// Whether calling `name` on the owner finishes its pending tasks: `await`
+/// or `cancel`, and for a `Select` also `awaitMany` and `cancelDiscard`.
+pub fn finishesTask(owner: TaskOwner, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "await") or std.mem.eql(u8, name, "cancel")) return true;
+    return owner == .select and (std.mem.eql(u8, name, "awaitMany") or std.mem.eql(u8, name, "cancelDiscard"));
+}
+
+/// Whether calling `name` on a buffered `std.Io` writer hands its buffered
+/// bytes to the sink: the interface's `flush`, and the file writer's `end`
+/// and `seekTo`, which flush first.
+pub fn flushesWriter(name: []const u8) bool {
+    return std.mem.eql(u8, name, "flush") or std.mem.eql(u8, name, "end") or std.mem.eql(u8, name, "seekTo");
+}
+
+/// Mutex methods that take a lock, with the method that gives it back. The
+/// `std.Io` forms take the `Io` instance as their only argument.
+const lock_pairs = [_]struct { lock: []const u8, unlock: []const u8 }{
+    .{ .lock = "lock", .unlock = "unlock" },
+    .{ .lock = "lockUncancelable", .unlock = "unlock" },
+    .{ .lock = "lockShared", .unlock = "unlockShared" },
+    .{ .lock = "lockSharedUncancelable", .unlock = "unlockShared" },
+};
+
+/// The unlock method for a mutex lock method, or null when `method` takes no lock.
+pub fn lockRelease(method: []const u8) ?[]const u8 {
+    for (lock_pairs) |pair| if (std.mem.eql(u8, method, pair.lock)) return pair.unlock;
+    return null;
+}
+
+/// Methods whose result keeps the resource it is called on, or takes it over:
+/// readers, writers and iterators over a handle, and the ownership moves of
+/// managed containers. Returning or storing such a result transfers the resource;
+/// any other method result (`readPositionalAll`, `stat`) leaves it with the caller.
+const transferring_methods = [_][]const u8{
+    "reader",
+    "readerStreaming",
+    "writer",
+    "writerStreaming",
+    "iterate",
+    "iterateAssumeFirstIteration",
+    "walk",
+    "getHandle",
+    "allocator",
+    "toOwnedSlice",
+    "toOwnedSliceSentinel",
+    "moveToUnmanaged",
+    "toUnmanaged",
+    "toManaged",
+};
+
+pub fn methodTransfersResource(method: []const u8) bool {
+    for (transferring_methods) |candidate| if (std.mem.eql(u8, method, candidate)) return true;
+    return false;
+}
+
 /// Allocator methods whose result is released with `free` or `destroy`.
 /// `print` and `printSentinel` are shared with writers; `uniqueAllocationRelease`
 /// leaves them out.
@@ -98,6 +164,68 @@ pub const sized_allocations = [_]SizedAllocation{
     .{ .method = "alignedAlloc" },
     .{ .method = "realloc" },
 };
+
+/// Whether the allocator expression `path`, as written at `use_index`, is the
+/// arena `std.Build` owns: `b.allocator` on a `*std.Build`, the allocator of a
+/// field or binding declared with a `Build` type (`self.builder.allocator`,
+/// `step.owner.allocator`), or a local alias of one. The build graph frees it,
+/// so its allocations need no release.
+pub fn buildGraphAllocator(
+    source: []const u8,
+    tokens: []const std.zig.Token,
+    scopes: *const syntax_scope.Index,
+    path: []const u8,
+    use_index: usize,
+) bool {
+    var current = path;
+    var position = use_index;
+    // At most one alias, `const alloc = b.allocator;`, sits between the use and the build allocator.
+    for (0..2) |_| {
+        const dot = std.mem.findScalarLast(u8, current, '.') orelse {
+            const binding = scopes.findBindingNamed(current, position) orelse return false;
+            current = aliasedPath(source, tokens, binding.token_index) orelse return false;
+            position = binding.token_index;
+            continue;
+        };
+        if (!std.mem.eql(u8, current[dot + 1 ..], "allocator")) return false;
+        const owner_path = current[0..dot];
+        const root_end = std.mem.findScalar(u8, owner_path, '.') orelse owner_path.len;
+        const root = scopes.findBindingNamed(owner_path[0..root_end], position) orelse return false;
+        if (declaredTypeNamesBuild(source, tokens, root.token_index)) return true;
+        const owner_dot = std.mem.findScalarLast(u8, owner_path, '.') orelse return false;
+        return fieldTypeNamesBuild(source, tokens, owner_path[owner_dot + 1 ..]);
+    }
+    return false;
+}
+
+/// The dotted path a `const name = a.b;` declaration at `binding_index` aliases.
+fn aliasedPath(source: []const u8, tokens: []const std.zig.Token, binding_index: usize) ?[]const u8 {
+    if (binding_index + 2 >= tokens.len or tokens[binding_index + 1].tag != .equal) return null;
+    var end = binding_index + 2;
+    while (end + 2 < tokens.len and tokens[end].tag == .identifier and tokens[end + 1].tag == .period) end += 2;
+    if (tokens[end].tag != .identifier or end + 1 >= tokens.len or tokens[end + 1].tag != .semicolon) return null;
+    return source[tokens[binding_index + 2].loc.start..tokens[end].loc.end];
+}
+
+/// Whether the `name: Type` declaration at `binding_index` spells `Build` in its type.
+fn declaredTypeNamesBuild(source: []const u8, tokens: []const std.zig.Token, binding_index: usize) bool {
+    if (binding_index + 1 >= tokens.len or tokens[binding_index + 1].tag != .colon) return false;
+    for (tokens[binding_index + 2 ..]) |token| switch (token.tag) {
+        .comma, .r_paren, .equal, .semicolon, .l_brace, .r_brace => return false,
+        .identifier => if (tokens_util.tokenIs(source, token, "Build")) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Whether some field or parameter named `name` is declared with a `Build` type.
+fn fieldTypeNamesBuild(source: []const u8, tokens: []const std.zig.Token, name: []const u8) bool {
+    for (tokens, 0..) |token, index| {
+        if (token.tag == .identifier and tokens_util.tokenIs(source, token, name) and
+            declaredTypeNamesBuild(source, tokens, index)) return true;
+    }
+    return false;
+}
 
 /// The release for an allocator method, or null when the method does not allocate.
 pub fn allocationRelease(method: []const u8) ?[]const u8 {
@@ -194,6 +322,33 @@ test "built-in pairs cover io handles threads and managed containers" {
     try std.testing.expect(lookup(defaults, "openIterableDir", null) == null);
 }
 
+test "lock pairs and transferring methods" {
+    try std.testing.expectEqualStrings("unlock", lockRelease("lockUncancelable").?);
+    try std.testing.expectEqualStrings("unlockShared", lockRelease("lockShared").?);
+    try std.testing.expect(lockRelease("tryLock") == null);
+    try std.testing.expect(methodTransfersResource("reader"));
+    try std.testing.expect(!methodTransfersResource("readPositionalAll"));
+}
+
+test "build graph allocators are found through bindings fields and aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Lib = struct { builder: *std.Build, owner: *Other };\n" ++
+        "fn f(b: *std.Build, lib: Lib, gpa: std.mem.Allocator) void { const alias = b.allocator; _ = .{ alias, lib, gpa }; }";
+    const tokens = try tokens_util.tokenize(arena.allocator(), source);
+    var scopes = try syntax_scope.Index.init(arena.allocator(), source, tokens);
+    // The `gpa` in `.{ alias, lib, gpa }`, where every binding is visible.
+    const use = tokens.len - 5;
+    try std.testing.expect(tokens_util.tokenIs(source, tokens[use], "gpa"));
+    try std.testing.expect(buildGraphAllocator(source, tokens, &scopes, "b.allocator", use));
+    try std.testing.expect(buildGraphAllocator(source, tokens, &scopes, "lib.builder.allocator", use));
+    try std.testing.expect(buildGraphAllocator(source, tokens, &scopes, "alias", use));
+    try std.testing.expect(!buildGraphAllocator(source, tokens, &scopes, "lib.owner.allocator", use));
+    try std.testing.expect(!buildGraphAllocator(source, tokens, &scopes, "gpa", use));
+    try std.testing.expect(!buildGraphAllocator(source, tokens, &scopes, "b.graph", use));
+}
+
 test "declared contracts win and respect their receiver" {
     var configuration = types.Configuration.defaults();
     configuration.resource_contracts = &.{
@@ -214,6 +369,13 @@ test "allocation releases distinguish shared writer names" {
     try std.testing.expect(uniqueAllocationRelease("print") == null);
     try std.testing.expectEqualStrings("free", allocationRelease("print").?);
     try std.testing.expect(allocationRelease("append") == null);
+}
+
+test "task owners and buffered writers name their releases" {
+    try std.testing.expect(spawnsTask("concurrent") and !spawnsTask("await"));
+    try std.testing.expect(finishesTask(.future, "cancel") and !finishesTask(.group, "cancelDiscard"));
+    try std.testing.expect(finishesTask(.select, "cancelDiscard") and finishesTask(.select, "awaitMany"));
+    try std.testing.expect(flushesWriter("end") and !flushesWriter("writeAll"));
 }
 
 test "acquiredIn applies declared pairs inside an initializer" {

@@ -3,7 +3,6 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
@@ -108,7 +107,7 @@ fn findErrorValueComparisons(context: RuleRun) !void {
                     else => continue,
                 }
                 if (tokens[cursor + 2].tag != .keyword_error or tokens[cursor + 3].tag != .l_brace) break :declared null;
-                const closing = matchingToken(tokens, cursor + 3, .l_brace, .r_brace) orelse break :declared null;
+                const closing = context.matchingToken(cursor + 3, .l_brace, .r_brace) orelse break :declared null;
                 if (closing >= binding_index or closing + 1 >= tokens.len) break :declared null;
                 switch (tokens[closing + 1].tag) {
                     .equal, .comma, .r_paren => {},

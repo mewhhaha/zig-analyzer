@@ -3,8 +3,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const containsComment = @import("../../syntax/tokens.zig").containsComment;
-const pathBefore = @import("../../syntax/tokens.zig").pathBefore;
-const pathAfter = @import("../../syntax/tokens.zig").pathAfter;
+const identicalPaths = @import("../../syntax/tokens.zig").identicalPaths;
 
 pub const rules = [_]types.Rule{
     .identical_logical_operands,
@@ -14,104 +13,51 @@ pub fn run(context: RuleRun) !void {
     const level = context.level(.identical_logical_operands);
     if (level == .off) return;
 
-    for (context.tokens, 0..) |token, op_index| {
-        if ((token.tag != .keyword_and and token.tag != .keyword_or) or
-            op_index == 0 or op_index + 1 >= context.tokens.len) continue;
-
-        const lhs_span = pathBefore(context.tokens, op_index) orelse continue;
-
-        if (lhs_span.start > 0 and !isLogicalBoundaryBefore(context.tokens[lhs_span.start - 1].tag)) continue;
-
-        const rhs_span = pathAfter(context.tokens, op_index + 1) orelse continue;
-
-        if (rhs_span.end < context.tokens.len and !isLogicalBoundaryAfter(context.tokens[rhs_span.end].tag)) continue;
-
-        const lhs_len = lhs_span.end - lhs_span.start;
-        const rhs_len = rhs_span.end - rhs_span.start;
-        if (lhs_len != rhs_len) continue;
-
-        var matches = true;
-        for (0..lhs_len) |offset| {
-            const lhs_tok = lhs_span.start + offset;
-            const rhs_tok = rhs_span.start + offset;
-            if (context.tokens[lhs_tok].tag != context.tokens[rhs_tok].tag or
-                !context.tokenIs(lhs_tok, context.tokenText(rhs_tok)))
-            {
-                matches = false;
-                break;
-            }
-        }
-        if (!matches) continue;
-
-        const expr_source = context.source[context.tokens[lhs_span.start].loc.start..context.tokens[rhs_span.end - 1].loc.end];
-        if (containsComment(expr_source)) continue;
-
-        const operand_text = context.source[context.tokens[lhs_span.start].loc.start..context.tokens[lhs_span.end - 1].loc.end];
-        const op_text = if (token.tag == .keyword_and) "and" else "or";
-
-        const edits = try context.allocator.alloc(types.Edit, 1);
-        var fix_start = token.loc.start;
-        if (lhs_span.end > 0 and context.tokens[lhs_span.end - 1].loc.end < token.loc.start) {
-            fix_start = context.tokens[lhs_span.end - 1].loc.end;
-        }
-        edits[0] = .{
-            .span = .{ .start = fix_start, .end = context.tokens[rhs_span.end - 1].loc.end },
-            .replacement = "",
+    const tree = context.tree;
+    for (0..tree.nodes.len) |raw_node| {
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(raw_node));
+        const tag = tree.nodeTag(node);
+        const op_text = switch (tag) {
+            .bool_and => "and",
+            .bool_or => "or",
+            else => continue,
         };
+        const left, const right = tree.nodeData(node).node_and_node;
+        // In a chain `a and b and b` the left operand is `a and b`; the
+        // operand next to this operator is its right-hand side.
+        const adjacent = if (tree.nodeTag(left) == tag) tree.nodeData(left).node_and_node[1] else left;
+        if (!identicalPaths(tree, adjacent, right)) continue;
 
+        const span: std.zig.Token.Loc = .{
+            .start = context.tokens[tree.firstToken(adjacent)].loc.start,
+            .end = context.tokens[tree.lastToken(right)].loc.end,
+        };
+        if (containsComment(context.source[span.start..span.end])) continue;
+
+        const operand_text = tree.getNodeSource(adjacent);
         const fixes = try context.allocator.alloc(types.Fix, 1);
         fixes[0] = .{
             .title = try context.allocator.print("Remove redundant '{s} {s}'", .{ op_text, operand_text }),
             .kind = .quickfix,
-            .edits = edits,
+            .edits = try context.allocator.dupe(types.Edit, &.{.{
+                .span = .{ .start = context.tokens[tree.lastToken(adjacent)].loc.end, .end = span.end },
+                .replacement = "",
+            }}),
             .preferred = true,
             .fix_all = true,
         };
 
-        const message = try context.allocator.print(
-            "logical '{s}' with identical operands '{s} {s} {s}' is redundant and likely a typo",
-            .{ op_text, operand_text, op_text, operand_text },
-        );
-
         try context.emit(.{
             .rule = .identical_logical_operands,
             .level = level,
-            .span = .{ .start = context.tokens[lhs_span.start].loc.start, .end = context.tokens[rhs_span.end - 1].loc.end },
-            .message = message,
+            .span = span,
+            .message = try context.allocator.print(
+                "logical '{s}' with identical operands '{s} {s} {s}' is redundant and likely a typo",
+                .{ op_text, operand_text, op_text, operand_text },
+            ),
             .fixes = fixes,
         });
     }
-}
-
-fn isLogicalBoundaryBefore(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .l_paren,
-        .keyword_if,
-        .keyword_while,
-        .keyword_and,
-        .keyword_or,
-        .keyword_return,
-        .equal,
-        .comma,
-        .colon,
-        .semicolon,
-        => true,
-        else => false,
-    };
-}
-
-fn isLogicalBoundaryAfter(tag: std.zig.Token.Tag) bool {
-    return switch (tag) {
-        .r_paren,
-        .keyword_and,
-        .keyword_or,
-        .semicolon,
-        .comma,
-        .l_brace,
-        .keyword_else,
-        => true,
-        else => false,
-    };
 }
 
 test "identical logical operands reports repeated conditions in and and or" {
@@ -143,11 +89,29 @@ test "distinct logical operands stay unchanged" {
         "    if (s.ptr.* and other.ptr.*) return true;\n" ++
         "    if (start < index and index < end) return true;\n" ++
         "    if (start == index or index + 1 == end) return true;\n" ++
+        "    if (a and b or b) return true;\n" ++
+        "    if (a or b and a) return true;\n" ++
         "    return false;\n" ++
         "}\n";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "operator precedence and chains decide the adjacent operands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn check(a: bool, b: bool) bool {\n" ++
+        "    if (a or b and b) return true;\n" ++
+        "    if (a and b and b) return true;\n" ++
+        "    return a or a or a;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try support.expectSpans(source, findings, &.{ "b and b", "b and b", "a or a", "a or a" });
+    // The two fixes of `a or a or a` touch, without overlapping, and leave `a`.
+    try std.testing.expect(findings[2].fixes[0].edits[0].span.end <= findings[3].fixes[0].edits[0].span.start);
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

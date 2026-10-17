@@ -36,6 +36,8 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
         if (!startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const acquisition = owningAcquisition(context, declaration_index, declaration_end, summary_index, pass) orelse continue;
+        // A leak in a test is reported by `std.testing.allocator` itself.
+        if (context.scopes.insideTestBlock(declaration_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const function_scope = functionScopeContaining(context, declaration_index) orelse continue;
@@ -86,7 +88,7 @@ fn runInternal(context: RuleRun, summary_index: ?summaries.Index, pass: Analysis
             binding_name,
             acquisition.release,
         ) orelse continue;
-        if (scopeHasErrorPathCleanup(context, binding_name, declaration_end + 1, fallible_index)) continue;
+        if (scopeHasErrorPathCleanup(context, binding_name, null, declaration_end + 1, fallible_index)) continue;
 
         const release_statement = switch (acquisition.kind) {
             .allocation => if (acquisition.release_owner_member) |member|
@@ -184,6 +186,7 @@ fn findFallibleContainerBuilders(context: RuleRun, level: types.Level) !void {
             if (callArgumentIsArenaBacked(context, allocator_argument, binding_index, 0)) arena_mutation_count += 1;
         }
         const first = first_mutation orelse continue;
+        if (context.scopes.insideTestBlock(declaration_index)) continue;
         if (mutation_count < 2 and !mutationCanRepeat(context, first, function_scope.opening)) continue;
         if (arena_mutation_count == mutation_count) continue;
         if (scopeHasContainerCleanup(context, binding, function_scope.declaration, declaration_end + 1, first)) continue;
@@ -229,6 +232,7 @@ fn findFallibleSliceBuilders(context: RuleRun, level: types.Level) !void {
             }
         }
         const first = first_realloc orelse continue;
+        if (context.scopes.insideTestBlock(declaration_index)) continue;
         if (!mutationCanRepeat(context, first, function_scope.opening) or
             sliceHasErrorCleanup(context, binding, function_scope.declaration, declaration_end + 1, first) or
             !scopeReturnsBinding(context, binding, function_scope.declaration, first + 1, scope_end)) continue;
@@ -388,7 +392,8 @@ fn findFallibleAggregateFieldInitializers(
                 summary_index,
                 pass,
             ) orelse continue;
-            if (acquisition.kind != .allocation or !rangeContainsTry(context.tokens, value_end + 1, aggregate_end)) continue;
+            if (acquisition.kind != .allocation or !rangeContainsTry(context.tokens, value_end + 1, aggregate_end) or
+                context.scopes.insideTestBlock(equal_index)) continue;
             const function_scope = functionScopeContaining(context, equal_index) orelse continue;
             if (acquisitionUsesArenaContract(context, function_scope, acquisition)) continue;
             const receiver = context.source[context.tokens[acquisition.release_owner_start].loc.start..context.tokens[acquisition.release_owner_end].loc.end];
@@ -458,7 +463,7 @@ fn findPartiallyInitializedOwnedFields(
             summary_index,
             pass,
         ) orelse continue;
-        if (acquisition.kind != .allocation) continue;
+        if (acquisition.kind != .allocation or context.scopes.insideTestBlock(equal_index)) continue;
         const scope_opening = context.enclosingOpeningBrace(equal_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const function_scope = functionScopeContaining(context, equal_index) orelse continue;
@@ -474,6 +479,7 @@ fn findPartiallyInitializedOwnedFields(
         if (std.mem.eql(u8, method, "create") and std.ascii.findIgnoreCase(receiver, "pool") != null) continue;
         const fallible_index = fallibleBeforeBindingUse(context, statement_end + 1, scope_end, owner, false) orelse continue;
         const field = context.tokenText(equal_index - 1);
+        if (scopeHasErrorPathCleanup(context, owner, field, statement_end + 1, fallible_index)) continue;
         const owned_path = context.source[context.tokens[owner_index].loc.start..context.tokens[equal_index - 1].loc.end];
         const release_statement = if (acquisition.release_owner_member) |member|
             try context.allocator.print("{s}.{s}.{s}({s})", .{ receiver, member, acquisition.release, owned_path })
@@ -549,12 +555,19 @@ fn locallyCreatedBindingBefore(context: RuleRun, name: []const u8, before: usize
 }
 
 fn findCleanupCapableValuesBeforeInsertion(context: RuleRun, level: types.Level) !void {
+    // Both lookups scan the whole file for a name, so each name is looked up once.
+    var return_types: std.StringHashMapUnmanaged(?[]const u8) = .empty;
+    defer return_types.deinit(context.allocator);
+    var cleanup_types: std.StringHashMapUnmanaged(bool) = .empty;
+    defer cleanup_types.deinit(context.allocator);
     for (context.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= context.tokens.len or
             context.tokens[declaration_index + 1].tag != .identifier or !startsStatement(context, declaration_index)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
-        const owner_type = calledReturnType(context, declaration_index + 2, declaration_end) orelse continue;
-        if (!typeCleanupReleasesOwnership(context, owner_type)) continue;
+        const owner_type = try calledReturnType(context, &return_types, declaration_index + 2, declaration_end) orelse continue;
+        const releases = try cleanup_types.getOrPut(context.allocator, owner_type);
+        if (!releases.found_existing) releases.value_ptr.* = typeCleanupReleasesOwnership(context, owner_type);
+        if (!releases.value_ptr.* or context.scopes.insideTestBlock(declaration_index)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         const fallible_index = fallibleBeforeBindingUse(context, declaration_end + 1, scope_end, binding, false) orelse continue;
@@ -644,7 +657,7 @@ fn functionCleansParameterBeforeInsertion(context: RuleRun, function_name: []con
         if (body_start >= context.tokens.len or context.tokens[body_start].tag != .l_brace) continue;
         const body_end = context.matchingToken(body_start, .l_brace, .r_brace) orelse continue;
         const owned_name = parameterAlias(context, parameter, body_start + 1, body_end) orelse parameter;
-        if (!scopeHasErrorPathCleanup(context, owned_name, body_start + 1, body_end)) continue;
+        if (!scopeHasErrorPathCleanup(context, owned_name, null, body_start + 1, body_end)) continue;
         if (callsFallibleContainerInsertionWithBinding(context, owned_name, body_start + 1, body_end)) return true;
     }
     return false;
@@ -697,7 +710,12 @@ fn callsFallibleContainerInsertionWithBinding(context: RuleRun, binding: []const
     return false;
 }
 
-fn calledReturnType(context: RuleRun, start: usize, end: usize) ?[]const u8 {
+fn calledReturnType(
+    context: RuleRun,
+    return_types: *std.StringHashMapUnmanaged(?[]const u8),
+    start: usize,
+    end: usize,
+) !?[]const u8 {
     var equal_index = start;
     while (equal_index < end and context.tokens[equal_index].tag != .equal) : (equal_index += 1) {}
     if (equal_index == end) return null;
@@ -710,6 +728,14 @@ fn calledReturnType(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     const name = context.tokenText(call_index);
     if (context.tokens[call_index + 1].tag == .l_brace) return name;
     if (context.tokens[call_index + 1].tag != .l_paren) return null;
+    const known = try return_types.getOrPut(context.allocator, name);
+    if (!known.found_existing) known.value_ptr.* = functionReturnType(context, name);
+    return known.value_ptr.*;
+}
+
+/// The last identifier between the parameters and the body of the first
+/// `fn name(` in the file.
+fn functionReturnType(context: RuleRun, name: []const u8) ?[]const u8 {
     for (context.tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= context.tokens.len or
             !context.tokenIs(fn_index + 1, name) or context.tokens[fn_index + 2].tag != .l_paren) continue;
@@ -870,7 +896,7 @@ fn owningAcquisitionAfterEqual(
     }
     const standard_allocator_argument = owned_call.standardAllocatorArgument(callable);
     if ((context.tokenIs(path_end, "print") or context.tokenIs(path_end, "printSentinel")) and
-        !owned_call.printReceiverIsAllocator(context.source, context.tokens, path_end - 2)) return null;
+        !owned_call.printReceiverIsAllocatorIndexed(context.scopes, path_end - 2)) return null;
     if (!isAllocatingMethod(context.tokenText(path_end)) and standard_allocator_argument == null) return null;
     if (argumentsReferenceArena(context, path_end + 2, call_close)) return null;
     if (standard_allocator_argument) |argument_index| {
@@ -1011,31 +1037,42 @@ fn declarationLooksArenaBackedAtDepth(
 
 const ScopeRange = struct { declaration: usize, opening: usize, closing: usize };
 
+/// The body of the function or test containing `target`, with its `fn` or
+/// `test` keyword: the last such keyword before `target` whose body encloses
+/// it. A keyword sits between its body and the brace enclosing that body, so
+/// only the blocks around `target` and the tokens before each are searched.
 fn functionScopeContaining(context: RuleRun, target: usize) ?ScopeRange {
-    var selected: ?ScopeRange = null;
-    for (context.tokens[0..target], 0..) |token, declaration_index| {
-        if (token.tag != .keyword_fn and token.tag != .keyword_test) continue;
-        const body_opening = if (token.tag == .keyword_fn and declaration_index + 2 < target and
-            context.tokens[declaration_index + 2].tag == .l_paren)
-        body: {
-            const parameters_end = context.matchingToken(declaration_index + 2, .l_paren, .r_paren) orelse continue;
-            break :body syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end) orelse continue;
-        } else body: {
-            var opening = declaration_index + 1;
-            while (opening < target and context.tokens[opening].tag != .l_brace and
-                context.tokens[opening].tag != .semicolon) : (opening += 1)
-            {}
-            break :body opening;
-        };
-        if (body_opening >= target or context.tokens[body_opening].tag != .l_brace) continue;
-        const body_closing = context.matchingToken(body_opening, .l_brace, .r_brace) orelse continue;
-        if (target < body_closing) selected = .{
-            .declaration = declaration_index,
-            .opening = body_opening,
-            .closing = body_closing,
-        };
+    var brace = context.enclosingOpeningBrace(target);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse continue;
+        if (closing <= target) continue;
+        const lower = if (context.enclosingOpeningBrace(opening)) |parent| parent + 1 else 0;
+        var declaration_index = opening;
+        while (declaration_index > lower) {
+            declaration_index -= 1;
+            const tag = context.tokens[declaration_index].tag;
+            if (tag != .keyword_fn and tag != .keyword_test) continue;
+            if (functionBodyOpening(context, declaration_index, target) != opening) continue;
+            return .{ .declaration = declaration_index, .opening = opening, .closing = closing };
+        }
     }
-    return selected;
+    return null;
+}
+
+/// Where the body of the `fn` or `test` at `declaration_index` opens, looking
+/// no further than `target` for a test or an anonymous function.
+fn functionBodyOpening(context: RuleRun, declaration_index: usize, target: usize) ?usize {
+    if (context.tokens[declaration_index].tag == .keyword_fn and declaration_index + 2 < target and
+        context.tokens[declaration_index + 2].tag == .l_paren)
+    {
+        const parameters_end = context.matchingToken(declaration_index + 2, .l_paren, .r_paren) orelse return null;
+        return syntax_scope.functionBodyAfterParameters(context.tokens, parameters_end);
+    }
+    var opening = declaration_index + 1;
+    while (opening < target and context.tokens[opening].tag != .l_brace and
+        context.tokens[opening].tag != .semicolon) : (opening += 1)
+    {}
+    return opening;
 }
 
 fn functionDocumentsArenaAllocator(context: RuleRun, function: ScopeRange, allocator_name: []const u8) bool {
@@ -1241,7 +1278,9 @@ fn scopeDeinitializesReceiver(context: RuleRun, scope_opening: usize, scope_end:
     return false;
 }
 
-fn scopeHasErrorPathCleanup(context: RuleRun, binding: []const u8, start: usize, scope_end: usize) bool {
+/// Whether a `defer` or `errdefer` in `[start, scope_end)` cleans up `binding`
+/// (or only its `field`, `errdefer allocator.free(owner.field)`, when given).
+fn scopeHasErrorPathCleanup(context: RuleRun, binding: []const u8, field: ?[]const u8, start: usize, scope_end: usize) bool {
     const scope = context.enclosingOpeningBrace(start) orelse return false;
     for (context.tokens[start..scope_end], start..) |token, defer_index| {
         if ((token.tag != .keyword_defer and token.tag != .keyword_errdefer) or
@@ -1267,7 +1306,10 @@ fn scopeHasErrorPathCleanup(context: RuleRun, binding: []const u8, start: usize,
                 method_index + 1 >= body_end or context.tokens[method_index + 1].tag != .l_paren) continue;
             const call_end = context.matchingToken(method_index + 1, .l_paren, .r_paren) orelse continue;
             for (context.tokens[method_index + 2 .. @min(call_end, body_end)], method_index + 2..) |argument, argument_index| {
-                if (argument.tag == .identifier and context.tokenIs(argument_index, binding)) return true;
+                if (argument.tag != .identifier or !context.tokenIs(argument_index, binding)) continue;
+                const released_field = field orelse return true;
+                if (argument_index + 2 < call_end and context.tokens[argument_index + 1].tag == .period and
+                    context.tokenIs(argument_index + 2, released_field)) return true;
             }
         }
     }
@@ -1838,6 +1880,45 @@ test "partially initialized owned fields need error cleanup" {
     );
 }
 
+test "an errdefer releasing the field path covers partial initialization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Epoch = struct { sources: []u8, other: []u8 };\n" ++
+        "fn init(allocator: std.mem.Allocator, count: usize) !Epoch {\n" ++
+        "    var epoch: Epoch = undefined;\n" ++
+        "    epoch.sources = try allocator.alloc(u8, count);\n" ++
+        "    errdefer allocator.free(epoch.sources);\n" ++
+        "    epoch.other = try allocator.alloc(u8, count);\n" ++
+        "    try check();\n" ++
+        "    return epoch;\n" ++
+        "}\n" ++
+        "fn wrongField(allocator: std.mem.Allocator, count: usize) !Epoch {\n" ++
+        "    var window: Epoch = undefined;\n" ++
+        "    window.sources = try allocator.alloc(u8, count);\n" ++
+        "    errdefer allocator.free(window.other);\n" ++
+        "    try check();\n" ++
+        "    return window;\n" ++
+        "}\n";
+    const findings = try findingsFor(arena.allocator(), source);
+    try support.expectSpans(source, findings, &.{ "other", "sources" });
+    try std.testing.expect(std.mem.find(u8, findings[0].message, "epoch.other") != null);
+    try std.testing.expect(std.mem.find(u8, findings[1].message, "window.sources") != null);
+}
+
+test "missing errdefers in tests are left to the testing allocator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "test \"copies\" {\n" ++
+        "    const allocator = std.testing.allocator;\n" ++
+        "    const copy = try allocator.dupe(u8, \"name\");\n" ++
+        "    try check();\n" ++
+        "    allocator.free(copy);\n" ++
+        "}\n";
+    try support.expectRules(try findingsFor(arena.allocator(), source), &.{});
+}
+
 test "partially initialized created objects need field cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2195,6 +2276,43 @@ test "container documentation does not suppress function error cleanup" {
     const found = try findingsFor(arena.allocator(), source);
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.missing_errdefer, found[0].rule);
+}
+
+test "the enclosing function scope matches a scan of every earlier function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const source: [:0]const u8 =
+        \\const top = .{ .value = 1 };
+        \\const Outer = struct {
+        \\    fn method(callback: *const fn (u8) void, options: struct { flag: bool }) enum { a, b } {
+        \\        while (@TypeOf(callback) == fn (u8) void) { callback(1); }
+        \\        comptime { _ = options; }
+        \\        const Inner = struct { fn deep() void { if (true) { return; } } };
+        \\        _ = Inner;
+        \\        return .a;
+        \\    }
+        \\};
+        \\test "case" { const local = 1; _ = local; }
+        \\test named { { _ = fn () void; } }
+        \\fn last() u8 { return 0; }
+        \\
+    ;
+    const tokens = try tokenize(allocator, source);
+    var syntax = try @import("../context.zig").Syntax.init(allocator, source, tokens);
+    var found: std.ArrayList(types.Finding) = .empty;
+    const context = syntax.ruleRun(allocator, types.Configuration.defaults(), &found);
+    for (0..tokens.len) |target| {
+        var expected: ?ScopeRange = null;
+        for (tokens[0..target], 0..) |token, declaration_index| {
+            if (token.tag != .keyword_fn and token.tag != .keyword_test) continue;
+            const body_opening = functionBodyOpening(context, declaration_index, target) orelse continue;
+            if (body_opening >= target or tokens[body_opening].tag != .l_brace) continue;
+            const body_closing = context.matchingToken(body_opening, .l_brace, .r_brace) orelse continue;
+            if (target < body_closing) expected = .{ .declaration = declaration_index, .opening = body_opening, .closing = body_closing };
+        }
+        try std.testing.expectEqual(expected, functionScopeContaining(context, target));
+    }
 }
 
 fn findingsFor(allocator: std.mem.Allocator, source: [:0]const u8) ![]const types.Finding {

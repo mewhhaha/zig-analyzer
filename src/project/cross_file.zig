@@ -9,11 +9,13 @@ const std = @import("std");
 const analysis = @import("../analysis.zig");
 const compile_units = @import("../compiler/compile_units.zig");
 const project_rules = @import("../rules/project.zig");
+const syntax_scope = @import("../syntax/scope.zig");
 const build_roots = @import("build_roots.zig");
 const check_cache = @import("check_cache.zig");
 const project_config = @import("config.zig");
 const imported_deprecations = @import("imported_deprecations.zig");
 const module_sites = @import("module_sites.zig");
+const source_store = @import("source_store.zig");
 
 const Record = check_cache.Record;
 
@@ -35,6 +37,9 @@ pub const Input = struct {
     files: []const project_rules.SourceFile,
     configuration: analysis.Configuration,
     cache: check_cache.Cache,
+    /// Scope indexes of `files`, in order, shared with other passes over the
+    /// same files; the pass keeps its own when null.
+    scopes: ?*syntax_scope.LazyIndexes = null,
 };
 
 pub const Results = struct {
@@ -65,7 +70,7 @@ pub fn run(input: Input) !Results {
     var shared_arena: std.heap.ArenaAllocator = .init(input.allocator);
     defer shared_arena.deinit();
     const arena = shared_arena.allocator();
-    const check_imports = input.configuration.level(.deprecated_declaration) != .off;
+    const check_imports = imported_deprecations.enabled(input.configuration);
     const check_members = input.configuration.level(.unresolved_member) != .off;
     if (!check_imports and !check_members or input.files.len == 0) return results;
 
@@ -73,6 +78,12 @@ pub fn run(input: Input) !Results {
     for (input.files, absolute_paths) |file, *path| {
         path.* = try std.Io.Dir.path.resolveAlloc(arena, &.{ input.root_path, file.path });
     }
+    var own_scopes: ?syntax_scope.LazyIndexes = null;
+    defer if (own_scopes) |*scopes| scopes.deinit();
+    const scopes = input.scopes orelse scopes: {
+        own_scopes = try .init(input.allocator, input.io, input.files.len);
+        break :scopes &own_scopes.?;
+    };
     var shared: Shared = .{
         .input = input,
         .check_imports = check_imports,
@@ -80,7 +91,10 @@ pub fn run(input: Input) !Results {
         .absolute_paths = absolute_paths,
         .results = results.files,
         .kept = &results.arenas,
+        .store = .init(input.allocator),
+        .scopes = scopes,
     };
+    defer shared.deinit();
     try shared.index(arena);
     if (check_members) {
         const candidates = try arena.alloc(build_roots.File, input.files.len);
@@ -117,21 +131,47 @@ const Shared = struct {
     /// The scanned files by absolute path, as the passes read them.
     sources: std.StringHashMapUnmanaged(imported_deprecations.Source) = .empty,
     module_files: std.StringHashMapUnmanaged(module_sites.File) = .empty,
+    /// Position in `input.files` of each scanned file, by absolute path.
+    positions: std.StringHashMapUnmanaged(u32) = .empty,
     /// Content hash of every file that was looked at: scanned files up front,
     /// others when first needed. Null for a file that does not exist.
     hashes: std.StringHashMapUnmanaged(?u64) = .empty,
     build_hashes: std.StringHashMapUnmanaged(?u64) = .empty,
+    /// Files outside the scan that imports reach, read and indexed once for
+    /// all workers instead of once per worker.
+    store: source_store.Store,
+    /// Scope index of each scanned file, built by the first worker that
+    /// needs it and shared by the others.
+    scopes: *syntax_scope.LazyIndexes,
+
+    fn deinit(shared: *Shared) void {
+        shared.store.deinit();
+    }
 
     fn index(shared: *Shared, arena: std.mem.Allocator) !void {
         const count: u32 = @intCast(shared.input.files.len);
         try shared.sources.ensureTotalCapacity(arena, count);
         try shared.module_files.ensureTotalCapacity(arena, count);
+        try shared.positions.ensureTotalCapacity(arena, count);
         try shared.hashes.ensureTotalCapacity(arena, count);
-        for (shared.input.files, shared.absolute_paths) |file, path| {
+        for (shared.input.files, shared.absolute_paths, 0..) |file, path, position| {
             shared.sources.putAssumeCapacity(path, .{ .path = path, .source = file.source, .tokens = file.tokens });
             shared.module_files.putAssumeCapacity(path, .{ .path = path, .source = file.source, .tokens = file.tokens.? });
+            shared.positions.putAssumeCapacity(path, @intCast(position));
             shared.hashes.putAssumeCapacity(path, std.hash.Wyhash.hash(0, file.source));
         }
+    }
+
+    /// The scope index of scanned file `position`, built on first use.
+    fn scopesAt(shared: *Shared, position: usize) !*const syntax_scope.Index {
+        const file = shared.input.files[position];
+        return shared.scopes.at(position, file.source, file.tokens.?);
+    }
+
+    fn knownScopes(context: *anyopaque, path: []const u8) !?*const syntax_scope.Index {
+        const shared: *Shared = @ptrCast(@alignCast(context));
+        const position = shared.positions.get(path) orelse return null;
+        return try shared.scopesAt(position);
     }
 
     fn fail(shared: *Shared, err: anyerror) void {
@@ -207,6 +247,7 @@ const Worker = struct {
             .modules = .init(shared.input.allocator),
         };
         worker.modules.known = &shared.module_files;
+        worker.modules.store = &shared.store;
         worker.modules.tracing = true;
         return worker;
     }
@@ -248,6 +289,7 @@ const Worker = struct {
         var dependencies: std.array_hash_map.String(check_cache.DependencyKind) = .empty;
         var imports: []const Record = &.{};
         var members: []const Record = &.{};
+        var imported_findings: []const analysis.Finding = &.{};
         const absolute_path = shared.absolute_paths[position];
         if (shared.check_imports) {
             const imported = try worker.importedDeprecations();
@@ -256,7 +298,9 @@ const Worker = struct {
                 .path = absolute_path,
                 .source = source_file.source,
                 .tokens = source_file.tokens.?,
+                .scopes = try shared.scopesAt(position),
             }, input.configuration, &found);
+            imported_findings = found.items;
             imports = try records(temporary, found.items);
             for (try imported.dependencyPaths(temporary)) |path| try dependencies.put(temporary, path, .file);
         }
@@ -275,7 +319,13 @@ const Worker = struct {
                 project_config.configurationForPath(input.configuration, source_file.path),
                 modules,
             );
-            members = try records(temporary, found);
+            var kept: usize = 0;
+            for (found) |finding| {
+                if (imported_deprecations.explains(imported_findings, finding)) continue;
+                found[kept] = finding;
+                kept += 1;
+            }
+            members = try records(temporary, found[0..kept]);
             var files = worker.modules.touched_files.keyIterator();
             while (files.next()) |path| try dependencies.put(temporary, path.*, .file);
             var roots = worker.modules.touched_roots.keyIterator();
@@ -317,6 +367,8 @@ const Worker = struct {
         errdefer worker.shared.input.allocator.destroy(imported);
         imported.init(worker.shared.input.io, worker.scratch.allocator());
         imported.useKnownSources(&worker.shared.sources);
+        imported.useKnownScopes(.{ .context = worker.shared, .scopes = Shared.knownScopes });
+        imported.useStore(&worker.shared.store);
         worker.imported = imported;
         return imported;
     }

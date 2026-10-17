@@ -12,8 +12,11 @@ pub fn run(context: RuleRun) !void {
     if (level == .off) return;
 
     for (context.tokens, 0..) |token, if_index| {
+        // The last link of an `else if` chain has no single condition to
+        // invert, and its block is already the chain's fallback.
         if (token.tag != .keyword_if or if_index + 7 >= context.tokens.len or
-            context.tokens[if_index + 1].tag != .l_paren) continue;
+            context.tokens[if_index + 1].tag != .l_paren or
+            (if_index > 0 and context.tokens[if_index - 1].tag == .keyword_else)) continue;
         const condition_end = context.matchingToken(if_index + 1, .l_paren, .r_paren) orelse continue;
         const body_start = condition_end + 1;
         if (body_start >= context.tokens.len or context.tokens[body_start].tag != .l_brace) continue;
@@ -62,6 +65,25 @@ test "else branches with cleanup before returning stay unchanged" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: [:0]const u8 = "if (ready) { work(); } else { cleanup(); return; }";
+    const findings = try findingsFor(arena.allocator(), source);
+
+    try std.testing.expectEqual(@as(usize, 0), findings.len);
+}
+
+test "the last link of an else-if chain is not an early-return candidate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn search(items: []const u32, wanted: u32, low: *usize, high: *usize, middle: usize) ?usize {\n" ++
+        "    if (items[middle] < wanted) {\n" ++
+        "        low.* = middle + 1;\n" ++
+        "    } else if (items[middle] > wanted) {\n" ++
+        "        high.* = middle;\n" ++
+        "    } else {\n" ++
+        "        return middle;\n" ++
+        "    }\n" ++
+        "    return null;\n" ++
+        "}";
     const findings = try findingsFor(arena.allocator(), source);
 
     try std.testing.expectEqual(@as(usize, 0), findings.len);

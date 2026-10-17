@@ -1,10 +1,12 @@
 //! Rules that need a callee's summary from another file: borrowed or owned
-//! returns, partial IO contracts, container invalidation through helpers, and
-//! local storage escaping through calls.
+//! returns, partial IO contracts, container invalidation through helpers,
+//! local storage escaping through calls, and writers flushed by helpers.
 const std = @import("std");
 const allocation_lifecycle = @import("../lifecycle/allocation_lifecycle.zig");
 const missing_errdefer = @import("../lifecycle/missing_errdefer.zig");
+const unflushed_writer = @import("../lifecycle/unflushed_writer.zig");
 const summaries = @import("../summaries.zig");
+const syntax_scope = @import("../../syntax/scope.zig");
 const run_module = @import("run.zig");
 const ProjectRun = run_module.ProjectRun;
 const File = run_module.File;
@@ -12,10 +14,6 @@ const types = @import("../types.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const tokenText = tokens_util.tokenText;
 const tokenIs = tokens_util.tokenIs;
-const statementEnd = tokens_util.statementEnd;
-const enclosingOpeningBrace = tokens_util.enclosingOpeningBrace;
-const matchingToken = tokens_util.matchingToken;
-const enclosingScopeEnd = tokens_util.enclosingScopeEnd;
 const findTag = tokens_util.findTag;
 const PathRange = tokens_util.Range;
 const Call = tokens_util.Call;
@@ -28,6 +26,11 @@ pub fn checkFile(run: ProjectRun, file_index: usize, summary_index: summaries.In
     if (run.level(.missing_errdefer) != .off) {
         var summary_findings: std.ArrayList(types.Finding) = .empty;
         try missing_errdefer.runWithSummaries(try run.ruleRun(file_index, &summary_findings), summary_index);
+        for (summary_findings.items) |finding| try run.emit(file_index, finding);
+    }
+    if (run.level(.unflushed_writer) != .off and unflushed_writer.createsWriter(file.source, file.tokens)) {
+        var summary_findings: std.ArrayList(types.Finding) = .empty;
+        try unflushed_writer.runWithSummaries(try run.ruleRun(file_index, &summary_findings), summary_index);
         for (summary_findings.items) |finding| try run.emit(file_index, finding);
     }
     try findDiscardedSummaryIo(run, file, file_index, summary_index);
@@ -78,18 +81,19 @@ fn findSummaryContainerInvalidations(
     const pointer_level = run.configuration.level(.invalidated_element_pointer);
     const iterator_level = run.configuration.level(.iterator_invalidated_during_loop);
     if (pointer_level == .off and iterator_level == .off) return;
+    const scopes = try run.scopes(file_index);
 
     for (file.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
-        const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = scopes.statementEnd(declaration_index) orelse continue;
+        const scope_end = scopes.enclosingScopeEnd(declaration_index) orelse continue;
         const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
 
         if (pointer_level != .off) {
             if (borrowedElementPath(file, declaration_index + 2, declaration_end)) |path| {
-                if (firstSummarizedMutation(file, summary_index, path, declaration_end + 1, scope_end)) |mutation| {
-                    if (bindingUsedAfter(file, binding, mutation.method_index + 1, scope_end)) {
+                if (firstSummarizedMutation(file, scopes, summary_index, path, declaration_end + 1, scope_end)) |mutation| {
+                    if (bindingUsedAfter(file, scopes, binding, mutation.method_index + 1, scope_end)) {
                         try run.report(.{
                             .file_index = file_index,
                             .rule = .invalidated_element_pointer,
@@ -106,8 +110,8 @@ fn findSummaryContainerInvalidations(
 
         if (iterator_level == .off) continue;
         const iterated_path = iteratorReceiverPath(file, declaration_index + 2, declaration_end) orelse continue;
-        const mutation = firstSummarizedMutation(file, summary_index, iterated_path, declaration_end + 1, scope_end) orelse continue;
-        if (!iteratorActiveAt(file, binding, mutation.method_index, declaration_end + 1, scope_end)) continue;
+        const mutation = firstSummarizedMutation(file, scopes, summary_index, iterated_path, declaration_end + 1, scope_end) orelse continue;
+        if (!iteratorActiveAt(file, scopes, binding, mutation.method_index, declaration_end + 1, scope_end)) continue;
         try run.report(.{
             .file_index = file_index,
             .rule = .iterator_invalidated_during_loop,
@@ -131,6 +135,8 @@ fn borrowedElementPath(file: File, start: usize, end: usize) ?PathRange {
                 return .{ .start = address_index + 1, .end = items_index - 2 };
             }
         }
+        // A later address is followed by no `.items[` either.
+        return null;
     }
     return null;
 }
@@ -152,6 +158,7 @@ const SummaryMutation = struct { method_index: usize, method: []const u8 };
 
 fn firstSummarizedMutation(
     file: File,
+    scopes: *const syntax_scope.Index,
     summary_index: summaries.Index,
     expected_path: PathRange,
     start: usize,
@@ -160,7 +167,7 @@ fn firstSummarizedMutation(
     for (file.tokens[start..end], start..) |token, opening| {
         if (token.tag != .l_paren or opening == 0 or file.tokens[opening - 1].tag != .identifier or
             (opening >= 2 and file.tokens[opening - 2].tag == .period)) continue;
-        const closing = matchingToken(file.tokens, opening, .l_paren, .r_paren) orelse continue;
+        const closing = scopes.matchingToken(opening) orelse continue;
         if (closing >= end) continue;
         const method = tokenText(file.source, file.tokens[opening - 1]);
         const mutation = summary_index.containerMutationCall(file.source, null, method) orelse continue;
@@ -215,13 +222,13 @@ fn mutationArgumentMatchesPath(
         tokenIs(file.source, file.tokens[expected.start + argument_count + 1], field);
 }
 
-fn iteratorActiveAt(file: File, iterator: []const u8, mutation: usize, start: usize, end: usize) bool {
+fn iteratorActiveAt(file: File, scopes: *const syntax_scope.Index, iterator: []const u8, mutation: usize, start: usize, end: usize) bool {
     for (file.tokens[start..end], start..) |token, while_index| {
         if (token.tag != .keyword_while or while_index >= mutation) continue;
         var body_start = while_index + 1;
         while (body_start < mutation and file.tokens[body_start].tag != .l_brace) : (body_start += 1) {}
         if (body_start >= mutation) continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = scopes.matchingToken(body_start) orelse continue;
         if (mutation >= body_end) continue;
         var index = while_index + 1;
         while (index + 3 < body_start) : (index += 1) {
@@ -239,10 +246,11 @@ fn findDiscardedSummaryIo(
     summary_index: summaries.Index,
 ) !void {
     if (run.configuration.level(.discarded_read_count) == .off and run.configuration.level(.discarded_write_count) == .off) return;
+    const scopes = try run.scopes(file_index);
     for (file.tokens, 0..) |token, equal_index| {
         if (token.tag != .equal or equal_index == 0 or file.tokens[equal_index - 1].tag != .identifier or
             !tokenIs(file.source, file.tokens[equal_index - 1], "_")) continue;
-        const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
+        const statement_end = scopes.statementEnd(equal_index) orelse continue;
         const call = outerCall(file.tokens, equal_index + 1, statement_end) orelse continue;
         const name = tokenText(file.source, file.tokens[call.name_index]);
         const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
@@ -277,10 +285,11 @@ fn findBorrowedReturnInvalidations(
 ) !void {
     if (run.configuration.level(.invalidated_element_pointer) == .off and
         run.configuration.level(.invalidated_container_view) == .off) return;
+    const scopes = try run.scopes(file_index);
     for (file.tokens, 0..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = scopes.statementEnd(declaration_index) orelse continue;
         const equal_index = findTag(file.tokens, declaration_index + 2, declaration_end, .equal) orelse continue;
         const call = firstCall(file.tokens, equal_index + 1, declaration_end) orelse continue;
         const receiver_index = call.receiver_index orelse continue;
@@ -289,7 +298,7 @@ fn findBorrowedReturnInvalidations(
         const borrowed = summary_index.borrowedReturnCall(file.source, receiver, name) orelse continue;
         if (call.closing + 1 != declaration_end) continue;
         if (borrowed.parameter != 0) continue;
-        const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
+        const scope_end = scopes.enclosingScopeEnd(declaration_index) orelse continue;
         const invalidation = firstBorrowInvalidation(
             file,
             summary_index,
@@ -299,7 +308,7 @@ fn findBorrowedReturnInvalidations(
             scope_end,
         ) orelse continue;
         const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
-        if (!bindingUsedAfter(file, binding, invalidation.method_index + 1, scope_end)) continue;
+        if (!bindingUsedAfter(file, scopes, binding, invalidation.method_index + 1, scope_end)) continue;
         const rule: types.Rule = if (borrowed.kind == .pointer) .invalidated_element_pointer else .invalidated_container_view;
         const level = run.configuration.level(rule);
         if (level == .off) continue;
@@ -374,10 +383,10 @@ fn firstBorrowInvalidation(
     return null;
 }
 
-fn bindingUsedAfter(file: File, binding: []const u8, start: usize, end: usize) bool {
-    const path_scope = enclosingOpeningBrace(file.tokens, start);
+fn bindingUsedAfter(file: File, scopes: *const syntax_scope.Index, binding: []const u8, start: usize, end: usize) bool {
+    const path_scope = scopes.enclosingOpeningBrace(start);
     const path_end = if (path_scope) |opening|
-        @min(matchingToken(file.tokens, opening, .l_brace, .r_brace) orelse end, end)
+        @min(scopes.matchingToken(opening) orelse end, end)
     else
         end;
     for (file.tokens[start..path_end], start..) |token, index| {
@@ -388,9 +397,9 @@ fn bindingUsedAfter(file: File, binding: []const u8, start: usize, end: usize) b
                 .semicolon, .l_brace, .r_brace => true,
                 else => false,
             };
-            if (direct_terminator and path_scope != null and enclosingOpeningBrace(file.tokens, index) == path_scope) switch (token.tag) {
+            if (direct_terminator and path_scope != null and scopes.enclosingOpeningBrace(index) == path_scope) switch (token.tag) {
                 .keyword_return, .keyword_continue, .keyword_break, .keyword_unreachable => {
-                    const statement_end = statementEnd(file.tokens, index) orelse return false;
+                    const statement_end = scopes.statementEnd(index) orelse return false;
                     for (file.tokens[index + 1 .. @min(statement_end, path_end)], index + 1..) |value_token, value_index| {
                         if (value_token.tag == .identifier and tokenIs(file.source, value_token, binding) and
                             (value_index == 0 or file.tokens[value_index - 1].tag != .period)) return true;
@@ -420,22 +429,23 @@ fn findEscapingLocalStorage(
 ) !void {
     const level = run.configuration.level(.local_storage_escape);
     if (level == .off) return;
+    const scopes = try run.scopes(file_index);
     for (file.tokens, 0..) |token, array_declaration| {
         if (token.tag != .keyword_var or array_declaration + 5 >= file.tokens.len or
             file.tokens[array_declaration + 1].tag != .identifier or file.tokens[array_declaration + 2].tag != .colon or
             file.tokens[array_declaration + 3].tag != .l_bracket or file.tokens[array_declaration + 4].tag != .number_literal or
             file.tokens[array_declaration + 5].tag != .r_bracket) continue;
-        const array_end = statementEnd(file.tokens, array_declaration) orelse continue;
-        const scope_end = enclosingScopeEnd(file.tokens, array_declaration) orelse continue;
+        const array_end = scopes.statementEnd(array_declaration) orelse continue;
+        const scope_end = scopes.enclosingScopeEnd(array_declaration) orelse continue;
         const array_name = tokenText(file.source, file.tokens[array_declaration + 1]);
         for (file.tokens[array_end + 1 .. scope_end], array_end + 1..) |candidate, alias_declaration| {
             if ((candidate.tag != .keyword_const and candidate.tag != .keyword_var) or
                 alias_declaration + 3 >= scope_end or file.tokens[alias_declaration + 1].tag != .identifier) continue;
-            const alias_end = statementEnd(file.tokens, alias_declaration) orelse continue;
-            if (!rangeBorrowsArray(file, array_name, alias_declaration + 2, alias_end)) continue;
+            const alias_end = scopes.statementEnd(alias_declaration) orelse continue;
+            if (!rangeBorrowsArray(file, scopes, array_name, alias_declaration + 2, alias_end)) continue;
             const alias = tokenText(file.source, file.tokens[alias_declaration + 1]);
-            const escaped = escapingCallResult(file, summary_index, alias, alias_end + 1, scope_end) orelse continue;
-            if (!bindingRetained(file, escaped.binding, escaped.declaration_end + 1, scope_end)) continue;
+            const escaped = escapingCallResult(file, scopes, summary_index, alias, alias_end + 1, scope_end) orelse continue;
+            if (!bindingRetained(file, scopes, escaped.binding, escaped.declaration_end + 1, scope_end)) continue;
             try run.report(.{
                 .file_index = file_index,
                 .rule = .local_storage_escape,
@@ -449,12 +459,12 @@ fn findEscapingLocalStorage(
     }
 }
 
-fn rangeBorrowsArray(file: File, name: []const u8, start: usize, end: usize) bool {
+fn rangeBorrowsArray(file: File, scopes: *const syntax_scope.Index, name: []const u8, start: usize, end: usize) bool {
     for (file.tokens[start..end], start..) |token, index| {
         if (token.tag == .ampersand and index + 1 < end and tokenIs(file.source, file.tokens[index + 1], name)) return true;
         if (token.tag != .identifier or !tokenIs(file.source, token, name) or index + 1 >= end or
             file.tokens[index + 1].tag != .l_bracket) continue;
-        const closing = matchingToken(file.tokens, index + 1, .l_bracket, .r_bracket) orelse continue;
+        const closing = scopes.matchingToken(index + 1) orelse continue;
         if (closing > end) continue;
         for (file.tokens[index + 2 .. closing]) |slice_token| if (slice_token.tag == .ellipsis2) return true;
     }
@@ -470,6 +480,7 @@ const EscapingCall = struct {
 
 fn escapingCallResult(
     file: File,
+    scopes: *const syntax_scope.Index,
     summary_index: summaries.Index,
     alias: []const u8,
     start: usize,
@@ -478,7 +489,7 @@ fn escapingCallResult(
     for (file.tokens[start..end], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= end or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = scopes.statementEnd(declaration_index) orelse continue;
         const equal_index = findTag(file.tokens, declaration_index + 2, declaration_end, .equal) orelse continue;
         const call = firstCall(file.tokens, equal_index + 1, declaration_end) orelse continue;
         const argument = exactArgument(file, call, alias) orelse continue;
@@ -519,17 +530,17 @@ fn exactArgument(file: File, call: Call, name: []const u8) ?Argument {
     return null;
 }
 
-fn bindingRetained(file: File, binding: []const u8, start: usize, end: usize) bool {
+fn bindingRetained(file: File, scopes: *const syntax_scope.Index, binding: []const u8, start: usize, end: usize) bool {
     for (file.tokens[start..end], start..) |token, index| {
         if (token.tag == .keyword_return) {
-            const return_end = statementEnd(file.tokens, index) orelse continue;
+            const return_end = scopes.statementEnd(index) orelse continue;
             if (rangeRefersToBinding(file, binding, index + 1, @min(return_end, end))) return true;
         }
         if (token.tag != .l_paren or index == 0 or file.tokens[index - 1].tag != .identifier) continue;
         const method = tokenText(file.source, file.tokens[index - 1]);
         if (!std.mem.eql(u8, method, "append") and !std.mem.eql(u8, method, "put") and
             !std.mem.eql(u8, method, "insert")) continue;
-        const closing = matchingToken(file.tokens, index, .l_paren, .r_paren) orelse continue;
+        const closing = scopes.matchingToken(index) orelse continue;
         if (closing >= end) continue;
         if (rangeRefersToBinding(file, binding, index + 1, closing)) return true;
     }
@@ -566,19 +577,20 @@ pub fn findDeferredOwnedEscapes(
 ) !void {
     if (run.configuration.level(.returning_released_value) == .off) return;
     for (run.files, 0..) |file, file_index| {
+        const scopes = try run.scopes(file_index);
         for (file.tokens, 0..) |token, declaration_index| {
             if ((token.tag != .keyword_const and token.tag != .keyword_var) or
                 declaration_index + 3 >= file.tokens.len or file.tokens[declaration_index + 1].tag != .identifier) continue;
-            const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+            const declaration_end = scopes.statementEnd(declaration_index) orelse continue;
             const call = firstCall(file.tokens, declaration_index + 2, declaration_end) orelse continue;
             const function_name = tokenText(file.source, file.tokens[call.name_index]);
             const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
             const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
             const returns_owned = summary_index.callReturnsOwned(file.source, receiver, function_name);
             if (!returns_owned) continue;
-            const scope_start = enclosingOpeningBrace(file.tokens, declaration_index) orelse continue;
-            const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
-            const release_end = deferredOwnedRelease(file, binding, declaration_end + 1, scope_end, scope_start) orelse continue;
+            const scope_start = scopes.enclosingOpeningBrace(declaration_index) orelse continue;
+            const scope_end = scopes.enclosingScopeEnd(declaration_index) orelse continue;
+            const release_end = deferredOwnedRelease(file, scopes, binding, declaration_end + 1, scope_end, scope_start) orelse continue;
             for (file.tokens[release_end + 1 .. scope_end], release_end + 1..) |candidate, equal_index| {
                 if (candidate.tag != .equal or equal_index + 2 >= scope_end or
                     !tokenIs(file.source, file.tokens[equal_index + 1], binding) or
@@ -602,14 +614,15 @@ pub fn findDeferredOwnedEscapes(
 
 fn deferredOwnedRelease(
     file: File,
+    scopes: *const syntax_scope.Index,
     binding: []const u8,
     start: usize,
     end: usize,
     scope_start: usize,
 ) ?usize {
     for (file.tokens[start..end], start..) |token, defer_index| {
-        if (token.tag != .keyword_defer or enclosingOpeningBrace(file.tokens, defer_index) != scope_start) continue;
-        const statement_end = statementEnd(file.tokens, defer_index) orelse continue;
+        if (token.tag != .keyword_defer or scopes.enclosingOpeningBrace(defer_index) != scope_start) continue;
+        const statement_end = scopes.statementEnd(defer_index) orelse continue;
         if (statement_end >= end) continue;
         var method_index = defer_index + 1;
         while (method_index < statement_end) : (method_index += 1) {
@@ -623,7 +636,7 @@ fn deferredOwnedRelease(
             if (method_index >= 2 and file.tokens[method_index - 1].tag == .period and
                 tokenIs(file.source, file.tokens[method_index - 2], binding)) return statement_end;
             if (method_index + 1 >= statement_end or file.tokens[method_index + 1].tag != .l_paren) continue;
-            const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+            const call_end = scopes.matchingToken(method_index + 1) orelse continue;
             for (file.tokens[method_index + 2 .. @min(call_end, statement_end)]) |argument| {
                 if (argument.tag == .identifier and tokenIs(file.source, argument, binding)) return statement_end;
             }

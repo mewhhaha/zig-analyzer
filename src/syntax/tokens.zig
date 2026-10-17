@@ -195,9 +195,13 @@ pub fn pathAfter(tokens: []const std.zig.Token, start: usize) ?Range {
 /// neighbouring tokens keeps operator precedence out of the rule.
 pub fn identicalPathOperands(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) ?[2]std.zig.Ast.Node.Index {
     const left, const right = tree.nodeData(node).node_and_node;
-    if (!isPathNode(tree, left) or !isPathNode(tree, right)) return null;
-    if (!std.mem.eql(u8, tree.getNodeSource(left), tree.getNodeSource(right))) return null;
-    return .{ left, right };
+    return if (identicalPaths(tree, left, right)) .{ left, right } else null;
+}
+
+/// Whether both nodes are the same dotted identifier path, optionally dereferenced.
+pub fn identicalPaths(tree: *const std.zig.Ast, left: std.zig.Ast.Node.Index, right: std.zig.Ast.Node.Index) bool {
+    if (!isPathNode(tree, left) or !isPathNode(tree, right)) return false;
+    return std.mem.eql(u8, tree.getNodeSource(left), tree.getNodeSource(right));
 }
 
 fn isPathNode(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) bool {
@@ -393,6 +397,15 @@ pub fn nextTagBefore(tokens: []const std.zig.Token, start: usize, wanted: std.zi
         if (token.tag == wanted) return index;
     }
     return null;
+}
+
+/// Closing brace of the block of the `test`, `test "name"` or `test name` declaration at `test_index`.
+pub fn testBlockEnd(tokens: []const std.zig.Token, test_index: usize) ?usize {
+    if (tokens[test_index].tag != .keyword_test) return null;
+    var opening = test_index + 1;
+    if (opening < tokens.len and (tokens[opening].tag == .string_literal or tokens[opening].tag == .identifier)) opening += 1;
+    if (opening >= tokens.len or tokens[opening].tag != .l_brace) return null;
+    return matchingToken(tokens, opening, .l_brace, .r_brace);
 }
 
 /// First token of the statement containing `index`.

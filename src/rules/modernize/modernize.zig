@@ -28,7 +28,7 @@ pub fn run(context: RuleRun) !void {
     try io_targets.run(context);
 }
 
-const StdlibReplacement = struct {
+pub const StdlibReplacement = struct {
     path: []const u8,
     advice: []const u8,
     removed: bool = false,
@@ -39,7 +39,9 @@ const StdlibReplacement = struct {
 
 // Verified against the Zig 0.17.0 standard library: entries marked removed are
 // absent from that release; the rest carry `Deprecated` doc comments there.
-const stdlib_replacements = [_]StdlibReplacement{
+// `removed-std-api` takes its advice from here too, for any spelling of a path
+// the installed standard library proves absent.
+pub const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "mem.indexOf", .advice = "std.mem.find", .drop_in = true },
     .{ .path = "mem.indexOfPos", .advice = "std.mem.findPos", .drop_in = true },
     .{ .path = "mem.lastIndexOf", .advice = "std.mem.findLast", .drop_in = true },
@@ -89,7 +91,8 @@ const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "heap.DebugAllocator", .advice = "std.heap.SafeAllocator with its explicit init and deinit API" },
     .{ .path = "heap.DebugAllocatorConfig", .advice = "std.heap.SafeAllocator.Options" },
     .{ .path = "heap.Check", .advice = "std.heap.SafeAllocator and its deinit API" },
-    .{ .path = "heap.stackFallback", .advice = "std.heap.StackFallbackAllocator.init with a caller-owned buffer", .removed = true },
+    .{ .path = "heap.stackFallback", .advice = "std.heap.BufferFirstAllocator.init with a caller-owned buffer", .removed = true },
+    .{ .path = "heap.StackFallbackAllocator", .advice = "std.heap.BufferFirstAllocator.init with a caller-owned buffer", .removed = true },
     .{ .path = "fs.path.resolve", .advice = "std.Io.Dir.path.resolveAlloc", .drop_in = true },
     .{ .path = "fs.path.resolveWindows", .advice = "std.Io.Dir.path.resolveAllocWindows", .drop_in = true },
     .{ .path = "fs.path.resolvePosix", .advice = "std.Io.Dir.path.resolveAllocPosix", .drop_in = true },
@@ -152,6 +155,45 @@ const stdlib_replacements = [_]StdlibReplacement{
     .{ .path = "io.getStdIn", .advice = "std.Io.File.stdin()", .removed = true },
     .{ .path = "io.getStdErr", .advice = "std.Io.File.stderr()", .removed = true },
     .{ .path = "time.sleep", .advice = "std.Io.sleep with an Io instance and clock", .removed = true },
+    .{ .path = "time.Timer", .advice = "std.Io.Timestamp.now(io, .awake) and its untilNow method", .removed = true },
+    .{ .path = "time.Instant", .advice = "std.Io.Timestamp", .removed = true },
+    .{ .path = "time.timestamp", .advice = "std.Io.Timestamp.now(io, .real).toSeconds()", .removed = true },
+    .{ .path = "time.milliTimestamp", .advice = "std.Io.Timestamp.now(io, .real).toMilliseconds()", .removed = true },
+    .{ .path = "time.microTimestamp", .advice = "std.Io.Timestamp.now(io, .real).toMicroseconds()", .removed = true },
+    .{ .path = "time.nanoTimestamp", .advice = "std.Io.Timestamp.now(io, .real).toNanoseconds()", .removed = true },
+    .{ .path = "Thread.sleep", .advice = "std.Io.sleep with an Io instance and clock", .removed = true },
+    .{ .path = "Thread.Mutex", .advice = "std.Io.Mutex", .removed = true },
+    .{ .path = "Thread.Condition", .advice = "std.Io.Condition", .removed = true },
+    .{ .path = "Thread.RwLock", .advice = "std.Io.RwLock", .removed = true },
+    .{ .path = "Thread.Semaphore", .advice = "std.Io.Semaphore", .removed = true },
+    .{ .path = "Thread.ResetEvent", .advice = "std.Io.Event", .removed = true },
+    .{ .path = "Thread.WaitGroup", .advice = "std.Io.Group", .removed = true },
+    .{ .path = "Thread.Pool", .advice = "std.Io.Group with Io.async or Io.concurrent", .removed = true },
+    .{ .path = "fs.cwd", .advice = "std.Io.Dir.cwd()", .removed = true },
+    .{ .path = "fs.File", .advice = "std.Io.File, whose operations take an Io instance", .removed = true },
+    .{ .path = "fs.Dir", .advice = "std.Io.Dir, whose operations take an Io instance", .removed = true },
+    .{ .path = "heap.GeneralPurposeAllocator", .advice = "std.heap.SafeAllocator with its explicit init and deinit API", .removed = true },
+    .{ .path = "process.args", .advice = "std.process.Args from the minimal.args field of main's std.process.Init parameter", .removed = true },
+    .{ .path = "process.argsAlloc", .advice = "std.process.Args.toSlice on the minimal.args field of main's std.process.Init parameter", .removed = true },
+    .{ .path = "process.getEnvMap", .advice = "std.process.Environ.Map from the environ_map field of main's std.process.Init parameter", .removed = true },
+    .{ .path = "process.getEnvVarOwned", .advice = "std.process.Environ.Map.get on the environ_map field of main's std.process.Init parameter, or std.process.Environ.getAlloc", .removed = true },
+    .{ .path = "process.getCwd", .advice = "std.process.currentPath with an Io instance", .removed = true },
+    .{ .path = "process.getCwdAlloc", .advice = "std.process.currentPathAlloc with an Io instance", .removed = true },
+    .{ .path = "crypto.random", .advice = "std.Io.random or std.Io.randomSecure on an Io instance, or std.Random.IoSource for a std.Random interface", .removed = true },
+    .{ .path = "io.fixedBufferStream", .advice = "std.Io.Reader.fixed or std.Io.Writer.fixed", .removed = true },
+    .{ .path = "net", .advice = "std.Io.net, whose operations take an Io instance", .removed = true },
+    .{ .path = "Io.File.OpenFlags", .advice = "std.Io.Dir.OpenFileOptions", .removed = true },
+    .{ .path = "Io.File.CreateFlags", .advice = "std.Io.Dir.CreateFileOptions", .removed = true },
+    .{ .path = "posix.exit", .advice = "std.process.exit", .removed = true },
+    .{ .path = "posix.getenv", .advice = "std.process.Environ.getPosix, or the environ_map field of main's std.process.Init parameter", .removed = true },
+    .{ .path = "fmt.format", .advice = "std.Io.Writer.print on the destination writer", .removed = true },
+    .{ .path = "fmt.FormatOptions", .advice = "std.fmt.Options", .removed = true },
+    .{ .path = "heap.memory_pool.Managed", .advice = "std.heap.MemoryPool and pass the allocator to allocating calls", .removed = true },
+    .{ .path = "zig.system.NativeTargetInfo", .advice = "std.zig.system.resolveTargetQuery", .removed = true },
+    .{ .path = "lang.Type.StructField", .advice = "std.lang.Type.Struct and its field_names, field_types and field_attrs arrays", .removed = true },
+    .{ .path = "lang.Type.UnionField", .advice = "std.lang.Type.Union and its field_names, field_types and field_attrs arrays", .removed = true },
+    .{ .path = "lang.Type.EnumField", .advice = "std.lang.Type.Enum and its field_names and field_values arrays", .removed = true },
+    .{ .path = "lang.Type.Fn.Param", .advice = "std.lang.Type.Fn and its param_types and param_attrs arrays", .removed = true },
     .{ .path = "BoundedArray", .advice = "std.ArrayList.initBuffer over a caller-owned buffer", .removed = true },
     .{ .path = "fifo.LinearFifo", .advice = "std.Io.Reader/std.Io.Writer buffering or an explicit ring buffer", .removed = true },
     .{ .path = "math.min", .advice = "@min", .removed = true },
@@ -884,6 +926,38 @@ fn requireStdDeclaration(comptime namespace: anytype, comptime path: []const u8)
     const segment_end = comptime std.mem.findScalar(u8, path, '.') orelse path.len;
     const member = @field(namespace, path[0..segment_end]);
     if (comptime segment_end != path.len) requireStdDeclaration(member, path[segment_end + 1 ..]);
+}
+
+test "removed standard library paths are absent and their advice names current declarations" {
+    @setEvalBranchQuota(100_000);
+    inline for (stdlib_replacements) |entry| {
+        if (comptime !entry.removed) continue;
+        comptime requireStdAbsent(std, entry.path);
+        if (comptime std.mem.startsWith(u8, entry.advice, "std.")) comptime requireStdPrefix(std, leadingPath(entry.advice["std.".len..]));
+    }
+}
+
+fn requireStdAbsent(comptime namespace: type, comptime path: []const u8) void {
+    const segment_end = std.mem.findScalar(u8, path, '.') orelse path.len;
+    if (!@hasDecl(namespace, path[0..segment_end])) return;
+    if (segment_end == path.len) @compileError("std path marked removed still exists: " ++ path);
+    requireStdAbsent(@field(namespace, path[0..segment_end]), path[segment_end + 1 ..]);
+}
+
+/// Checks each segment while the path names namespaces; a function such as
+/// `std.ArrayList` ends what can be checked.
+fn requireStdPrefix(comptime namespace: type, comptime path: []const u8) void {
+    const segment_end = std.mem.findScalar(u8, path, '.') orelse path.len;
+    if (!@hasDecl(namespace, path[0..segment_end])) @compileError("advice names a missing std declaration: " ++ path);
+    const member = @field(namespace, path[0..segment_end]);
+    if (segment_end != path.len and @TypeOf(member) == type) requireStdPrefix(member, path[segment_end + 1 ..]);
+}
+
+fn leadingPath(comptime advice: []const u8) []const u8 {
+    for (advice, 0..) |byte, position| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '.') return advice[0..position];
+    }
+    return advice;
 }
 
 test "modernize 0.17 distinguishes removed aliases and shape-changing replacements" {

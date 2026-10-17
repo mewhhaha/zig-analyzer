@@ -96,6 +96,7 @@ pub const Cache = struct {
         hasher.update(std.mem.asBytes(&configuration.function_length_limit));
         hasher.update(std.mem.asBytes(&configuration.line_length_limit));
         hasher.update(std.mem.asBytes(&configuration.line_length_allow_unsplittable));
+        hasher.update(std.mem.asBytes(&configuration.function_case));
         for (configuration.todo_markers) |marker| {
             hasher.update(std.mem.asBytes(&marker.len));
             hasher.update(marker);

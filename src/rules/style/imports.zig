@@ -33,7 +33,8 @@ fn findImportIssues(context: RuleRun) !void {
     const unused_level = context.level(.unused_import);
     const path_level = context.level(.redundant_import_path);
     if (duplicate_level == .off and unused_level == .off and path_level == .off) return;
-    var seen_paths: std.StringHashMapUnmanaged(std.zig.Token.Loc) = .empty;
+    // The `const` token of the first import of each path.
+    var seen_paths: std.StringHashMapUnmanaged(usize) = .empty;
     defer seen_paths.deinit(context.allocator);
     var brace_depth: usize = 0;
     for (tokens, 0..) |token, index| {
@@ -50,19 +51,13 @@ fn findImportIssues(context: RuleRun) !void {
         const path = raw_path[1 .. raw_path.len - 1];
         const declaration_span = std.zig.Token.Loc{ .start = lineStart(source, token.loc.start), .end = lineEnd(source, tokens[index + 7].loc.end) };
         if (duplicate_level != .off) {
-            if (seen_paths.get(path)) |first_span| {
-                const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start) fixes: {
-                    const allocated = try Fix.single(context.allocator, .{
-                        .title = "Remove duplicate import",
-                        .span = declaration_span,
-                        .replacement = "",
-                        .preferred = true,
-                        .fix_all = true,
-                    });
-                    break :fixes allocated;
-                } else &.{};
+            if (seen_paths.get(path)) |first| {
+                const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start)
+                    try duplicateRemoval(context, first + 1, index + 1, declaration_span)
+                else
+                    &.{};
                 const related = try context.allocator.alloc(RelatedSpan, 1);
-                related[0] = .{ .span = first_span, .message = "the same module is imported here first" };
+                related[0] = .{ .span = tokens[first + 5].loc, .message = "the same module is imported here first" };
                 try context.emit(.{
                     .rule = .duplicate_import,
                     .level = duplicate_level,
@@ -71,7 +66,7 @@ fn findImportIssues(context: RuleRun) !void {
                     .related = related,
                     .fixes = fixes,
                 });
-            } else try seen_paths.put(context.allocator, path, tokens[index + 5].loc);
+            } else try seen_paths.put(context.allocator, path, index);
         }
         if (unused_level != .off and identifierUseCount(source, tokens, alias) == 1) {
             const fixes: []const Fix = if (attachedCommentStart(source, declaration_span.start) == declaration_span.start) fixes: {
@@ -117,6 +112,43 @@ fn identifierUseCount(source: []const u8, tokens: []const std.zig.Token, name: [
         if (token.tag == .identifier and tokenIs(source, token, name)) count += 1;
     }
     return count;
+}
+
+/// Removes the duplicate import declared at `duplicate` and renames its
+/// references to the first import's alias, declared at `first`. Declined when
+/// a reference resolves elsewhere or the first alias is not visible there.
+/// Fix-all applies the removal and its renames together or not at all, so a
+/// rename is never lost.
+fn duplicateRemoval(context: RuleRun, first: usize, duplicate: usize, declaration_span: std.zig.Token.Loc) ![]const Fix {
+    const first_alias = context.tokenText(first);
+    const duplicate_alias = context.tokenText(duplicate);
+    var edits: std.ArrayList(types.Edit) = .empty;
+    defer edits.deinit(context.allocator);
+    try edits.append(context.allocator, .{ .span = declaration_span, .replacement = "" });
+    for (context.tokens, 0..) |token, index| {
+        if (index == duplicate or token.tag != .identifier or !context.tokenIs(index, duplicate_alias) or
+            (index > 0 and context.tokens[index - 1].tag == .period)) continue;
+        // A field or label spelled like the alias is not a reference.
+        if (context.tokens[index + 1].tag == .colon or (index > 0 and context.tokens[index - 1].tag == .colon and
+            index > 1 and (context.tokens[index - 2].tag == .keyword_break or context.tokens[index - 2].tag == .keyword_continue))) return &.{};
+        const reference = context.scopes.findBinding(index) orelse return &.{};
+        const visible = context.scopes.findBindingNamed(first_alias, index) orelse return &.{};
+        if (reference.token_index != duplicate or visible.token_index != first) return &.{};
+        try edits.append(context.allocator, .{ .span = token.loc, .replacement = first_alias });
+    }
+    const removal_only = edits.items.len == 1;
+    const fixes = try context.allocator.alloc(Fix, 1);
+    fixes[0] = .{
+        .title = if (removal_only)
+            "Remove duplicate import"
+        else
+            try context.allocator.print("Remove duplicate import and use '{s}'", .{first_alias}),
+        .kind = .quickfix,
+        .edits = try edits.toOwnedSlice(context.allocator),
+        .preferred = true,
+        .fix_all = true,
+    };
+    return fixes;
 }
 
 const Import = struct {
@@ -227,6 +259,38 @@ fn sortedImportText(allocator: std.mem.Allocator, source: []const u8, imports: [
         previous_group = group;
     }
     return try writer.toOwnedSlice();
+}
+
+test "a referenced duplicate import is removed by renaming its references" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Before = @import(\"effects.zig\");\n" ++
+        "const After = @import(\"effects.zig\");\n" ++
+        "fn copy(store: *After.Store) Before.Store {\n" ++
+        "    return .{ .After = After.limit, .rows = store.rows };\n" ++
+        "}\n";
+    const configuration = support.only(&.{.duplicate_import}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    const fix = found[0].fixes[0];
+    try std.testing.expect(fix.fix_all);
+    try std.testing.expectEqual(@as(usize, 3), fix.edits.len);
+    var rewritten: std.ArrayList(u8) = .empty;
+    try rewritten.appendSlice(arena.allocator(), source);
+    var edit_index = fix.edits.len;
+    while (edit_index > 0) {
+        edit_index -= 1;
+        const edit = fix.edits[edit_index];
+        try rewritten.replaceRange(arena.allocator(), edit.span.start, edit.span.end - edit.span.start, edit.replacement);
+    }
+    try std.testing.expectEqualStrings(
+        "const Before = @import(\"effects.zig\");\n" ++
+            "fn copy(store: *Before.Store) Before.Store {\n" ++
+            "    return .{ .After = Before.limit, .rows = store.rows };\n" ++
+            "}\n",
+        rewritten.items,
+    );
 }
 
 test "organize imports preserves directly attached comments" {

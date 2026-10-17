@@ -1,10 +1,8 @@
 //! Names that resolve to nothing: calls, identifiers and labels checked against the lexical scope index.
 const std = @import("std");
 
-const syntax_scope = @import("../../syntax/scope.zig");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
@@ -71,8 +69,8 @@ fn findUnresolvedIdentifiers(context: RuleRun) !void {
         const name = tokenText(source, token);
         if (std.mem.eql(u8, name, "_") or std.zig.isPrimitive(name) or
             context.scopes.findBinding(token_index) != null or
-            syntax_scope.isContainerFieldDeclaration(tokens, token_index) or
-            containerHeaderResolvesToNestedDeclaration(source, tokens, token_index, name)) continue;
+            context.scopes.isContainerFieldDeclaration(token_index) or
+            containerHeaderResolvesToNestedDeclaration(context, token_index, name)) continue;
         // Field names and enum literals are resolved through their receiver or
         // result type. Calls retain the more specific unresolved-call finding.
         if (token_index > 0 and tokens[token_index - 1].tag == .period) continue;
@@ -88,12 +86,9 @@ fn findUnresolvedIdentifiers(context: RuleRun) !void {
     }
 }
 
-fn containerHeaderResolvesToNestedDeclaration(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    identifier_index: usize,
-    name: []const u8,
-) bool {
+fn containerHeaderResolvesToNestedDeclaration(context: RuleRun, identifier_index: usize, name: []const u8) bool {
+    const source = context.source;
+    const tokens = context.tokens;
     var container_keyword: ?usize = null;
     var cursor = identifier_index;
     while (cursor > 0 and identifier_index - cursor < 32) {
@@ -114,7 +109,7 @@ fn containerHeaderResolvesToNestedDeclaration(
         if (tokens[opening].tag == .semicolon) return false;
     }
     if (opening == tokens.len) return false;
-    const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse return false;
+    const closing = context.matchingToken(opening, .l_brace, .r_brace) orelse return false;
 
     var depth: usize = 0;
     for (tokens[opening + 1 .. closing], opening + 1..) |token, index| {

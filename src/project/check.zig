@@ -4,6 +4,7 @@ const analysis = @import("../analysis.zig");
 const compile_units = @import("../compiler/compile_units.zig");
 const compiler_session = @import("../compiler/session.zig");
 const project_rules = @import("../rules/project.zig");
+const syntax_scope = @import("../syntax/scope.zig");
 const text_edits = @import("../syntax/text_edits.zig");
 const check_cache = @import("check_cache.zig");
 const project_config = @import("config.zig");
@@ -53,6 +54,29 @@ test "CLI module member findings refresh when an imported file changes despite c
     defer refreshed.deinit();
     _ = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path }, &refreshed.writer);
     try std.testing.expect(std.mem.find(u8, refreshed.written(), "unresolved-member") == null);
+}
+
+test "CLI removed std paths name their replacement instead of a bare unresolved member" {
+    _ = @import("../compiler/zig_environment.zig").libDirectory(std.testing.io) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ZigEnvironmentUnavailable, error.ZigEnvironmentMalformed => return error.SkipZigTest,
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    // The defaults, rather than the configuration of a directory above.
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "zig-analyzer.json", .data = "{}" });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.zig",
+        .data = "const std = @import(\"std\");\nconst fs = std.fs;\npub fn run() void {\n    _ = fs.cwd();\n    _ = std.fs.cwd();\n}\n",
+    });
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    _ = try runWithWriter(std.testing.io, std.testing.allocator, .{ .path = path, .cache = false }, &output.writer);
+    const finding = "warning[removed-std-api]: std.fs.cwd was removed from the standard library; use std.Io.Dir.cwd()";
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, output.written(), finding));
+    try std.testing.expect(std.mem.find(u8, output.written(), "unresolved-member") == null);
 }
 
 pub const Options = struct {
@@ -240,16 +264,22 @@ fn runWithWriter(
         concurrency_available = false;
         checkProjectTask(io, allocator, root, loaded_files, configuration, cache, &project_result);
     };
-    for (loaded_files, file_results) |loaded_file, *result| {
-        if (concurrency_available) {
-            group.concurrent(io, checkFileTask, .{ io, allocator, root, loaded_file, configuration, options.fix, cache, result }) catch {
-                concurrency_available = false;
-                checkFileTask(io, allocator, root, loaded_file, configuration, options.fix, cache, result);
-            };
-        } else {
-            checkFileTask(io, allocator, root, loaded_file, configuration, options.fix, cache, result);
-        }
+    var file_checks: FileChecks = .{
+        .io = io,
+        .allocator = allocator,
+        .root = root,
+        .loaded_files = loaded_files,
+        .configuration = configuration,
+        .fix = options.fix,
+        .cache = cache,
+        .results = file_results,
+        .order = try largestFirst(arena, loaded_files),
+    };
+    if (concurrency_available) {
+        const workers = @min(std.Thread.getCpuCount() catch 1, loaded_files.len);
+        for (1..workers) |_| group.concurrent(io, FileChecks.work, .{&file_checks}) catch break;
     }
+    file_checks.work();
     try group.await(io);
     if (project_result.failure) |failure| return failure;
     if (project_result.output) |output| try writer.writeAll(output);
@@ -326,17 +356,20 @@ fn reportProjectFindings(
         });
     }
     // The cross-file pass and the project rules read the same files and share
-    // nothing, so they run side by side; their output is joined in that order.
+    // only their scope indexes, so they run side by side; their output is
+    // joined in that order.
+    var scopes: syntax_scope.LazyIndexes = try .init(std.heap.smp_allocator, io, files.items.len);
+    defer scopes.deinit();
     var cross: CrossFileTask = .{};
     defer if (cross.output) |output| allocator.free(output);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    group.concurrent(io, crossFileTask, .{ io, allocator, root, files.items, configuration, cache, &cross }) catch
-        crossFileTask(io, allocator, root, files.items, configuration, cache, &cross);
+    group.concurrent(io, crossFileTask, .{ io, allocator, root, files.items, configuration, cache, &scopes, &cross }) catch
+        crossFileTask(io, allocator, root, files.items, configuration, cache, &scopes, &cross);
     var rules_output: std.Io.Writer.Allocating = .init(allocator);
     defer rules_output.deinit();
     var rules_summary: Summary = .{};
-    const rules_failure = reportProjectRules(io, allocator, root, loaded_files, files.items, configuration, cache, &rules_output.writer, &rules_summary);
+    const rules_failure = reportProjectRules(io, allocator, root, loaded_files, files.items, configuration, cache, &scopes, &rules_output.writer, &rules_summary);
     try group.await(io);
     if (cross.failure) |failure| return failure;
     try writer.writeAll(cross.output.?);
@@ -359,11 +392,12 @@ fn crossFileTask(
     files: []const project_rules.SourceFile,
     configuration: analysis.Configuration,
     cache: check_cache.Cache,
+    scopes: *syntax_scope.LazyIndexes,
     task: *CrossFileTask,
 ) void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     var summary: Summary = .{};
-    reportCrossFileFindings(io, allocator, root, files, configuration, cache, &output.writer, &summary) catch |err| {
+    reportCrossFileFindings(io, allocator, root, files, configuration, cache, scopes, &output.writer, &summary) catch |err| {
         output.deinit();
         task.failure = err;
         return;
@@ -384,6 +418,7 @@ fn reportProjectRules(
     files: []const project_rules.SourceFile,
     configuration: analysis.Configuration,
     cache: check_cache.Cache,
+    scopes: *syntax_scope.LazyIndexes,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
@@ -416,8 +451,9 @@ fn reportProjectRules(
         return;
     };
     const compiler_facts = try collectCompilerFacts(io, allocator, root, loaded_files, configuration, writer);
-    const findings = try project_rules.findingsConcurrently(io, allocator, files, configuration, compiler_facts);
-    defer project_rules.freeFindings(allocator, findings);
+    // Not the arena: the per-file passes release their scratch as they go.
+    const findings = try project_rules.findingsConcurrently(io, std.heap.smp_allocator, files, configuration, compiler_facts, scopes);
+    defer project_rules.freeFindings(std.heap.smp_allocator, findings);
     var records: std.ArrayList(check_cache.ProjectRecord) = .empty;
     defer records.deinit(allocator);
     const suppressions = try allocator.alloc(?analysis.Suppressions, files.len);
@@ -469,6 +505,7 @@ fn reportCrossFileFindings(
     files: []const project_rules.SourceFile,
     configuration: analysis.Configuration,
     cache: check_cache.Cache,
+    scopes: *syntax_scope.LazyIndexes,
     writer: *std.Io.Writer,
     summary: *Summary,
 ) !void {
@@ -479,6 +516,7 @@ fn reportCrossFileFindings(
         .files = files,
         .configuration = configuration,
         .cache = cache,
+        .scopes = scopes,
     });
     defer results.deinit();
     if (results.failure) |failure| return failure;
@@ -847,6 +885,57 @@ fn checkFile(
         });
     }
     summary.findings += reported.len;
+}
+
+/// The per-file checks, shared by one worker per CPU. A task per file would
+/// start a thread per file, keeping every file's analysis in memory at once
+/// and contending for the allocator's per-CPU state.
+const FileChecks = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: ScanRoot,
+    loaded_files: []const LoadedFile,
+    configuration: analysis.Configuration,
+    fix: bool,
+    cache: check_cache.Cache,
+    results: []FileCheckResult,
+    /// File indexes in the order workers take them.
+    order: []const usize,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn work(checks: *FileChecks) void {
+        while (true) {
+            const position = checks.next.fetchAdd(1, .monotonic);
+            if (position >= checks.order.len) return;
+            const index = checks.order[position];
+            checkFileTask(
+                checks.io,
+                checks.allocator,
+                checks.root,
+                checks.loaded_files[index],
+                checks.configuration,
+                checks.fix,
+                checks.cache,
+                &checks.results[index],
+            );
+        }
+    }
+};
+
+/// Indexes of `loaded_files`, largest source first, so the slowest files
+/// start early instead of finishing last on one worker.
+fn largestFirst(allocator: std.mem.Allocator, loaded_files: []const LoadedFile) ![]const usize {
+    const order = try allocator.alloc(usize, loaded_files.len);
+    for (order, 0..) |*index, position| index.* = position;
+    std.mem.sort(usize, order, loaded_files, struct {
+        fn lessThan(files: []const LoadedFile, left: usize, right: usize) bool {
+            const left_len = if (files[left].source) |source| source.len else 0;
+            const right_len = if (files[right].source) |source| source.len else 0;
+            if (left_len != right_len) return left_len > right_len;
+            return left < right;
+        }
+    }.lessThan);
+    return order;
 }
 
 fn checkFileTask(

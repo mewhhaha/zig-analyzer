@@ -556,10 +556,14 @@ pub fn constantTarget(
 }
 
 /// What a `fn Name(...) type { return struct { ... }; }` type function returns.
+/// A `return` inside a container the body declares belongs to that
+/// container's own function. With `single`, a function with more than one
+/// `return` has no result, since its comptime arguments pick the one taken.
 pub fn typeFunctionResult(
     source: []const u8,
     tokens: []const std.zig.Token,
     name_index: usize,
+    single: bool,
 ) ?DeclarationDescent {
     if (name_index + 1 >= tokens.len or tokens[name_index + 1].tag != .l_paren) return null;
     const parameters_end = matchingToken(tokens, name_index + 1, .l_paren, .r_paren) orelse return null;
@@ -571,29 +575,41 @@ pub fn typeFunctionResult(
     const return_type = std.mem.trim(u8, source[tokens[parameters_end].loc.end..tokens[body_start].loc.start], " \t\r\n");
     if (!std.mem.eql(u8, return_type, "type")) return null;
     const body_end = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return null;
+    // A returned container literal is preferred over a returned path.
+    var container_result: ?DeclarationDescent = null;
+    var path_result: ?DeclarationDescent = null;
+    var return_count: usize = 0;
     var index = body_start + 1;
     while (index < body_end) : (index += 1) {
-        if (tokens[index].tag != .keyword_return) continue;
-        var value_index = index + 1;
-        while (value_index < body_end and
-            (tokens[value_index].tag == .keyword_extern or tokens[value_index].tag == .keyword_packed)) : (value_index += 1)
-        {}
-        switch (tokens[value_index].tag) {
+        switch (tokens[index].tag) {
             .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
-                const range = containerLiteralRange(tokens, value_index) orelse return null;
-                return .{ .container = range };
+                const range = containerLiteralRange(tokens, index) orelse continue;
+                index = range.end;
+            },
+            .keyword_return => {
+                return_count += 1;
+                if (single and return_count > 1) return null;
+                var value_index = index + 1;
+                while (value_index < body_end and
+                    (tokens[value_index].tag == .keyword_extern or tokens[value_index].tag == .keyword_packed)) : (value_index += 1)
+                {}
+                switch (tokens[value_index].tag) {
+                    .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {
+                        const range = containerLiteralRange(tokens, value_index) orelse return null;
+                        if (container_result == null) container_result = .{ .container = range };
+                        index = range.end;
+                    },
+                    else => if (path_result == null) {
+                        if (pathEndIndex(tokens, index + 1, body_end)) |last| {
+                            path_result = .{ .alias_path = source[tokens[index + 1].loc.start..tokens[last].loc.end] };
+                        }
+                    },
+                }
             },
             else => {},
         }
     }
-    index = body_start + 1;
-    while (index < body_end) : (index += 1) {
-        if (tokens[index].tag != .keyword_return) continue;
-        if (pathEndIndex(tokens, index + 1, body_end)) |last| {
-            return .{ .alias_path = source[tokens[index + 1].loc.start..tokens[last].loc.end] };
-        }
-    }
-    return null;
+    return container_result orelse path_result;
 }
 
 /// A name declared directly inside a container.
@@ -650,7 +666,10 @@ pub fn containerMembers(
             .identifier => {
                 if (brace_depth != 0 or parenthesis_depth != 0) continue;
                 const next_tag = if (index + 1 < container.end) tokens[index + 1].tag else null;
-                const starts_tag = index == container.start or tokens[index - 1].tag == .comma;
+                const starts_tag = index == container.start or switch (tokens[index - 1].tag) {
+                    .comma, .semicolon, .r_brace, .doc_comment, .container_doc_comment => true,
+                    else => false,
+                };
                 const is_field_or_tag = next_tag == .colon or
                     (starts_tag and (next_tag == null or next_tag == .comma or next_tag == .equal));
                 if (!is_field_or_tag) continue;
@@ -899,6 +918,51 @@ test "module resolution returns only public declarations" {
     try std.testing.expectEqual(@as(usize, 2), members.len);
     try std.testing.expectEqualStrings("default_limit", members[0].name);
     try std.testing.expectEqualStrings("clampToLimit", members[1].name);
+}
+
+test "container members include enum tags after doc comments" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const source: [:0]const u8 =
+        "pub const Order = enum {\n" ++
+        "    /// Greater.\n" ++
+        "    gt,\n" ++
+        "    /// Less.\n" ++
+        "    lt = 4,\n" ++
+        "    eq,\n" ++
+        "    pub fn invert(order: Order) Order { return order; }\n" ++
+        "};\n";
+    const tokens = try tokenize(arena, source);
+    const declaration = containerDeclarationNamed(source, tokens, .{ .start = 0, .end = tokens.len }, "Order").?;
+    const range = (try constantTarget(arena, source, tokens, declaration.name_index)).?.container;
+    const members = try containerMembers(arena, source, tokens, range, false);
+    var names: std.ArrayList(u8) = .empty;
+    for (members) |member| try names.print(arena, "{s} ", .{member.name});
+    try std.testing.expectEqualStrings("gt lt eq invert ", names.items);
+}
+
+test "type function results skip nested containers and may require one return" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const source: [:0]const u8 =
+        "fn Groove(comptime T: type) type {\n" ++
+        "    const Helper = struct { fn Inner() type { return struct { const wrong = T; }; } };\n" ++
+        "    _ = Helper;\n" ++
+        "    return struct { const right = T; };\n" ++
+        "}\n" ++
+        "fn Static(comptime size: usize) type {\n" ++
+        "    if (size <= 64) return Small;\n" ++
+        "    return Large;\n" ++
+        "}\n";
+    const tokens = try tokenize(arena_state.allocator(), source);
+    const groove = typeFunctionResult(source, tokens, 1, true).?.container;
+    try std.testing.expect(std.mem.find(u8, source[tokens[groove.start].loc.start..tokens[groove.end].loc.start], "right") != null);
+    const static_index = for (tokens, 0..) |token, index| {
+        if (std.mem.eql(u8, source[token.loc.start..token.loc.end], "Static")) break index;
+    } else unreachable;
+    try std.testing.expect(typeFunctionResult(source, tokens, static_index, true) == null);
+    try std.testing.expectEqualStrings("Small", typeFunctionResult(source, tokens, static_index, false).?.alias_path);
 }
 
 test "import resolution identifies aliases" {

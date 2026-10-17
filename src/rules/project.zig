@@ -14,6 +14,7 @@ const public_api = @import("project/public_api.zig");
 const recursive_call = @import("project/recursive_call.zig");
 const run_module = @import("project/run.zig");
 const support = @import("test_support.zig");
+const syntax_scope = @import("../syntax/scope.zig");
 const tokenize = @import("../syntax/tokens.zig").tokenize;
 const types = @import("types.zig");
 
@@ -34,6 +35,9 @@ pub const refines = ownership.refines;
 
 /// Rules whose proof walks the import graph.
 const graph_rules = import_graph.rules ++ [_]types.Rule{.unreachable_public_declaration};
+
+/// Rules whose passes read the scope index of every file.
+const indexed_rules = allocation_after_init.rules ++ recursive_call.rules ++ ownership.rules ++ ownership.refines;
 
 /// Whether an enabled rule needs facts from the patched compiler.
 pub fn needsCompilerFacts(configuration: types.Configuration) bool {
@@ -65,23 +69,31 @@ pub fn findingsWithCompilerFacts(
     configuration: types.Configuration,
     compiler_facts: CompilerFacts,
 ) ![]const Finding {
-    return findingsConcurrently(null, allocator, files, configuration, compiler_facts);
+    return findingsConcurrently(null, allocator, files, configuration, compiler_facts, null);
 }
 
 /// `findingsWithCompilerFacts`, spreading per-file passes over a few threads
 /// when `io` is given. `allocator` must then be safe to use from threads; the
-/// findings are the same either way.
+/// findings are the same either way. `scopes`, when given, holds the scope
+/// indexes of `files` in order, shared with other passes over the same files.
 pub fn findingsConcurrently(
     io: ?std.Io,
     allocator: std.mem.Allocator,
     files: []const SourceFile,
     configuration: types.Configuration,
     compiler_facts: CompilerFacts,
+    scopes: ?*syntax_scope.LazyIndexes,
 ) ![]const Finding {
     if (!enabled(configuration)) return &.{};
     var scratch_arena: std.heap.ArenaAllocator = .init(allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
+    var own_scopes: ?syntax_scope.LazyIndexes = null;
+    defer if (own_scopes) |*owned| owned.deinit();
+    const file_scopes = scopes orelse file_scopes: {
+        own_scopes = try .init(allocator, io, files.len);
+        break :file_scopes &own_scopes.?;
+    };
 
     const project_files = try scratch.alloc(run_module.File, files.len);
     for (files, project_files) |file, *project_file| {
@@ -94,11 +106,13 @@ pub fn findingsConcurrently(
     const run: run_module.ProjectRun = .{
         .allocator = scratch,
         .results = allocator,
+        .backing = allocator,
         .files = project_files,
         .configuration = configuration,
         .compiler_facts = compiler_facts,
         .findings = &found,
         .syntaxes = syntaxes,
+        .file_scopes = file_scopes,
         .io = io,
     };
 
@@ -111,6 +125,9 @@ pub fn findingsConcurrently(
     try conventions.findInconsistentParameterVocabulary(run);
     try conventions.findInconsistentErrorSetStyle(run);
     try literal_boolean_argument.find(run);
+    // The passes from here on read every file's scope index; they are built
+    // on several threads up front rather than one at a time as each is reached.
+    if (configuration.anyEnabled(&indexed_rules)) try run_module.forEachIndex(run, files.len, run, buildScopes);
     try allocation_after_init.find(run);
     try recursive_call.find(run);
     try import_graph.findImportBoundaryViolations(run, imports);
@@ -125,6 +142,10 @@ pub fn findingsConcurrently(
         }
     }.lessThan);
     return try found.toOwnedSlice(allocator);
+}
+
+fn buildScopes(run: run_module.ProjectRun, file_index: usize) !void {
+    _ = try run.scopes(file_index);
 }
 
 test "project findings compose imports tests and build options" {

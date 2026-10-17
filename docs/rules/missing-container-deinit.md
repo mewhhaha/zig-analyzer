@@ -24,8 +24,10 @@ types within functions and tests, whether the type comes from the annotation
 allocating methods (`append`, `appendSlice`, `put`, `getOrPut`,
 `ensureTotalCapacity`, etc.). A `defer container.deinit(allocator);`, direct
 `deinit`, conversion via `toOwnedSlice`, or returning the container satisfies
-ownership. Managed containers (`std.array_list.Managed`) and containers fed by
-the build graph's `b.allocator` arena are not reported. An automated quickfix
+ownership. Managed containers (`std.array_list.Managed`), containers fed by
+the build graph's arena (`b.allocator`, a `*std.Build` field's allocator, or an
+alias of either), and containers in `test` blocks, where
+`std.testing.allocator` reports leaks, are not reported. An automated quickfix
 inserts the appropriate `defer container.deinit(allocator);`.
 
 An `.empty` or `.{}` initializer alone does not establish heap ownership.

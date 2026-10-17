@@ -1,8 +1,6 @@
 //! `else` branches after an `if` branch that always returns, breaks or continues.
 const std = @import("std");
 
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
-const matchingOpeningToken = @import("../../syntax/tokens.zig").matchingOpeningToken;
 const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
@@ -25,12 +23,15 @@ fn findNeedlessElse(context: RuleRun) !void {
     for (tokens, 0..) |token, else_index| {
         if (token.tag != .keyword_else or else_index == 0 or else_index + 1 >= tokens.len or tokens[else_index + 1].tag != .l_brace) continue;
         if (tokens[else_index - 1].tag != .r_brace) continue;
-        const preceding_open = matchingOpeningToken(tokens, else_index - 1, .l_brace, .r_brace) orelse continue;
+        const preceding_open = context.scopes.matchingToken(else_index - 1) orelse continue;
         // A loop's else runs when the loop exits without break, so it is never removable.
-        if (!precedingBlockIsIfStatement(tokens, preceding_open)) continue;
-        if (blockBelongsToElseIf(tokens, preceding_open)) continue;
+        if (!precedingBlockIsIfStatement(context, preceding_open)) continue;
+        if (blockBelongsToElseIf(context, preceding_open)) continue;
         if (!blockAlwaysTerminates(tokens, preceding_open, else_index - 1)) continue;
-        const else_close = matchingToken(tokens, else_index + 1, .l_brace, .r_brace) orelse continue;
+        const else_close = context.matchingToken(else_index + 1, .l_brace, .r_brace) orelse continue;
+        // 'if (c) { return a; } else { return b; }' states two symmetric
+        // exits; flattening it would only hide that the branches are peers.
+        if (blockAlwaysTerminates(tokens, else_index + 1, else_close)) continue;
         const declares_bindings = blockDeclaresBindings(tokens, else_index + 1, else_close);
         const fixes = if (declares_bindings) blk: {
             const f = try Fix.single(context.allocator, .{
@@ -104,8 +105,9 @@ fn blockDeclaresBindings(tokens: []const std.zig.Token, opening: usize, closing:
     return false;
 }
 
-fn precedingBlockIsIfStatement(tokens: []const std.zig.Token, opening: usize) bool {
-    const condition_open = ifConditionOpenForBlock(tokens, opening) orelse return false;
+fn precedingBlockIsIfStatement(context: RuleRun, opening: usize) bool {
+    const tokens = context.tokens;
+    const condition_open = ifConditionOpenForBlock(context, opening) orelse return false;
     if (condition_open < 2) return false;
     return switch (tokens[condition_open - 2].tag) {
         .l_brace, .r_brace, .semicolon => true,
@@ -113,12 +115,14 @@ fn precedingBlockIsIfStatement(tokens: []const std.zig.Token, opening: usize) bo
     };
 }
 
-fn blockBelongsToElseIf(tokens: []const std.zig.Token, opening: usize) bool {
-    const condition_open = ifConditionOpenForBlock(tokens, opening) orelse return false;
+fn blockBelongsToElseIf(context: RuleRun, opening: usize) bool {
+    const tokens = context.tokens;
+    const condition_open = ifConditionOpenForBlock(context, opening) orelse return false;
     return condition_open >= 2 and tokens[condition_open - 2].tag == .keyword_else;
 }
 
-fn ifConditionOpenForBlock(tokens: []const std.zig.Token, opening: usize) ?usize {
+fn ifConditionOpenForBlock(context: RuleRun, opening: usize) ?usize {
+    const tokens = context.tokens;
     var cursor = opening;
     if (cursor > 0 and tokens[cursor - 1].tag == .pipe) {
         cursor -= 1;
@@ -127,7 +131,7 @@ fn ifConditionOpenForBlock(tokens: []const std.zig.Token, opening: usize) ?usize
         cursor -= 1;
     }
     if (cursor == 0 or tokens[cursor - 1].tag != .r_paren) return null;
-    const condition_open = matchingOpeningToken(tokens, cursor - 1, .l_paren, .r_paren) orelse return null;
+    const condition_open = context.scopes.matchingToken(cursor - 1) orelse return null;
     if (condition_open == 0 or tokens[condition_open - 1].tag != .keyword_if) return null;
     return condition_open;
 }
@@ -178,6 +182,35 @@ test "else after one terminating branch stays inside an else-if chain" {
     for (found) |finding| if (finding.rule == .needless_else_after_terminator) {
         warning_count += 1;
         try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn simple").?);
+    };
+    try std.testing.expectEqual(@as(usize, 1), warning_count);
+}
+
+test "symmetric terminating branches keep their else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn pick(first: bool) u32 {\n" ++
+        "    if (first) { return 1; } else { return 2; }\n" ++
+        "}\n" ++
+        "fn scan(values: []const u8) void {\n" ++
+        "    for (values) |value| {\n" ++
+        "        if (value == 0) { continue; } else { break; }\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "fn checked(first: bool) u32 {\n" ++
+        "    if (first) { return 1; } else { unreachable; }\n" ++
+        "}\n" ++
+        "fn fallthrough(first: bool) u32 {\n" ++
+        "    if (first) { return 1; } else { consume(); }\n" ++
+        "    return 2;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.needless_else_after_terminator}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var warning_count: usize = 0;
+    for (found) |finding| if (finding.rule == .needless_else_after_terminator) {
+        warning_count += 1;
+        try std.testing.expect(finding.span.start > std.mem.find(u8, source, "fn fallthrough").?);
     };
     try std.testing.expectEqual(@as(usize, 1), warning_count);
 }

@@ -3,10 +3,11 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
 const statementEnd = @import("../../syntax/tokens.zig").statementEnd;
+const syntax_scope = @import("../../syntax/scope.zig");
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
+const deprecated_declarations = @import("../modernize/deprecated_declarations.zig");
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 
@@ -74,8 +75,8 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
     const level = context.level(.non_idiomatic_name);
     if (level == .off) return;
     const foreign_binding_dominated = fileIsDominatedByForeignBindings(source, tokens);
-    var type_declaring_names: std.StringHashMapUnmanaged(void) = .empty;
-    defer type_declaring_names.deinit(context.allocator);
+    var type_declarations: TypeDeclarations = .{ .scopes = context.scopes };
+    defer type_declarations.deinit(context.allocator);
     var structural_type_declarations: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer structural_type_declarations.deinit(context.allocator);
     var value_declarations: std.AutoHashMapUnmanaged(usize, void) = .empty;
@@ -96,15 +97,14 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
     for (tokens, 0..) |token, index| {
         if (token.tag != .identifier or index == 0) continue;
         const declares_type = switch (tokens[index - 1].tag) {
-            .keyword_const => declarationInitializesType(tokens, index),
-            .keyword_fn => functionDeclarationReturnsType(source, tokens, index),
+            .keyword_const => declarationInitializesType(context.scopes, index),
+            .keyword_fn => functionDeclarationReturnsType(context.scopes, index),
             else => false,
         };
-        if (declares_type) try type_declaring_names.put(context.allocator, tokenText(source, token), {});
-        if (tokens[index - 1].tag == .keyword_comptime and index + 2 < tokens.len and tokens[index + 1].tag == .colon and
-            tokenIs(source, tokens[index + 2], "type"))
+        if (declares_type or (tokens[index - 1].tag == .keyword_comptime and index + 2 < tokens.len and
+            tokens[index + 1].tag == .colon and tokenIs(source, tokens[index + 2], "type")))
         {
-            try type_declaring_names.put(context.allocator, tokenText(source, token), {});
+            try type_declarations.put(context.allocator, tokenText(source, token), index);
         }
     }
     for (tokens, 0..) |token, index| {
@@ -121,29 +121,35 @@ fn findNonIdiomaticNames(context: RuleRun) !void {
         const name = tokenText(source, token);
         if (std.mem.startsWith(u8, name, "@\"")) continue;
         const is_namespace = declaration_tag == .keyword_const and
-            (declarationIsNamespace(tokens, index) or declarationIsBareImport(source, tokens, index));
+            (declarationIsNamespace(context.scopes, index) or declarationIsBareImport(source, tokens, index));
         const is_type = declaration_tag == .keyword_const and
             (structural_type_declarations.contains(index) or
                 (!context.scopes.insideFunctionOrTestBody(index) and resolvedShapeNamesType(name, context.resolved_shapes)) or
-                declarationNamesType(source, tokens, index, &type_declaring_names));
-        const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(source, tokens, index);
+                declarationNamesType(source, tokens, index, &type_declarations));
+        const type_function = declaration_tag == .keyword_fn and functionDeclarationReturnsType(context.scopes, index);
         if (declaration_tag == .keyword_const and !is_namespace and !is_type and
             !value_declarations.contains(index)) continue;
+        const function_case = context.configuration.function_case;
         const idiomatic = if (is_namespace)
             isSnakeCase(name) or isTitleCase(name)
         else if (type_function or is_type)
             isTitleCase(name)
-        else if (declaration_tag == .keyword_fn)
-            isCamelCase(name)
-        else
-            isSnakeCase(name);
+        else if (declaration_tag == .keyword_fn) switch (function_case) {
+            .camel_case => isCamelCase(name),
+            .snake_case => isSnakeCase(name),
+        } else isSnakeCase(name);
         if (idiomatic) continue;
+        // 'const O_RDONLY = 0;' keeps the spelling of the C API or protocol
+        // constant it mirrors, which readers search for verbatim.
+        if (declaration_tag == .keyword_const and isConstantCase(name)) continue;
+        // A deprecated declaration keeps its old name for existing callers.
+        if (deprecated_declarations.deprecationAdvice(source, tokens, index) != null) continue;
         const convention = if (is_namespace)
             "snake_case or TitleCase"
         else if (type_function or is_type)
             "TitleCase"
         else if (declaration_tag == .keyword_fn)
-            "camelCase"
+            function_case.text()
         else
             "snake_case";
         try context.emit(.{
@@ -275,7 +281,8 @@ fn fileIsDominatedByForeignBindings(source: []const u8, tokens: []const std.zig.
     return declarations >= 10 and foreign_bindings * 5 >= declarations * 4;
 }
 
-fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: usize) bool {
+fn declarationInitializesType(scopes: *const syntax_scope.Index, identifier_index: usize) bool {
+    const tokens = scopes.tokens;
     if (identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
     const initializer_index = if ((tokens[identifier_index + 2].tag == .keyword_extern or
         tokens[identifier_index + 2].tag == .keyword_packed) and identifier_index + 3 < tokens.len)
@@ -287,7 +294,7 @@ fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: u
             var opening = initializer_index + 1;
             while (opening < tokens.len and tokens[opening].tag != .l_brace and tokens[opening].tag != .semicolon) : (opening += 1) {}
             if (opening >= tokens.len or tokens[opening].tag != .l_brace) break :type false;
-            const closing = matchingToken(tokens, opening, .l_brace, .r_brace) orelse break :type false;
+            const closing = scopes.matchingToken(opening) orelse break :type false;
             break :type closing + 1 < tokens.len and tokens[closing + 1].tag == .semicolon;
         },
         // 'error{...}' declares an error-set type; 'error.Name' is a value.
@@ -296,13 +303,41 @@ fn declarationInitializesType(tokens: []const std.zig.Token, identifier_index: u
     };
 }
 
+/// Declarations that name a type: their tokens answer bare references, which
+/// the scope index resolves, and their names answer member accesses
+/// (`lib.Generic(u8)`), which no lexical scope resolves.
+const TypeDeclarations = struct {
+    scopes: *const syntax_scope.Index,
+    names: std.StringHashMapUnmanaged(void) = .empty,
+    tokens: std.AutoHashMapUnmanaged(usize, void) = .empty,
+
+    fn deinit(declarations: *TypeDeclarations, allocator: std.mem.Allocator) void {
+        declarations.names.deinit(allocator);
+        declarations.tokens.deinit(allocator);
+    }
+
+    fn put(declarations: *TypeDeclarations, allocator: std.mem.Allocator, name: []const u8, token_index: usize) !void {
+        try declarations.names.put(allocator, name, {});
+        try declarations.tokens.put(allocator, token_index, {});
+    }
+
+    /// Whether the identifier at `use_index` names one of the declarations: the
+    /// one in scope when unqualified, any of that name after a member access.
+    fn named(declarations: *const TypeDeclarations, tokens: []const std.zig.Token, use_index: usize, name: []const u8) bool {
+        if (use_index > 0 and tokens[use_index - 1].tag == .period) return declarations.names.contains(name);
+        const binding = declarations.scopes.findBinding(use_index) orelse return false;
+        return declarations.tokens.contains(binding.token_index);
+    }
+};
+
 fn declarationNamesType(
     source: []const u8,
     tokens: []const std.zig.Token,
     identifier_index: usize,
-    type_declaring_names: *const std.StringHashMapUnmanaged(void),
+    type_declarations: *const TypeDeclarations,
 ) bool {
-    if (declarationInitializesType(tokens, identifier_index)) return true;
+    const scopes = type_declarations.scopes;
+    if (declarationInitializesType(scopes, identifier_index)) return true;
     if (initializerMergesErrorSets(tokens, identifier_index)) return true;
     if (identifier_index + 2 >= tokens.len or tokens[identifier_index + 1].tag != .equal) return false;
     const initializer_index = identifier_index + 2;
@@ -317,15 +352,20 @@ fn declarationNamesType(
     {
         const builtin_name = tokenText(source, tokens[identifier_index + 2]);
         if (std.mem.eql(u8, builtin_name, "@Vector")) {
-            const call_end = matchingToken(tokens, identifier_index + 3, .l_paren, .r_paren) orelse return false;
+            const call_end = scopes.matchingToken(identifier_index + 3) orelse return false;
             if (call_end + 1 < tokens.len and tokens[call_end + 1].tag == .l_brace) return false;
         }
         const type_builtins = [_][]const u8{
             "@This", "@TypeOf", "@Type", "@Int", "@Enum", "@Union", "@Struct", "@Pointer", "@Array", "@Vector", "@Fn", "@Tuple", "@FieldType",
         };
-        for (type_builtins) |name| if (std.mem.eql(u8, builtin_name, name)) return true;
+        for (type_builtins) |name| if (std.mem.eql(u8, builtin_name, name)) {
+            // '@TypeOf(x) != void' compares the type and yields a bool.
+            const call_end = scopes.matchingToken(identifier_index + 3) orelse return false;
+            return call_end + 1 < tokens.len and
+                (tokens[call_end + 1].tag == .semicolon or tokens[call_end + 1].tag == .period);
+        };
         if (std.mem.eql(u8, builtin_name, "@import")) {
-            const import_end = matchingToken(tokens, identifier_index + 3, .l_paren, .r_paren) orelse return false;
+            const import_end = scopes.matchingToken(identifier_index + 3) orelse return false;
             var target_index = import_end;
             while (target_index + 2 < tokens.len and tokens[target_index + 1].tag == .period and
                 tokens[target_index + 2].tag == .identifier)
@@ -340,7 +380,16 @@ fn declarationNamesType(
     const declaration_end = statementEnd(tokens, identifier_index) orelse return false;
     const declaration_name = tokenText(source, tokens[identifier_index]);
     const declares_error_type = std.mem.eql(u8, declaration_name, "Error") or std.mem.endsWith(u8, declaration_name, "Error");
+    // Only the initializer's own expression counts: an error set inside a
+    // labeled block, a 'catch' body or a nested struct says nothing about it.
+    var brace_depth: usize = 0;
     for (tokens[initializer_index..declaration_end], initializer_index..) |token, index| {
+        switch (token.tag) {
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -|= 1,
+            else => {},
+        }
+        if (brace_depth != 0) continue;
         const name = tokenText(source, token);
         if (std.mem.eql(u8, name, "error") and index + 1 < declaration_end and tokens[index + 1].tag == .l_brace) return true;
         if (declares_error_type and token.tag == .identifier and
@@ -350,7 +399,9 @@ fn declarationNamesType(
         tokens[identifier_index + 2].tag == .builtin and
         tokenIs(source, tokens[identifier_index + 2], "@typeInfo"))
     {
-        var cursor = identifier_index + 3;
+        // '@typeInfo(p.child)' reflects on a value; only fields read from the
+        // result ('@typeInfo(T).pointer.child') name a type.
+        var cursor = scopes.matchingToken(identifier_index + 3) orelse return false;
         while (cursor < tokens.len and tokens[cursor].tag != .semicolon) : (cursor += 1) {
             if (tokens[cursor].tag != .identifier or cursor == 0 or tokens[cursor - 1].tag != .period) continue;
             const field_name = tokenText(source, tokens[cursor]);
@@ -369,15 +420,17 @@ fn declarationNamesType(
     if (target_index + 1 >= tokens.len) return false;
     const target = tokenText(source, tokens[target_index]);
     switch (tokens[target_index + 1].tag) {
-        .semicolon => if (target_index != identifier_index + 2 and isTitleCase(target)) return true,
+        // 'std.c.EVFILT.READ' is a C-style constant, not a type.
+        .semicolon => if (target_index != identifier_index + 2 and isTitleCase(target) and
+            (target.len == 1 or !isConstantCase(target))) return true,
         .l_paren => {
-            const call_end = matchingToken(tokens, target_index + 1, .l_paren, .r_paren) orelse return false;
+            const call_end = scopes.matchingToken(target_index + 1) orelse return false;
             if (call_end + 1 >= tokens.len or tokens[call_end + 1].tag != .semicolon) return false;
-            return type_declaring_names.contains(target);
+            return type_declarations.named(tokens, target_index, target);
         },
         else => return false,
     }
-    return type_declaring_names.contains(target);
+    return type_declarations.named(tokens, target_index, target);
 }
 
 /// '||' only merges error sets, so an initializer containing one at top level
@@ -443,11 +496,12 @@ fn declarationKeywordStartsStatement(tokens: []const std.zig.Token, keyword_inde
     };
 }
 
-fn declarationIsNamespace(tokens: []const std.zig.Token, identifier_index: usize) bool {
-    if (!declarationInitializesType(tokens, identifier_index)) return false;
+fn declarationIsNamespace(scopes: *const syntax_scope.Index, identifier_index: usize) bool {
+    const tokens = scopes.tokens;
+    if (!declarationInitializesType(scopes, identifier_index)) return false;
     if (identifier_index + 3 >= tokens.len or tokens[identifier_index + 1].tag != .equal or
         tokens[identifier_index + 2].tag != .keyword_struct or tokens[identifier_index + 3].tag != .l_brace) return false;
-    const closing = matchingToken(tokens, identifier_index + 3, .l_brace, .r_brace) orelse return false;
+    const closing = scopes.matchingToken(identifier_index + 3) orelse return false;
     var brace_depth: usize = 1;
     var parenthesis_depth: usize = 0;
     for (tokens[identifier_index + 4 .. closing], identifier_index + 4..) |token, index| {
@@ -456,31 +510,52 @@ fn declarationIsNamespace(tokens: []const std.zig.Token, identifier_index: usize
             .r_brace => brace_depth -|= 1,
             .l_paren => parenthesis_depth += 1,
             .r_paren => parenthesis_depth -|= 1,
+            // 'var count: u32 = 0;' is a declaration with a type, not a field.
             .identifier => if (brace_depth == 1 and parenthesis_depth == 0 and index + 1 < closing and
-                tokens[index + 1].tag == .colon) return false,
+                tokens[index + 1].tag == .colon and tokens[index - 1].tag != .keyword_const and
+                tokens[index - 1].tag != .keyword_var) return false,
             else => {},
         }
     }
     return true;
 }
 
-fn functionDeclarationReturnsType(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    identifier_index: usize,
-) bool {
+fn functionDeclarationReturnsType(scopes: *const syntax_scope.Index, identifier_index: usize) bool {
+    const tokens = scopes.tokens;
     if (identifier_index + 1 >= tokens.len or tokens[identifier_index + 1].tag != .l_paren) return false;
-    const parameters_end = matchingToken(tokens, identifier_index + 1, .l_paren, .r_paren) orelse return false;
+    const parameters_end = scopes.matchingToken(identifier_index + 1) orelse return false;
     if (parameters_end + 1 >= tokens.len) return false;
-    return tokenIs(source, tokens[parameters_end + 1], "type");
+    return tokenIs(scopes.source, tokens[parameters_end + 1], "type");
 }
 
-fn isCamelCase(name: []const u8) bool {
+/// Trailing underscores only tell a name apart from another (`type_`,
+/// `Details_`), so the case is judged without them.
+fn withoutTrailingUnderscores(name: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, name, "_");
+}
+
+fn isCamelCase(full_name: []const u8) bool {
+    const name = withoutTrailingUnderscores(full_name);
     return name.len != 0 and std.ascii.isLower(name[0]) and std.mem.findScalar(u8, name, '_') == null;
 }
 
-fn isTitleCase(name: []const u8) bool {
-    return name.len != 0 and std.ascii.isUpper(name[0]) and std.mem.findScalar(u8, name, '_') == null;
+/// An underscore may separate digit groups, as in `Sha3_256` or `Aegis128L_256`.
+fn isTitleCase(full_name: []const u8) bool {
+    const name = withoutTrailingUnderscores(full_name);
+    if (name.len == 0 or !std.ascii.isUpper(name[0])) return false;
+    for (name, 0..) |character, index| {
+        if (character == '_' and (index + 1 == name.len or !std.ascii.isDigit(name[index + 1]))) return false;
+    }
+    return true;
+}
+
+/// `^[A-Z][A-Z0-9_]*$`, the spelling of C and protocol constants.
+fn isConstantCase(name: []const u8) bool {
+    if (name.len == 0 or !std.ascii.isUpper(name[0])) return false;
+    for (name) |character| {
+        if (!std.ascii.isUpper(character) and !std.ascii.isDigit(character) and character != '_') return false;
+    }
+    return true;
 }
 
 fn isSnakeCase(name: []const u8) bool {
@@ -522,7 +597,7 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
             });
         }
         const public_declaration = index >= 2 and tokens[index - 2].tag == .keyword_pub;
-        if (vague_level != .off and public_declaration and declaration_tag == .keyword_const and declarationInitializesType(tokens, index)) {
+        if (vague_level != .off and public_declaration and declaration_tag == .keyword_const and declarationInitializesType(context.scopes, index)) {
             if (vagueTypeWord(name)) |word| {
                 try context.emit(.{
                     .rule = .vague_type_name,
@@ -566,13 +641,13 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
                 tokens[namespace_index + 1].tag != .identifier or tokens[namespace_index + 2].tag != .equal or
                 tokens[namespace_index + 3].tag != .keyword_struct or tokens[namespace_index + 4].tag != .l_brace) continue;
             const namespace_name = tokenText(source, tokens[namespace_index + 1]);
-            const closing = matchingToken(tokens, namespace_index + 4, .l_brace, .r_brace) orelse continue;
+            const closing = context.matchingToken(namespace_index + 4, .l_brace, .r_brace) orelse continue;
             var cursor = namespace_index + 5;
             while (cursor < closing) : (cursor += 1) {
                 if (tokens[cursor].tag != .keyword_const or cursor + 3 >= closing or tokens[cursor + 1].tag != .identifier) continue;
                 const declaration_name = tokenText(source, tokens[cursor + 1]);
                 const suffix = redundantNamespaceSuffix(namespace_name, declaration_name) orelse continue;
-                if (suffix.len == 0 or !declarationInitializesType(tokens, cursor + 1)) continue;
+                if (suffix.len == 0 or !declarationInitializesType(context.scopes, cursor + 1)) continue;
                 try context.emit(.{
                     .rule = .redundant_qualified_name,
                     .level = qualified_level,
@@ -587,6 +662,8 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
     }
 
     if (public_docs_level != .off) {
+        var surface: PublicSurface = try .init(context);
+        defer surface.deinit();
         for (tokens, 0..) |token, pub_index| {
             if (token.tag != .keyword_pub or pub_index + 2 >= tokens.len) continue;
             const declaration_tag = tokens[pub_index + 1].tag;
@@ -594,8 +671,9 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
             if (tokens[pub_index + 2].tag != .identifier) continue;
             if (pub_index > 0 and tokens[pub_index - 1].tag == .doc_comment) continue;
             const declaration_name = tokenText(source, tokens[pub_index + 2]);
-            if (declaration_tag == .keyword_fn and std.mem.eql(u8, declaration_name, "main")) continue;
-            if (declaration_tag == .keyword_fn and isBuildEntryPoint(source, tokens, pub_index + 2)) continue;
+            if (isProtocolName(declaration_name)) continue;
+            if (declaration_tag == .keyword_fn and isBuildEntryPoint(context.scopes, pub_index + 2)) continue;
+            if (!surface.contains(pub_index)) continue;
             try context.emit(.{
                 .rule = .public_declaration_docs,
                 .level = public_docs_level,
@@ -606,10 +684,221 @@ fn findOfficialStyleIssues(context: RuleRun) !void {
     }
 }
 
-fn isBuildEntryPoint(source: []const u8, tokens: []const std.zig.Token, name_index: usize) bool {
+/// Names whose meaning a language or std protocol fixes (`std.hash_map`
+/// contexts, `std.fmt`, `std.json` hooks, `std.Options`, entry points), so a
+/// doc comment would only restate the protocol.
+fn isProtocolName(name: []const u8) bool {
+    const protocol_names = [_][]const u8{
+        "init",      "deinit",             "hash",  "eql",     "format",      "jsonStringify",
+        "jsonParse", "jsonParseFromValue", "Error", "Options", "std_options", "main",
+    };
+    for (protocol_names) |protocol_name| if (std.mem.eql(u8, name, protocol_name)) return true;
+    return false;
+}
+
+/// The declarations reachable from the file's root through `pub`
+/// declarations. A `pub` member of a private container is unreachable from
+/// the file's root, and so from any module root, unless a `pub` alias in the
+/// file re-exports the container.
+const PublicSurface = struct {
+    context: RuleRun,
+    /// A private declaration's name token, mapped to the `pub` keyword of an
+    /// alias that re-exports it: `pub const Api = Impl;`,
+    /// `pub const Small = Generic(8);`, `pub const Handle = *Opaque;`, a
+    /// branch of `pub const Native = switch (arch) { .x86 => X86, ... };`, or
+    /// a public type function's `return Base(T);`.
+    aliases: std.AutoHashMapUnmanaged(usize, usize) = .empty,
+
+    fn init(context: RuleRun) !PublicSurface {
+        var surface: PublicSurface = .{ .context = context };
+        errdefer surface.deinit();
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, pub_index| {
+            if (token.tag != .keyword_pub or pub_index + 4 >= tokens.len or tokens[pub_index + 2].tag != .identifier) continue;
+            // A constant's initializer, or the body of a type function, which
+            // may return another declaration: 'return Base(T, .{});'.
+            var index = pub_index + 4;
+            const end = switch (tokens[pub_index + 1].tag) {
+                .keyword_const => if (tokens[pub_index + 3].tag == .equal)
+                    context.scopes.statementEnd(index) orelse continue
+                else
+                    continue,
+                .keyword_fn => end: {
+                    if (tokens[pub_index + 3].tag != .l_paren) continue;
+                    const parameters_end = context.scopes.matchingToken(pub_index + 3) orelse continue;
+                    if (parameters_end + 2 >= tokens.len or !context.tokenIs(parameters_end + 1, "type") or
+                        tokens[parameters_end + 2].tag != .l_brace) continue;
+                    index = parameters_end + 3;
+                    break :end context.scopes.matchingToken(parameters_end + 2) orelse continue;
+                },
+                else => continue,
+            };
+            // The expression itself: container bodies hold their own
+            // declarations, which this loop reaches separately.
+            while (index < end) : (index += 1) {
+                switch (tokens[index].tag) {
+                    .l_brace => if (containerStart(context, index) != null) {
+                        index = context.scopes.matchingToken(index) orelse break;
+                    },
+                    .identifier => if (selectsDeclaration(tokens, index)) {
+                        const target = context.scopes.findBinding(index) orelse continue;
+                        const entry = try surface.aliases.getOrPut(context.allocator, target.token_index);
+                        if (!entry.found_existing) entry.value_ptr.* = pub_index;
+                    },
+                    else => {},
+                }
+            }
+        }
+        return surface;
+    }
+
+    /// Whether the identifier at `index` is a whole branch of the initializer
+    /// or returned type, or the callee or pointee of one, rather than part of
+    /// a longer path.
+    fn selectsDeclaration(tokens: []const std.zig.Token, index: usize) bool {
+        if (index + 1 >= tokens.len) return false;
+        switch (tokens[index - 1].tag) {
+            .equal, .equal_angle_bracket_right, .keyword_else, .keyword_orelse, .keyword_return, .r_paren, .asterisk, .question_mark => {},
+            .keyword_const => if (tokens[index - 2].tag != .asterisk) return false,
+            else => return false,
+        }
+        return switch (tokens[index + 1].tag) {
+            .semicolon, .comma, .r_brace, .keyword_else, .l_paren => true,
+            else => false,
+        };
+    }
+
+    fn deinit(surface: *PublicSurface) void {
+        surface.aliases.deinit(surface.context.allocator);
+    }
+
+    /// Whether the `pub` declaration at `pub_index` is on the surface: each
+    /// container around it is exposed by a declaration on the surface.
+    fn contains(surface: *const PublicSurface, pub_index: usize) bool {
+        var cursor = pub_index;
+        // Aliases can point back into the containers they are declared in,
+        // so the walk is bounded rather than trusted to reach the root.
+        for (0..64) |_| {
+            const opening = surface.context.scopes.enclosingOpeningBrace(cursor) orelse return true;
+            cursor = surface.exposer(opening) orelse return false;
+        }
+        return false;
+    }
+
+    /// The `pub` keyword of the declaration, or the name of the field, that
+    /// exposes the container opened at `opening`: `pub const Name = struct {`,
+    /// possibly as a branch of the `if` or `switch` the declaration selects its
+    /// type with, a `pub fn Name(...) type` returning it, an alias of either,
+    /// or `field: struct {`. Null for private, local and anonymous containers.
+    fn exposer(surface: *const PublicSurface, opening: usize) ?usize {
+        const context = surface.context;
+        const tokens = context.tokens;
+        var cursor = containerStart(context, opening) orelse return null;
+        // Each step moves to the start of an enclosing conditional expression,
+        // so the walk is as long as the 'if'/'switch' nesting of one initializer.
+        while (cursor >= 1) {
+            switch (tokens[cursor - 1].tag) {
+                .equal => {
+                    // 'pub const Name = ' or 'pub const Name: type = '
+                    if (cursor < 3) return null;
+                    var name = cursor - 2;
+                    if (name >= 2 and tokens[name].tag == .identifier and tokens[name - 1].tag == .colon) name -= 2;
+                    if (name < 1 or tokens[name].tag != .identifier or
+                        (tokens[name - 1].tag != .keyword_const and tokens[name - 1].tag != .keyword_var)) return null;
+                    if (name >= 2 and tokens[name - 2].tag == .keyword_pub) return name - 2;
+                    return surface.alias(name, opening);
+                },
+                .keyword_return => {
+                    const body = context.scopes.enclosingFunctionBody(cursor - 1) orelse return null;
+                    if (body < 4 or tokens[body - 2].tag != .r_paren or !context.tokenIs(body - 1, "type")) return null;
+                    const parameters = context.scopes.matchingToken(body - 2) orelse return null;
+                    if (parameters < 2 or tokens[parameters - 1].tag != .identifier or tokens[parameters - 2].tag != .keyword_fn) return null;
+                    if (parameters >= 3 and tokens[parameters - 3].tag == .keyword_pub) return parameters - 3;
+                    return surface.alias(parameters - 1, opening);
+                },
+                // '.linux => struct {': the prong's switch starts the expression.
+                .equal_angle_bracket_right => {
+                    const body = context.scopes.enclosingOpeningBrace(cursor - 1) orelse return null;
+                    if (body < 2 or tokens[body - 1].tag != .r_paren) return null;
+                    const operand = context.scopes.matchingToken(body - 1) orelse return null;
+                    if (operand < 1 or tokens[operand - 1].tag != .keyword_switch) return null;
+                    cursor = operand - 1;
+                },
+                // 'buffered: struct {': a field's type is reachable through the field.
+                .colon => {
+                    if (cursor < 3 or tokens[cursor - 2].tag != .identifier) return null;
+                    switch (tokens[cursor - 3].tag) {
+                        .l_brace, .r_brace, .semicolon, .comma, .doc_comment, .keyword_comptime => return cursor - 2,
+                        else => return null,
+                    }
+                },
+                // 'Override orelse if (c) enum {': the left operand starts the expression.
+                .keyword_orelse => {
+                    if (cursor < 2 or tokens[cursor - 2].tag != .identifier) return null;
+                    var start = cursor - 2;
+                    while (start >= 2 and tokens[start - 1].tag == .period and tokens[start - 2].tag == .identifier) start -= 2;
+                    cursor = start;
+                },
+                // 'if (is_mips) struct {'
+                .r_paren => {
+                    const condition = context.scopes.matchingToken(cursor - 1) orelse return null;
+                    if (condition < 1 or tokens[condition - 1].tag != .keyword_if) return null;
+                    cursor = condition - 1;
+                },
+                // 'if (c) Name else struct {' and 'if (c) struct { ... } else struct {'
+                .keyword_else => {
+                    if (cursor < 3) return null;
+                    var branch_start = switch (tokens[cursor - 2].tag) {
+                        .identifier => cursor - 2,
+                        .r_brace => containerStart(context, context.scopes.matchingToken(cursor - 2) orelse return null) orelse return null,
+                        else => return null,
+                    };
+                    while (branch_start >= 2 and tokens[branch_start - 1].tag == .period and
+                        tokens[branch_start - 2].tag == .identifier) branch_start -= 2;
+                    if (branch_start < 1 or tokens[branch_start - 1].tag != .r_paren) return null;
+                    const condition = context.scopes.matchingToken(branch_start - 1) orelse return null;
+                    if (condition < 1 or tokens[condition - 1].tag != .keyword_if) return null;
+                    cursor = condition - 1;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// The `pub` alias re-exporting the private declaration named at
+    /// `name_index`, unless it sits inside the container opened at `opening`.
+    fn alias(surface: *const PublicSurface, name_index: usize, opening: usize) ?usize {
+        const alias_pub = surface.aliases.get(name_index) orelse return null;
+        const closing = surface.context.scopes.matchingToken(opening) orelse return null;
+        if (alias_pub > opening and alias_pub < closing) return null;
+        return alias_pub;
+    }
+};
+
+/// The first token of the container type whose body opens at `opening`,
+/// counting `extern` or `packed` and the `(enum)`/`(u8)` argument; null when
+/// the brace opens no container.
+fn containerStart(context: RuleRun, opening: usize) ?usize {
+    const tokens = context.tokens;
+    if (opening < 1) return null;
+    var keyword = opening - 1;
+    // 'union(enum) {', 'enum(u8) {', 'packed struct(u32) {'
+    if (tokens[keyword].tag == .r_paren) keyword = (context.scopes.matchingToken(keyword) orelse return null) -| 1;
+    switch (tokens[keyword].tag) {
+        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {},
+        else => return null,
+    }
+    if (keyword > 0 and (tokens[keyword - 1].tag == .keyword_extern or tokens[keyword - 1].tag == .keyword_packed)) keyword -= 1;
+    return keyword;
+}
+
+fn isBuildEntryPoint(scopes: *const syntax_scope.Index, name_index: usize) bool {
+    const source = scopes.source;
+    const tokens = scopes.tokens;
     if (!tokenIs(source, tokens[name_index], "build") or name_index + 1 >= tokens.len or
         tokens[name_index + 1].tag != .l_paren) return false;
-    const parameters_end = matchingToken(tokens, name_index + 1, .l_paren, .r_paren) orelse return false;
+    const parameters_end = scopes.matchingToken(name_index + 1) orelse return false;
     for (tokens[name_index + 2 .. parameters_end], name_index + 2..) |token, index| {
         if (token.tag != .identifier or !tokenIs(source, token, "Build") or index < 2) continue;
         if (tokens[index - 1].tag == .period and tokens[index - 2].tag == .identifier and
@@ -846,6 +1135,186 @@ test "vector values use value naming while vector type aliases use type naming" 
         try std.testing.expectEqualStrings("BadVectorValue", source[finding.span.start..finding.span.end]);
     };
     try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "C-style constants, deprecated aliases, digit groups and trailing underscores keep their spelling" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub const O_RDONLY = 0;\n" ++
+        "const SIGINT: c_int = 2;\n" ++
+        "pub const Sha3_256 = struct { state: u64 };\n" ++
+        "pub const Aegis128L_256 = Sha3_256;\n" ++
+        "const NewType = struct { x: u8 };\n" ++
+        "/// Deprecated: use `NewType`.\n" ++
+        "pub const old_type = NewType;\n" ++
+        "/// Deprecated in favor of `newName`.\n" ++
+        "pub fn old_name() void {}\n" ++
+        "fn copy(details: anytype) void { const Details_ = @TypeOf(details); _ = Details_; }\n" ++
+        "fn type_() void {}\n" ++
+        "const Bad_Type = struct { x: u8 };\n";
+    const configuration = support.only(&.{.non_idiomatic_name}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("Bad_Type", source[finding.span.start..finding.span.end]);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "namespaces with typed declarations and expressions about types keep value names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "pub const cpu = struct { pub const generic: u32 = 1; };\n" ++
+        "const have_flock = @TypeOf(std.posix.system.flock) != void;\n" ++
+        "fn signals() void {\n" ++
+        "    const global = struct { threadlocal var stack: [16]u8 = undefined; };\n" ++
+        "    _ = &global.stack;\n" ++
+        "}\n" ++
+        "fn markSecret(ptr: anytype) void {\n" ++
+        "    const p = @typeInfo(@TypeOf(ptr)).pointer;\n" ++
+        "    const child = @typeInfo(p.child);\n" ++
+        "    _ = child;\n" ++
+        "}\n" ++
+        "fn poll() void {\n" ++
+        "    const filter = std.c.EVFILT.READ;\n" ++
+        "    _ = filter;\n" ++
+        "}\n" ++
+        "fn reserve(page: anytype) void {\n" ++
+        "    const cap = page.adjust() catch |err| capacity: {\n" ++
+        "        comptime std.debug.assert(@TypeOf(err) == error{OutOfMemory});\n" ++
+        "        break :capacity page.capacity;\n" ++
+        "    };\n" ++
+        "    _ = cap;\n" ++
+        "}\n";
+    const configuration = support.only(&.{.non_idiomatic_name}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    for (found) |finding| {
+        if (finding.rule == .non_idiomatic_name) std.debug.print("unexpected naming finding: {s}\n", .{finding.message});
+        try std.testing.expect(finding.rule != .non_idiomatic_name);
+    }
+}
+
+test "unqualified references resolve type declarations in scope" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn local() void {\n" ++
+        "    const Inner = struct { fn Make() type { return u8; } };\n" ++
+        "    _ = Inner;\n" ++
+        "}\n" ++
+        "fn Make() u32 { return 1; }\n" ++
+        "fn caller() void {\n" ++
+        "    const made = Make();\n" ++
+        "    _ = made;\n" ++
+        "}\n" ++
+        "fn Generic(comptime T: type) type { return struct { value: T }; }\n" ++
+        "const bad_alias = Generic(u8);\n";
+    const configuration = support.only(&.{.non_idiomatic_name}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+    };
+    // The value function 'Make' is misnamed; 'made' holds its value, not the
+    // type the unrelated local 'Inner.Make' returns.
+    try std.testing.expectEqual(@as(usize, 2), reported.items.len);
+    try std.testing.expectEqualStrings("Make", reported.items[0]);
+    try std.testing.expectEqualStrings("bad_alias", reported.items[1]);
+}
+
+test "functions follow the configured function case" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn parse_header() void {}\n" ++
+        "fn parseHeader() void {}\n" ++
+        "fn Header(comptime T: type) type { return struct { value: T }; }\n";
+    var configuration = support.only(&.{.non_idiomatic_name}, .information);
+    configuration.function_case = .snake_case;
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var naming_count: usize = 0;
+    for (found) |finding| if (finding.rule == .non_idiomatic_name) {
+        naming_count += 1;
+        try std.testing.expectEqualStrings("parseHeader", source[finding.span.start..finding.span.end]);
+        try std.testing.expect(std.mem.find(u8, finding.message, "snake_case") != null);
+    };
+    try std.testing.expectEqual(@as(usize, 1), naming_count);
+}
+
+test "protocol names and members of private containers need no API documentation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "pub const Error = error{Failed};\n" ++
+        "pub const Options = struct { verbose: bool = false };\n" ++
+        "/// A map.\n" ++
+        "pub const Map = struct {\n" ++
+        "    pub fn init() Map { return .{}; }\n" ++
+        "    pub fn deinit(_: *Map) void {}\n" ++
+        "    pub fn hash(_: Map) u64 { return 0; }\n" ++
+        "    pub fn eql(_: Map, _: Map) bool { return true; }\n" ++
+        "    pub fn format(_: Map, _: anytype) !void {}\n" ++
+        "    pub fn jsonStringify(_: Map, _: anytype) !void {}\n" ++
+        "    pub fn memberCount() void {}\n" ++
+        "};\n" ++
+        "const Private = struct {\n" ++
+        "    pub fn hidden() void {}\n" ++
+        "    pub const Nested = struct { pub fn deeper() void {} };\n" ++
+        "};\n" ++
+        "/// A generic list.\n" ++
+        "pub fn List(comptime T: type) type {\n" ++
+        "    return struct { pub fn first() ?T { return null; } };\n" ++
+        "}\n" ++
+        "fn PrivateList(comptime T: type) type {\n" ++
+        "    return struct { pub fn last() ?T { return null; } };\n" ++
+        "}\n" ++
+        "/// A tag.\n" ++
+        "pub const Tag = union(enum) { a: u8, pub fn tagName() void {} };\n" ++
+        "/// Control names.\n" ++
+        "pub const CTL = switch (os) {\n" ++
+        "    .linux => struct { pub const KERN = 1; },\n" ++
+        "    else => if (bsd) struct { pub const VM = 2; } else void,\n" ++
+        "};\n" ++
+        "/// Signal actions.\n" ++
+        "pub const SA = if (mips) Legacy.SA else struct { pub const ONSTACK = 3; };\n" ++
+        "const Hidden = switch (os) { else => struct { pub const NOT_API = 4; } };\n" ++
+        "const Impl = struct { pub fn viaAlias() void {} };\n" ++
+        "/// The implementation.\n" ++
+        "pub const Api = Impl;\n" ++
+        "fn Sized(comptime n: u8) type { return struct { pub fn bytes() u8 { return n; } }; }\n" ++
+        "/// Eight bytes.\n" ++
+        "pub const Small = Sized(8);\n" ++
+        "const Cycle = struct { pub const Self = Cycle; pub fn looped() void {} };\n" ++
+        "const X86 = extern struct { pub fn current() void {} };\n" ++
+        "/// The native context.\n" ++
+        "pub const Native = switch (arch) { .x86 => X86, else => void };\n" ++
+        "const object_s = opaque { pub const retain = 1; };\n" ++
+        "/// An object.\n" ++
+        "pub const object_t = *object_s;\n" ++
+        "/// Compression state.\n" ++
+        "pub const Compress = struct { buffered: struct { pub const empty = 0; } };\n" ++
+        "/// Permissions.\n" ++
+        "pub const Permissions = Override orelse if (windows) enum(u32) { pub const default_dir = 1; } else u32;\n" ++
+        "fn Base(comptime T: type) type { return struct { pub fn based() ?T { return null; } }; }\n" ++
+        "/// A wrapper.\n" ++
+        "pub fn Wrapper(comptime T: type) type { return Base(T); }\n" ++
+        "fn use() void { _ = Private; _ = PrivateList; _ = Hidden; _ = Cycle; }\n";
+    const configuration = support.only(&.{.public_declaration_docs}, .information);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList([]const u8) = .empty;
+    for (found) |finding| if (finding.rule == .public_declaration_docs) {
+        try reported.append(arena.allocator(), source[finding.span.start..finding.span.end]);
+    };
+    const expected = [_][]const u8{
+        "memberCount", "first",  "tagName", "KERN",        "VM",    "ONSTACK", "viaAlias", "bytes",
+        "current",     "retain", "empty",   "default_dir", "based",
+    };
+    try std.testing.expectEqual(expected.len, reported.items.len);
+    for (expected, reported.items) |name, reported_name| try std.testing.expectEqualStrings(name, reported_name);
 }
 
 test "main entry points do not require API documentation" {

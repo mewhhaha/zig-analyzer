@@ -14,13 +14,16 @@ stale memory or state.
 
 ## When it fires
 
-It applies to a retained `items` slice (whole or subslice), `keys()` or `values()`
-view, or iterator of a container recognized by its declared type, such as
-`var list: std.ArrayList(u8) = .empty`, followed by an operation that may
-reallocate or rehash it. Container fields and a view retained across `realloc`
-of its source allocation are covered too. Reading only the length or comparing
-only the pointer of the stale view is not a use, and a mutation that returns
-from its own branch does not affect the sibling branch.
+It applies to a retained `items` slice (whole or subslice), `keys()` or
+`values()` view, or iterator of a container recognized by its declared type,
+such as `var list: std.ArrayList(u8) = .empty`, followed by an operation that
+may reallocate or rehash it. Container fields and a view retained across
+`realloc` of its source allocation are covered too; across `realloc`, a view is
+a slice or element address of the allocation, or what a `for` over it yields
+through a pointer capture (`|*node|`), not a by-value capture's copy or an
+index. Reading only the length or comparing only the pointer of the stale view
+is not a use, and a mutation that returns from its own branch does not affect
+the sibling branch.
 
 It also reports `list.appendSlice(gpa, list.items)` (and `insertSlice`,
 `replaceRange`): growing the list frees the storage the source slice still

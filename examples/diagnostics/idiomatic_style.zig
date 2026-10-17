@@ -55,11 +55,11 @@ fn inspectCapture(optional: ?u32) void {
     }
 }
 
-fn openAfterFallibleWork(dir: std.fs.Dir) !void {
+fn openAfterFallibleWork(io: std.Io, dir: std.Io.Dir) !void {
     // expect: cleanup-after-fallible-operation
-    const file = try dir.openFile("input", .{});
+    const file = try dir.openFile(io, "input", .{});
     _ = try load();
-    defer file.close();
+    defer file.close(io);
 }
 
 fn collapsedError() ?u32 {
@@ -91,12 +91,12 @@ fn optionalPresence(optional: ?u32) bool {
     return if (optional) |_| true else false;
 }
 
-fn manuallyTerminated(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+fn manuallyTerminated(allocator: std.mem.Allocator, input: []const u8) ![:0]u8 {
     // expect: prefer-sentinel-termination
     const result = try allocator.alloc(u8, input.len + 1);
     @memcpy(result[0..input.len], input);
     result[input.len] = 0;
-    return result;
+    return result[0..input.len :0];
 }
 
 fn expectedFailure() !void {

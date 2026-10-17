@@ -8,15 +8,72 @@ const support = @import("../test_support.zig");
 const TokenRange = @import("../../syntax/tokens.zig").Range;
 
 pub fn run(context: RuleRun) !void {
+    var declarations = try Declarations.init(context);
+    defer declarations.deinit(context.allocator);
     try findReallocFallbackLeaks(context);
-    try findOptionalOwnershipOverwrites(context);
-    try findOptionalBindingOverwritesInLoops(context);
+    try findOptionalOwnershipOverwrites(context, &declarations);
+    try findOptionalBindingOverwritesInLoops(context, &declarations);
     try findShortenedAllocationReturns(context);
-    try findDiscardedOwnedRemovals(context);
-    try findPartialOwnershipTransfers(context);
+    try findDiscardedOwnedRemovals(context, &declarations);
+    try findPartialOwnershipTransfers(context, &declarations);
 }
 
-fn findOptionalBindingOverwritesInLoops(context: RuleRun) !void {
+/// Token positions grouped by a name, in token order.
+const NamePositions = std.StringHashMapUnmanaged(std.ArrayList(u32));
+
+/// Where the file declares functions and constants, by name, found in one
+/// pass so the type and return-type lookups below do not rescan the file.
+const Declarations = struct {
+    /// `fn name(` (the `fn`), by name.
+    functions: NamePositions = .empty,
+    /// `const name` (the name), by name.
+    constants: NamePositions = .empty,
+    /// `name:` (the name), by name: parameters, fields and typed bindings.
+    typed: NamePositions = .empty,
+
+    fn init(context: RuleRun) !Declarations {
+        var declarations: Declarations = .{};
+        errdefer declarations.deinit(context.allocator);
+        const tokens = context.tokens;
+        for (tokens, 0..) |token, index| switch (token.tag) {
+            .keyword_fn => if (index + 2 < tokens.len and tokens[index + 2].tag == .l_paren) {
+                try add(context.allocator, &declarations.functions, context.tokenText(index + 1), index);
+            },
+            .identifier => if (index > 0 and tokens[index - 1].tag == .keyword_const) {
+                try add(context.allocator, &declarations.constants, context.tokenText(index), index);
+            },
+            else => {},
+        };
+        for (tokens[0..tokens.len -| 1], 0..) |_, index| {
+            if (tokens[index + 1].tag == .colon) try add(context.allocator, &declarations.typed, context.tokenText(index), index);
+        }
+        return declarations;
+    }
+
+    fn deinit(declarations: *Declarations, allocator: std.mem.Allocator) void {
+        for ([_]*NamePositions{ &declarations.functions, &declarations.constants, &declarations.typed }) |positions| {
+            var lists = positions.valueIterator();
+            while (lists.next()) |list| list.deinit(allocator);
+            positions.deinit(allocator);
+        }
+    }
+
+    fn add(allocator: std.mem.Allocator, positions: *NamePositions, name: []const u8, index: usize) !void {
+        const entry = try positions.getOrPut(allocator, name);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(allocator, @intCast(index));
+    }
+
+    fn named(positions: *const NamePositions, name: []const u8) []const u32 {
+        return if (positions.get(name)) |list| list.items else &.{};
+    }
+
+    fn orderPosition(target: usize, position: u32) std.math.Order {
+        return std.math.order(target, position);
+    }
+};
+
+fn findOptionalBindingOverwritesInLoops(context: RuleRun, declarations: *const Declarations) !void {
     const level = context.level(.overwritten_owning_value);
     if (level == .off) return;
     for (context.tokens, 0..) |token, declaration_index| {
@@ -25,7 +82,7 @@ fn findOptionalBindingOverwritesInLoops(context: RuleRun) !void {
             context.tokens[declaration_index + 3].tag != .question_mark or context.tokens[declaration_index + 4].tag != .identifier) continue;
         const binding = context.tokenText(declaration_index + 1);
         const owner_type = context.tokenText(declaration_index + 4);
-        if (!typeHasCleanupMethod(context, owner_type)) continue;
+        if (!typeHasCleanupMethod(context, declarations, owner_type)) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
         var index = declaration_end + 1;
@@ -64,8 +121,8 @@ fn loopContaining(context: RuleRun, target: usize) ?LoopRange {
     return selected;
 }
 
-pub fn typeHasCleanupMethod(context: RuleRun, type_name: []const u8) bool {
-    const container = typeContainer(context, type_name) orelse return false;
+fn typeHasCleanupMethod(context: RuleRun, declarations: *const Declarations, type_name: []const u8) bool {
+    const container = typeContainer(context, declarations, type_name) orelse return false;
     for (context.tokens[container.start + 1 .. container.end], container.start + 1..) |token, function_index| {
         if (token.tag == .keyword_fn and function_index + 1 < container.end and
             context.tokenIs(function_index + 1, "deinit")) return true;
@@ -126,7 +183,7 @@ fn findReallocFallbackLeaks(context: RuleRun) !void {
     }
 }
 
-fn findOptionalOwnershipOverwrites(context: RuleRun) !void {
+fn findOptionalOwnershipOverwrites(context: RuleRun, declarations: *const Declarations) !void {
     const level = context.level(.overwritten_owning_value);
     if (level == .off) return;
     for (context.tokens, 0..) |token, equal_index| {
@@ -136,8 +193,8 @@ fn findOptionalOwnershipOverwrites(context: RuleRun) !void {
         if (!rangeAllocates(context, equal_index + 1, statement_end)) continue;
         const base_name = context.tokenText(equal_index - 3);
         const field_name = context.tokenText(equal_index - 1);
-        const owner_type = bindingTypeNameBefore(context, base_name, equal_index) orelse continue;
-        if (!cleanupIncludesField(context, owner_type, field_name)) continue;
+        const owner_type = bindingTypeNameBefore(context, declarations, base_name, equal_index) orelse continue;
+        if (!cleanupIncludesField(context, declarations, owner_type, field_name)) continue;
         const branch_open = context.enclosingOpeningBrace(equal_index) orelse continue;
         const capture = optionalFieldCapture(
             context,
@@ -226,7 +283,7 @@ fn rangeCallsFunction(context: RuleRun, name: []const u8, start: usize, end: usi
     return false;
 }
 
-fn findDiscardedOwnedRemovals(context: RuleRun) !void {
+fn findDiscardedOwnedRemovals(context: RuleRun, declarations: *const Declarations) !void {
     const level = context.level(.unreleased_allocation);
     if (level == .off) return;
     for (context.tokens, 0..) |token, equal_index| {
@@ -248,7 +305,7 @@ fn findDiscardedOwnedRemovals(context: RuleRun) !void {
             });
             continue;
         };
-        const owned_field = sliceFieldOfType(context, element_type) orelse continue;
+        const owned_field = sliceFieldOfType(context, declarations, element_type) orelse continue;
         if (!containerCleansElementField(context, removal, owned_field) or
             removedFieldReleasedBefore(context, field, owned_field, removal)) continue;
         try context.emit(.{
@@ -353,7 +410,7 @@ fn removedFieldReleasedBefore(context: RuleRun, sequence_field: []const u8, owne
     return false;
 }
 
-fn findPartialOwnershipTransfers(context: RuleRun) !void {
+fn findPartialOwnershipTransfers(context: RuleRun, declarations: *const Declarations) !void {
     const level = context.level(.partial_ownership_transfer);
     if (level == .off) return;
     for (context.tokens, 0..) |token, declaration_index| {
@@ -361,7 +418,7 @@ fn findPartialOwnershipTransfers(context: RuleRun) !void {
             context.tokens[declaration_index + 1].tag != .identifier) continue;
         const declaration_end = context.statementEnd(declaration_index) orelse continue;
         const callee = calledFunction(context, declaration_index + 2, declaration_end) orelse continue;
-        const return_type = functionReturnType(context, callee) orelse continue;
+        const return_type = functionReturnType(context, declarations, callee) orelse continue;
         const owner_scope = context.enclosingOpeningBrace(declaration_index) orelse continue;
         const binding = context.tokenText(declaration_index + 1);
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
@@ -370,8 +427,8 @@ fn findPartialOwnershipTransfers(context: RuleRun) !void {
             if (context.tokens[index].tag != .keyword_return or context.enclosingOpeningBrace(index) != owner_scope) continue;
             const return_end = context.statementEnd(index) orelse continue;
             const transferred_field = bindingFieldInRange(context, binding, index + 1, return_end) orelse continue;
-            if (!cleanupIncludesField(context, return_type, transferred_field)) continue;
-            const omitted_field = cleanupFieldOtherThan(context, return_type, transferred_field) orelse continue;
+            if (!cleanupIncludesField(context, declarations, return_type, transferred_field)) continue;
+            const omitted_field = cleanupFieldOtherThan(context, declarations, return_type, transferred_field) orelse continue;
             if (rangeCallsPathMethod(context, binding, "deinit", declaration_end + 1, index)) continue;
             try context.emit(.{
                 .rule = .partial_ownership_transfer,
@@ -387,8 +444,8 @@ fn findPartialOwnershipTransfers(context: RuleRun) !void {
     }
 }
 
-fn cleanupIncludesField(context: RuleRun, type_name: []const u8, field_name: []const u8) bool {
-    const container = typeContainer(context, type_name) orelse return false;
+fn cleanupIncludesField(context: RuleRun, declarations: *const Declarations, type_name: []const u8, field_name: []const u8) bool {
+    const container = typeContainer(context, declarations, type_name) orelse return false;
     for (context.tokens[container.start + 1 .. container.end], container.start + 1..) |token, self_index| {
         if (token.tag != .identifier or !context.tokenIs(self_index, "self") or self_index + 2 >= container.end or
             context.tokens[self_index + 1].tag != .period or !context.tokenIs(self_index + 2, field_name)) continue;
@@ -531,8 +588,8 @@ fn arrayListElementType(context: RuleRun, removal_index: usize, field_name: []co
     return null;
 }
 
-fn sliceFieldOfType(context: RuleRun, type_name: []const u8) ?[]const u8 {
-    const container = typeContainer(context, type_name) orelse return null;
+fn sliceFieldOfType(context: RuleRun, declarations: *const Declarations, type_name: []const u8) ?[]const u8 {
+    const container = typeContainer(context, declarations, type_name) orelse return null;
     for (context.tokens[container.start + 1 .. container.end], container.start + 1..) |token, field_index| {
         if (token.tag != .identifier or field_index + 3 >= container.end or context.tokens[field_index + 1].tag != .colon or
             context.tokens[field_index + 2].tag != .l_bracket or context.tokens[field_index + 3].tag != .r_bracket) continue;
@@ -541,10 +598,10 @@ fn sliceFieldOfType(context: RuleRun, type_name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn typeContainer(context: RuleRun, type_name: []const u8) ?TokenRange {
-    for (context.tokens, 0..) |token, name_index| {
-        if (token.tag != .identifier or !context.tokenIs(name_index, type_name) or name_index == 0 or
-            context.tokens[name_index - 1].tag != .keyword_const) continue;
+/// The braces of the first `const type_name = ... {` with a body.
+fn typeContainer(context: RuleRun, declarations: *const Declarations, type_name: []const u8) ?TokenRange {
+    for (Declarations.named(&declarations.constants, type_name)) |name_position| {
+        const name_index: usize = name_position;
         var opening = name_index + 1;
         while (opening < context.tokens.len and opening - name_index < 8 and context.tokens[opening].tag != .l_brace) : (opening += 1) {}
         if (opening >= context.tokens.len or context.tokens[opening].tag != .l_brace) continue;
@@ -570,25 +627,26 @@ fn containerCleansElementField(context: RuleRun, removal_index: usize, field_nam
     return false;
 }
 
-fn bindingTypeNameBefore(context: RuleRun, binding: []const u8, before: usize) ?[]const u8 {
-    var index = before;
-    while (index > 0) {
-        index -= 1;
-        if (!context.tokenIs(index, binding) or index + 2 >= before or context.tokens[index + 1].tag != .colon) continue;
-        var type_name: ?[]const u8 = null;
-        var type_index = index + 2;
-        while (type_index < before) : (type_index += 1) {
-            switch (context.tokens[type_index].tag) {
-                .identifier => {
-                    if (!context.tokenIs(type_index, "const")) type_name = context.tokenText(type_index);
-                },
-                .comma, .r_paren, .equal, .semicolon => break,
-                else => {},
-            }
+/// The type named by the nearest `binding: Type` before `before`.
+fn bindingTypeNameBefore(context: RuleRun, declarations: *const Declarations, binding: []const u8, before: usize) ?[]const u8 {
+    const typed = Declarations.named(&declarations.typed, binding);
+    // `typed[0..following]` leave room for a type before `before`; the last
+    // of them is the nearest.
+    const following = std.sort.lowerBound(u32, typed, before -| 2, Declarations.orderPosition);
+    if (following == 0) return null;
+    const index: usize = typed[following - 1];
+    var type_name: ?[]const u8 = null;
+    var type_index = index + 2;
+    while (type_index < before) : (type_index += 1) {
+        switch (context.tokens[type_index].tag) {
+            .identifier => {
+                if (!context.tokenIs(type_index, "const")) type_name = context.tokenText(type_index);
+            },
+            .comma, .r_paren, .equal, .semicolon => break,
+            else => {},
         }
-        return type_name;
     }
-    return null;
+    return type_name;
 }
 
 fn calledFunction(context: RuleRun, start: usize, end: usize) ?[]const u8 {
@@ -599,10 +657,10 @@ fn calledFunction(context: RuleRun, start: usize, end: usize) ?[]const u8 {
     return null;
 }
 
-fn functionReturnType(context: RuleRun, name: []const u8) ?[]const u8 {
-    for (context.tokens, 0..) |token, fn_index| {
-        if (token.tag != .keyword_fn or fn_index + 2 >= context.tokens.len or !context.tokenIs(fn_index + 1, name) or
-            context.tokens[fn_index + 2].tag != .l_paren) continue;
+/// The type the first `fn name(...)` with a parameter list returns.
+fn functionReturnType(context: RuleRun, declarations: *const Declarations, name: []const u8) ?[]const u8 {
+    for (Declarations.named(&declarations.functions, name)) |function_position| {
+        const fn_index: usize = function_position;
         const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse continue;
         var body_open = parameters_end + 1;
         var selected: ?[]const u8 = null;
@@ -626,8 +684,8 @@ fn bindingFieldInRange(context: RuleRun, binding: []const u8, start: usize, end:
     return null;
 }
 
-fn cleanupFieldOtherThan(context: RuleRun, type_name: []const u8, transferred: []const u8) ?[]const u8 {
-    const container = typeContainer(context, type_name) orelse return null;
+fn cleanupFieldOtherThan(context: RuleRun, declarations: *const Declarations, type_name: []const u8, transferred: []const u8) ?[]const u8 {
+    const container = typeContainer(context, declarations, type_name) orelse return null;
     for (context.tokens[container.start + 1 .. container.end], container.start + 1..) |token, self_index| {
         if (token.tag != .identifier or !context.tokenIs(self_index, "self") or self_index + 2 >= container.end or
             context.tokens[self_index + 1].tag != .period or context.tokens[self_index + 2].tag != .identifier) continue;

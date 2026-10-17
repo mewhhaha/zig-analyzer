@@ -468,7 +468,7 @@ pub const Linter = struct {
         findings_list: *std.ArrayList(analysis.Finding),
         dependencies: ?*Dependencies,
     ) !void {
-        if (lint_configuration.level(.deprecated_declaration) == .off) return;
+        if (!imported_deprecations.enabled(lint_configuration)) return;
         const path = try uri_module.toPath(allocator, document.uri) orelse return;
         defer allocator.free(path);
         var imported: imported_deprecations.ImportedDeprecations = undefined;

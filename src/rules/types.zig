@@ -99,6 +99,7 @@ pub const Rule = enum {
     exposed_private_type,
     exposed_private_error_set,
     deprecated_declaration,
+    removed_std_api,
     mutated_container_copy,
     prefer_range_for,
     prefer_index_of,
@@ -208,6 +209,11 @@ pub const Rule = enum {
     prefer_write_byte,
     prefer_simd_iota,
     missing_container_deinit,
+    prefer_typed_io_parameter,
+    prefer_doctest,
+    unflushed_writer,
+    unawaited_async,
+    unconsumed_delimiter,
 
     pub fn code(rule: Rule) []const u8 {
         return switch (rule) {
@@ -254,6 +260,7 @@ pub const Configuration = struct {
     line_length_limit: usize = 100,
     line_length_allow_unsplittable: bool = true,
     todo_markers: []const []const u8 = &.{ "TODO", "FIXME", "XXX" },
+    function_case: FunctionCase = .camel_case,
     warning: ?[]const u8 = null,
 
     pub fn defaults() Configuration {
@@ -274,6 +281,21 @@ pub const Configuration = struct {
 };
 
 pub const LintProfile = enum { none, official, idiomatic, strict, modernize, disciplined };
+
+/// How `non-idiomatic-name` expects functions that do not return a type to be
+/// spelled. Zig's style guide uses camelCase; some projects use snake_case.
+pub const FunctionCase = enum {
+    camel_case,
+    snake_case,
+
+    /// The spelling `zig-analyzer.json` uses for the value.
+    pub fn text(case: FunctionCase) []const u8 {
+        return switch (case) {
+            .camel_case => "camelCase",
+            .snake_case => "snake_case",
+        };
+    }
+};
 
 pub const Edit = struct {
     span: std.zig.Token.Loc,

@@ -83,7 +83,9 @@ fn findUncheckedRangeEnds(context: RuleRun) !void {
         if (rangeContainsCall(context.tokens, left_start, operator_index) or
             leftOperandEndsWithCall(context.tokens, operator_index) or
             leftOperandComesFromSearchMatch(context, left_start, operator_index, operator_index + 1, right_end) or
-            narrowedOperandsCannotOverflowUsize(context, left_start, operator_index, right_end)) continue;
+            narrowedOperandsCannotOverflowUsize(context, left_start, operator_index, right_end) or
+            additionCannotWrap(context, left_start, operator_index, right_end) or
+            additionInsideAssertion(context, statement_start, operator_index)) continue;
         if (runtime_length and rightOperandBoundedByRemaining(
             context,
             left_start,
@@ -132,7 +134,8 @@ fn findUncheckedDeclaredRangeEnds(context: RuleRun) !void {
             !unsignedIntegerExpression(context, left_start, operator_index) or
             !unsignedIntegerExpression(context, operator_index + 1, right_end) or
             !rangeRepresentsLength(context, operator_index + 1, right_end, operator_index)) continue;
-        if (rightOperandBoundedByRemaining(context, left_start, operator_index, right_end) or
+        if (additionCannotWrap(context, left_start, operator_index, right_end) or
+            rightOperandBoundedByRemaining(context, left_start, operator_index, right_end) or
             leftOperandComesFromSearchMatch(context, left_start, operator_index, operator_index + 1, right_end) or
             arithmeticHasVisibleGuard(context, operator_index, left_start, right_end, declaration_index)) continue;
         const scope_end = context.enclosingScopeEnd(declaration_index) orelse continue;
@@ -304,6 +307,101 @@ fn additionIsInsideClamp(context: RuleRun, operator_index: usize) bool {
 fn additionIsSliceEnd(context: RuleRun, left_start: usize, right_end: usize) bool {
     if (context.tokens[right_end].tag != .r_bracket or left_start == 0) return false;
     return context.tokens[left_start - 1].tag == .ellipsis2;
+}
+
+/// Sums that cannot wrap `usize`: lengths of objects in memory plus literals
+/// (`a.len + 1 + b.len`), a narrower unsigned value widened to a
+/// length's `usize` (`buf_len + bytes.len` with `buf_len: u8`), and many-pointer
+/// arithmetic, which is not integer overflow.
+fn additionCannotWrap(context: RuleRun, operand_start: usize, operator_index: usize, right_end: usize) bool {
+    // The left operand of a returned sum starts at its `return`.
+    const left_start = if (context.tokens[operand_start].tag == .keyword_return) operand_start + 1 else operand_start;
+    if (left_start >= operator_index) return false;
+    if (lengthTermsOnly(context, left_start, right_end)) return true;
+    if (operator_index >= left_start + 2 and context.tokens[operator_index - 2].tag == .period and
+        context.tokenIs(operator_index - 1, "ptr")) return true;
+    return (lengthPath(context, operator_index + 1, right_end) and narrowUnsignedPath(context, left_start, operator_index)) or
+        (lengthPath(context, left_start, operator_index) and narrowUnsignedPath(context, operator_index + 1, right_end));
+}
+
+/// Whether `[start, end)` is a `+`-separated sum of `.len` paths and number literals.
+fn lengthTermsOnly(context: RuleRun, start: usize, end: usize) bool {
+    var cursor = start;
+    var lengths: usize = 0;
+    while (cursor < end) {
+        if (context.tokens[cursor].tag == .number_literal) {
+            cursor += 1;
+        } else {
+            var term_end = cursor;
+            while (term_end < end and context.tokens[term_end].tag != .plus) : (term_end += 1) {}
+            if (!lengthPath(context, cursor, term_end)) return false;
+            lengths += 1;
+            cursor = term_end;
+        }
+        if (cursor == end) break;
+        if (context.tokens[cursor].tag != .plus) return false;
+        cursor += 1;
+    }
+    return lengths != 0 and cursor == end;
+}
+
+/// Whether `[start, end)` is a dotted path ending in `.len`.
+fn lengthPath(context: RuleRun, start: usize, end: usize) bool {
+    if (end < start + 3 or !context.tokenIs(end - 1, "len") or (end - start) % 2 == 0) return false;
+    for (context.tokens[start..end], 0..) |token, offset| {
+        if (token.tag != if (offset % 2 == 0) std.zig.Token.Tag.identifier else .period) return false;
+    }
+    return true;
+}
+
+/// Whether `[start, end)` is a binding or field path declared with an
+/// unsigned integer type narrower than `usize`.
+fn narrowUnsignedPath(context: RuleRun, start: usize, end: usize) bool {
+    if (end <= start or (end - start) % 2 == 0) return false;
+    for (context.tokens[start..end], 0..) |token, offset| {
+        if (token.tag != if (offset % 2 == 0) std.zig.Token.Tag.identifier else .period) return false;
+    }
+    const bits = if (end - start == 1)
+        declaredUnsignedBits(context, start)
+    else
+        fieldUnsignedBits(context, context.tokenText(end - 1));
+    return if (bits) |known| known < @bitSizeOf(usize) else false;
+}
+
+/// The bit width of the unsigned integer type the binding visible at
+/// `name_index` is declared with.
+fn declaredUnsignedBits(context: RuleRun, name_index: usize) ?usize {
+    const declaration = (context.scopes.findBinding(name_index) orelse return null).token_index;
+    if (declaration + 3 >= context.tokens.len or context.tokens[declaration + 1].tag != .colon or
+        context.tokens[declaration + 2].tag != .identifier or context.tokens[declaration + 3].tag == .period) return null;
+    return unsignedTypeBits(context.tokenText(declaration + 2));
+}
+
+/// The widest unsigned integer type a field named `field_name` is declared
+/// with, or null when one of its declarations is not an unsigned integer.
+fn fieldUnsignedBits(context: RuleRun, field_name: []const u8) ?usize {
+    var widest: ?usize = null;
+    for (context.tokens, 0..) |token, field_index| {
+        if (token.tag != .identifier or !context.tokenIs(field_index, field_name) or
+            field_index + 2 >= context.tokens.len or context.tokens[field_index + 1].tag != .colon) continue;
+        if (context.tokens[field_index + 2].tag != .identifier) return null;
+        const bits = unsignedTypeBits(context.tokenText(field_index + 2)) orelse return null;
+        widest = @max(widest orelse 0, bits);
+    }
+    return widest;
+}
+
+/// Whether the addition is an argument of `assert(...)`: an assertion states
+/// the invariant rather than computing a range end.
+fn additionInsideAssertion(context: RuleRun, statement_start: usize, operator_index: usize) bool {
+    var cursor = operator_index;
+    while (cursor > statement_start + 1) {
+        cursor -= 1;
+        if (context.tokens[cursor].tag != .l_paren or !context.tokenIs(cursor - 1, "assert")) continue;
+        const closing = context.matchingToken(cursor, .l_paren, .r_paren) orelse return false;
+        return operator_index < closing;
+    }
+    return false;
 }
 
 fn additionOperandEnd(tokens: []const std.zig.Token, start: usize, maximum: usize) usize {
@@ -1125,6 +1223,37 @@ test "subtraction and checked range ends stay clean" {
         "const word_len: u16 = @intCast(word.len); _ = word_len; return col + word.len <= limit; }";
     const found = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
     for (found) |finding| try std.testing.expect(finding.rule != .unchecked_range_end);
+}
+
+test "sums of lengths, assertions, widened operands and pointer arithmetic stay clean" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Digest = struct { buf_len: u8, buf: [64]u8 };" ++
+        "fn joined(buffer: []u8, a: []const u8, b: []const u8) []u8 { return buffer[0 .. a.len + 1 + b.len]; }" ++
+        "fn fits(a: []const u8, b: []const u8, limit: usize) bool { return a.list.items.len + b.len > limit; }" ++
+        "fn total(a: []const u8, b: []const u8) usize { const sum = a.len + b.len; return buffer[0..sum].len; }" ++
+        "fn room(self: *List, offset: usize, n: usize) void { std.debug.assert(offset + n <= self.capacity); }" ++
+        "fn update(d: *Digest, b: []const u8) bool { return d.buf_len + b.len >= 64; }" ++
+        "fn small(count: u16, b: []const u8, limit: usize) bool { return count + b.len > limit; }" ++
+        "fn last(buf: []u8, end: [*]u8) bool { return buf.ptr + buf.len == end; }";
+    const found = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.rule != .unchecked_range_end);
+}
+
+test "a wide operand added to a length still reports" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn wide(count: u64, b: []const u8, limit: usize) bool { return count + b.len > limit; }" ++
+        "fn cursor(offset: usize, b: []const u8, limit: usize) bool { return offset + b.len > limit; }" ++
+        "fn later(offset: usize, b: []const u8, limit: usize) bool { const ok = offset + b.len <= limit; assert(ok); return ok; }";
+    const found = try support.findings(arena.allocator(), run, source, types.Configuration.defaults());
+    var range_count: usize = 0;
+    for (found) |finding| if (finding.rule == .unchecked_range_end) {
+        range_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), range_count);
 }
 
 test "nested functions do not consume an outer declared range end" {

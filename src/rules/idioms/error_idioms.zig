@@ -31,6 +31,7 @@ fn findCollapsedErrors(context: RuleRun) !void {
             context.tokens[fallback_index].tag == .number_literal and std.mem.eql(u8, fallback, "0");
         if (!collapses) continue;
         if (absenceImmediatelyTested(context, fallback_index)) continue;
+        if (std.mem.eql(u8, fallback, "false") and conditionTestsFallback(context, fallback_index)) continue;
         try context.emit(.{
             .rule = .error_collapsed_to_absence,
             .level = level,
@@ -56,6 +57,37 @@ fn absenceImmediatelyTested(context: RuleRun, fallback_index: usize) bool {
         .pipe => after > fallback_index + 1,
         else => false,
     };
+}
+
+/// Whether a `catch false` is an operand of `!`, `and` or `or` in the
+/// condition of an `if` or `while`, which branches on the failure at once
+/// the way `if (x catch null) |value|` does.
+fn conditionTestsFallback(context: RuleRun, fallback_index: usize) bool {
+    const tokens = context.tokens;
+    var index = fallback_index + 1;
+    while (index < tokens.len) {
+        switch (tokens[index].tag) {
+            .keyword_and, .keyword_or => index += 1,
+            .l_paren, .l_bracket => index = (context.scopes.matchingToken(index) orelse return false) + 1,
+            .r_paren => {
+                const opening = context.scopes.matchingToken(index) orelse return false;
+                if (opening == 0) return false;
+                switch (tokens[opening - 1].tag) {
+                    .keyword_if, .keyword_while => return true,
+                    .bang, .keyword_and, .keyword_or, .l_paren => index += 1,
+                    else => return false,
+                }
+            },
+            // The rest of an operand that follows a boolean operator.
+            .identifier, .period, .bang, .builtin, .number_literal, .equal_equal, .bang_equal => index += 1,
+            .keyword_catch => {
+                if (index + 1 >= tokens.len) return false;
+                index += 2;
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn findRedundantCaptures(context: RuleRun) !void {
@@ -121,6 +153,22 @@ test "immediately tested catch null is deliberate absence handling" {
         try std.testing.expect(finding.span.start > std.mem.find(u8, source, "leaked").?);
     };
     try std.testing.expectEqual(@as(usize, 1), collapsed_count);
+}
+
+test "catch false tested by an if or while condition handles the failure at once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn check(a: u32, b: u32) bool {\n" ++
+        "    if (!(equal(a, b) catch false) or !(equal(b, a) catch false)) return false;\n" ++
+        "    while (a > 0 and (equal(a, 1) catch false)) {}\n" ++
+        "    try require(equal(a, b) catch false);\n" ++
+        "    return a == 0 and (equal(a, b) catch false);\n" ++
+        "}\n";
+    const configuration = support.only(&.{.error_collapsed_to_absence}, .warning);
+    const findings = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 2), findings.len);
+    for (findings) |finding| try std.testing.expect(finding.span.start > std.mem.find(u8, source, "try require").?);
 }
 
 test "collapsed errors and unused captures are distinguished" {

@@ -124,7 +124,10 @@ fn reportAffix(context: RuleRun, affix: Affix, call_index: usize) !void {
                 .start = context.tokens[call.call_start].loc.start,
                 .end = context.tokens[call.call_end].loc.end,
             },
-            .replacement = replacement,
+            .replacement = if (conjunctionFitsOperand(context, call.call_start, call.call_end))
+                replacement
+            else
+                try context.allocator.print("({s})", .{replacement}),
             .preferred = true,
             .fix_all = true,
         });
@@ -187,6 +190,38 @@ fn isSimpleExpression(context: RuleRun, start: usize, end: usize) bool {
         }
     }
     return true;
+}
+
+/// Whether an `a and b` expression can replace the call spanning
+/// `[first, last]` without parentheses: no neighbouring operator binds tighter
+/// than `and`, as `!`, a comparison or `orelse` would.
+fn conjunctionFitsOperand(context: RuleRun, first: usize, last: usize) bool {
+    const before: std.zig.Token.Tag = if (first == 0) .eof else context.tokens[first - 1].tag;
+    const open_before = switch (before) {
+        .eof, .l_paren, .l_brace, .r_brace, .comma, .semicolon, .equal, .equal_angle_bracket_right, .keyword_and, .keyword_or, .keyword_return => true,
+        else => false,
+    };
+    const open_after = switch (context.tokens[last + 1].tag) {
+        .eof, .r_paren, .r_brace, .comma, .semicolon, .keyword_and, .keyword_or => true,
+        else => false,
+    };
+    return open_before and open_after;
+}
+
+test "a scalar affix check keeps its precedence beside tighter operators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        \\fn check(prefix: []const u8, root: []const u8) bool {
+        \\    if (std.mem.endsWith(u8, root, "f")) return true;
+        \\    return prefix.len == 0 or !std.mem.endsWith(u8, prefix, "/") or std.mem.startsWith(u8, root, "-") == false;
+        \\}
+    ;
+    const findings = try support.findings(arena.allocator(), run, source, support.only(&.{ .prefer_ends_with_scalar, .prefer_starts_with_scalar }, .warning));
+    try std.testing.expectEqual(3, findings.len);
+    try std.testing.expectEqualStrings("root.len > 0 and root[root.len - 1] == 'f'", findings[0].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("(prefix.len > 0 and prefix[prefix.len - 1] == '/')", findings[1].fixes[0].edits[0].replacement);
+    try std.testing.expectEqualStrings("(root.len > 0 and root[0] == '-')", findings[2].fixes[0].edits[0].replacement);
 }
 
 test "prefer starts with scalar detects 1-character needle and offers quickfix" {

@@ -51,11 +51,11 @@ fn findComptimeIdioms(context: RuleRun) !void {
     if (comptime_level == .off and inline_level == .off) return;
     for (tokens, 0..) |token, index| {
         const is_redundant_comptime = token.tag == .keyword_comptime and comptime_level != .off and
-            index + 1 < tokens.len and tokens[index + 1].tag != .l_brace and insideComptimeScope(tokens, index);
+            index + 1 < tokens.len and tokens[index + 1].tag != .l_brace and insideComptimeScope(context, index);
         const is_redundant_inline = token.tag == .keyword_inline and inline_level != .off and
             index + 1 < tokens.len and
             (tokens[index + 1].tag == .keyword_for or tokens[index + 1].tag == .keyword_while) and
-            insideComptimeScope(tokens, index);
+            insideComptimeScope(context, index);
         if (!is_redundant_comptime and !is_redundant_inline) continue;
         const fixes = try Fix.single(context.allocator, .{
             .title = if (is_redundant_comptime) "Remove redundant comptime" else "Remove redundant inline",
@@ -81,21 +81,11 @@ fn findComptimeIdioms(context: RuleRun) !void {
     }
 }
 
-fn insideComptimeScope(tokens: []const std.zig.Token, index: usize) bool {
-    var cursor = index;
-    var nested_closings: usize = 0;
-    while (cursor > 0) {
-        cursor -= 1;
-        if (tokens[cursor].tag == .r_brace) {
-            nested_closings += 1;
-            continue;
-        }
-        if (tokens[cursor].tag != .l_brace) continue;
-        if (nested_closings != 0) {
-            nested_closings -= 1;
-            continue;
-        }
-        if (cursor > 0 and tokens[cursor - 1].tag == .keyword_comptime) return true;
+/// Whether a block enclosing `index` is a `comptime { ... }` block.
+fn insideComptimeScope(context: RuleRun, index: usize) bool {
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (opening > 0 and context.tokens[opening - 1].tag == .keyword_comptime) return true;
     }
     return false;
 }

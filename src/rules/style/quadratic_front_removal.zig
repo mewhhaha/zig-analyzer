@@ -14,7 +14,7 @@ pub fn run(context: RuleRun) !void {
 
     for (context.tokens, 0..) |token, while_index| {
         if (token.tag != .keyword_while or while_index + 1 >= context.tokens.len or
-            context.tokens[while_index + 1].tag != .l_paren) continue;
+            context.tokens[while_index + 1].tag != .l_paren or context.scopes.insideTestBlock(while_index)) continue;
         const condition_end = context.matchingToken(while_index + 1, .l_paren, .r_paren) orelse continue;
         const drained = drainedArrayListPath(context, while_index + 2, condition_end, while_index) orelse continue;
         const body_open = context.whileBodyOpening(condition_end) orelse continue;
@@ -164,6 +164,20 @@ test "draining an array list with ordered front removal reports" {
 
     try std.testing.expectEqual(@as(usize, 1), found.len);
     try std.testing.expectEqual(types.Rule.quadratic_front_removal, found[0].rule);
+}
+
+test "a test may drain its fixture from the front" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "test \"drain\" { const allocator = std.testing.allocator; " ++
+        "var queue: std.ArrayList(u32) = .empty; defer queue.deinit(allocator); " ++
+        "while (queue.items.len > 0) { consume(queue.orderedRemove(0)); } }";
+    const configuration = support.only(&.{.quadratic_front_removal}, .information);
+
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+
+    try std.testing.expectEqual(@as(usize, 0), found.len);
 }
 
 test "one-off and non-front array list removals remain clean" {

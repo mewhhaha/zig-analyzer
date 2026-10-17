@@ -108,7 +108,13 @@ pub const Store = struct {
     /// (absolute), with `configurationForPath` relaxations for that file.
     pub fn forFile(store: *Store, file_path: []const u8) !Resolved {
         var resolved = try store.forDirectory(std.Io.Dir.path.dirname(file_path) orelse file_path);
-        resolved.configuration = configurationForPath(resolved.configuration, file_path);
+        // The relaxations read the path inside the project, as the CLI does;
+        // the directories above the root may be named anything.
+        const project_path = if (isWithin(file_path, resolved.root))
+            std.mem.trimStart(u8, file_path[resolved.root.len..], "/\\")
+        else
+            file_path;
+        resolved.configuration = configurationForPath(resolved.configuration, project_path);
         return resolved;
     }
 
@@ -216,25 +222,11 @@ fn isWithin(path: []const u8, directory: []const u8) bool {
     return std.Io.Dir.path.isSep(path[directory.len]);
 }
 
-/// Per-path relaxations of a project's configuration: debug printing is
-/// legitimate in tests and build scripts.
+/// Per-path relaxations of a project's configuration for the file at `path`,
+/// relative to the project root: debug printing is legitimate in tests and
+/// build scripts, and the discipline rules hold only production code.
 pub fn configurationForPath(configuration: analysis.Configuration, path: []const u8) analysis.Configuration {
-    var file_configuration = configuration;
-    if (isTestOnlyPath(path) or std.mem.eql(u8, std.Io.Dir.path.basename(path), "build.zig")) {
-        file_configuration.levels[@backingInt(analysis.Rule.prefer_log_over_print)] = .off;
-    }
-    return file_configuration;
-}
-
-fn isTestOnlyPath(path: []const u8) bool {
-    const basename = std.Io.Dir.path.basename(path);
-    if (std.mem.endsWith(u8, basename, "_test.zig") or std.mem.endsWith(u8, basename, "_tests.zig")) return true;
-    var components = std.mem.splitAny(u8, path, "/\\");
-    while (components.next()) |component| {
-        if (std.mem.eql(u8, component, "test") or std.mem.eql(u8, component, "tests") or
-            std.mem.eql(u8, component, "testing")) return true;
-    }
-    return false;
+    return analysis.configurationForPath(configuration, path);
 }
 
 test "test and build paths keep debug printing out of production logging guidance" {

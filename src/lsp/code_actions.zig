@@ -64,7 +64,7 @@ const Offers = struct {
     only: ?[]const Kind,
     requested_span: std.zig.Token.Loc,
     actions: std.ArrayList(lsp.types.CodeAction.Result) = .empty,
-    fix_all_edits: std.ArrayList(analysis.Edit) = .empty,
+    fix_all_fixes: std.ArrayList([]const analysis.Edit) = .empty,
     line_suppressions: std.ArrayList(OfferedSuppression) = .empty,
     file_suppressions: std.ArrayList(OfferedSuppression) = .empty,
     rule_fix_alls: std.ArrayList(analysis.Rule) = .empty,
@@ -97,7 +97,7 @@ const Offers = struct {
     fn fixes(offers: *Offers, finding: analysis.Finding, all_findings: []const analysis.Finding) !void {
         const arena = offers.arena;
         for (finding.fixes) |fix| {
-            if (fix.fix_all) try offers.fix_all_edits.appendSlice(arena, fix.edits);
+            if (fix.fix_all) try offers.fix_all_fixes.append(arena, fix.edits);
             const kind = action_lsp.kind(fix.kind);
             if (!offers.requested(kind)) continue;
             if (fix.kind != .organize_imports and fix.kind != .fix_all and !offers.overlaps(finding.span)) continue;
@@ -120,14 +120,14 @@ const Offers = struct {
             if (offered == rule) return;
         }
         try offers.rule_fix_alls.append(arena, rule);
-        var rule_edits: std.ArrayList(analysis.Edit) = .empty;
+        var rule_fixes: std.ArrayList([]const analysis.Edit) = .empty;
         for (all_findings) |other| {
             if (other.rule != rule) continue;
             for (other.fixes) |other_fix| {
-                if (other_fix.fix_all) try rule_edits.appendSlice(arena, other_fix.edits);
+                if (other_fix.fix_all) try rule_fixes.append(arena, other_fix.edits);
             }
         }
-        const safe_edits = try text_edits.nonOverlapping(arena, rule_edits.items);
+        const safe_edits = try text_edits.wholeFixes(arena, rule_fixes.items);
         if (safe_edits.len == 0) return;
         if (!offers.requested(.@"source.fixAll") and !offers.requested(.quickfix)) return;
         try offers.add(
@@ -254,7 +254,7 @@ const Offers = struct {
     /// One action applying every safe fix-all edit of the file.
     fn fixAllSafe(offers: *Offers) !void {
         if (!offers.requested(.@"source.fixAll")) return;
-        const safe_edits = try text_edits.nonOverlapping(offers.arena, offers.fix_all_edits.items);
+        const safe_edits = try text_edits.wholeFixes(offers.arena, offers.fix_all_fixes.items);
         if (safe_edits.len == 0) return;
         try offers.actions.append(offers.arena, .{ .code_action = .{
             .title = "Fix all safe zig-analyzer findings",

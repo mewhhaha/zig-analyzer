@@ -4,6 +4,12 @@ const Suppressions = @import("../configuration.zig").Suppressions;
 const types = @import("../types.zig");
 const syntax_scope = @import("../../syntax/scope.zig");
 const tokenize = @import("../../syntax/tokens.zig").tokenize;
+const stdlib_replacements = @import("modernize.zig").stdlib_replacements;
+
+/// Whether an index run reports anything under `configuration`.
+pub fn enabled(configuration: types.Configuration) bool {
+    return configuration.level(.deprecated_declaration) != .off or configuration.level(.removed_std_api) != .off;
+}
 
 pub const Source = struct {
     path: []const u8,
@@ -67,6 +73,11 @@ pub const Index = struct {
     import_paths: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     root: ?*File = null,
     used_files: std.StringHashMapUnmanaged(void) = .empty,
+    /// Directory of the file `@import("std")` resolved to; files under it are
+    /// the standard library. Borrowed from `import_paths`.
+    std_directory: ?[]const u8 = null,
+    /// The members of each container body looked up so far; see `declarationIn`.
+    members: std.AutoHashMapUnmanaged(MembersKey, Members) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, loader: ?Loader) Index {
         return .{ .allocator = allocator, .loader = loader };
@@ -90,6 +101,9 @@ pub const Index = struct {
         }
         index.import_paths.deinit(index.allocator);
         index.used_files.deinit(index.allocator);
+        var members = index.members.valueIterator();
+        while (members.next()) |container| if (container.names) |*names| names.deinit(index.allocator);
+        index.members.deinit(index.allocator);
     }
 
     pub fn addSource(index: *Index, source: Source) !void {
@@ -105,7 +119,8 @@ pub const Index = struct {
     }
 
     pub fn run(index: *Index, context: Target, path: []const u8, imported_only: bool) !void {
-        if (context.level(.deprecated_declaration) == .off) return;
+        if (!enabled(context.configuration)) return;
+        const deprecations = context.level(.deprecated_declaration) != .off;
         const file = try index.addFile(.{ .path = path, .source = context.source, .tokens = context.tokens, .scopes = context.scopes });
         index.root = file;
         index.used_files.clearRetainingCapacity();
@@ -122,13 +137,17 @@ pub const Index = struct {
                 cursor = end;
                 break :blk try index.resolveExpression(file, .{ .start = start, .end = end + 1 }, 24) orelse continue;
             } else continue;
-            if (token.tag == .identifier) try index.emitReference(context, file, site, token.loc, imported_only);
+            if (deprecations and token.tag == .identifier) try index.emitReference(context, file, site, token.loc, imported_only);
             while (cursor + 2 < file.tokens.len and file.tokens[cursor + 1].tag == .period and
                 file.tokens[cursor + 2].tag == .identifier)
             {
                 const member_index = cursor + 2;
-                site = try index.member(site, tokenText(file, member_index), 24) orelse break;
-                try index.emitReference(context, file, site, file.tokens[member_index].loc, imported_only);
+                const container = try index.namespace(site, 23) orelse break;
+                site = try index.declarationIn(container, tokenText(file, member_index)) orelse {
+                    try index.emitRemoved(context, file, start, site, container, member_index);
+                    break;
+                };
+                if (deprecations) try index.emitReference(context, file, site, file.tokens[member_index].loc, imported_only);
                 cursor = member_index;
             }
         }
@@ -174,6 +193,7 @@ pub const Index = struct {
             entry.value_ptr.* = try loader.resolve(loader.context, index.allocator, current.source.path, spelling);
         }
         const path = entry.value_ptr.* orelse return null;
+        if (index.std_directory == null and std.mem.eql(u8, spelling, "std")) index.std_directory = std.Io.Dir.path.dirname(path);
         try index.used_files.put(index.allocator, path, {});
         if (index.files.get(path)) |file| return file;
         const source = try loader.load(loader.context, index.allocator, path) orelse return null;
@@ -240,26 +260,47 @@ pub const Index = struct {
     fn member(index: *Index, site: Site, name: []const u8, budget: usize) anyerror!?Site {
         if (budget == 0) return null;
         const container_site = try index.namespace(site, budget - 1) orelse return null;
+        return try index.declarationIn(container_site, name);
+    }
+
+    /// The declaration `name` selects in the container body `container_site`:
+    /// its only top-level declaration of that name, public unless the body is
+    /// in the file being checked. Each body is scanned once and its names kept.
+    fn declarationIn(index: *Index, container_site: Site, name: []const u8) !?Site {
+        const file = container_site.file;
         const body = container_site.body.?;
-        var cursor = body.start;
-        var selected: ?usize = null;
-        while (cursor < body.end) : (cursor += 1) {
-            const tag = container_site.file.tokens[cursor].tag;
-            if (tag == .l_brace or tag == .l_paren or tag == .l_bracket) {
-                cursor = container_site.file.scopes.matchingToken(cursor) orelse return null;
-                continue;
-            }
-            if (tag != .keyword_const and tag != .keyword_var and tag != .keyword_fn) continue;
-            if (cursor + 1 >= body.end or container_site.file.tokens[cursor + 1].tag != .identifier or
-                !std.mem.eql(u8, tokenText(container_site.file, cursor + 1), name)) continue;
-            if (container_site.file != index.root and !isPublic(container_site.file, cursor)) continue;
-            if (selected != null) return null;
-            selected = cursor + 1;
+        const key: MembersKey = .{
+            .file = @intFromPtr(file),
+            .start = body.start,
+            .end = body.end,
+            .public_only = file != index.root,
+        };
+        const entry = try index.members.getOrPut(index.allocator, key);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .{};
+            errdefer _ = index.members.remove(key);
+            entry.value_ptr.names = try containerMembers(index.allocator, file, body, key.public_only);
         }
-        return if (selected) |declaration| .{ .file = container_site.file, .declaration = declaration } else null;
+        const names = entry.value_ptr.names orelse return null;
+        const declaration = names.get(name) orelse return null;
+        return .{ .file = file, .declaration = declaration orelse return null };
     }
 
     fn namespace(index: *Index, site: Site, budget: usize) anyerror!?Site {
+        return index.namespaceOf(site, budget, .values);
+    }
+
+    /// What a declaration may be for `namespaceOf` to read a container from it.
+    const Reach = enum {
+        /// Also a typed constant, variable or parameter, through its type.
+        values,
+        /// Only a namespace or type: a value's members are the fields and
+        /// methods of an instance, not a namespace path.
+        namespaces,
+    };
+
+    /// The container `site` names.
+    fn namespaceOf(index: *Index, site: Site, budget: usize, reach: Reach) anyerror!?Site {
         if (budget == 0) return null;
         if (site.body != null) return site;
         const declaration = site.declaration orelse return null;
@@ -267,7 +308,9 @@ pub const Index = struct {
         if (declaration + 2 >= file.tokens.len) return null;
         const typed_namespace = tokenIs(file, declaration + 2, "type") and file.tokens[declaration + 1].tag == .colon;
         if (typed_namespace and (declaration == 0 or file.tokens[declaration - 1].tag != .keyword_const)) return null;
-        const expression = if (file.tokens[declaration + 1].tag == .colon and !typed_namespace)
+        const typed_value = file.tokens[declaration + 1].tag == .colon and !typed_namespace;
+        if (typed_value and reach == .namespaces) return null;
+        const expression = if (typed_value)
             declaredType(file, declaration) orelse return null
         else
             constantInitializer(file, declaration) orelse return null;
@@ -284,7 +327,110 @@ pub const Index = struct {
             return .{ .file = file, .body = .{ .start = start + 1, .end = end } };
         }
         const target = try index.resolveExpression(file, expression, budget - 1) orelse return null;
-        return try index.namespace(target, budget - 1);
+        return try index.namespaceOf(target, budget - 1, reach);
+    }
+
+    /// Reports member `member_index` of the chain starting at `chain_start`
+    /// when `container`, the standard-library namespace `receiver` names,
+    /// provably declares no such member, with the replacement when one is
+    /// known. Values, namespaces the index cannot list (generated by a call,
+    /// `@Type`, or a conditional), and containers outside the installed
+    /// standard library are declined.
+    fn emitRemoved(index: *Index, context: Target, root: *File, chain_start: usize, receiver: Site, container: Site, member_index: usize) !void {
+        const level = context.level(.removed_std_api);
+        if (level == .off or !index.isStandard(container.file)) return;
+        const name = tokenText(root, member_index);
+        if (name[0] == '@') return;
+        // The receiver must name the container as a namespace, not as the type
+        // of a value. Checked before the member scan: a field read through a
+        // value is the common way to get here, and a typed declaration fails
+        // this at once.
+        const namespace_site = try index.namespaceOf(receiver, 23, .namespaces) orelse return;
+        if (namespace_site.file != container.file or !std.meta.eql(namespace_site.body, container.body) or
+            !declaresNoMember(container, name)) return;
+        var path: std.ArrayList(u8) = .empty;
+        defer path.deinit(context.allocator);
+        if (!try index.ownerPath(context.allocator, container, &path)) return;
+        if (path.items.len != 0) try path.append(context.allocator, '.');
+        try path.appendSlice(context.allocator, name);
+
+        // The longest known path wins, so std.io.fixedBufferStream gets its
+        // own advice rather than std.io's.
+        var ends: [3]usize = .{ path.items.len, 0, 0 };
+        var last = member_index;
+        var extra: usize = 0;
+        while (extra + 1 < ends.len and last + 2 < root.tokens.len and root.tokens[last + 1].tag == .period and
+            root.tokens[last + 2].tag == .identifier) : (extra += 1)
+        {
+            last += 2;
+            try path.append(context.allocator, '.');
+            try path.appendSlice(context.allocator, tokenText(root, last));
+            ends[extra + 1] = path.items.len;
+        }
+        var advice: ?[]const u8 = null;
+        var known = path.items[0..ends[0]];
+        var known_end = member_index;
+        var candidate = extra + 1;
+        while (candidate > 0) {
+            candidate -= 1;
+            const prefix = path.items[0..ends[candidate]];
+            for (&stdlib_replacements) |entry| {
+                if (!std.mem.eql(u8, entry.path, prefix)) continue;
+                advice = entry.advice;
+                known = prefix;
+                known_end = member_index + 2 * candidate;
+                break;
+            }
+            if (advice != null) break;
+        }
+        if (advice != null) {
+            // That rule reports the same table entry, with its fixes, when it
+            // is spelled from the std import.
+            if (context.level(.modernize_deprecated_stdlib) != .off and spelledFromStd(root, chain_start, known_end, known)) return;
+        } else for (removed_namespaces) |entry| {
+            if (std.mem.eql(u8, entry.path, known)) advice = entry.advice;
+        }
+        const message = if (advice) |replacement|
+            try context.allocator.print("std.{s} was removed from the standard library; use {s}", .{ known, replacement })
+        else
+            try context.allocator.print("std.{s} does not exist in the standard library", .{known});
+        errdefer context.allocator.free(message);
+        try context.emit(.{ .rule = .removed_std_api, .level = level, .span = root.tokens[member_index].loc, .message = message });
+    }
+
+    fn isStandard(index: *const Index, file: *const File) bool {
+        const directory = index.std_directory orelse return false;
+        const path = file.source.path;
+        return path.len > directory.len + 1 and std.mem.startsWith(u8, path, directory) and
+            std.Io.Dir.path.isSep(path[directory.len]);
+    }
+
+    /// Appends the standard-library path of `container`, empty for the root
+    /// (`fs`, `Io.Dir`, `Build.LazyPath`), or returns false when a container
+    /// on the way is not a named declaration.
+    fn ownerPath(index: *const Index, allocator: std.mem.Allocator, container: Site, path: *std.ArrayList(u8)) !bool {
+        const file = container.file;
+        const directory = index.std_directory.?;
+        const file_path = file.source.path;
+        if (!std.mem.endsWith(u8, file_path, ".zig")) return false;
+        const relative = file_path[directory.len + 1 .. file_path.len - ".zig".len];
+        if (!std.mem.eql(u8, relative, "std")) {
+            for (relative) |byte| try path.append(allocator, if (std.Io.Dir.path.isSep(byte)) '.' else byte);
+        }
+        var names: [8]usize = undefined;
+        var count: usize = 0;
+        var brace: u32 = if (container.body.?.start == 0) syntax_scope.none_token else @intCast(container.body.?.start - 1);
+        while (brace != syntax_scope.none_token) : (count += 1) {
+            if (count == names.len) return false;
+            names[count] = containerName(file, brace) orelse return false;
+            brace = file.scopes.enclosing_braces[names[count]];
+        }
+        while (count > 0) {
+            count -= 1;
+            if (path.items.len != 0) try path.append(allocator, '.');
+            try path.appendSlice(allocator, tokenText(file, names[count]));
+        }
+        return true;
     }
 
     fn resolveExpression(index: *Index, file: *File, raw_range: Range, budget: usize) anyerror!?Site {
@@ -362,6 +508,109 @@ pub fn deprecationAdvice(source: []const u8, tokens: []const std.zig.Token, decl
     return null;
 }
 
+/// Whole namespaces the standard library dropped, for members of them that the
+/// replacement table does not name.
+const removed_namespaces = [_]struct { path: []const u8, advice: []const u8 }{
+    .{ .path = "io", .advice = "std.Io" },
+};
+
+/// A container body: the address of its file, its token range, and whether
+/// only public declarations count.
+const MembersKey = struct { file: usize, start: usize, end: usize, public_only: bool };
+
+const Members = struct {
+    /// Each top-level declaration name, mapped to its name token, or to null
+    /// when it is declared twice; null when a group in the body is unbalanced.
+    names: ?std.StringHashMapUnmanaged(?usize) = null,
+};
+
+fn containerMembers(
+    allocator: std.mem.Allocator,
+    file: *const File,
+    body: Range,
+    public_only: bool,
+) !?std.StringHashMapUnmanaged(?usize) {
+    var names: std.StringHashMapUnmanaged(?usize) = .empty;
+    errdefer names.deinit(allocator);
+    var cursor = body.start;
+    while (cursor < body.end) : (cursor += 1) {
+        const tag = file.tokens[cursor].tag;
+        if (tag == .l_brace or tag == .l_paren or tag == .l_bracket) {
+            cursor = file.scopes.matchingToken(cursor) orelse {
+                names.deinit(allocator);
+                return null;
+            };
+            continue;
+        }
+        if (tag != .keyword_const and tag != .keyword_var and tag != .keyword_fn) continue;
+        if (cursor + 1 >= body.end or file.tokens[cursor + 1].tag != .identifier) continue;
+        if (public_only and !isPublic(file, cursor)) continue;
+        const entry = try names.getOrPut(allocator, tokenText(file, cursor + 1));
+        entry.value_ptr.* = if (entry.found_existing) null else cursor + 1;
+    }
+    return names;
+}
+
+/// Whether no top-level token of `container` names `name`: no declaration,
+/// private or public, no field or enum value, and no `usingnamespace` that
+/// could provide it. Any other top-level mention also counts as a doubt, except
+/// a member access such as `std.Io.Dir`, which names another container's member.
+fn declaresNoMember(container: Site, name: []const u8) bool {
+    const file = container.file;
+    const body = container.body.?;
+    var cursor = body.start;
+    while (cursor < body.end) : (cursor += 1) {
+        switch (file.tokens[cursor].tag) {
+            .l_brace, .l_paren, .l_bracket => cursor = file.scopes.matchingToken(cursor) orelse return false,
+            .identifier => {
+                if (cursor > 0 and file.tokens[cursor - 1].tag == .period) continue;
+                var text = tokenText(file, cursor);
+                if (std.mem.eql(u8, text, "usingnamespace")) return false;
+                if (text.len >= 3 and text[0] == '@') text = text[2 .. text.len - 1];
+                if (std.mem.eql(u8, text, name)) return false;
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// The name token of the `const Name = struct {` (or enum, union, opaque)
+/// declaration whose body opens at `brace`.
+fn containerName(file: *const File, brace: usize) ?usize {
+    if (brace == 0) return null;
+    var cursor = brace - 1;
+    if (file.tokens[cursor].tag == .r_paren) cursor = (file.scopes.matchingToken(cursor) orelse return null) -| 1;
+    switch (file.tokens[cursor].tag) {
+        .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {},
+        else => return null,
+    }
+    while (cursor > 0 and (file.tokens[cursor - 1].tag == .keyword_extern or file.tokens[cursor - 1].tag == .keyword_packed)) cursor -= 1;
+    if (cursor < 3 or file.tokens[cursor - 1].tag != .equal) return null;
+    cursor -= 2;
+    if (cursor >= 2 and tokenIs(file, cursor, "type") and file.tokens[cursor - 1].tag == .colon) cursor -= 2;
+    if (cursor == 0 or file.tokens[cursor].tag != .identifier or file.tokens[cursor - 1].tag != .keyword_const) return null;
+    return cursor;
+}
+
+/// Whether tokens `start` through `end` spell `std.<path>` from a plain
+/// `const std = @import("std");`, the form `modernize-deprecated-stdlib` reads.
+fn spelledFromStd(file: *const File, start: usize, end: usize, path: []const u8) bool {
+    if (!tokenIs(file, start, "std")) return false;
+    const binding = file.scopes.findBinding(start) orelse return false;
+    const declaration = binding.token_index;
+    if (declaration == 0 or declaration + 6 >= file.tokens.len or file.tokens[declaration - 1].tag != .keyword_const or
+        file.tokens[declaration + 1].tag != .equal or !tokenIs(file, declaration + 2, "@import") or
+        !tokenIs(file, declaration + 4, "\"std\"") or file.tokens[declaration + 6].tag != .semicolon) return false;
+    var cursor = start;
+    var segments = std.mem.splitScalar(u8, path, '.');
+    while (segments.next()) |segment| {
+        if (cursor + 2 > end or !tokenIs(file, cursor + 2, segment)) return false;
+        cursor += 2;
+    }
+    return cursor == end;
+}
+
 fn isPublic(file: *const File, keyword: usize) bool {
     var cursor = keyword;
     while (cursor > 0) {
@@ -433,13 +682,23 @@ const TestLoader = struct {
 };
 
 fn testFindings(allocator: std.mem.Allocator, source: [:0]const u8, loader: ?Loader, imported_only: bool) ![]const types.Finding {
+    return testFindingsWith(allocator, source, loader, imported_only, .defaults());
+}
+
+fn testFindingsWith(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    loader: ?Loader,
+    imported_only: bool,
+    configuration: types.Configuration,
+) ![]const types.Finding {
     const tokens = try tokenize(allocator, source);
     defer allocator.free(tokens);
     var found: std.ArrayList(types.Finding) = .empty;
     errdefer found.deinit(allocator);
     var index: Index = .init(allocator, loader);
     defer index.deinit();
-    try index.run(.{ .allocator = allocator, .source = source, .tokens = tokens, .configuration = .defaults(), .findings = &found }, "/root/main.zig", imported_only);
+    try index.run(.{ .allocator = allocator, .source = source, .tokens = tokens, .configuration = configuration, .findings = &found }, "/root/main.zig", imported_only);
     const suppressions = try Suppressions.init(allocator, source);
     defer suppressions.deinit(allocator);
     suppressions.filter(&found);
@@ -536,7 +795,98 @@ test "deprecation index borrowed overlays override loader sources and disabled c
     try std.testing.expect(std.mem.find(u8, found.items[0].message, "unsaved advice") != null);
     try std.testing.expectEqual(@as(usize, 0), loader.reads);
     configuration.levels[@backingInt(types.Rule.deprecated_declaration)] = .off;
+    configuration.levels[@backingInt(types.Rule.removed_std_api)] = .off;
     found.clearRetainingCapacity();
     try index.run(.{ .allocator = allocator, .source = source, .tokens = tokens, .configuration = configuration, .findings = &found }, "/root/main.zig", true);
     try std.testing.expectEqual(@as(usize, 0), found.items.len);
+}
+
+const test_std_sources = [_]Source{
+    .{ .path = "/lib/std/std.zig", .source = "pub const fs = @import(\"fs.zig\");\npub const Thread = @import(\"Thread.zig\");\n" ++
+        "pub const Build = @import(\"Build.zig\");\npub const lang = @import(\"lang.zig\");\n" ++
+        "pub const Generated = Make(u8);\npub const options: Options = .{};\npub const Options = struct { level: u8 = 0 };\n" ++
+        "pub const Mixed = struct { usingnamespace @import(\"fs.zig\"); };\nfn Make(comptime T: type) type { return struct { value: T }; }\n" },
+    .{ .path = "/lib/std/fs.zig", .source = "const std = @import(\"std.zig\");\npub const path = @import(\"fs/path.zig\");\n" ++
+        "pub const max_path_bytes = std.Io.Dir.max_path_bytes;\nfn hidden() void {}\n" },
+    .{ .path = "/lib/std/fs/path.zig", .source = "pub fn current() void {}\n" },
+    .{ .path = "/lib/std/Thread.zig", .source = "impl: u8,\npub fn spawn() void {}\n" },
+    .{ .path = "/lib/std/lang.zig", .source = "pub const Mode = enum { debug, fast };\n" },
+    .{ .path = "/lib/std/Build.zig", .source = "pub const LazyPath = union(enum) {\n    src: u8,\n    pub fn dirname() void {}\n};\n" },
+    .{ .path = "/root/api.zig", .source = "pub fn present() void {}\n" },
+};
+
+test "removed std paths resolve through aliases and name their replacements" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loader: TestLoader = .{ .sources = &test_std_sources };
+    const source = "const std = @import(\"std\");\nconst fs = std.fs;\nconst Thread = std.Thread;\n" ++
+        "fn f(file: fs.File) void {\n" ++
+        "    _ = std.fs.cwd();\n" ++
+        "    _ = fs.cwd();\n" ++
+        "    _ = @import(\"std\").fs.cwd();\n" ++
+        "    _ = std.io.fixedBufferStream;\n" ++
+        "    _ = std.io.Writer;\n" ++
+        "    _ = std.fs.unknown;\n" ++
+        "    _ = std.Build.LazyPath.basename;\n" ++
+        "    var mutex: Thread.Mutex = .{};\n" ++
+        "    const dir: fs.Dir = undefined;\n" ++
+        "    _ = .{ file, &mutex, dir };\n" ++
+        "}\n";
+    const found = try testFindings(arena.allocator(), source, loader.callbacks(), true);
+    const expected = [_]struct { span: []const u8, message: []const u8 }{
+        .{ .span = "File", .message = "std.fs.File was removed from the standard library; use std.Io.File, whose operations take an Io instance" },
+        .{ .span = "cwd", .message = "std.fs.cwd was removed from the standard library; use std.Io.Dir.cwd()" },
+        .{ .span = "cwd", .message = "std.fs.cwd was removed from the standard library; use std.Io.Dir.cwd()" },
+        .{ .span = "cwd", .message = "std.fs.cwd was removed from the standard library; use std.Io.Dir.cwd()" },
+        .{ .span = "io", .message = "std.io.fixedBufferStream was removed from the standard library; use std.Io.Reader.fixed or std.Io.Writer.fixed" },
+        .{ .span = "io", .message = "std.io was removed from the standard library; use std.Io" },
+        .{ .span = "unknown", .message = "std.fs.unknown does not exist in the standard library" },
+        .{ .span = "basename", .message = "std.Build.LazyPath.basename was removed from the standard library; use path resolution during a make step" },
+        .{ .span = "Mutex", .message = "std.Thread.Mutex was removed from the standard library; use std.Io.Mutex" },
+        .{ .span = "Dir", .message = "std.fs.Dir was removed from the standard library; use std.Io.Dir, whose operations take an Io instance" },
+    };
+    try std.testing.expectEqual(expected.len, found.len);
+    for (expected, found) |want, finding| {
+        try std.testing.expectEqual(types.Rule.removed_std_api, finding.rule);
+        try std.testing.expectEqualStrings(want.span, source[finding.span.start..finding.span.end]);
+        try std.testing.expectEqualStrings(want.message, finding.message);
+    }
+}
+
+test "removed std paths decline values fields generated namespaces and other modules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loader: TestLoader = .{ .sources = &test_std_sources };
+    const found = try testFindings(arena.allocator(), "const std = @import(\"std\");\nconst api = @import(\"api.zig\");\n" ++
+        "fn f(thread: std.Thread, mode: std.lang.Mode) void {\n" ++
+        "    _ = std.fs.hidden;\n" ++
+        "    _ = thread.impl;\n" ++
+        "    _ = thread.missing;\n" ++
+        "    _ = std.lang.Mode.debug;\n" ++
+        "    _ = mode.missing;\n" ++
+        "    _ = std.Generated.missing;\n" ++
+        "    _ = std.options.level;\n" ++
+        "    _ = std.options.missing;\n" ++
+        "    _ = std.Mixed.missing;\n" ++
+        "    _ = std.fs.path.current;\n" ++
+        "    _ = std.Build.LazyPath.src;\n" ++
+        "    _ = std.fs.@\"cwd\";\n" ++
+        "    _ = api.missing;\n" ++
+        "}\n", loader.callbacks(), true);
+    try std.testing.expectEqual(@as(usize, 0), found.len);
+}
+
+test "removed std paths spelled from the std import defer to the modernize table rule" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loader: TestLoader = .{ .sources = &test_std_sources };
+    var configuration = types.Configuration.defaults();
+    configuration.levels[@backingInt(types.Rule.modernize_deprecated_stdlib)] = .warning;
+    const source = "const std = @import(\"std\");\nconst fs = std.fs;\n" ++
+        "fn f() void { _ = std.fs.cwd(); _ = fs.cwd(); _ = std.fs.unknown; _ = std.io.Writer; }\n";
+    const found = try testFindingsWith(arena.allocator(), source, loader.callbacks(), true, configuration);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqual(std.mem.find(u8, source, " fs.cwd").? + " fs.".len, found[0].span.start);
+    try std.testing.expectEqualStrings("unknown", source[found[1].span.start..found[1].span.end]);
+    try std.testing.expectEqualStrings("io", source[found[2].span.start..found[2].span.end]);
 }

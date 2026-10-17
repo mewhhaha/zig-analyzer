@@ -187,7 +187,8 @@ test "style findings require proven operands and expose safe fixes" {
         "    _ = failing() catch {};\n" ++
         "    _ = unknown == true;\n" ++
         "    _ = switch (mode) { .fast => 1, else => 2 };\n" ++
-        "    if (enabled == true) { return value; } else { return 0; }\n" ++
+        "    if (enabled == true) { return value; } else { _ = unknown; }\n" ++
+        "    return 0;\n" ++
         "}\n";
     var configuration = Configuration.defaults();
     for (std.enums.values(Rule)) |rule| if (rule.tier() == .style) {

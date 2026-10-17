@@ -24,6 +24,7 @@ pub const refines = [_]types.Rule{
     .iterator_invalidated_during_loop,
     .local_storage_escape,
     .returning_released_value,
+    .unflushed_writer,
 } ++ allocation_lifecycle.rules;
 
 const summary_rules = refines ++ rules;
@@ -58,8 +59,14 @@ const FileChecks = struct {
     per_file: []std.ArrayList(run_module.Finding),
 
     fn check(checks: FileChecks, file_index: usize) !void {
+        // The file's syntax and scratch are released when its checks end, so
+        // only the files in flight hold a tree; findings are copied out.
+        var file_arena: std.heap.ArenaAllocator = .init(checks.run.backing);
+        defer file_arena.deinit();
         var file_run = checks.run;
+        file_run.allocator = file_arena.allocator();
         file_run.findings = &checks.per_file[file_index];
+        defer checks.run.syntaxes[file_index] = null;
         try summary_checks.checkFile(file_run, file_index, checks.summary_index);
     }
 };

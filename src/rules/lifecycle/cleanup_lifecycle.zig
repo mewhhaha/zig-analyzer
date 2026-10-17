@@ -20,6 +20,8 @@ fn findReassignedCleanupBindings(context: RuleRun) !void {
         const scope_opening = context.enclosingOpeningBrace(defer_index) orelse continue;
         const scope_end = context.matchingToken(scope_opening, .l_brace, .r_brace) orelse continue;
         const defer_end = context.statementEnd(defer_index) orelse continue;
+        // Unbalanced braces can end the statement past its block.
+        if (defer_end >= scope_end) continue;
         const cleanup_binding = cleanupBinding(context, defer_index + 1, defer_end) orelse continue;
         for (context.tokens[defer_end + 1 .. scope_end], defer_end + 1..) |candidate, index| {
             if (candidate.tag != .identifier or !context.tokenIs(index, cleanup_binding) or index + 1 >= scope_end or

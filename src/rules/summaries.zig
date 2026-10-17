@@ -89,6 +89,9 @@ pub const OwnedReturn = struct {
     release: []const u8,
     allocator_parameter: ?usize = null,
     allocator_parameter_member: ?[]const u8 = null,
+    /// The function returns a single-item pointer to an array (`*align(n) [n]u8`),
+    /// which `destroy` releases as correctly as `free`.
+    array_pointer: bool = false,
 };
 
 const ImportAlias = struct {
@@ -309,6 +312,19 @@ pub const Index = struct {
         const function = index.functionForCall(source, receiver, name) orelse return null;
         if (function.unresolved) return null;
         return function.container_mutation;
+    }
+
+    /// The function a call in `source` resolves to, through an import alias
+    /// or in the same file, for rules that read the callee's body; null when
+    /// the call is ambiguous, unknown, or recursive.
+    pub fn calledFunction(
+        index: Index,
+        source: []const u8,
+        receiver: ?[]const u8,
+        name: []const u8,
+    ) ?FunctionSummary {
+        const function = index.functionForCall(source, receiver, name) orelse return null;
+        return if (function.unresolved) null else function;
     }
 
     pub fn hasImportedLifecycleFacts(index: Index, source: []const u8) bool {
@@ -575,8 +591,10 @@ pub fn build(
     try buildLookups(allocator, &index);
     try markRecursiveFunctions(allocator, index);
     inferDirectEffects(index, configuration);
+    var calls = try CallFacts.init(allocator, index);
+    defer calls.deinit(allocator);
     for (0..index.functions.len) |_| {
-        if (!try propagateCallEffects(allocator, &index)) break;
+        if (!try propagateCallEffects(allocator, &index, &calls)) break;
     }
     return index;
 }
@@ -824,25 +842,22 @@ fn parameterName(source: []const u8, tokens: []const std.zig.Token, start: usize
 fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
     for (index.functions) |*function| {
         if (function.unresolved) continue;
-        for (function.parameter_names, 0..) |parameter_name, parameter| {
-            for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
-                if (tokenBelongsToNestedFunction(function.*, use_index)) continue;
-                if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), parameter_name)) continue;
-                if (useIsDirectRelease(function.*, use_index, configuration.resource_contracts)) {
-                    mergeEffect(
-                        &function.parameter_effects[parameter],
-                        if (effectUseIsUnconditional(function.*, use_index)) .released else .unknown,
-                    );
-                    continue;
+        // A parameter's effects follow from its own uses in order, so one pass
+        // over the body serves every parameter.
+        for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
+            if (token.tag != .identifier) continue;
+            const name = tokenText(function.source, token);
+            var outside_nested_functions = false;
+            for (function.parameter_names, 0..) |parameter_name, parameter| {
+                if (!std.mem.eql(u8, name, parameter_name)) continue;
+                if (!outside_nested_functions) {
+                    if (tokenBelongsToNestedFunction(function.*, use_index)) break;
+                    outside_nested_functions = true;
                 }
-                if (parameterUseIsCopied(function.*, use_index)) continue;
-                if ((statementStartsWith(function.tokens, use_index, .keyword_return) or
-                    useIsStored(function.*, use_index)) and parameterUseDefinitelyEscapes(function.*, use_index))
-                {
-                    function.parameter_escapes[parameter] = true;
-                    mergeEffect(&function.parameter_effects[parameter], .escaped);
-                }
+                inferUseEffect(function, parameter, use_index, configuration);
             }
+        }
+        for (function.parameter_names, 0..) |parameter_name, parameter| {
             if (borrowedAliasEscapes(function.*, parameter_name)) {
                 function.parameter_escapes[parameter] = true;
             }
@@ -857,6 +872,24 @@ fn inferDirectEffects(index: Index, configuration: types.Configuration) void {
         }
         function.partial_io = directPartialIoReturn(function.*);
         function.container_mutation = directContainerMutation(function.*);
+    }
+}
+
+/// What the use of `function`'s parameter `parameter` at `use_index` does to it.
+fn inferUseEffect(function: *FunctionSummary, parameter: usize, use_index: usize, configuration: types.Configuration) void {
+    if (useIsDirectRelease(function.*, use_index, configuration.resource_contracts)) {
+        mergeEffect(
+            &function.parameter_effects[parameter],
+            if (effectUseIsUnconditional(function.*, use_index)) .released else .unknown,
+        );
+        return;
+    }
+    if (parameterUseIsCopied(function.*, use_index)) return;
+    if ((statementStartsWith(function.tokens, use_index, .keyword_return) or
+        useIsStored(function.*, use_index)) and parameterUseDefinitelyEscapes(function.*, use_index))
+    {
+        function.parameter_escapes[parameter] = true;
+        mergeEffect(&function.parameter_effects[parameter], .escaped);
     }
 }
 
@@ -902,9 +935,9 @@ fn directContainerMutation(function: FunctionSummary) ?ContainerMutation {
     };
     for (function.parameter_names, 0..) |parameter_name, parameter| {
         for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, use_index| {
-            if (tokenBelongsToNestedFunction(function, use_index) or token.tag != .identifier or
-                !std.mem.eql(u8, tokenText(function.source, token), parameter_name) or use_index + 3 >= function.body_end or
-                function.tokens[use_index + 1].tag != .period or function.tokens[use_index + 2].tag != .identifier) continue;
+            if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), parameter_name) or
+                use_index + 3 >= function.body_end or function.tokens[use_index + 1].tag != .period or
+                function.tokens[use_index + 2].tag != .identifier or tokenBelongsToNestedFunction(function, use_index)) continue;
             const direct_method = function.tokens[use_index + 3].tag == .l_paren;
             if (!direct_method and (use_index + 5 >= function.body_end or function.tokens[use_index + 3].tag != .period or
                 function.tokens[use_index + 4].tag != .identifier or function.tokens[use_index + 5].tag != .l_paren)) continue;
@@ -1004,7 +1037,7 @@ fn directBorrowedReturn(function: FunctionSummary) ?BorrowedReturn {
     const kind = declaredBorrowKind(function) orelse return null;
     var selected: ?BorrowedReturn = null;
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, return_index| {
-        if (tokenBelongsToNestedFunction(function, return_index) or token.tag != .keyword_return) continue;
+        if (token.tag != .keyword_return or tokenBelongsToNestedFunction(function, return_index)) continue;
         const return_end = statementEnd(function.tokens, return_index, function.body_end);
         if (return_index + 1 < return_end and function.tokens[return_index + 1].tag == .keyword_error) continue;
         const borrowed = borrowed: {
@@ -1058,7 +1091,7 @@ fn declaredBorrowKind(function: FunctionSummary) ?BorrowKind {
 fn directPartialIoReturn(function: FunctionSummary) PartialIo {
     var selected: PartialIo = .none;
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, return_index| {
-        if (tokenBelongsToNestedFunction(function, return_index) or token.tag != .keyword_return) continue;
+        if (token.tag != .keyword_return or tokenBelongsToNestedFunction(function, return_index)) continue;
         const return_end = statementEnd(function.tokens, return_index, function.body_end);
         if (return_index + 1 < return_end and function.tokens[return_index + 1].tag == .keyword_error) continue;
         var returned: PartialIo = .none;
@@ -1094,8 +1127,8 @@ const DirectOwnedReturn = struct {
 fn directOwnedReturn(function: FunctionSummary, contracts: []const types.ResourceContract) ?DirectOwnedReturn {
     var selected: ?DirectOwnedReturn = null;
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, token_index| {
-        if (tokenBelongsToNestedFunction(function, token_index)) continue;
         if (token.tag != .keyword_return) continue;
+        if (tokenBelongsToNestedFunction(function, token_index)) continue;
         const statement_end = statementEnd(function.tokens, token_index, function.body_end);
         if (token_index + 1 < statement_end and function.tokens[token_index + 1].tag == .keyword_error) continue;
         const possible_owned: ?DirectOwnedReturn = owned: {
@@ -1153,7 +1186,7 @@ fn directOwnedBinding(
             "putAssumeCapacity",
         };
         for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, call_open| {
-            if (tokenBelongsToNestedFunction(function, call_open) or token.tag != .l_paren) continue;
+            if (token.tag != .l_paren or tokenBelongsToNestedFunction(function, call_open)) continue;
             const call_end = matchingDelimiter(function.tokens, call_open) orelse continue;
             if (call_end >= return_index or exactArgumentIndex(
                 function.source,
@@ -1171,8 +1204,8 @@ fn directOwnedBinding(
             for (retaining_methods) |candidate| if (std.mem.eql(u8, method, candidate)) break :transferred true;
         }
         for (function.tokens[function.body_start + 1 .. return_index], function.body_start + 1..) |token, use_index| {
-            if (tokenBelongsToNestedFunction(function, use_index) or token.tag != .identifier or
-                !std.mem.eql(u8, tokenText(function.source, token), binding_name)) continue;
+            if (token.tag != .identifier or !std.mem.eql(u8, tokenText(function.source, token), binding_name) or
+                tokenBelongsToNestedFunction(function, use_index)) continue;
             if (useIsStored(function, use_index) and parameterUseDefinitelyEscapes(function, use_index)) break :transferred true;
         }
         break :transferred false;
@@ -1317,13 +1350,78 @@ fn localAllocatorProvenance(
     return null;
 }
 
-fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
-    var changed = false;
-    for (index.functions) |*caller| {
-        if (caller.unresolved) continue;
+/// The calls and returns of every function body that `propagateCallEffects`
+/// reads, found in one scan, and the functions to revisit when a summary
+/// changes. A round re-evaluates only the functions whose callees changed
+/// since their last evaluation: the others would merge in what they already
+/// hold, so every round ends in the state a full rescan would reach.
+const CallFacts = struct {
+    sites: std.ArrayList(CallSite) = .empty,
+    /// `(caller parameter, argument position)` of each parameter a call passes on.
+    arguments: std.ArrayList([2]u32) = .empty,
+    returns: std.ArrayList(Span) = .empty,
+    candidates: std.ArrayList(ReturnCandidate) = .empty,
+    /// Per function, its span of `sites` and of `returns`.
+    function_sites: []Span = &.{},
+    function_returns: []Span = &.{},
+    /// The functions with a call to each name, in order and without repeats.
+    callers: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+    /// Whether a callee of each function changed since it was evaluated.
+    dirty: []bool = &.{},
+
+    const Span = struct { start: u32, end: u32 };
+
+    /// A call that can pass a caller's parameters to a summarized callee.
+    const CallSite = struct {
+        call_open: usize,
+        callable: []const u8,
+        arguments: Span,
+    };
+
+    /// A call whose closing parenthesis ends a `return` statement.
+    const ReturnCandidate = struct {
+        call_open: usize,
+        call_end: usize,
+        callable: []const u8,
+    };
+
+    fn init(allocator: std.mem.Allocator, index: Index) !CallFacts {
+        var facts: CallFacts = .{};
+        errdefer facts.deinit(allocator);
+        facts.function_sites = try allocator.alloc(Span, index.functions.len);
+        facts.function_returns = try allocator.alloc(Span, index.functions.len);
+        facts.dirty = try allocator.alloc(bool, index.functions.len);
+        @memset(facts.dirty, true);
+        for (index.functions, 0..) |caller, position| {
+            const sites_start: u32 = @intCast(facts.sites.items.len);
+            const returns_start: u32 = @intCast(facts.returns.items.len);
+            if (!caller.unresolved) {
+                try facts.collectSites(allocator, index, caller, position);
+                if (!caller.returns_owned) try facts.collectReturns(allocator, caller, position);
+            }
+            facts.function_sites[position] = .{ .start = sites_start, .end = @intCast(facts.sites.items.len) };
+            facts.function_returns[position] = .{ .start = returns_start, .end = @intCast(facts.returns.items.len) };
+        }
+        return facts;
+    }
+
+    fn deinit(facts: *CallFacts, allocator: std.mem.Allocator) void {
+        facts.sites.deinit(allocator);
+        facts.arguments.deinit(allocator);
+        facts.returns.deinit(allocator);
+        facts.candidates.deinit(allocator);
+        allocator.free(facts.function_sites);
+        allocator.free(facts.function_returns);
+        var lists = facts.callers.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        facts.callers.deinit(allocator);
+        allocator.free(facts.dirty);
+    }
+
+    fn collectSites(facts: *CallFacts, allocator: std.mem.Allocator, index: Index, caller: FunctionSummary, position: usize) !void {
         for (caller.tokens[caller.body_start + 1 .. caller.body_end], caller.body_start + 1..) |token, call_open| {
-            if (tokenBelongsToNestedFunction(caller.*, call_open)) continue;
             if (token.tag != .l_paren) continue;
+            if (tokenBelongsToNestedFunction(caller, call_open)) continue;
             const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
             const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
             const method = callableBaseName(callable);
@@ -1336,83 +1434,137 @@ fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index) !bool {
             if ((method_call and (std.mem.eql(u8, method, "free") or std.mem.eql(u8, method, "destroy") or
                 std.mem.eql(u8, method, "close") or std.mem.eql(u8, method, "deinit") or
                 std.mem.eql(u8, method, "release")) and !imported_call) or index.releaseContract(callable) != null) continue;
+            const arguments_start: u32 = @intCast(facts.arguments.items.len);
             for (caller.parameter_names, 0..) |parameter_name, caller_parameter| {
                 const argument = exactArgumentIndex(caller.source, caller.tokens, parameter_name, call_open + 1, call_end) orelse continue;
-                const reported_effect = index.parameterEffectForCall(caller.source, callable, argument);
-                const effect = if (reported_effect == .released and !effectUseIsUnconditional(caller.*, call_open))
+                try facts.arguments.append(allocator, .{ @intCast(caller_parameter), @intCast(argument) });
+            }
+            try facts.sites.append(allocator, .{
+                .call_open = call_open,
+                .callable = callable,
+                .arguments = .{ .start = arguments_start, .end = @intCast(facts.arguments.items.len) },
+            });
+            try facts.addCaller(allocator, callable, position);
+        }
+    }
+
+    fn collectReturns(facts: *CallFacts, allocator: std.mem.Allocator, caller: FunctionSummary, position: usize) !void {
+        for (caller.tokens[caller.body_start + 1 .. caller.body_end], caller.body_start + 1..) |token, return_index| {
+            if (token.tag != .keyword_return or tokenBelongsToNestedFunction(caller, return_index)) continue;
+            const return_end = statementEnd(caller.tokens, return_index, caller.body_end);
+            if (return_index + 1 < return_end and caller.tokens[return_index + 1].tag == .keyword_error) continue;
+            const candidates_start: u32 = @intCast(facts.candidates.items.len);
+            for (caller.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, call_open| {
+                if (candidate.tag != .l_paren) continue;
+                const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
+                if (call_end + 1 != return_end) continue;
+                const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
+                try facts.candidates.append(allocator, .{ .call_open = call_open, .call_end = call_end, .callable = callable });
+                try facts.addCaller(allocator, callable, position);
+            }
+            try facts.returns.append(allocator, .{ .start = candidates_start, .end = @intCast(facts.candidates.items.len) });
+        }
+    }
+
+    /// Records that `position` calls `callable`, whose summary is looked up
+    /// by its last name in every file.
+    fn addCaller(facts: *CallFacts, allocator: std.mem.Allocator, callable: []const u8, position: usize) !void {
+        const entry = try facts.callers.getOrPut(allocator, callableBaseName(callable));
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        const list = entry.value_ptr;
+        if (list.items.len != 0 and list.items[list.items.len - 1] == position) return;
+        try list.append(allocator, @intCast(position));
+    }
+
+    fn siteArguments(facts: *const CallFacts, site: CallSite) []const [2]u32 {
+        return facts.arguments.items[site.arguments.start..site.arguments.end];
+    }
+
+    /// Marks every function that calls something named like `function`.
+    fn changed(facts: *CallFacts, function: FunctionSummary) void {
+        const list = facts.callers.get(function.name) orelse return;
+        for (list.items) |caller| facts.dirty[caller] = true;
+    }
+};
+
+fn propagateCallEffects(allocator: std.mem.Allocator, index: *Index, calls: *CallFacts) !bool {
+    var changed = false;
+    for (index.functions, 0..) |*caller, position| {
+        if (caller.unresolved or !calls.dirty[position]) continue;
+        calls.dirty[position] = false;
+        var caller_changed = false;
+        const sites = calls.function_sites[position];
+        for (calls.sites.items[sites.start..sites.end]) |site| {
+            for (calls.siteArguments(site)) |use| {
+                const caller_parameter = use[0];
+                const argument = use[1];
+                const reported_effect = index.parameterEffectForCall(caller.source, site.callable, argument);
+                const effect = if (reported_effect == .released and !effectUseIsUnconditional(caller.*, site.call_open))
                     .unknown
                 else
                     reported_effect;
-                if (index.parameterEscapesForCall(caller.source, callable, argument)) {
-                    changed = changed or !caller.parameter_escapes[caller_parameter];
+                if (index.parameterEscapesForCall(caller.source, site.callable, argument)) {
+                    caller_changed = caller_changed or !caller.parameter_escapes[caller_parameter];
                     caller.parameter_escapes[caller_parameter] = true;
                 }
                 const before = caller.parameter_effects[caller_parameter];
                 mergeEffect(&caller.parameter_effects[caller_parameter], effect);
-                changed = changed or before != caller.parameter_effects[caller_parameter];
+                caller_changed = caller_changed or before != caller.parameter_effects[caller_parameter];
             }
         }
-        if (caller.returns_owned) continue;
-        var selected: ?DirectOwnedReturn = null;
-        for (caller.tokens[caller.body_start + 1 .. caller.body_end], caller.body_start + 1..) |token, return_index| {
-            if (tokenBelongsToNestedFunction(caller.*, return_index) or token.tag != .keyword_return) continue;
-            const return_end = statementEnd(caller.tokens, return_index, caller.body_end);
-            if (return_index + 1 < return_end and caller.tokens[return_index + 1].tag == .keyword_error) continue;
-            const possible_returned: ?DirectOwnedReturn = returned: {
-                for (caller.tokens[return_index + 1 .. return_end], return_index + 1..) |candidate, call_open| {
-                    if (candidate.tag != .l_paren) continue;
-                    const call_end = matchingDelimiter(caller.tokens, call_open) orelse continue;
-                    if (call_end + 1 != return_end) continue;
-                    const callable = callableBefore(caller.source, caller.tokens, call_open) orelse continue;
-                    const owned = index.ownedReturnForCall(caller.source, callable) orelse continue;
-                    var allocator_parameter: ?usize = null;
-                    var allocator_parameter_member: ?[]const u8 = null;
-                    if (owned.allocator_parameter) |callee_allocator_parameter| {
-                        if (parameterProvenanceAtArgument(
-                            caller.*,
-                            call_open + 1,
-                            call_end,
-                            callee_allocator_parameter,
-                        )) |provenance| {
-                            allocator_parameter = provenance.parameter;
-                            allocator_parameter_member = try composeAllocatorMemberPath(
-                                allocator,
-                                &index.owned_member_paths,
-                                provenance.member,
-                                owned.allocator_parameter_member,
-                            );
+        if (!caller.returns_owned) owned: {
+            var selected: ?DirectOwnedReturn = null;
+            const returns = calls.function_returns[position];
+            for (calls.returns.items[returns.start..returns.end]) |candidates| {
+                const possible_returned: ?DirectOwnedReturn = returned: {
+                    for (calls.candidates.items[candidates.start..candidates.end]) |candidate| {
+                        const owned = index.ownedReturnForCall(caller.source, candidate.callable) orelse continue;
+                        var allocator_parameter: ?usize = null;
+                        var allocator_parameter_member: ?[]const u8 = null;
+                        if (owned.allocator_parameter) |callee_allocator_parameter| {
+                            if (parameterProvenanceAtArgument(
+                                caller.*,
+                                candidate.call_open + 1,
+                                candidate.call_end,
+                                callee_allocator_parameter,
+                            )) |provenance| {
+                                allocator_parameter = provenance.parameter;
+                                allocator_parameter_member = try composeAllocatorMemberPath(
+                                    allocator,
+                                    &index.owned_member_paths,
+                                    provenance.member,
+                                    owned.allocator_parameter_member,
+                                );
+                            }
                         }
+                        break :returned DirectOwnedReturn{
+                            .release = owned.release,
+                            .allocator_parameter = allocator_parameter,
+                            .allocator_parameter_member = allocator_parameter_member,
+                        };
                     }
-                    break :returned DirectOwnedReturn{
-                        .release = owned.release,
-                        .allocator_parameter = allocator_parameter,
-                        .allocator_parameter_member = allocator_parameter_member,
-                    };
+                    break :returned null;
+                };
+                const returned = possible_returned orelse break :owned;
+                if (selected) |known| {
+                    if (!std.mem.eql(u8, known.release, returned.release) or
+                        known.allocator_parameter != returned.allocator_parameter or
+                        !optionalTextEql(known.allocator_parameter_member, returned.allocator_parameter_member)) break :owned;
+                } else {
+                    selected = returned;
                 }
-                break :returned null;
-            };
-            const returned = possible_returned orelse {
-                selected = null;
-                break;
-            };
-            if (selected) |known| {
-                if (!std.mem.eql(u8, known.release, returned.release) or
-                    known.allocator_parameter != returned.allocator_parameter or
-                    !optionalTextEql(known.allocator_parameter_member, returned.allocator_parameter_member))
-                {
-                    selected = null;
-                    break;
-                }
-            } else {
-                selected = returned;
+            }
+            if (selected) |owned| {
+                caller.returns_owned = true;
+                caller.return_release = owned.release;
+                caller.allocator_parameter = owned.allocator_parameter;
+                caller.allocator_parameter_member = owned.allocator_parameter_member;
+                caller_changed = true;
             }
         }
-        if (selected) |owned| {
-            caller.returns_owned = true;
-            caller.return_release = owned.release;
-            caller.allocator_parameter = owned.allocator_parameter;
-            caller.allocator_parameter_member = owned.allocator_parameter_member;
+        if (caller_changed) {
             changed = true;
+            calls.changed(caller.*);
         }
     }
     return changed;
@@ -1438,7 +1590,35 @@ fn ownedReturnFromFunction(function: FunctionSummary) ?OwnedReturn {
         .release = function.return_release orelse "free",
         .allocator_parameter = function.allocator_parameter,
         .allocator_parameter_member = function.allocator_parameter_member,
+        .array_pointer = returnsArrayPointer(function),
     };
+}
+
+/// Whether the return type, after any error set, is `*[n]T` with optional
+/// `align(...)` and `const`: a single-item pointer to an array, not a slice.
+fn returnsArrayPointer(function: FunctionSummary) bool {
+    const tokens = function.tokens;
+    var index = function.return_type_start;
+    for (tokens[function.return_type_start..function.body_start], function.return_type_start..) |token, bang| {
+        if (token.tag == .bang) index = bang + 1;
+    }
+    if (index >= function.body_start or tokens[index].tag != .asterisk) return false;
+    index += 1;
+    while (index < function.body_start) {
+        switch (tokens[index].tag) {
+            .keyword_const, .keyword_volatile, .keyword_allowzero => index += 1,
+            .keyword_align => {
+                if (index + 1 >= function.body_start or tokens[index + 1].tag != .l_paren) return false;
+                index = (matchingDelimiter(tokens, index + 1) orelse return false) + 1;
+            },
+            .l_bracket => return index + 1 < function.body_start and switch (tokens[index + 1].tag) {
+                .r_bracket, .asterisk, .colon => false,
+                else => true,
+            },
+            else => return false,
+        }
+    }
+    return false;
 }
 
 fn optionalTextEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1481,7 +1661,7 @@ fn visitFunction(
     try stack.append(allocator, function_index);
     const function = index.functions[function_index];
     for (function.tokens[function.body_start + 1 .. function.body_end], function.body_start + 1..) |token, call_open| {
-        if (tokenBelongsToNestedFunction(function, call_open) or token.tag != .l_paren) continue;
+        if (token.tag != .l_paren or tokenBelongsToNestedFunction(function, call_open)) continue;
         const callable = callableBefore(function.source, function.tokens, call_open) orelse continue;
         const called = uniqueFunctionIndexForCall(index, function, callable) orelse continue;
         switch (states[called]) {
@@ -1563,8 +1743,8 @@ fn effectUseIsUnconditional(function: FunctionSummary, use_index: usize) bool {
         break :registration opening - 1;
     };
     for (function.tokens[function.body_start + 1 .. registration], function.body_start + 1..) |token, index| {
-        if (tokenBelongsToNestedFunction(function, index)) continue;
-        if (token.tag == .keyword_return or token.tag == .keyword_try) return false;
+        if (token.tag != .keyword_return and token.tag != .keyword_try) continue;
+        if (!tokenBelongsToNestedFunction(function, index)) return false;
     }
     return true;
 }
@@ -1786,6 +1966,30 @@ test "summaries propagate releases and owned returns through direct calls" {
     try std.testing.expectEqualStrings("free", index.ownedReturn("make").?.release);
     try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("make").?.allocator_parameter);
     try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("forwardMake").?.allocator_parameter);
+}
+
+test "revisiting only changed callers reaches the fixed point of full rounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    // Callers come before their callees, so each round settles one more link.
+    const sources = [_]Source{.{
+        .file_index = 0,
+        .source = "fn first(allocator: anytype, bytes: []u8, kept: []u8) void { second(allocator, bytes); store(kept); }" ++
+            "fn second(allocator: anytype, bytes: []u8) void { third(allocator, bytes); }" ++
+            "fn third(allocator: anytype, bytes: []u8) void { allocator.free(bytes); }" ++
+            "fn store(kept: []u8) void { global = kept; }" ++
+            "fn makeFirst(allocator: anytype) ![]u8 { return makeSecond(allocator); }" ++
+            "fn makeSecond(allocator: anytype) ![]u8 { return makeThird(allocator); }" ++
+            "fn makeThird(allocator: anytype) ![]u8 { return allocator.alloc(u8, 4); }",
+    }};
+    var index = try build(allocator, &sources, types.Configuration.defaults());
+    try std.testing.expectEqual(ParameterEffect.released, index.parameterEffect("first", 1));
+    try std.testing.expectEqual(index.parameterEffect("store", 0), index.parameterEffect("first", 2));
+    try std.testing.expectEqual(@as(?usize, 0), index.ownedReturn("makeFirst").?.allocator_parameter);
+    // A round that revisits every function changes nothing more.
+    var calls = try CallFacts.init(allocator, index);
+    try std.testing.expect(!try propagateCallEffects(allocator, &index, &calls));
 }
 
 test "conditional releases do not become parameter release proofs" {

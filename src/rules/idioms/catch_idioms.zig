@@ -3,9 +3,8 @@ const std = @import("std");
 
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
-const matchingToken = @import("../../syntax/tokens.zig").matchingToken;
-const matchingOpeningToken = @import("../../syntax/tokens.zig").matchingOpeningToken;
 const callExpressionStart = @import("../../syntax/tokens.zig").callExpressionStart;
+const statementStart = @import("../../syntax/tokens.zig").statementStart;
 const rule_context = @import("../context.zig");
 const RuleRun = rule_context.RuleRun;
 const types = @import("../types.zig");
@@ -34,7 +33,7 @@ fn findDiscardedErrors(context: RuleRun) !void {
         const opening = catchBodyStart(tokens, index) orelse continue;
         if (opening + 1 >= tokens.len or tokens[opening].tag != .l_brace or tokens[opening + 1].tag != .r_brace) continue;
         const body = source[tokens[opening].loc.end..tokens[opening + 1].loc.start];
-        if (std.mem.trim(u8, body, &std.ascii.whitespace).len != 0) continue;
+        if (std.mem.trim(u8, body, &std.ascii.whitespace).len != 0 or insideErrdefer(context, index)) continue;
         try context.emit(.{
             .rule = .discarded_error,
             .level = level,
@@ -44,22 +43,42 @@ fn findDiscardedErrors(context: RuleRun) !void {
     }
 }
 
+/// Whether the statement holding `index` is an `errdefer`: the function is
+/// already returning an error, and a cleanup error cannot be returned too.
+fn insideErrdefer(context: RuleRun, index: usize) bool {
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (context.tokens[cursor].tag) {
+            .keyword_errdefer => return true,
+            .keyword_defer, .semicolon => return false,
+            .r_paren, .r_bracket, .r_brace => cursor = context.scopes.matchingToken(cursor) orelse return false,
+            .l_brace => return cursor > 0 and context.tokens[cursor - 1].tag == .keyword_errdefer,
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn findCatchDiagnostics(context: RuleRun) !void {
     const source = context.source;
     const tokens = context.tokens;
     const unreachable_level = context.level(.unsafe_catch_unreachable);
     const context_level = context.level(.lost_error_context);
     if (unreachable_level == .off and context_level == .off) return;
+    var functions: FunctionsByName = .{};
+    defer functions.deinit(context.allocator);
 
     for (tokens, 0..) |token, catch_index| {
         if (token.tag != .keyword_catch) continue;
         const body_start = catchBodyStart(tokens, catch_index) orelse continue;
         if (unreachable_level != .off and tokens[body_start].tag == .keyword_unreachable and
-            catchExpressionIsKnownFallible(source, tokens, catch_index))
+            try catchExpressionIsKnownFallible(context, &functions, catch_index))
         {
             const fixes: []const Fix = fixes: {
-                if (!enclosingFunctionReturnsErrorUnion(tokens, catch_index)) break :fixes &.{};
-                const call_open = matchingOpeningToken(tokens, catch_index - 1, .l_paren, .r_paren) orelse break :fixes &.{};
+                // A deferred expression cannot propagate an error with `try`.
+                if (!enclosingFunctionReturnsErrorUnion(context, catch_index) or insideDefer(context, catch_index)) break :fixes &.{};
+                const call_open = context.scopes.matchingToken(catch_index - 1) orelse break :fixes &.{};
                 const expression_start = callExpressionStart(tokens, call_open) orelse break :fixes &.{};
                 const expression = std.mem.trim(u8, source[tokens[expression_start].loc.start..token.loc.start], " \t\r\n");
                 const allocated = try Fix.single(context.allocator, .{
@@ -78,9 +97,12 @@ fn findCatchDiagnostics(context: RuleRun) !void {
             });
         }
         if (context_level == .off) continue;
-        const remapped_error = remappedErrorToken(source, tokens, body_start) orelse continue;
+        const remapped_error = remappedErrorToken(context, body_start) orelse continue;
         // A body that stores or logs the captured error keeps its identity.
-        if (catchCaptureIsUsed(source, tokens, catch_index, body_start)) continue;
+        if (catchCaptureIsUsed(context, catch_index, body_start)) continue;
+        // An operation that can fail in one way loses nothing when that
+        // failure keeps its name or an overflow becomes a domain limit.
+        if (try operandFailsOnlyAs(context, &functions, catch_index, tokenText(source, remapped_error))) continue;
         try context.emit(.{
             .rule = .lost_error_context,
             .level = context_level,
@@ -93,19 +115,16 @@ fn findCatchDiagnostics(context: RuleRun) !void {
     }
 }
 
-fn catchCaptureIsUsed(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    catch_index: usize,
-    body_start: usize,
-) bool {
+fn catchCaptureIsUsed(context: RuleRun, catch_index: usize, body_start: usize) bool {
+    const source = context.source;
+    const tokens = context.tokens;
     if (catch_index + 2 >= tokens.len or tokens[catch_index + 1].tag != .pipe or
         tokens[catch_index + 2].tag != .identifier) return false;
     const capture_name = tokenText(source, tokens[catch_index + 2]);
     if (std.mem.eql(u8, capture_name, "_")) return false;
     var limit = @min(tokens.len, body_start + 16);
     if (tokens[body_start].tag == .l_brace) {
-        limit = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return false;
+        limit = context.matchingToken(body_start, .l_brace, .r_brace) orelse return false;
     }
     for (tokens[body_start..limit], body_start..) |token, index| {
         if (token.tag == .semicolon and tokens[body_start].tag != .l_brace) break;
@@ -128,46 +147,67 @@ fn catchBodyStart(tokens: []const std.zig.Token, catch_index: usize) ?usize {
     return if (index < tokens.len) index else null;
 }
 
-fn enclosingFunctionReturnsErrorUnion(tokens: []const std.zig.Token, index: usize) bool {
-    var nested_closing_braces: usize = 0;
-    var cursor = index;
-    while (cursor > 0) {
-        cursor -= 1;
-        switch (tokens[cursor].tag) {
-            .r_brace => nested_closing_braces += 1,
-            .l_brace => {
-                if (nested_closing_braces != 0) {
-                    nested_closing_braces -= 1;
-                    continue;
-                }
-                var signature_cursor = cursor;
-                while (signature_cursor > 0) {
-                    signature_cursor -= 1;
-                    switch (tokens[signature_cursor].tag) {
-                        .keyword_fn => {
-                            var parameters_open = signature_cursor + 1;
-                            while (parameters_open < cursor and tokens[parameters_open].tag != .l_paren) : (parameters_open += 1) {}
-                            if (parameters_open >= cursor) return false;
-                            const parameters_end = matchingToken(tokens, parameters_open, .l_paren, .r_paren) orelse return false;
-                            for (tokens[parameters_end + 1 .. cursor]) |return_token| {
-                                if (return_token.tag == .bang) return true;
-                            }
-                            return false;
-                        },
-                        .semicolon, .l_brace, .r_brace => break,
-                        else => {},
+/// Whether the innermost enclosing block that a `fn` signature opens returns
+/// an error union.
+fn enclosingFunctionReturnsErrorUnion(context: RuleRun, index: usize) bool {
+    const tokens = context.tokens;
+    var brace = context.enclosingOpeningBrace(index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        var signature_cursor = opening;
+        while (signature_cursor > 0) {
+            signature_cursor -= 1;
+            switch (tokens[signature_cursor].tag) {
+                .keyword_fn => {
+                    var parameters_open = signature_cursor + 1;
+                    while (parameters_open < opening and tokens[parameters_open].tag != .l_paren) : (parameters_open += 1) {}
+                    if (parameters_open >= opening) return false;
+                    const parameters_end = context.matchingToken(parameters_open, .l_paren, .r_paren) orelse return false;
+                    for (tokens[parameters_end + 1 .. opening]) |return_token| {
+                        if (return_token.tag == .bang) return true;
                     }
-                }
-            },
-            else => {},
+                    return false;
+                },
+                .semicolon, .l_brace, .r_brace => break,
+                else => {},
+            }
         }
     }
     return false;
 }
 
-fn catchExpressionIsKnownFallible(source: []const u8, tokens: []const std.zig.Token, catch_index: usize) bool {
+/// The `fn` tokens of the file by declared name, in source order; built on
+/// first use so files without `catch unreachable` never pay for it.
+const FunctionsByName = struct {
+    built: bool = false,
+    names: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty,
+
+    fn deinit(functions: *FunctionsByName, allocator: std.mem.Allocator) void {
+        var lists = functions.names.valueIterator();
+        while (lists.next()) |list| list.deinit(allocator);
+        functions.names.deinit(allocator);
+    }
+
+    fn named(functions: *FunctionsByName, context: RuleRun, name: []const u8) ![]const usize {
+        if (!functions.built) {
+            functions.built = true;
+            const tokens = context.tokens;
+            for (tokens, 0..) |token, index| {
+                if (token.tag != .keyword_fn or index + 2 >= tokens.len or tokens[index + 2].tag != .l_paren) continue;
+                const entry = try functions.names.getOrPut(context.allocator, tokenText(context.source, tokens[index + 1]));
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(context.allocator, index);
+            }
+        }
+        const found = functions.names.get(name) orelse return &.{};
+        return found.items;
+    }
+};
+
+fn catchExpressionIsKnownFallible(context: RuleRun, functions: *FunctionsByName, catch_index: usize) !bool {
+    const source = context.source;
+    const tokens = context.tokens;
     if (catch_index == 0 or tokens[catch_index - 1].tag != .r_paren) return false;
-    const opening = matchingOpeningToken(tokens, catch_index - 1, .l_paren, .r_paren) orelse return false;
+    const opening = context.scopes.matchingToken(catch_index - 1) orelse return false;
     if (opening == 0 or tokens[opening - 1].tag != .identifier) return false;
     const callee_name = tokenText(source, tokens[opening - 1]);
     const known_fallible = [_][]const u8{
@@ -176,10 +216,8 @@ fn catchExpressionIsKnownFallible(source: []const u8, tokens: []const std.zig.To
     };
     for (known_fallible) |name| if (std.mem.eql(u8, callee_name, name)) return true;
 
-    for (tokens, 0..) |token, index| {
-        if (token.tag != .keyword_fn or index + 2 >= tokens.len or
-            !tokenIs(source, tokens[index + 1], callee_name) or tokens[index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(tokens, index + 2, .l_paren, .r_paren) orelse continue;
+    for (try functions.named(context, callee_name)) |index| {
+        const parameters_end = context.matchingToken(index + 2, .l_paren, .r_paren) orelse continue;
         var return_index = parameters_end + 1;
         const return_limit = @min(tokens.len, parameters_end + 32);
         while (return_index < return_limit and tokens[return_index].tag != .semicolon and
@@ -188,7 +226,7 @@ fn catchExpressionIsKnownFallible(source: []const u8, tokens: []const std.zig.To
             if (tokenIs(source, tokens[return_index], "!")) return true;
             if (tokens[return_index].tag != .l_brace) continue;
             if (return_index > parameters_end + 1 and tokenIs(source, tokens[return_index - 1], "error")) {
-                return_index = matchingToken(tokens, return_index, .l_brace, .r_brace) orelse return false;
+                return_index = context.matchingToken(return_index, .l_brace, .r_brace) orelse return false;
                 continue;
             }
             return false;
@@ -197,16 +235,94 @@ fn catchExpressionIsKnownFallible(source: []const u8, tokens: []const std.zig.To
     return false;
 }
 
-fn remappedErrorToken(
-    source: []const u8,
-    tokens: []const std.zig.Token,
-    body_start: usize,
-) ?std.zig.Token {
+/// Whether the `catch` at `catch_index` belongs to a `defer` or `errdefer`
+/// statement or block.
+fn insideDefer(context: RuleRun, catch_index: usize) bool {
+    const tokens = context.tokens;
+    const start = statementStart(tokens, catch_index);
+    if (tokens[start].tag == .keyword_defer or tokens[start].tag == .keyword_errdefer) return true;
+    const function_body = context.scopes.enclosingFunctionBody(catch_index) orelse return false;
+    var brace = context.enclosingOpeningBrace(catch_index);
+    while (brace) |opening| : (brace = context.enclosingOpeningBrace(opening)) {
+        if (opening <= function_body) return false;
+        var before = opening;
+        // 'errdefer |err| {'
+        if (before >= 3 and tokens[before - 1].tag == .pipe and tokens[before - 3].tag == .pipe) before -= 3;
+        if (before >= 1 and (tokens[before - 1].tag == .keyword_defer or tokens[before - 1].tag == .keyword_errdefer)) return true;
+    }
+    return false;
+}
+
+/// Whether the operand of the `catch` at `catch_index` can fail only with
+/// `remapped`, or only with `error.Overflow` from checked arithmetic. The
+/// operand's error set is known for `std.math` arithmetic, allocator
+/// methods, and functions this file declares once with a one-error set.
+fn operandFailsOnlyAs(context: RuleRun, functions: *FunctionsByName, catch_index: usize, remapped: []const u8) !bool {
+    const tokens = context.tokens;
+    if (catch_index == 0 or tokens[catch_index - 1].tag != .r_paren) return false;
+    const opening = context.scopes.matchingToken(catch_index - 1) orelse return false;
+    const start = callExpressionStart(tokens, opening) orelse return false;
+    const callee = context.tokenText(opening - 1);
+    if (opening >= start + 3 and context.tokenIs(opening - 3, "math")) {
+        const checked_arithmetic = [_][]const u8{ "add", "sub", "mul", "negate", "shlExact" };
+        for (checked_arithmetic) |name| if (std.mem.eql(u8, callee, name)) return true;
+        return false;
+    }
+    if (std.mem.eql(u8, remapped, "OutOfMemory") and opening >= start + 3) {
+        const allocating = [_][]const u8{ "alloc", "alignedAlloc", "allocSentinel", "allocWithOptions", "create", "dupe", "dupeZ", "realloc" };
+        for (allocating) |name| if (std.mem.eql(u8, callee, name)) return true;
+        const receiver = context.tokenText(opening - 3);
+        if (std.mem.eql(u8, callee, "print") and std.mem.find(u8, receiver, "allocator") != null) return true;
+    }
+    // A call through `self` or no receiver names a declaration of this file.
+    if (opening != start + 1 and (opening != start + 3 or !context.tokenIs(start, "self"))) return false;
+    const declarations = try functions.named(context, callee);
+    if (declarations.len != 1) return false;
+    const only_error = declaredSingleError(context, declarations[0]) orelse return false;
+    return std.mem.eql(u8, only_error, remapped);
+}
+
+/// The one error a function's declared return error set holds:
+/// `Allocator.Error`, `error{Name}`, or a file-level alias of either.
+fn declaredSingleError(context: RuleRun, fn_index: usize) ?[]const u8 {
+    const tokens = context.tokens;
+    const parameters_end = context.matchingToken(fn_index + 2, .l_paren, .r_paren) orelse return null;
+    var bang = parameters_end + 1;
+    while (bang < tokens.len and bang < parameters_end + 16 and tokens[bang].tag != .bang) : (bang += 1) {
+        switch (tokens[bang].tag) {
+            .keyword_error => if (bang + 1 < tokens.len and tokens[bang + 1].tag == .l_brace) {
+                bang = context.matchingToken(bang + 1, .l_brace, .r_brace) orelse return null;
+            },
+            .l_brace, .semicolon => return null,
+            else => {},
+        }
+    }
+    if (bang >= tokens.len or tokens[bang].tag != .bang) return null;
+    return singleErrorOf(context, parameters_end + 1, bang, 0);
+}
+
+fn singleErrorOf(context: RuleRun, start: usize, end: usize, depth: u8) ?[]const u8 {
+    const tokens = context.tokens;
+    if (end == start + 4 and tokens[start].tag == .keyword_error and tokens[start + 1].tag == .l_brace and
+        tokens[start + 2].tag == .identifier and tokens[start + 3].tag == .r_brace) return context.tokenText(start + 2);
+    if (end >= start + 3 and context.tokenIs(end - 1, "Error") and tokens[end - 2].tag == .period and
+        context.tokenIs(end - 3, "Allocator")) return "OutOfMemory";
+    if (end != start + 1 or tokens[start].tag != .identifier or depth > 2) return null;
+    const binding = context.scopes.findBinding(start) orelse return null;
+    const name = binding.token_index;
+    if (name + 2 >= tokens.len or tokens[name - 1].tag != .keyword_const or tokens[name + 1].tag != .equal) return null;
+    const value_end = context.statementEnd(name + 2) orelse return null;
+    return singleErrorOf(context, name + 2, value_end, depth + 1);
+}
+
+fn remappedErrorToken(context: RuleRun, body_start: usize) ?std.zig.Token {
+    const source = context.source;
+    const tokens = context.tokens;
     var index = body_start;
     var limit = @min(tokens.len, body_start + 16);
     const braced = tokens[body_start].tag == .l_brace;
     if (braced) {
-        const closing = matchingToken(tokens, body_start, .l_brace, .r_brace) orelse return null;
+        const closing = context.matchingToken(body_start, .l_brace, .r_brace) orelse return null;
         limit = closing;
         index += 1;
     }
@@ -238,6 +354,25 @@ test "discarded error ignores an explanatory catch comment" {
     const configuration = support.only(&.{.discarded_error}, .warning);
     const found = try support.findings(arena.allocator(), run, source, configuration);
     for (found) |finding| try std.testing.expect(finding.rule != .discarded_error);
+}
+
+test "discarded error accepts errdefer cleanup but not deferred cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn run(store: *Store, output: *Writer) !void {\n" ++
+        "    const first = try store.begin(.{});\n" ++
+        "    errdefer store.end(first, .{}) catch {};\n" ++
+        "    errdefer {\n" ++
+        "        store.sync() catch {};\n" ++
+        "    }\n" ++
+        "    defer output.flush() catch {};\n" ++
+        "    try store.commit(first);\n" ++
+        "}\n";
+    const configuration = support.only(&.{.discarded_error}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(std.mem.find(u8, source, "catch {};\n    try").?, found[0].span.start);
 }
 
 test "a catch body that records the captured error keeps its context" {
@@ -350,4 +485,49 @@ test "catch unreachable offers try only inside fallible functions" {
         }
     };
     try std.testing.expectEqual(@as(usize, 2), unreachable_count);
+}
+
+test "lost error context ignores single-error operands that keep or translate their failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const std = @import(\"std\");\n" ++
+        "const Error = error{InvalidArtifact};\n" ++
+        "fn grow(allocator: std.mem.Allocator, a: usize, b: usize) ![]u8 {\n" ++
+        "    const total = std.math.add(usize, a, b) catch return error.ModuleTooLarge;\n" ++
+        "    const message = allocator.print(\"{d}\", .{total}) catch return error.OutOfMemory;\n" ++
+        "    _ = message;\n" ++
+        "    check() catch return error.InvalidArtifact;\n" ++
+        "    report() catch return error.OutOfMemory;\n" ++
+        "    report() catch return error.InvalidArtifact;\n" ++
+        "    return allocator.alloc(u8, total) catch return error.InvalidArtifact;\n" ++
+        "}\n" ++
+        "fn check() Error!void {}\n" ++
+        "fn report() std.mem.Allocator.Error!void {}\n";
+    const configuration = support.only(&.{.lost_error_context}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    var reported: std.ArrayList(usize) = .empty;
+    for (found) |finding| if (finding.rule == .lost_error_context) {
+        try reported.append(arena.allocator(), std.mem.countScalar(u8, source[0..finding.span.start], '\n') + 1);
+    };
+    // OutOfMemory renamed InvalidArtifact hides the allocation failure.
+    try std.testing.expectEqualSlices(usize, &.{ 9, 10 }, reported.items);
+}
+
+test "catch unreachable in a defer offers no try" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "fn release() !void { return error.Failed; }\n" ++
+        "fn run(owned: bool) !void {\n" ++
+        "    defer if (owned) release() catch unreachable;\n" ++
+        "    errdefer {\n" ++
+        "        release() catch unreachable;\n" ++
+        "    }\n" ++
+        "    try release();\n" ++
+        "}\n";
+    const configuration = support.only(&.{.unsafe_catch_unreachable}, .warning);
+    const found = try support.findings(arena.allocator(), run, source, configuration);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    for (found) |finding| try std.testing.expectEqual(@as(usize, 0), finding.fixes.len);
 }

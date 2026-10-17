@@ -6,20 +6,172 @@ const syntax_scope = @import("../../syntax/scope.zig");
 const summaries = @import("../summaries.zig");
 const run_module = @import("run.zig");
 const ProjectRun = run_module.ProjectRun;
-const File = run_module.File;
 const types = @import("../types.zig");
 const tokens_util = @import("../../syntax/tokens.zig");
 const tokenText = tokens_util.tokenText;
 const tokenIs = tokens_util.tokenIs;
-const statementEnd = tokens_util.statementEnd;
-const enclosingOpeningBrace = tokens_util.enclosingOpeningBrace;
-const matchingToken = tokens_util.matchingToken;
-const enclosingScopeEnd = tokens_util.enclosingScopeEnd;
 const findTag = tokens_util.findTag;
 const firstCall = tokens_util.firstCall;
 const project = @import("../project.zig");
 
 pub const rules = [_]types.Rule{.incomplete_owned_field_cleanup};
+
+/// A project file with its scope index, which the scans below use to match
+/// delimiters and find statement ends, and the lookups they repeat per item.
+const File = struct {
+    source: [:0]const u8,
+    tokens: []const std.zig.Token,
+    scopes: *const syntax_scope.Index,
+    facts: *Facts,
+};
+
+/// Token positions grouped by a name, in token order.
+const NamePositions = std.StringHashMapUnmanaged(std.ArrayList(u32));
+
+/// Lookups over one file that the proofs below would otherwise repeat for
+/// every container, field or call: built in one pass over the tokens, or
+/// memoized per name, so no proof rescans the whole file per item.
+const Facts = struct {
+    allocator: std.mem.Allocator,
+    /// `Name {` (the name), by name.
+    braced_names: NamePositions = .empty,
+    /// `fn name(` (the `fn`), by name.
+    functions: NamePositions = .empty,
+    /// `fn` tokens, counted by the spelling of the token after them.
+    function_counts: std.StringHashMapUnmanaged(usize) = .empty,
+    /// `receiver.append(` and `receiver.appendAssumeCapacity(` (the method),
+    /// by the spelling of the receiver.
+    appends: NamePositions = .empty,
+    /// The first `const Name = struct {` that closes, by name.
+    containers: std.StringHashMapUnmanaged(TypeContainer) = .empty,
+    /// The `fn name(...)` whose body each opening brace starts.
+    function_bodies: std.AutoHashMapUnmanaged(usize, ContainingFunction) = .empty,
+    /// The first direct `name:` member of a container, by container range
+    /// and name; built for a container when first asked.
+    container_fields: std.AutoHashMapUnmanaged([2]usize, std.StringHashMapUnmanaged(usize)) = .empty,
+    /// Whether the file appends an owned allocation to a sequence field, by
+    /// field name; memoized.
+    owned_allocations: std.StringHashMapUnmanaged(bool) = .empty,
+    /// The element type of every field the file declares as an `ArrayList`,
+    /// by field name; null when the file declares the name with two
+    /// different element types. Built when first asked, as are the next two.
+    element_types: ?std.StringHashMapUnmanaged(?[]const u8) = null,
+    /// Whether the `ArrayList` fields of each name hold only pointers.
+    stores_pointers: ?std.StringHashMapUnmanaged(bool) = null,
+    /// The element field the first cleanup loop over each sequence frees.
+    cleanup_owned_fields: ?std.StringHashMapUnmanaged([]const u8) = null,
+
+    fn init(allocator: std.mem.Allocator, source: []const u8, tokens: []const std.zig.Token, scopes: *const syntax_scope.Index) !Facts {
+        var facts: Facts = .{ .allocator = allocator };
+        errdefer facts.deinit();
+        for (tokens, 0..) |token, index| switch (token.tag) {
+            .identifier => {
+                if (index + 1 >= tokens.len or tokens[index + 1].tag != .l_paren) {
+                    if (index + 1 < tokens.len and tokens[index + 1].tag == .l_brace) {
+                        try facts.add(&facts.braced_names, tokenText(source, token), index);
+                    }
+                    continue;
+                }
+                if (index < 2 or tokens[index - 1].tag != .period or
+                    (!tokenIs(source, token, "append") and !tokenIs(source, token, "appendAssumeCapacity"))) continue;
+                try facts.add(&facts.appends, tokenText(source, tokens[index - 2]), index);
+            },
+            .keyword_fn => {
+                if (index + 1 >= tokens.len) continue;
+                const count = try facts.function_counts.getOrPut(allocator, tokenText(source, tokens[index + 1]));
+                count.value_ptr.* = if (count.found_existing) count.value_ptr.* + 1 else 1;
+                if (index + 2 >= tokens.len or tokens[index + 2].tag != .l_paren) continue;
+                try facts.add(&facts.functions, tokenText(source, tokens[index + 1]), index);
+                const parameters_end = scopes.matchingToken(index + 2) orelse continue;
+                const body_start = syntax_scope.functionBodyAfterParameters(tokens, parameters_end) orelse continue;
+                if (scopes.matchingToken(body_start) == null) continue;
+                try facts.function_bodies.put(allocator, body_start, .{
+                    .parameters_start = index + 3,
+                    .parameters_end = parameters_end,
+                    .body_start = body_start,
+                });
+            },
+            .keyword_const => {
+                if (index + 4 >= tokens.len or tokens[index + 2].tag != .equal or
+                    tokens[index + 3].tag != .keyword_struct or tokens[index + 4].tag != .l_brace) continue;
+                const container_end = scopes.matchingToken(index + 4) orelse continue;
+                const entry = try facts.containers.getOrPut(allocator, tokenText(source, tokens[index + 1]));
+                if (!entry.found_existing) entry.value_ptr.* = .{ .start = index + 5, .end = container_end };
+            },
+            else => {},
+        };
+        return facts;
+    }
+
+    fn deinit(facts: *Facts) void {
+        for ([_]*NamePositions{ &facts.braced_names, &facts.functions, &facts.appends }) |positions| {
+            var lists = positions.valueIterator();
+            while (lists.next()) |list| list.deinit(facts.allocator);
+            positions.deinit(facts.allocator);
+        }
+        var fields = facts.container_fields.valueIterator();
+        while (fields.next()) |members| members.deinit(facts.allocator);
+        facts.container_fields.deinit(facts.allocator);
+        facts.function_counts.deinit(facts.allocator);
+        facts.containers.deinit(facts.allocator);
+        facts.function_bodies.deinit(facts.allocator);
+        facts.owned_allocations.deinit(facts.allocator);
+        if (facts.element_types) |*types_by_field| types_by_field.deinit(facts.allocator);
+        if (facts.stores_pointers) |*pointers| pointers.deinit(facts.allocator);
+        if (facts.cleanup_owned_fields) |*cleanups| cleanups.deinit(facts.allocator);
+    }
+
+    fn elementType(facts: *Facts, file: File, field_name: []const u8) !?[]const u8 {
+        if (facts.element_types == null) {
+            facts.element_types = .empty;
+            try collectSequenceElementTypes(facts.allocator, file, &facts.element_types.?);
+        }
+        return facts.element_types.?.get(field_name) orelse null;
+    }
+
+    fn add(facts: *Facts, positions: *NamePositions, name: []const u8, index: usize) !void {
+        const entry = try positions.getOrPut(facts.allocator, name);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(facts.allocator, @intCast(index));
+    }
+
+    fn named(positions: *const NamePositions, name: []const u8) []const u32 {
+        return if (positions.get(name)) |list| list.items else &.{};
+    }
+
+    /// The positions of `name` in `[start, end)`.
+    fn namedIn(positions: *const NamePositions, name: []const u8, start: usize, end: usize) []const u32 {
+        const all = named(positions, name);
+        const first = std.sort.lowerBound(u32, all, start, orderPosition);
+        const last = std.sort.lowerBound(u32, all, end, orderPosition);
+        return all[first..last];
+    }
+
+    fn orderPosition(target: usize, position: u32) std.math.Order {
+        return std.math.order(target, position);
+    }
+
+    /// The `name` member declared directly in the container `[start, end)`.
+    fn containerField(facts: *Facts, file: File, start: usize, end: usize, name: []const u8) !?usize {
+        const entry = try facts.container_fields.getOrPut(facts.allocator, .{ start, end });
+        if (!entry.found_existing) {
+            entry.value_ptr.* = .empty;
+            var depth: usize = 0;
+            for (file.tokens[start..end], start..) |token, field_index| {
+                switch (token.tag) {
+                    .l_brace => depth += 1,
+                    .r_brace => depth -|= 1,
+                    else => {},
+                }
+                if (depth != 0 or token.tag != .identifier or field_index + 2 >= end or
+                    file.tokens[field_index + 1].tag != .colon) continue;
+                const member = try entry.value_ptr.getOrPut(facts.allocator, tokenText(file.source, token));
+                if (!member.found_existing) member.value_ptr.* = field_index;
+            }
+        }
+        return entry.value_ptr.get(name);
+    }
+};
 
 const OwnedFieldEvidence = struct {
     file_index: usize,
@@ -39,25 +191,91 @@ const OwnedBinding = struct {
     name: []const u8,
 };
 
+/// The owned fields proven in one file, in the order they were proven, with
+/// each type's fields indexed so lookups do not scan every proven field.
+const FieldEvidence = struct {
+    items: std.ArrayList(OwnedFieldEvidence) = .empty,
+    /// Positions in `items` of each type's fields, in order.
+    by_type: std.StringHashMapUnmanaged(std.ArrayList(u32)) = .empty,
+
+    fn deinit(evidence: *FieldEvidence, allocator: std.mem.Allocator) void {
+        var positions = evidence.by_type.valueIterator();
+        while (positions.next()) |list| list.deinit(allocator);
+        evidence.by_type.deinit(allocator);
+        evidence.items.deinit(allocator);
+    }
+
+    fn append(evidence: *FieldEvidence, allocator: std.mem.Allocator, field: OwnedFieldEvidence) !void {
+        const entry = try evidence.by_type.getOrPut(allocator, field.type_name);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(allocator, @intCast(evidence.items.items.len));
+        try evidence.items.append(allocator, field);
+    }
+
+    /// Positions in `items` of the fields proven for `type_name`, in order.
+    fn ofType(evidence: *const FieldEvidence, type_name: []const u8) []const u32 {
+        return if (evidence.by_type.get(type_name)) |positions| positions.items else &.{};
+    }
+
+    fn proven(evidence: *const FieldEvidence, type_name: []const u8, field_name: []const u8) bool {
+        for (evidence.ofType(type_name)) |position| {
+            if (std.mem.eql(u8, evidence.items.items[position].field_name, field_name)) return true;
+        }
+        return false;
+    }
+};
+
 pub fn findIncompleteOwnedFieldCleanup(
     run: ProjectRun,
     summary_index: summaries.Index,
 ) !void {
-    const level = run.configuration.level(.incomplete_owned_field_cleanup);
-    if (level == .off and run.configuration.level(.unreleased_allocation) == .off and
+    if (run.configuration.level(.incomplete_owned_field_cleanup) == .off and
+        run.configuration.level(.unreleased_allocation) == .off and
         run.configuration.level(.overwritten_owning_value) == .off and
         run.configuration.level(.partial_ownership_transfer) == .off and
         run.configuration.level(.missing_errdefer) == .off) return;
-    var evidence: std.ArrayList(OwnedFieldEvidence) = .empty;
+    // A file's proofs read only its own evidence, so files are checked on
+    // several threads, each into a list of its own joined in file order.
+    const per_file = try run.allocator.alloc(std.ArrayList(run_module.Finding), run.files.len);
+    @memset(per_file, .empty);
+    try run_module.forEachIndex(run, run.files.len, FileChecks{
+        .run = run,
+        .summary_index = summary_index,
+        .per_file = per_file,
+    }, FileChecks.check);
+    for (per_file) |found| try run.findings.appendSlice(run.results, found.items);
+}
+
+const FileChecks = struct {
+    run: ProjectRun,
+    summary_index: summaries.Index,
+    per_file: []std.ArrayList(run_module.Finding),
+
+    fn check(checks: FileChecks, file_index: usize) !void {
+        var file_arena: std.heap.ArenaAllocator = .init(checks.run.backing);
+        defer file_arena.deinit();
+        var file_run = checks.run;
+        file_run.allocator = file_arena.allocator();
+        file_run.findings = &checks.per_file[file_index];
+        try checkFile(file_run, checks.summary_index, file_index);
+    }
+};
+
+fn checkFile(run: ProjectRun, summary_index: summaries.Index, file_index: usize) !void {
+    const level = run.configuration.level(.incomplete_owned_field_cleanup);
+    const project_file = run.files[file_index];
+    const scopes = try run.scopes(file_index);
+    var facts: Facts = try .init(run.allocator, project_file.source, project_file.tokens, scopes);
+    defer facts.deinit();
+    const file: File = .{ .source = project_file.source, .tokens = project_file.tokens, .scopes = scopes, .facts = &facts };
+    var evidence: FieldEvidence = .{};
     defer evidence.deinit(run.allocator);
     var sequence_evidence: std.ArrayList(OwnedSequenceEvidence) = .empty;
     defer sequence_evidence.deinit(run.allocator);
-    for (run.files, 0..) |file, file_index| {
-        try collectOwnedFieldEvidence(run.allocator, file, file_index, summary_index, &evidence);
-        try collectOwnedSequenceEvidence(run.allocator, file, file_index, summary_index, &sequence_evidence);
-    }
+    try collectOwnedFieldEvidence(run.allocator, file, file_index, summary_index, &evidence);
+    try collectOwnedSequenceEvidence(run.allocator, file, file_index, summary_index, &sequence_evidence);
     for (sequence_evidence.items) |sequence| {
-        if (ownedFieldIsProven(evidence.items, sequence.file_index, sequence.type_name, sequence.field_name)) continue;
+        if (evidence.proven(sequence.type_name, sequence.field_name)) continue;
         try evidence.append(run.allocator, .{
             .file_index = sequence.file_index,
             .type_name = sequence.type_name,
@@ -65,133 +283,128 @@ pub fn findIncompleteOwnedFieldCleanup(
             .span = sequence.span,
         });
     }
-    try findIncompleteOwnedElementCleanup(run, evidence.items);
-    try findDroppedOwnedElements(run, evidence.items);
-    try findOwnedElementOverwrites(run, summary_index, evidence.items);
-    try findAliasedOwnedElementOverwrites(run, summary_index, evidence.items);
-    try findCapturedOwnedElementOverwrites(run, summary_index, evidence.items);
-    try findDirectOwnedFieldOverwrites(run, summary_index, evidence.items);
-    try findRemovedOwnedValueTransfers(run, evidence.items);
+    try findIncompleteOwnedElementCleanup(run, file, file_index, &evidence);
+    try findDroppedOwnedElements(run, file, file_index, &evidence);
+    try findOwnedElementOverwrites(run, file, file_index, summary_index, &evidence);
+    try findAliasedOwnedElementOverwrites(run, file, file_index, summary_index, &evidence);
+    try findCapturedOwnedElementOverwrites(run, file, file_index, summary_index, &evidence);
+    try findDirectOwnedFieldOverwrites(run, file, file_index, summary_index, &evidence);
+    try findRemovedOwnedValueTransfers(run, file, file_index, &evidence);
     try findOwnedSequenceIssues(
         run,
+        file,
         summary_index,
         sequence_evidence.items,
     );
-    try findFailureUnsafeOwnedSliceShrinks(run, evidence.items);
+    try findFailureUnsafeOwnedSliceShrinks(run, file, file_index, &evidence);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        for (file.tokens, 0..) |token, declaration_index| {
-            if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-                file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
-                file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
-            const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
-            var owned_count: usize = 0;
-            for (evidence.items) |field| if (field.file_index == file_index and std.mem.eql(u8, field.type_name, type_name)) {
-                owned_count += 1;
-            };
-            if (owned_count < 2) continue;
-            const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-            const cleanup = cleanupMethod(file, declaration_index + 5, container_end) orelse continue;
-            var released_count: usize = 0;
-            for (evidence.items) |field| {
-                if (field.file_index != file_index or !std.mem.eql(u8, field.type_name, type_name)) continue;
-                if (fieldReleased(
-                    file,
-                    cleanup,
-                    file_index,
-                    declaration_index + 5,
-                    container_end,
-                    evidence.items,
-                    field.field_name,
-                )) released_count += 1;
-            }
-            if (released_count == 0 or released_count == owned_count) continue;
-            for (evidence.items) |field| {
-                if (field.file_index != file_index or !std.mem.eql(u8, field.type_name, type_name) or
-                    fieldReleased(
-                        file,
-                        cleanup,
-                        file_index,
-                        declaration_index + 5,
-                        container_end,
-                        evidence.items,
-                        field.field_name,
-                    )) continue;
-                try run.report(.{
-                    .file_index = file_index,
-                    .rule = .incomplete_owned_field_cleanup,
-                    .span = field.span,
-                    .message = try run.allocator.print(
-                        "cleanup for '{s}' releases {d} of {d} proven owned fields but omits '{s}'",
-                        .{ type_name, released_count, owned_count, field.field_name },
-                    ),
-                });
-            }
+    for (file.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
+            file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
+            file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
+        const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
+        const owned_count = evidence.ofType(type_name).len;
+        if (owned_count < 2) continue;
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
+        // Fields allocated from an arena the aggregate owns go with it.
+        if (containerOwnsArena(file, declaration_index + 5, container_end)) continue;
+        const cleanup = cleanupMethod(file, declaration_index + 5, container_end) orelse continue;
+        var released_count: usize = 0;
+        for (evidence.ofType(type_name)) |position| {
+            const field = evidence.items.items[position];
+            if (try fieldReleased(
+                file,
+                cleanup,
+                declaration_index + 5,
+                container_end,
+                &evidence,
+                field.field_name,
+            )) released_count += 1;
+        }
+        if (released_count == 0 or released_count == owned_count) continue;
+        for (evidence.ofType(type_name)) |position| {
+            const field = evidence.items.items[position];
+            if (try fieldReleased(
+                file,
+                cleanup,
+                declaration_index + 5,
+                container_end,
+                &evidence,
+                field.field_name,
+            )) continue;
+            try run.report(.{
+                .file_index = file_index,
+                .rule = .incomplete_owned_field_cleanup,
+                .span = field.span,
+                .message = try run.allocator.print(
+                    "cleanup for '{s}' releases {d} of {d} proven owned fields but omits '{s}'",
+                    .{ type_name, released_count, owned_count, field.field_name },
+                ),
+            });
         }
     }
 }
 
 fn findDirectOwnedFieldOverwrites(
     run: ProjectRun,
+    file: File,
+    file_index: usize,
     summary_index: summaries.Index,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
 ) !void {
     const level = run.configuration.level(.overwritten_owning_value);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        for (file.tokens, 0..) |token, declaration_index| {
-            if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-                file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
-                file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
-            const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
-            const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-            for (file.tokens[declaration_index + 5 .. container_end], declaration_index + 5..) |candidate, function_index| {
-                if (candidate.tag != .keyword_fn or function_index + 2 >= container_end or
-                    file.tokens[function_index + 2].tag != .l_paren) continue;
-                const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
-                const receiver = firstParameterName(file, function_index + 3, parameters_end) orelse continue;
-                const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-                const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
-                if (body_end > container_end) continue;
-                var equal_index = body_start + 1;
-                while (equal_index + 1 < body_end) : (equal_index += 1) {
-                    if (file.tokens[equal_index].tag != .equal or equal_index < 3 or
-                        file.tokens[equal_index - 1].tag != .identifier or file.tokens[equal_index - 2].tag != .period or
-                        !tokenIs(file.source, file.tokens[equal_index - 3], receiver)) continue;
-                    const field_name = tokenText(file.source, file.tokens[equal_index - 1]);
-                    if (!ownedFieldIsProven(evidence, file_index, type_name, field_name) or
-                        containerFieldIsOptional(file, declaration_index + 5, container_end, field_name)) continue;
-                    const assignment_end = statementEnd(file.tokens, equal_index) orelse continue;
-                    if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, assignment_end, body_start + 1)) continue;
-                    const released = rangeReleasesElementField(file, receiver, field_name, body_start + 1, equal_index) or
-                        aggregateFieldReleasedByHelper(
-                            file,
-                            file_index,
-                            evidence,
-                            receiver,
-                            field_name,
-                            body_start + 1,
-                            equal_index,
-                            declaration_index + 5,
-                            container_end,
-                        );
-                    if (released and !rangeContainsTry(file.tokens, equal_index + 1, assignment_end)) continue;
-                    try run.report(.{
-                        .file_index = file_index,
-                        .rule = .overwritten_owning_value,
-                        .span = file.tokens[equal_index - 1].loc,
-                        .message = if (released)
-                            try run.allocator.print(
-                                "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
-                                .{ type_name, field_name },
-                            )
-                        else
-                            try run.allocator.print(
-                                "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
-                                .{ type_name, field_name },
-                            ),
-                    });
-                }
+    for (file.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
+            file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
+            file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
+        const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
+        for (file.tokens[declaration_index + 5 .. container_end], declaration_index + 5..) |candidate, function_index| {
+            if (candidate.tag != .keyword_fn or function_index + 2 >= container_end or
+                file.tokens[function_index + 2].tag != .l_paren) continue;
+            const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
+            const receiver = firstParameterName(file, function_index + 3, parameters_end) orelse continue;
+            const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
+            const body_end = file.scopes.matchingToken(body_start) orelse continue;
+            if (body_end > container_end) continue;
+            var equal_index = body_start + 1;
+            while (equal_index + 1 < body_end) : (equal_index += 1) {
+                if (file.tokens[equal_index].tag != .equal or equal_index < 3 or
+                    file.tokens[equal_index - 1].tag != .identifier or file.tokens[equal_index - 2].tag != .period or
+                    !tokenIs(file.source, file.tokens[equal_index - 3], receiver)) continue;
+                const field_name = tokenText(file.source, file.tokens[equal_index - 1]);
+                if (!evidence.proven(type_name, field_name) or
+                    containerFieldIsOptional(file, declaration_index + 5, container_end, field_name)) continue;
+                const assignment_end = file.scopes.statementEnd(equal_index) orelse continue;
+                if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, assignment_end, body_start + 1)) continue;
+                const released = rangeReleasesElementField(file, receiver, field_name, body_start + 1, equal_index) or
+                    try aggregateFieldReleasedByHelper(
+                        file,
+                        evidence,
+                        receiver,
+                        field_name,
+                        body_start + 1,
+                        equal_index,
+                        declaration_index + 5,
+                        container_end,
+                    );
+                if (released and !rangeContainsTry(file.tokens, equal_index + 1, assignment_end)) continue;
+                try run.report(.{
+                    .file_index = file_index,
+                    .rule = .overwritten_owning_value,
+                    .span = file.tokens[equal_index - 1].loc,
+                    .message = if (released)
+                        try run.allocator.print(
+                            "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
+                            .{ type_name, field_name },
+                        )
+                    else
+                        try run.allocator.print(
+                            "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
+                            .{ type_name, field_name },
+                        ),
+                });
             }
         }
     }
@@ -222,21 +435,19 @@ fn collectOwnedFieldEvidence(
     file: File,
     file_index: usize,
     summary_index: summaries.Index,
-    evidence: *std.ArrayList(OwnedFieldEvidence),
+    evidence: *FieldEvidence,
 ) !void {
-    var element_types = ElementTypeCache{};
-    defer element_types.entries.deinit(allocator);
     try collectCleanupOwnedFieldEvidence(allocator, file, file_index, summary_index, evidence);
     for (file.tokens, 0..) |token, fn_index| {
         if (token.tag != .keyword_fn or fn_index + 2 >= file.tokens.len or file.tokens[fn_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(fn_index + 2) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         var owned_bindings: std.ArrayList(OwnedBinding) = .empty;
         for (file.tokens[body_start + 1 .. body_end], body_start + 1..) |candidate, declaration_index| {
             if ((candidate.tag != .keyword_const and candidate.tag != .keyword_var) or declaration_index + 3 >= body_end or
                 file.tokens[declaration_index + 1].tag != .identifier) continue;
-            const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+            const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
             const equal_index = findTag(file.tokens, declaration_index + 2, declaration_end, .equal) orelse continue;
             if (equal_index + 2 < declaration_end and file.tokens[equal_index + 1].tag == .identifier and
                 file.tokens[equal_index + 2].tag == .l_brace)
@@ -270,7 +481,7 @@ fn collectOwnedFieldEvidence(
         if (functionReturnType(file, parameters_end + 1, body_start)) |type_name| {
             for (file.tokens[body_start + 1 .. body_end], body_start + 1..) |candidate, return_index| {
                 if (candidate.tag != .keyword_return) continue;
-                const return_end = statementEnd(file.tokens, return_index) orelse continue;
+                const return_end = file.scopes.statementEnd(return_index) orelse continue;
                 try collectAggregateOwnedFields(
                     allocator,
                     file,
@@ -299,8 +510,8 @@ fn collectOwnedFieldEvidence(
                 method_index < 2 or file.tokens[method_index - 1].tag != .period or
                 file.tokens[method_index - 2].tag != .identifier or method_index + 1 >= body_end or
                 file.tokens[method_index + 1].tag != .l_paren) continue;
-            const element_type = try element_types.lookup(allocator, file, tokenText(file.source, file.tokens[method_index - 2])) orelse continue;
-            const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+            const element_type = try file.facts.elementType(file, tokenText(file.source, file.tokens[method_index - 2])) orelse continue;
+            const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
             try collectAggregateOwnedFields(
                 allocator,
                 file,
@@ -332,13 +543,13 @@ fn collectPointerFieldAssignments(
     start: usize,
     end: usize,
     summary_index: summaries.Index,
-    evidence: *std.ArrayList(OwnedFieldEvidence),
+    evidence: *FieldEvidence,
 ) !void {
     for (file.tokens[start..end], start..) |token, equal_index| {
         if (token.tag != .equal or equal_index < start + 3 or
             file.tokens[equal_index - 1].tag != .identifier or file.tokens[equal_index - 2].tag != .period or
             file.tokens[equal_index - 3].tag != .identifier) continue;
-        const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
         const call = firstCall(file.tokens, equal_index + 1, statement_end) orelse continue;
         const name = tokenText(file.source, file.tokens[call.name_index]);
         const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
@@ -346,7 +557,7 @@ fn collectPointerFieldAssignments(
         const binding = tokenText(file.source, file.tokens[equal_index - 3]);
         const type_name = localBindingReturnType(file, binding, start, equal_index) orelse continue;
         const field_name = tokenText(file.source, file.tokens[equal_index - 1]);
-        if (ownedFieldIsProven(evidence.items, file_index, type_name, field_name)) continue;
+        if (evidence.proven(type_name, field_name)) continue;
         try evidence.append(allocator, .{
             .file_index = file_index,
             .type_name = type_name,
@@ -365,7 +576,7 @@ fn localBindingReturnType(
     for (file.tokens[start..before], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= before or
             !tokenIs(file.source, file.tokens[declaration_index + 1], binding)) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= before) continue;
         const call = firstCall(file.tokens, declaration_index + 2, declaration_end) orelse continue;
         return uniqueFunctionReturnType(file, tokenText(file.source, file.tokens[call.name_index]));
@@ -374,17 +585,11 @@ fn localBindingReturnType(
 }
 
 fn uniqueFunctionReturnType(file: File, function_name: []const u8) ?[]const u8 {
-    var selected: ?[]const u8 = null;
-    for (file.tokens, 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= file.tokens.len or
-            !tokenIs(file.source, file.tokens[function_index + 1], function_name) or
-            file.tokens[function_index + 2].tag != .l_paren) continue;
-        if (selected != null) return null;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse return null;
-        const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse return null;
-        selected = functionReturnType(file, parameters_end + 1, body_start) orelse return null;
-    }
-    return selected;
+    const functions = Facts.named(&file.facts.functions, function_name);
+    if (functions.len != 1) return null;
+    const parameters_end = file.scopes.matchingToken(functions[0] + 2) orelse return null;
+    const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse return null;
+    return functionReturnType(file, parameters_end + 1, body_start);
 }
 
 fn collectDirectAggregateOwnedFields(
@@ -395,7 +600,7 @@ fn collectDirectAggregateOwnedFields(
     start: usize,
     end: usize,
     summary_index: summaries.Index,
-    evidence: *std.ArrayList(OwnedFieldEvidence),
+    evidence: *FieldEvidence,
 ) !void {
     var field_index = start;
     while (field_index + 3 < end) : (field_index += 1) {
@@ -407,7 +612,7 @@ fn collectDirectAggregateOwnedFields(
         const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
         if (!summary_index.callReturnsOwned(file.source, receiver, name)) continue;
         const field_name = tokenText(file.source, file.tokens[field_index + 1]);
-        if (ownedFieldIsProven(evidence.items, file_index, type_name, field_name)) continue;
+        if (evidence.proven(type_name, field_name)) continue;
         try evidence.append(allocator, .{
             .file_index = file_index,
             .type_name = type_name,
@@ -422,28 +627,27 @@ fn collectCleanupOwnedFieldEvidence(
     file: File,
     file_index: usize,
     summary_index: summaries.Index,
-    evidence: *std.ArrayList(OwnedFieldEvidence),
+    evidence: *FieldEvidence,
 ) !void {
     for (file.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
             file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
-        const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
         const cleanup = cleanupMethod(file, declaration_index + 5, container_end) orelse continue;
         const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
         for (file.tokens[declaration_index + 5 .. container_end], declaration_index + 5..) |field, field_index| {
             if (field.tag != .identifier or field_index + 1 >= container_end or
-                file.tokens[field_index + 1].tag != .colon or !fieldReleased(
+                file.tokens[field_index + 1].tag != .colon or !try fieldReleased(
                 file,
                 cleanup,
-                file_index,
                 declaration_index + 5,
                 container_end,
-                evidence.items,
+                evidence,
                 tokenText(file.source, field),
             )) continue;
             const field_name = tokenText(file.source, field);
-            if (ownedFieldIsProven(evidence.items, file_index, type_name, field_name)) continue;
+            if (evidence.proven(type_name, field_name)) continue;
             try evidence.append(allocator, .{
                 .file_index = file_index,
                 .type_name = type_name,
@@ -451,22 +655,21 @@ fn collectCleanupOwnedFieldEvidence(
                 .span = field.loc,
             });
         }
-        for (file.tokens, 0..) |aggregate_type, type_index| {
-            if (aggregate_type.tag != .identifier or !tokenIs(file.source, aggregate_type, type_name) or
-                type_index + 1 >= file.tokens.len or file.tokens[type_index + 1].tag != .l_brace) continue;
-            const aggregate_end = matchingToken(file.tokens, type_index + 1, .l_brace, .r_brace) orelse continue;
+        for (Facts.named(&file.facts.braced_names, type_name)) |aggregate_position| {
+            const type_index: usize = aggregate_position;
+            const aggregate_end = file.scopes.matchingToken(type_index + 1) orelse continue;
             var field_index = type_index + 2;
             while (field_index + 3 < aggregate_end) : (field_index += 1) {
                 if (file.tokens[field_index].tag != .period or file.tokens[field_index + 1].tag != .identifier or
                     file.tokens[field_index + 2].tag != .equal or
-                    enclosingOpeningBrace(file.tokens, field_index) != type_index + 1) continue;
+                    file.scopes.enclosingOpeningBrace(field_index) != type_index + 1) continue;
                 const value_end = aggregateFieldValueEnd(file.tokens, field_index + 3, aggregate_end);
                 const call = firstCall(file.tokens, field_index + 3, value_end) orelse continue;
                 const name = tokenText(file.source, file.tokens[call.name_index]);
                 const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
                 if (!summary_index.callReturnsOwned(file.source, receiver, name)) continue;
                 const field_name = tokenText(file.source, file.tokens[field_index + 1]);
-                if (ownedFieldIsProven(evidence.items, file_index, type_name, field_name)) continue;
+                if (evidence.proven(type_name, field_name)) continue;
                 try evidence.append(allocator, .{
                     .file_index = file_index,
                     .type_name = type_name,
@@ -503,7 +706,7 @@ fn collectAggregateOwnedFields(
     start: usize,
     end: usize,
     owned_bindings: []const OwnedBinding,
-    evidence: *std.ArrayList(OwnedFieldEvidence),
+    evidence: *FieldEvidence,
 ) !void {
     var index = start;
     while (index + 3 < end) : (index += 1) {
@@ -517,13 +720,7 @@ fn collectAggregateOwnedFields(
         if (!owned) continue;
         if (aggregateBindingFieldCount(file, binding, start, end) != 1) continue;
         const field_name = tokenText(file.source, file.tokens[index + 1]);
-        var duplicate = false;
-        for (evidence.items) |known| if (known.file_index == file_index and
-            std.mem.eql(u8, known.type_name, type_name) and std.mem.eql(u8, known.field_name, field_name))
-        {
-            duplicate = true;
-        };
-        if (!duplicate) try evidence.append(allocator, .{
+        if (!evidence.proven(type_name, field_name)) try evidence.append(allocator, .{
             .file_index = file_index,
             .type_name = type_name,
             .field_name = field_name,
@@ -542,27 +739,6 @@ fn aggregateBindingFieldCount(file: File, binding: []const u8, start: usize, end
     return count;
 }
 
-const OwnedAllocationCache = struct {
-    entries: std.ArrayList(Entry) = .empty,
-
-    const Entry = struct { field_name: []const u8, owned: bool };
-
-    fn lookup(
-        cache: *OwnedAllocationCache,
-        allocator: std.mem.Allocator,
-        file: File,
-        field_name: []const u8,
-        summary_index: summaries.Index,
-    ) !bool {
-        for (cache.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.field_name, field_name)) return entry.owned;
-        }
-        const owned = sequenceStoresOwnedAllocation(file, field_name, 0, file.tokens.len, summary_index);
-        try cache.entries.append(allocator, .{ .field_name = field_name, .owned = owned });
-        return owned;
-    }
-};
-
 fn collectOwnedSequenceEvidence(
     allocator: std.mem.Allocator,
     file: File,
@@ -570,14 +746,12 @@ fn collectOwnedSequenceEvidence(
     summary_index: summaries.Index,
     evidence: *std.ArrayList(OwnedSequenceEvidence),
 ) !void {
-    var owned_cache = OwnedAllocationCache{};
-    defer owned_cache.entries.deinit(allocator);
     for (file.tokens, 0..) |token, declaration_index| {
         if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
             file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
             file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
         const container_start = declaration_index + 5;
-        const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
         const type_name = tokenText(file.source, file.tokens[declaration_index + 1]);
         const arena_lifetime = containerOwnsArena(file, container_start, container_end);
         var depth: usize = 0;
@@ -590,12 +764,8 @@ fn collectOwnedSequenceEvidence(
             if (depth != 0 or field.tag != .identifier or field_index + 1 >= container_end or
                 file.tokens[field_index + 1].tag != .colon or !fieldStoresSlices(file, field_index, container_end)) continue;
             const field_name = tokenText(file.source, field);
-            if ((arena_lifetime or !try owned_cache.lookup(
-                allocator,
-                file,
-                field_name,
-                summary_index,
-            )) and !sequenceCleanupReleasesElements(file, field_name, container_start, container_end)) continue;
+            if ((arena_lifetime or !try sequenceStoresOwnedAllocation(file, field_name, summary_index)) and
+                !sequenceCleanupReleasesElements(file, field_name, container_start, container_end)) continue;
             try evidence.append(allocator, .{
                 .file_index = file_index,
                 .type_name = type_name,
@@ -655,33 +825,26 @@ fn fieldStoresSlices(file: File, field_index: usize, container_end: usize) bool 
             (!tokenIs(file.source, token, "ArrayList") and !tokenIs(file.source, token, "ArrayListUnmanaged")) or
             type_index + 3 >= field_end or file.tokens[type_index + 1].tag != .l_paren or
             file.tokens[type_index + 2].tag != .l_bracket) continue;
-        const bracket_end = matchingToken(file.tokens, type_index + 2, .l_bracket, .r_bracket) orelse continue;
+        const bracket_end = file.scopes.matchingToken(type_index + 2) orelse continue;
         if (bracket_end >= field_end) continue;
         return bracket_end == type_index + 3 or file.tokens[type_index + 3].tag == .colon;
     }
     return false;
 }
 
-fn sequenceStoresOwnedAllocation(
-    file: File,
-    field_name: []const u8,
-    start: usize,
-    end: usize,
-    summary_index: summaries.Index,
-) bool {
-    for (file.tokens[start..end], start..) |token, method_index| {
-        if (token.tag != .identifier or
-            (!tokenIs(file.source, token, "append") and !tokenIs(file.source, token, "appendAssumeCapacity")) or
-            method_index < 2 or file.tokens[method_index - 1].tag != .period or
-            !tokenIs(file.source, file.tokens[method_index - 2], field_name) or
-            method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
-        const call = firstCall(file.tokens, method_index + 2, @min(call_end, end)) orelse continue;
+/// Whether the file appends an owned allocation to a sequence field spelled
+/// `field_name`; memoized per name.
+fn sequenceStoresOwnedAllocation(file: File, field_name: []const u8, summary_index: summaries.Index) !bool {
+    const entry = try file.facts.owned_allocations.getOrPut(file.facts.allocator, field_name);
+    if (!entry.found_existing) entry.value_ptr.* = for (Facts.named(&file.facts.appends, field_name)) |method_position| {
+        const method_index: usize = method_position;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
+        const call = firstCall(file.tokens, method_index + 2, call_end) orelse continue;
         const name = tokenText(file.source, file.tokens[call.name_index]);
         const receiver = if (call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
-        if (summary_index.callReturnsOwned(file.source, receiver, name)) return true;
-    }
-    return false;
+        if (summary_index.callReturnsOwned(file.source, receiver, name)) break true;
+    } else false;
+    return entry.value_ptr.*;
 }
 
 fn sequenceCleanupReleasesElements(
@@ -692,47 +855,24 @@ fn sequenceCleanupReleasesElements(
 ) bool {
     for (file.tokens[start..end], start..) |token, function_index| {
         if (token.tag != .keyword_fn or function_index + 2 >= end or file.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
         const receiver = firstParameterName(file, function_index + 3, parameters_end) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         const element = sequenceElementCapture(file, receiver, field_name, body_start + 1, body_end) orelse continue;
         if (rawElementReleased(file, element, body_start + 1, body_end)) return true;
     }
     return false;
 }
 
-const TypeContainerCache = struct {
-    entries: std.ArrayList(Entry) = .empty,
-
-    const Entry = struct { file_index: usize, type_name: []const u8, container: ?TypeContainer };
-
-    fn lookup(
-        cache: *TypeContainerCache,
-        allocator: std.mem.Allocator,
-        files: []const File,
-        file_index: usize,
-        type_name: []const u8,
-    ) !?TypeContainer {
-        for (cache.entries.items) |entry| {
-            if (entry.file_index == file_index and std.mem.eql(u8, entry.type_name, type_name)) return entry.container;
-        }
-        const container = typeContainer(files[file_index], type_name);
-        try cache.entries.append(allocator, .{ .file_index = file_index, .type_name = type_name, .container = container });
-        return container;
-    }
-};
-
 fn findOwnedSequenceIssues(
     run: ProjectRun,
+    file: File,
     summary_index: summaries.Index,
     evidence: []const OwnedSequenceEvidence,
 ) !void {
-    var containers = TypeContainerCache{};
-    defer containers.entries.deinit(run.allocator);
     for (evidence) |sequence| {
-        const file = run.files[sequence.file_index];
-        const container = try containers.lookup(run.allocator, run.files, sequence.file_index, sequence.type_name) orelse continue;
+        const container = file.facts.containers.get(sequence.type_name) orelse continue;
         try findOwnedSequenceCleanupOmissions(run, file, sequence, container);
         try findOwnedSequenceDiscardedRemovals(run, file, sequence, container);
         try findOwnedSequenceOverwrites(
@@ -754,18 +894,6 @@ fn findOwnedSequenceIssues(
 
 const TypeContainer = struct { start: usize, end: usize };
 
-fn typeContainer(file: File, type_name: []const u8) ?TypeContainer {
-    for (file.tokens, 0..) |token, declaration_index| {
-        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-            !tokenIs(file.source, file.tokens[declaration_index + 1], type_name) or
-            file.tokens[declaration_index + 2].tag != .equal or file.tokens[declaration_index + 3].tag != .keyword_struct or
-            file.tokens[declaration_index + 4].tag != .l_brace) continue;
-        const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-        return .{ .start = declaration_index + 5, .end = container_end };
-    }
-    return null;
-}
-
 fn findOwnedSequenceCleanupOmissions(
     run: ProjectRun,
     file: File,
@@ -776,10 +904,10 @@ fn findOwnedSequenceCleanupOmissions(
     for (file.tokens[container.start..container.end], container.start..) |token, function_index| {
         if (token.tag != .keyword_fn or function_index + 2 >= container.end or
             file.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
         const receiver = firstParameterName(file, function_index + 3, parameters_end) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         const drop = sequenceDropCall(file, receiver, sequence.field_name, body_start + 1, body_end) orelse continue;
         if (cleanupDelegatesToAnotherMethod(file, receiver, sequence.field_name, body_start + 1, body_end)) continue;
         if (sequenceElementCapture(file, receiver, sequence.field_name, body_start + 1, body_end)) |element| {
@@ -802,7 +930,7 @@ fn rawElementReleased(file: File, element: []const u8, start: usize, end: usize)
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         for (file.tokens[method_index + 2 .. @min(call_end, end)]) |argument| {
             if (argument.tag == .identifier and tokenIs(file.source, argument, element)) return true;
         }
@@ -819,7 +947,7 @@ fn findOwnedSequenceDiscardedRemovals(
     if (run.configuration.level(.unreleased_allocation) == .off) return;
     for (file.tokens[container.start..container.end], container.start..) |token, equal_index| {
         if (token.tag != .equal or equal_index == 0 or !tokenIs(file.source, file.tokens[equal_index - 1], "_")) continue;
-        const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
         for (file.tokens[equal_index + 1 .. statement_end], equal_index + 1..) |candidate, method_index| {
             if (candidate.tag != .identifier or
                 (!tokenIs(file.source, candidate, "swapRemove") and !tokenIs(file.source, candidate, "orderedRemove")) or
@@ -840,7 +968,7 @@ fn findOwnedSequenceDiscardedRemovals(
 }
 
 fn rawSequenceElementReleasedBefore(file: File, field_name: []const u8, before: usize) bool {
-    const scope_start = enclosingOpeningBrace(file.tokens, before) orelse return false;
+    const scope_start = file.scopes.enclosingOpeningBrace(before) orelse return false;
     return rangeReleasesRawSequenceElement(file, field_name, scope_start + 1, before);
 }
 
@@ -854,7 +982,7 @@ fn rangeReleasesRawSequenceElement(
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         var saw_field = false;
         var saw_items = false;
         for (file.tokens[method_index + 2 .. @min(call_end, end)]) |argument| {
@@ -884,7 +1012,7 @@ fn rawAliasTargetsSequenceElement(
     for (file.tokens[start..end], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 2 >= end or
             !tokenIs(file.source, file.tokens[declaration_index + 1], alias)) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= end) continue;
         var saw_field = false;
         var saw_items = false;
@@ -911,8 +1039,8 @@ fn findOwnedSequenceOverwrites(
         const items_index = findItemsBefore(file, equal_index, equal_index -| 16) orelse continue;
         if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
             !tokenIs(file.source, file.tokens[items_index - 2], sequence.field_name)) continue;
-        const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
-        const scope_start = enclosingOpeningBrace(file.tokens, equal_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
+        const scope_start = file.scopes.enclosingOpeningBrace(equal_index) orelse continue;
         if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, scope_start + 1)) continue;
         const released = rangeReleasesRawSequenceElement(file, sequence.field_name, scope_start + 1, equal_index);
         if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
@@ -942,13 +1070,11 @@ fn findInlineOwnedSequenceInsertions(
     _: TypeContainer,
 ) !void {
     if (run.configuration.level(.missing_errdefer) == .off) return;
-    for (file.tokens, 0..) |token, method_index| {
-        if (token.tag != .identifier or !tokenIs(file.source, token, "append") or
-            method_index < 2 or file.tokens[method_index - 1].tag != .period or
-            !tokenIs(file.source, file.tokens[method_index - 2], sequence.field_name) or
-            method_index + 1 >= file.tokens.len or file.tokens[method_index + 1].tag != .l_paren) continue;
+    for (Facts.named(&file.facts.appends, sequence.field_name)) |method_position| {
+        const method_index: usize = method_position;
+        if (!tokenIs(file.source, file.tokens[method_index], "append")) continue;
         if (inlineSequenceOwnerHasErrdefer(file, method_index)) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         const allocation_call = firstCall(file.tokens, method_index + 2, call_end) orelse continue;
         const name = tokenText(file.source, file.tokens[allocation_call.name_index]);
         const receiver = if (allocation_call.receiver_index) |index| tokenText(file.source, file.tokens[index]) else null;
@@ -969,10 +1095,10 @@ fn inlineSequenceOwnerHasErrdefer(file: File, append_index: usize) bool {
     if (append_index < 4 or file.tokens[append_index - 3].tag != .period or
         file.tokens[append_index - 4].tag != .identifier) return false;
     const owner = tokenText(file.source, file.tokens[append_index - 4]);
-    const scope_start = enclosingOpeningBrace(file.tokens, append_index) orelse return false;
+    const scope_start = file.scopes.enclosingOpeningBrace(append_index) orelse return false;
     for (file.tokens[scope_start + 1 .. append_index], scope_start + 1..) |token, defer_index| {
         if (token.tag != .keyword_errdefer) continue;
-        const defer_end = statementEnd(file.tokens, defer_index) orelse continue;
+        const defer_end = file.scopes.statementEnd(defer_index) orelse continue;
         if (defer_end >= append_index) continue;
         var saw_owner = false;
         var saw_cleanup = false;
@@ -989,37 +1115,37 @@ fn inlineSequenceOwnerHasErrdefer(file: File, append_index: usize) bool {
 
 fn findFailureUnsafeOwnedSliceShrinks(
     run: ProjectRun,
-    evidence: []const OwnedFieldEvidence,
+    file: File,
+    file_index: usize,
+    evidence: *const FieldEvidence,
 ) !void {
     if (run.configuration.level(.partial_ownership_transfer) == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        for (file.tokens, 0..) |token, declaration_index| {
-            if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-                file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
-                file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
-            const container_start = declaration_index + 5;
-            const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-            var depth: usize = 0;
-            for (file.tokens[container_start..container_end], container_start..) |field, field_index| {
-                switch (field.tag) {
-                    .l_brace => depth += 1,
-                    .r_brace => depth -|= 1,
-                    else => {},
-                }
-                if (depth != 0 or field.tag != .identifier or field_index + 1 >= container_end or
-                    file.tokens[field_index + 1].tag != .colon) continue;
-                const element_type = directSliceElementType(file, field_index, container_end) orelse continue;
-                if (!hasOwnedFieldEvidence(evidence, file_index, element_type)) continue;
-                try findFieldFailureUnsafeShrinks(
-                    run,
-                    file,
-                    file_index,
-                    tokenText(file.source, field),
-                    element_type,
-                    container_start,
-                    container_end,
-                );
+    for (file.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
+            file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
+            file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
+        const container_start = declaration_index + 5;
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
+        var depth: usize = 0;
+        for (file.tokens[container_start..container_end], container_start..) |field, field_index| {
+            switch (field.tag) {
+                .l_brace => depth += 1,
+                .r_brace => depth -|= 1,
+                else => {},
             }
+            if (depth != 0 or field.tag != .identifier or field_index + 1 >= container_end or
+                file.tokens[field_index + 1].tag != .colon) continue;
+            const element_type = directSliceElementType(file, field_index, container_end) orelse continue;
+            if (evidence.ofType(element_type).len == 0) continue;
+            try findFieldFailureUnsafeShrinks(
+                run,
+                file,
+                file_index,
+                tokenText(file.source, field),
+                element_type,
+                container_start,
+                container_end,
+            );
         }
     }
 }
@@ -1027,7 +1153,7 @@ fn findFailureUnsafeOwnedSliceShrinks(
 fn directSliceElementType(file: File, field_index: usize, container_end: usize) ?[]const u8 {
     const field_end = @min(fieldTypeEnd(file.tokens, field_index + 2), container_end);
     if (field_index + 4 >= field_end or file.tokens[field_index + 2].tag != .l_bracket) return null;
-    const bracket_end = matchingToken(file.tokens, field_index + 2, .l_bracket, .r_bracket) orelse return null;
+    const bracket_end = file.scopes.matchingToken(field_index + 2) orelse return null;
     if (bracket_end >= field_end or
         (bracket_end != field_index + 3 and file.tokens[field_index + 3].tag != .colon)) return null;
     return functionReturnType(file, bracket_end + 1, field_end);
@@ -1045,16 +1171,16 @@ fn findFieldFailureUnsafeShrinks(
     for (file.tokens[container_start..container_end], container_start..) |token, function_index| {
         if (token.tag != .keyword_fn or function_index + 2 >= container_end or
             file.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
         const receiver = firstParameterName(file, function_index + 3, parameters_end) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         for (file.tokens[body_start + 1 .. body_end], body_start + 1..) |candidate, equal_index| {
             if (candidate.tag != .equal or equal_index < 3 or
                 !tokenIs(file.source, file.tokens[equal_index - 1], field_name) or
                 file.tokens[equal_index - 2].tag != .period or
                 !tokenIs(file.source, file.tokens[equal_index - 3], receiver)) continue;
-            const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
+            const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
             const realloc_index = reallocOfField(
                 file,
                 receiver,
@@ -1093,7 +1219,7 @@ fn reallocOfField(
     for (file.tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or !tokenIs(file.source, token, "realloc") or
             method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         if (fieldPathArgumentIndex(file, receiver, field_name, method_index + 2, @min(call_end, end)) != null) {
             return method_index;
         }
@@ -1110,7 +1236,7 @@ fn ownedElementCopyBefore(
 ) ?usize {
     for (file.tokens[start..end], start..) |token, equal_index| {
         if (token.tag != .equal) continue;
-        const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
         const mutation_start = statementBoundaryStart(file.tokens, equal_index, start);
         const left = indexedFieldPath(file, receiver, field_name, mutation_start, equal_index) orelse continue;
         const right = indexedFieldPath(file, receiver, field_name, equal_index + 1, @min(statement_end, end)) orelse continue;
@@ -1147,7 +1273,7 @@ fn indexedFieldPath(
     while (index + 3 < end) : (index += 1) {
         if (!tokenIs(file.source, file.tokens[index], receiver) or file.tokens[index + 1].tag != .period or
             !tokenIs(file.source, file.tokens[index + 2], field_name) or file.tokens[index + 3].tag != .l_bracket) continue;
-        const bracket_end = matchingToken(file.tokens, index + 3, .l_bracket, .r_bracket) orelse continue;
+        const bracket_end = file.scopes.matchingToken(index + 3) orelse continue;
         if (bracket_end >= end) continue;
         selected = .{ .start = index, .end = bracket_end };
     }
@@ -1162,7 +1288,7 @@ fn rangeHasErrdeferForField(
 ) bool {
     for (file.tokens[start..end], start..) |token, defer_index| {
         if (token.tag != .keyword_errdefer) continue;
-        const defer_end = statementEnd(file.tokens, defer_index) orelse continue;
+        const defer_end = file.scopes.statementEnd(defer_index) orelse continue;
         if (defer_end > end) continue;
         for (file.tokens[defer_index + 1 .. defer_end]) |part| {
             if (part.tag == .identifier and tokenIs(file.source, part, field_name)) return true;
@@ -1170,28 +1296,6 @@ fn rangeHasErrdeferForField(
     }
     return false;
 }
-
-/// The element type of every field the file declares as an `ArrayList`,
-/// found in one pass over the file the first time a field is looked up.
-const ElementTypeCache = struct {
-    /// Element type per field name; null when the file declares the name with
-    /// two different element types.
-    entries: std.StringHashMapUnmanaged(?[]const u8) = .empty,
-    built: bool = false,
-
-    fn lookup(
-        cache: *ElementTypeCache,
-        allocator: std.mem.Allocator,
-        file: File,
-        field_name: []const u8,
-    ) !?[]const u8 {
-        if (!cache.built) {
-            try collectSequenceElementTypes(allocator, file, &cache.entries);
-            cache.built = true;
-        }
-        return cache.entries.get(field_name) orelse null;
-    }
-};
 
 fn collectSequenceElementTypes(
     allocator: std.mem.Allocator,
@@ -1241,53 +1345,52 @@ fn fieldTypeEnd(tokens: []const std.zig.Token, start: usize) usize {
 /// member scans attribute direct members to each container exactly once. It
 /// matches only the `const Name = struct {` shape that the struct scans process
 /// independently; anything else keeps the legacy overlapping scan.
-fn nestedStructClose(tokens: []const std.zig.Token, index: usize, end: usize) ?usize {
+fn nestedStructClose(file: File, index: usize, end: usize) ?usize {
     if (index + 4 >= end) return null;
+    const tokens = file.tokens;
     if (tokens[index].tag != .keyword_const or tokens[index + 1].tag != .identifier or
         tokens[index + 2].tag != .equal or tokens[index + 3].tag != .keyword_struct or
         tokens[index + 4].tag != .l_brace) return null;
-    const close = matchingToken(tokens, index + 4, .l_brace, .r_brace) orelse return null;
+    const close = file.scopes.matchingToken(index + 4) orelse return null;
     if (close >= end) return null;
     return close;
 }
 
 fn findIncompleteOwnedElementCleanup(
     run: ProjectRun,
-    evidence: []const OwnedFieldEvidence,
+    file: File,
+    file_index: usize,
+    evidence: *const FieldEvidence,
 ) !void {
     const level = run.configuration.level(.incomplete_owned_field_cleanup);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, declaration_index| {
-            if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-                file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
-                file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
-            const container_end = matchingToken(file.tokens, declaration_index + 4, .l_brace, .r_brace) orelse continue;
-            var field_index = declaration_index + 5;
-            while (field_index < container_end) : (field_index += 1) {
-                if (nestedStructClose(file.tokens, field_index, container_end)) |close| {
-                    field_index = close;
-                    continue;
-                }
-                const field_token = file.tokens[field_index];
-                if (field_token.tag != .identifier or field_index + 1 >= container_end or
-                    file.tokens[field_index + 1].tag != .colon) continue;
-                const sequence_field = tokenText(file.source, field_token);
-                const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
-                if (!hasOwnedFieldEvidence(evidence, file_index, element_type)) continue;
-                try findSequenceCleanupOmissions(
-                    run,
-                    file,
-                    file_index,
-                    declaration_index + 5,
-                    container_end,
-                    sequence_field,
-                    element_type,
-                    evidence,
-                );
+    for (file.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
+            file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
+            file.tokens[declaration_index + 3].tag != .keyword_struct or file.tokens[declaration_index + 4].tag != .l_brace) continue;
+        const container_end = file.scopes.matchingToken(declaration_index + 4) orelse continue;
+        var field_index = declaration_index + 5;
+        while (field_index < container_end) : (field_index += 1) {
+            if (nestedStructClose(file, field_index, container_end)) |close| {
+                field_index = close;
+                continue;
             }
+            const field_token = file.tokens[field_index];
+            if (field_token.tag != .identifier or field_index + 1 >= container_end or
+                file.tokens[field_index + 1].tag != .colon) continue;
+            const sequence_field = tokenText(file.source, field_token);
+            const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+            if (evidence.ofType(element_type).len == 0) continue;
+            try findSequenceCleanupOmissions(
+                run,
+                file,
+                file_index,
+                declaration_index + 5,
+                container_end,
+                sequence_field,
+                element_type,
+                evidence,
+            );
         }
     }
 }
@@ -1300,21 +1403,21 @@ fn findSequenceCleanupOmissions(
     container_end: usize,
     sequence_field: []const u8,
     element_type: []const u8,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
 ) !void {
     var fn_index = container_start;
     while (fn_index < container_end) : (fn_index += 1) {
-        if (nestedStructClose(file.tokens, fn_index, container_end)) |close| {
+        if (nestedStructClose(file, fn_index, container_end)) |close| {
             fn_index = close;
             continue;
         }
         const token = file.tokens[fn_index];
         if (token.tag != .keyword_fn or fn_index + 2 >= container_end or file.tokens[fn_index + 1].tag != .identifier or
             file.tokens[fn_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(fn_index + 2) orelse continue;
         const receiver = firstParameterName(file, fn_index + 3, parameters_end) orelse continue;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         if (body_end > container_end) continue;
         const drop = sequenceDropCall(file, receiver, sequence_field, body_start + 1, body_end) orelse continue;
         if (cleanupDelegatesToAnotherMethod(file, receiver, sequence_field, body_start + 1, body_end)) continue;
@@ -1322,8 +1425,8 @@ fn findSequenceCleanupOmissions(
         if (capture) |element| {
             if (elementCleanupIsOpaque(file, element, body_start + 1, body_end)) continue;
         }
-        for (evidence) |owned_field| {
-            if (owned_field.file_index != file_index or !std.mem.eql(u8, owned_field.type_name, element_type)) continue;
+        for (evidence.ofType(element_type)) |position| {
+            const owned_field = evidence.items.items[position];
             if (sequenceFieldReleasedByHelper(
                 file,
                 receiver,
@@ -1402,7 +1505,7 @@ fn sequenceElementCapture(
     var index = start;
     while (index + 7 < end) : (index += 1) {
         if (file.tokens[index].tag != .keyword_for or file.tokens[index + 1].tag != .l_paren) continue;
-        const condition_end = matchingToken(file.tokens, index + 1, .l_paren, .r_paren) orelse continue;
+        const condition_end = file.scopes.matchingToken(index + 1) orelse continue;
         var names_sequence = false;
         var condition = index + 2;
         while (condition + 4 < condition_end) : (condition += 1) {
@@ -1443,25 +1546,15 @@ fn sequenceFieldReleasedByHelper(
     for (file.tokens[start..end], start..) |token, call_index| {
         if (token.tag != .identifier or call_index + 1 >= end or file.tokens[call_index + 1].tag != .l_paren or
             (call_index > 0 and (file.tokens[call_index - 1].tag == .period or file.tokens[call_index - 1].tag == .keyword_fn))) continue;
-        const call_end = matchingToken(file.tokens, call_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(call_index + 1) orelse continue;
         const argument_index = sequencePathArgumentIndex(file, receiver, sequence_field, call_index + 2, call_end) orelse continue;
-        const function_name = tokenText(file.source, token);
-        var selected_function: ?usize = null;
-        for (file.tokens, 0..) |candidate, function_index| {
-            if (candidate.tag != .keyword_fn or function_index + 2 >= file.tokens.len or
-                !tokenIs(file.source, file.tokens[function_index + 1], function_name) or
-                file.tokens[function_index + 2].tag != .l_paren) continue;
-            if (selected_function != null) {
-                selected_function = null;
-                break;
-            }
-            selected_function = function_index;
-        }
-        const function_index = selected_function orelse continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const functions = Facts.named(&file.facts.functions, tokenText(file.source, token));
+        if (functions.len != 1) continue;
+        const function_index: usize = functions[0];
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
         const parameter = parameterNameAt(file, function_index + 3, parameters_end, argument_index) orelse continue;
         const helper_body = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const helper_end = matchingToken(file.tokens, helper_body, .l_brace, .r_brace) orelse continue;
+        const helper_end = file.scopes.matchingToken(helper_body) orelse continue;
         const element = sequenceParameterCapture(file, parameter, helper_body + 1, helper_end) orelse continue;
         if (elementFieldReleased(file, element, owned_field, helper_body + 1, helper_end)) return true;
     }
@@ -1528,7 +1621,7 @@ fn parameterNameAt(file: File, start: usize, end: usize, wanted: usize) ?[]const
 fn sequenceParameterCapture(file: File, parameter: []const u8, start: usize, end: usize) ?[]const u8 {
     for (file.tokens[start..end], start..) |token, for_index| {
         if (token.tag != .keyword_for or for_index + 1 >= end or file.tokens[for_index + 1].tag != .l_paren) continue;
-        const condition_end = matchingToken(file.tokens, for_index + 1, .l_paren, .r_paren) orelse continue;
+        const condition_end = file.scopes.matchingToken(for_index + 1) orelse continue;
         var names_parameter = false;
         for (file.tokens[for_index + 2 .. condition_end]) |condition| {
             if (condition.tag == .identifier and tokenIs(file.source, condition, parameter)) names_parameter = true;
@@ -1553,7 +1646,7 @@ fn elementFieldReleased(
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         var index = method_index + 2;
         while (index + 2 < call_end) : (index += 1) {
             if (tokenIs(file.source, file.tokens[index], element) and file.tokens[index + 1].tag == .period and
@@ -1588,7 +1681,7 @@ fn optionalElementFieldReleased(
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             release_index + 1 >= end or file.tokens[release_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, release_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(release_index + 1) orelse continue;
         for (file.tokens[release_index + 2 .. @min(call_end, end)], release_index + 2..) |argument, argument_index| {
             if (argument.tag == .identifier and tokenIs(file.source, file.tokens[argument_index], binding)) return true;
         }
@@ -1596,40 +1689,33 @@ fn optionalElementFieldReleased(
     return false;
 }
 
-fn hasOwnedFieldEvidence(evidence: []const OwnedFieldEvidence, file_index: usize, type_name: []const u8) bool {
-    for (evidence) |field| if (field.file_index == file_index and std.mem.eql(u8, field.type_name, type_name)) return true;
-    return false;
-}
-
 fn findRemovedOwnedValueTransfers(
     run: ProjectRun,
-    evidence: []const OwnedFieldEvidence,
+    file: File,
+    file_index: usize,
+    evidence: *const FieldEvidence,
 ) !void {
     if (run.configuration.level(.partial_ownership_transfer) == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, declaration_index| {
-            if ((token.tag != .keyword_const and token.tag != .keyword_var) or
-                declaration_index + 3 >= file.tokens.len or file.tokens[declaration_index + 1].tag != .identifier) continue;
-            const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
-            const sequence_field = removedValueSequence(file, declaration_index + 2, declaration_end) orelse continue;
-            const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
-            if (!hasOwnedFieldEvidence(evidence, file_index, element_type)) continue;
-            const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
-            const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
-            const insertion = fallibleInsertionOfBinding(file, binding, declaration_end + 1, scope_end) orelse continue;
-            if (rangeHasErrdeferForBinding(file, binding, declaration_end + 1, insertion)) continue;
-            try run.report(.{
-                .file_index = file_index,
-                .rule = .partial_ownership_transfer,
-                .span = file.tokens[insertion].loc,
-                .message = try run.allocator.print(
-                    "fallible insertion can lose removed owned '{s}' value '{s}' when it fails",
-                    .{ element_type, binding },
-                ),
-            });
-        }
+    for (file.tokens, 0..) |token, declaration_index| {
+        if ((token.tag != .keyword_const and token.tag != .keyword_var) or
+            declaration_index + 3 >= file.tokens.len or file.tokens[declaration_index + 1].tag != .identifier) continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
+        const sequence_field = removedValueSequence(file, declaration_index + 2, declaration_end) orelse continue;
+        const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+        if (evidence.ofType(element_type).len == 0) continue;
+        const binding = tokenText(file.source, file.tokens[declaration_index + 1]);
+        const scope_end = file.scopes.enclosingScopeEnd(declaration_index) orelse continue;
+        const insertion = fallibleInsertionOfBinding(file, binding, declaration_end + 1, scope_end) orelse continue;
+        if (rangeHasErrdeferForBinding(file, binding, declaration_end + 1, insertion)) continue;
+        try run.report(.{
+            .file_index = file_index,
+            .rule = .partial_ownership_transfer,
+            .span = file.tokens[insertion].loc,
+            .message = try run.allocator.print(
+                "fallible insertion can lose removed owned '{s}' value '{s}' when it fails",
+                .{ element_type, binding },
+            ),
+        });
     }
 }
 
@@ -1652,12 +1738,12 @@ fn fallibleInsertionOfBinding(
 ) ?usize {
     for (file.tokens[start..end], start..) |token, try_index| {
         if (token.tag != .keyword_try) continue;
-        const statement_end = statementEnd(file.tokens, try_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(try_index) orelse continue;
         if (statement_end > end) continue;
         for (file.tokens[try_index + 1 .. statement_end], try_index + 1..) |candidate, call_index| {
             if (candidate.tag != .identifier or call_index + 1 >= statement_end or
                 file.tokens[call_index + 1].tag != .l_paren) continue;
-            const call_end = matchingToken(file.tokens, call_index + 1, .l_paren, .r_paren) orelse continue;
+            const call_end = file.scopes.matchingToken(call_index + 1) orelse continue;
             if (call_end > statement_end) continue;
             const argument_index = bareArgumentPosition(file, binding, call_index + 2, call_end) orelse continue;
             const function_name = tokenText(file.source, candidate);
@@ -1675,12 +1761,7 @@ fn standardFallibleInsertion(function_name: []const u8) bool {
 }
 
 fn localFunctionCount(file: File, function_name: []const u8) usize {
-    var count: usize = 0;
-    for (file.tokens, 0..) |token, function_index| {
-        if (token.tag == .keyword_fn and function_index + 1 < file.tokens.len and
-            tokenIs(file.source, file.tokens[function_index + 1], function_name)) count += 1;
-    }
-    return count;
+    return file.facts.function_counts.get(function_name) orelse 0;
 }
 
 fn localFunctionForwardsToFallibleInsertion(
@@ -1689,23 +1770,21 @@ fn localFunctionForwardsToFallibleInsertion(
     parameter_index: usize,
 ) bool {
     if (localFunctionCount(file, function_name) != 1) return false;
-    for (file.tokens, 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= file.tokens.len or
-            !tokenIs(file.source, file.tokens[function_index + 1], function_name) or
-            file.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse return false;
+    for (Facts.named(&file.facts.functions, function_name)) |function_position| {
+        const function_index: usize = function_position;
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse return false;
         const parameter = parameterNameAt(file, function_index + 3, parameters_end, parameter_index) orelse return false;
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse return false;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse return false;
+        const body_end = file.scopes.matchingToken(body_start) orelse return false;
         for (file.tokens[body_start + 1 .. body_end], body_start + 1..) |candidate, try_index| {
             if (candidate.tag != .keyword_try) continue;
-            const statement_end = statementEnd(file.tokens, try_index) orelse continue;
+            const statement_end = file.scopes.statementEnd(try_index) orelse continue;
             if (statement_end > body_end) continue;
             for (file.tokens[try_index + 1 .. statement_end], try_index + 1..) |call, call_index| {
                 if (call.tag != .identifier or !standardFallibleInsertion(tokenText(file.source, call)) or
                     localFunctionCount(file, tokenText(file.source, call)) != 0 or
                     call_index + 1 >= statement_end or file.tokens[call_index + 1].tag != .l_paren) continue;
-                const call_end = matchingToken(file.tokens, call_index + 1, .l_paren, .r_paren) orelse continue;
+                const call_end = file.scopes.matchingToken(call_index + 1) orelse continue;
                 if (call_end > statement_end or
                     bareArgumentPosition(file, parameter, call_index + 2, call_end) == null) continue;
                 return !rangeHasErrdeferForBinding(file, parameter, body_start + 1, call_index);
@@ -1744,7 +1823,7 @@ fn rangeHasErrdeferForBinding(
 ) bool {
     for (file.tokens[start..end], start..) |token, defer_index| {
         if (token.tag != .keyword_errdefer) continue;
-        const defer_end = statementEnd(file.tokens, defer_index) orelse continue;
+        const defer_end = file.scopes.statementEnd(defer_index) orelse continue;
         if (defer_end > end) continue;
         for (file.tokens[defer_index + 1 .. defer_end]) |candidate| {
             if (candidate.tag == .identifier and tokenIs(file.source, candidate, binding)) return true;
@@ -1755,86 +1834,103 @@ fn rangeHasErrdeferForBinding(
 
 fn findDroppedOwnedElements(
     run: ProjectRun,
-    evidence: []const OwnedFieldEvidence,
+    file: File,
+    file_index: usize,
+    evidence: *const FieldEvidence,
 ) !void {
     const level = run.configuration.level(.unreleased_allocation);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, equal_index| {
-            if (token.tag != .equal or equal_index == 0 or !tokenIs(file.source, file.tokens[equal_index - 1], "_")) continue;
-            const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
-            for (file.tokens[equal_index + 1 .. statement_end], equal_index + 1..) |candidate, method_index| {
-                if (candidate.tag != .identifier or
-                    (!tokenIs(file.source, candidate, "swapRemove") and !tokenIs(file.source, candidate, "orderedRemove")) or
-                    method_index < 2 or file.tokens[method_index - 1].tag != .period or file.tokens[method_index - 2].tag != .identifier) continue;
-                const sequence_field = tokenText(file.source, file.tokens[method_index - 2]);
-                const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
-                if (removedElementTransferredBefore(file, sequence_field, method_index)) continue;
-                if (sequenceElementDeinitializedBeforeRemoval(file, sequence_field, method_index)) continue;
-                if (sequenceStoresPointers(file, sequence_field) and
-                    removedPointerMatchesParameter(file, sequence_field, method_index)) continue;
-                var reported = false;
-                for (evidence) |owned_field| {
-                    if (owned_field.file_index != file_index or !std.mem.eql(u8, owned_field.type_name, element_type)) continue;
-                    if (elementFieldReleasedBeforeRemoval(file, owned_field.field_name, method_index)) continue;
-                    try run.report(.{
-                        .file_index = file_index,
-                        .rule = .unreleased_allocation,
-                        .span = candidate.loc,
-                        .message = try run.allocator.print(
-                            "discarding removed '{s}' drops proven owned field '{s}'",
-                            .{ element_type, owned_field.field_name },
-                        ),
-                    });
-                    reported = true;
-                }
-                if (reported) continue;
-                const cleanup_field = sequenceCleanupOwnedField(file, sequence_field) orelse continue;
-                if (elementFieldReleasedBeforeRemoval(file, cleanup_field, method_index)) continue;
+    for (file.tokens, 0..) |token, equal_index| {
+        if (token.tag != .equal or equal_index == 0 or !tokenIs(file.source, file.tokens[equal_index - 1], "_")) continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
+        for (file.tokens[equal_index + 1 .. statement_end], equal_index + 1..) |candidate, method_index| {
+            if (candidate.tag != .identifier or
+                (!tokenIs(file.source, candidate, "swapRemove") and !tokenIs(file.source, candidate, "orderedRemove")) or
+                method_index < 2 or file.tokens[method_index - 1].tag != .period or file.tokens[method_index - 2].tag != .identifier) continue;
+            const sequence_field = tokenText(file.source, file.tokens[method_index - 2]);
+            const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+            if (removedElementTransferredBefore(file, sequence_field, method_index)) continue;
+            if (sequenceElementDeinitializedBeforeRemoval(file, sequence_field, method_index)) continue;
+            if (try sequenceStoresPointers(file, sequence_field) and
+                removedPointerMatchesParameter(file, sequence_field, method_index)) continue;
+            var reported = false;
+            for (evidence.ofType(element_type)) |position| {
+                const owned_field = evidence.items.items[position];
+                if (elementFieldReleasedBeforeRemoval(file, owned_field.field_name, method_index)) continue;
                 try run.report(.{
                     .file_index = file_index,
                     .rule = .unreleased_allocation,
                     .span = candidate.loc,
                     .message = try run.allocator.print(
                         "discarding removed '{s}' drops proven owned field '{s}'",
-                        .{ element_type, cleanup_field },
+                        .{ element_type, owned_field.field_name },
                     ),
                 });
+                reported = true;
             }
+            if (reported) continue;
+            const cleanup_field = try sequenceCleanupOwnedField(file, sequence_field) orelse continue;
+            if (elementFieldReleasedBeforeRemoval(file, cleanup_field, method_index)) continue;
+            try run.report(.{
+                .file_index = file_index,
+                .rule = .unreleased_allocation,
+                .span = candidate.loc,
+                .message = try run.allocator.print(
+                    "discarding removed '{s}' drops proven owned field '{s}'",
+                    .{ element_type, cleanup_field },
+                ),
+            });
         }
     }
 }
 
-fn sequenceCleanupOwnedField(file: File, sequence_field: []const u8) ?[]const u8 {
-    for (file.tokens, 0..) |token, for_index| {
-        if (token.tag != .keyword_for or for_index + 1 >= file.tokens.len or
-            file.tokens[for_index + 1].tag != .l_paren) continue;
-        const iterable_end = matchingToken(file.tokens, for_index + 1, .l_paren, .r_paren) orelse continue;
-        var names_sequence = false;
-        var names_items = false;
-        for (file.tokens[for_index + 2 .. iterable_end]) |part| {
-            if (part.tag != .identifier) continue;
-            if (tokenIs(file.source, part, sequence_field)) names_sequence = true;
-            if (tokenIs(file.source, part, "items")) names_items = true;
-        }
-        if (!names_sequence or !names_items or iterable_end + 2 >= file.tokens.len or
-            file.tokens[iterable_end + 1].tag != .pipe or file.tokens[iterable_end + 2].tag != .identifier) continue;
-        const element = tokenText(file.source, file.tokens[iterable_end + 2]);
-        const cleanup_end = statementEnd(file.tokens, for_index) orelse continue;
-        var index = iterable_end + 3;
-        while (index + 4 < cleanup_end) : (index += 1) {
-            if (!tokenIs(file.source, file.tokens[index], "free") or file.tokens[index + 1].tag != .l_paren) continue;
-            const free_end = matchingToken(file.tokens, index + 1, .l_paren, .r_paren) orelse continue;
-            if (free_end > cleanup_end) continue;
-            var argument_index = index + 2;
-            while (argument_index + 2 < free_end) : (argument_index += 1) {
-                if (!tokenIs(file.source, file.tokens[argument_index], element) or
-                    file.tokens[argument_index + 1].tag != .period or
-                    file.tokens[argument_index + 2].tag != .identifier) continue;
-                return tokenText(file.source, file.tokens[argument_index + 2]);
+/// The element field the first cleanup loop over `sequence_field.items`
+/// frees.
+fn sequenceCleanupOwnedField(file: File, sequence_field: []const u8) !?[]const u8 {
+    if (file.facts.cleanup_owned_fields == null) {
+        // A loop's freed field does not depend on the sequence it is looked up
+        // for, so one pass records it for every name its iterable mentions.
+        var cleanups: std.StringHashMapUnmanaged([]const u8) = .empty;
+        errdefer cleanups.deinit(file.facts.allocator);
+        for (file.tokens, 0..) |token, for_index| {
+            if (token.tag != .keyword_for or for_index + 1 >= file.tokens.len or
+                file.tokens[for_index + 1].tag != .l_paren) continue;
+            const iterable_end = file.scopes.matchingToken(for_index + 1) orelse continue;
+            var names_items = false;
+            for (file.tokens[for_index + 2 .. iterable_end]) |part| {
+                if (part.tag == .identifier and tokenIs(file.source, part, "items")) names_items = true;
             }
+            if (!names_items) continue;
+            const freed = loopFreedElementField(file, for_index, iterable_end) orelse continue;
+            for (file.tokens[for_index + 2 .. iterable_end]) |part| {
+                if (part.tag != .identifier) continue;
+                const entry = try cleanups.getOrPut(file.facts.allocator, tokenText(file.source, part));
+                if (!entry.found_existing) entry.value_ptr.* = freed;
+            }
+        }
+        file.facts.cleanup_owned_fields = cleanups;
+    }
+    return file.facts.cleanup_owned_fields.?.get(sequence_field);
+}
+
+/// The field of the capture that the loop `for (...) |element|` at
+/// `for_index` frees first, as in `free(element.name)`.
+fn loopFreedElementField(file: File, for_index: usize, iterable_end: usize) ?[]const u8 {
+    if (iterable_end + 2 >= file.tokens.len or
+        file.tokens[iterable_end + 1].tag != .pipe or file.tokens[iterable_end + 2].tag != .identifier) return null;
+    const element = tokenText(file.source, file.tokens[iterable_end + 2]);
+    const cleanup_end = file.scopes.statementEnd(for_index) orelse return null;
+    var index = iterable_end + 3;
+    while (index + 4 < cleanup_end) : (index += 1) {
+        if (!tokenIs(file.source, file.tokens[index], "free") or file.tokens[index + 1].tag != .l_paren) continue;
+        const free_end = file.scopes.matchingToken(index + 1) orelse continue;
+        if (free_end > cleanup_end) continue;
+        var argument_index = index + 2;
+        while (argument_index + 2 < free_end) : (argument_index += 1) {
+            if (!tokenIs(file.source, file.tokens[argument_index], element) or
+                file.tokens[argument_index + 1].tag != .period or
+                file.tokens[argument_index + 2].tag != .identifier) continue;
+            return tokenText(file.source, file.tokens[argument_index + 2]);
         }
     }
     return null;
@@ -1846,7 +1942,7 @@ fn removedElementTransferredBefore(
     removal_index: usize,
 ) bool {
     if (removal_index + 1 >= file.tokens.len or file.tokens[removal_index + 1].tag != .l_paren) return false;
-    const removal_end = matchingToken(file.tokens, removal_index + 1, .l_paren, .r_paren) orelse return false;
+    const removal_end = file.scopes.matchingToken(removal_index + 1) orelse return false;
     var removed_index: ?[]const u8 = null;
     for (file.tokens[removal_index + 2 .. removal_end]) |argument| {
         if (argument.tag != .identifier) continue;
@@ -1854,11 +1950,11 @@ fn removedElementTransferredBefore(
         removed_index = tokenText(file.source, argument);
     }
     const index_name = removed_index orelse return false;
-    const scope_start = enclosingOpeningBrace(file.tokens, removal_index) orelse return false;
+    const scope_start = file.scopes.enclosingOpeningBrace(removal_index) orelse return false;
     for (file.tokens[scope_start + 1 .. removal_index], scope_start + 1..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 3 >= removal_index or
             file.tokens[declaration_index + 1].tag != .identifier) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= removal_index) continue;
         var saw_sequence = false;
         var saw_items = false;
@@ -1874,10 +1970,10 @@ fn removedElementTransferredBefore(
         for (file.tokens[declaration_end + 1 .. removal_index], declaration_end + 1..) |candidate, append_index| {
             if (candidate.tag != .identifier or !tokenIs(file.source, candidate, "append") or
                 append_index + 1 >= removal_index or file.tokens[append_index + 1].tag != .l_paren) continue;
-            const append_end = matchingToken(file.tokens, append_index + 1, .l_paren, .r_paren) orelse continue;
+            const append_end = file.scopes.matchingToken(append_index + 1) orelse continue;
             if (append_end >= removal_index or bareArgumentPosition(file, binding, append_index + 2, append_end) == null) continue;
             const append_statement_start = statementBoundaryStart(file.tokens, append_index, declaration_end + 1);
-            const append_statement_end = statementEnd(file.tokens, append_index) orelse continue;
+            const append_statement_end = file.scopes.statementEnd(append_index) orelse continue;
             if (rangeContainsTry(file.tokens, append_statement_start, append_statement_end)) return true;
         }
     }
@@ -1890,14 +1986,14 @@ fn sequenceElementDeinitializedBeforeRemoval(
     removal_index: usize,
 ) bool {
     if (removal_index + 1 >= file.tokens.len or file.tokens[removal_index + 1].tag != .l_paren) return false;
-    const removal_end = matchingToken(file.tokens, removal_index + 1, .l_paren, .r_paren) orelse return false;
-    const scope_start = enclosingOpeningBrace(file.tokens, removal_index) orelse return false;
+    const removal_end = file.scopes.matchingToken(removal_index + 1) orelse return false;
+    const scope_start = file.scopes.enclosingOpeningBrace(removal_index) orelse return false;
     var path_index = scope_start + 1;
     while (path_index + 7 < removal_index) : (path_index += 1) {
         if (!tokenIs(file.source, file.tokens[path_index], sequence_field) or
             file.tokens[path_index + 1].tag != .period or !tokenIs(file.source, file.tokens[path_index + 2], "items") or
             file.tokens[path_index + 3].tag != .l_bracket) continue;
-        const bracket_end = matchingToken(file.tokens, path_index + 3, .l_bracket, .r_bracket) orelse continue;
+        const bracket_end = file.scopes.matchingToken(path_index + 3) orelse continue;
         if (bracket_end + 3 >= removal_index or file.tokens[bracket_end + 1].tag != .period or
             !tokenIs(file.source, file.tokens[bracket_end + 2], "deinit") or
             file.tokens[bracket_end + 3].tag != .l_paren) continue;
@@ -1912,21 +2008,30 @@ fn sequenceElementDeinitializedBeforeRemoval(
     return false;
 }
 
-fn sequenceStoresPointers(file: File, field_name: []const u8) bool {
-    var stores_pointers = false;
-    for (file.tokens, 0..) |token, field_index| {
-        if (token.tag != .identifier or !tokenIs(file.source, token, field_name) or
-            field_index + 4 >= file.tokens.len or file.tokens[field_index + 1].tag != .colon) continue;
-        const field_end = fieldTypeEnd(file.tokens, field_index + 2);
-        for (file.tokens[field_index + 2 .. field_end], field_index + 2..) |candidate, type_index| {
-            if (candidate.tag != .identifier or
-                (!tokenIs(file.source, candidate, "ArrayList") and !tokenIs(file.source, candidate, "ArrayListUnmanaged")) or
-                type_index + 2 >= field_end or file.tokens[type_index + 1].tag != .l_paren) continue;
-            if (file.tokens[type_index + 2].tag != .asterisk) return false;
-            stores_pointers = true;
+/// Whether the `ArrayList` fields spelled `field_name` all hold pointers.
+fn sequenceStoresPointers(file: File, field_name: []const u8) !bool {
+    if (file.facts.stores_pointers == null) {
+        // One pass records, per name, whether every such field holds pointers.
+        var pointers: std.StringHashMapUnmanaged(bool) = .empty;
+        errdefer pointers.deinit(file.facts.allocator);
+        for (file.tokens, 0..) |token, field_index| {
+            if (token.tag != .identifier or field_index + 4 >= file.tokens.len or file.tokens[field_index + 1].tag != .colon) continue;
+            const field_end = fieldTypeEnd(file.tokens, field_index + 2);
+            for (file.tokens[field_index + 2 .. field_end], field_index + 2..) |candidate, type_index| {
+                if (candidate.tag != .identifier or
+                    (!tokenIs(file.source, candidate, "ArrayList") and !tokenIs(file.source, candidate, "ArrayListUnmanaged")) or
+                    type_index + 2 >= field_end or file.tokens[type_index + 1].tag != .l_paren) continue;
+                const entry = try pointers.getOrPut(file.facts.allocator, tokenText(file.source, token));
+                if (file.tokens[type_index + 2].tag != .asterisk) {
+                    entry.value_ptr.* = false;
+                } else if (!entry.found_existing) {
+                    entry.value_ptr.* = true;
+                }
+            }
         }
+        file.facts.stores_pointers = pointers;
     }
-    return stores_pointers;
+    return file.facts.stores_pointers.?.get(field_name) orelse false;
 }
 
 const ContainingFunction = struct {
@@ -1935,22 +2040,17 @@ const ContainingFunction = struct {
     body_start: usize,
 };
 
+/// The innermost `fn name(...)` body around `target`: function bodies nest,
+/// so it is the first one met walking out through the enclosing blocks.
 fn functionContaining(file: File, target: usize) ?ContainingFunction {
-    var selected: ?ContainingFunction = null;
-    for (file.tokens[0..target], 0..) |token, function_index| {
-        if (token.tag != .keyword_fn or function_index + 2 >= target or
-            file.tokens[function_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
-        const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
-        if (target <= body_start or target >= body_end) continue;
-        selected = .{
-            .parameters_start = function_index + 3,
-            .parameters_end = parameters_end,
-            .body_start = body_start,
-        };
+    var brace = file.scopes.enclosingOpeningBrace(target);
+    while (brace) |opening| : (brace = file.scopes.enclosingOpeningBrace(opening)) {
+        const function = file.facts.function_bodies.get(opening) orelse continue;
+        const body_end = file.scopes.matchingToken(opening) orelse continue;
+        if (target <= opening or target >= body_end) continue;
+        return function;
     }
-    return selected;
+    return null;
 }
 
 fn removedPointerMatchesParameter(
@@ -1959,7 +2059,7 @@ fn removedPointerMatchesParameter(
     removal_index: usize,
 ) bool {
     if (removal_index + 1 >= file.tokens.len or file.tokens[removal_index + 1].tag != .l_paren) return false;
-    const removal_end = matchingToken(file.tokens, removal_index + 1, .l_paren, .r_paren) orelse return false;
+    const removal_end = file.scopes.matchingToken(removal_index + 1) orelse return false;
     if (removal_index + 3 != removal_end or file.tokens[removal_index + 2].tag != .identifier) return false;
     const removal_position = tokenText(file.source, file.tokens[removal_index + 2]);
     const function = functionContaining(file, removal_index) orelse return false;
@@ -1968,7 +2068,7 @@ fn removedPointerMatchesParameter(
     while (for_index < removal_index) : (for_index += 1) {
         if (file.tokens[for_index].tag != .keyword_for or for_index + 1 >= removal_index or
             file.tokens[for_index + 1].tag != .l_paren) continue;
-        const iterable_end = matchingToken(file.tokens, for_index + 1, .l_paren, .r_paren) orelse continue;
+        const iterable_end = file.scopes.matchingToken(for_index + 1) orelse continue;
         if (iterable_end + 5 >= removal_index or file.tokens[iterable_end + 1].tag != .pipe) continue;
         var saw_sequence = false;
         var saw_items = false;
@@ -2028,12 +2128,12 @@ fn tokenRangesHaveSameSpelling(
 }
 
 fn elementFieldReleasedBeforeRemoval(file: File, field_name: []const u8, removal_index: usize) bool {
-    const scope_start = enclosingOpeningBrace(file.tokens, removal_index) orelse return false;
+    const scope_start = file.scopes.enclosingOpeningBrace(removal_index) orelse return false;
     for (file.tokens[scope_start + 1 .. removal_index], scope_start + 1..) |token, method_index| {
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             method_index + 1 >= removal_index or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         if (call_end >= removal_index) continue;
         var index = method_index + 2;
         while (index + 1 < call_end) : (index += 1) {
@@ -2045,28 +2145,77 @@ fn elementFieldReleasedBeforeRemoval(file: File, field_name: []const u8, removal
 
 fn findOwnedElementOverwrites(
     run: ProjectRun,
+    file: File,
+    file_index: usize,
     summary_index: summaries.Index,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
 ) !void {
     const level = run.configuration.level(.overwritten_owning_value);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, equal_index| {
-            if (token.tag != .equal or equal_index < 6) continue;
+    for (file.tokens, 0..) |token, equal_index| {
+        if (token.tag != .equal or equal_index < 6) continue;
+        const field_index = equal_index - 1;
+        if (file.tokens[field_index].tag != .identifier or file.tokens[field_index - 1].tag != .period) continue;
+        const items_index = findItemsBefore(file, field_index, equal_index -| 16) orelse continue;
+        if (items_index < 2 or file.tokens[items_index - 1].tag != .period or file.tokens[items_index - 2].tag != .identifier) continue;
+        const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
+        const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+        const field_name = tokenText(file.source, file.tokens[field_index]);
+        if (!evidence.proven(element_type, field_name)) continue;
+        const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
+        const scope_start = file.scopes.enclosingOpeningBrace(equal_index) orelse continue;
+        if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, scope_start + 1)) continue;
+        const released = rangeReleasesElementField(file, sequence_field, field_name, scope_start + 1, equal_index);
+        if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
+        try run.report(.{
+            .file_index = file_index,
+            .rule = .overwritten_owning_value,
+            .span = file.tokens[field_index].loc,
+            .message = if (released)
+                try run.allocator.print(
+                    "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
+                    .{ element_type, field_name },
+                )
+            else
+                try run.allocator.print(
+                    "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
+                    .{ element_type, field_name },
+                ),
+        });
+    }
+}
+
+fn findAliasedOwnedElementOverwrites(
+    run: ProjectRun,
+    file: File,
+    file_index: usize,
+    summary_index: summaries.Index,
+    evidence: *const FieldEvidence,
+) !void {
+    const level = run.configuration.level(.overwritten_owning_value);
+    if (level == .off) return;
+    for (file.tokens, 0..) |token, declaration_index| {
+        if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
+            file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
+            file.tokens[declaration_index + 3].tag != .ampersand) continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
+        const items_index = findItemsBefore(file, declaration_end, declaration_index + 3) orelse continue;
+        if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
+            file.tokens[items_index - 2].tag != .identifier) continue;
+        const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
+        const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+        const alias = tokenText(file.source, file.tokens[declaration_index + 1]);
+        const scope_end = file.scopes.enclosingScopeEnd(declaration_index) orelse continue;
+        var equal_index = declaration_end + 1;
+        while (equal_index + 2 < scope_end) : (equal_index += 1) {
+            if (file.tokens[equal_index].tag != .equal or file.tokens[equal_index - 1].tag != .identifier or
+                file.tokens[equal_index - 2].tag != .period or !tokenIs(file.source, file.tokens[equal_index - 3], alias)) continue;
             const field_index = equal_index - 1;
-            if (file.tokens[field_index].tag != .identifier or file.tokens[field_index - 1].tag != .period) continue;
-            const items_index = findItemsBefore(file, field_index, equal_index -| 16) orelse continue;
-            if (items_index < 2 or file.tokens[items_index - 1].tag != .period or file.tokens[items_index - 2].tag != .identifier) continue;
-            const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
             const field_name = tokenText(file.source, file.tokens[field_index]);
-            if (!ownedFieldIsProven(evidence, file_index, element_type, field_name)) continue;
-            const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
-            const scope_start = enclosingOpeningBrace(file.tokens, equal_index) orelse continue;
-            if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, scope_start + 1)) continue;
-            const released = rangeReleasesElementField(file, sequence_field, field_name, scope_start + 1, equal_index);
+            if (!evidence.proven(element_type, field_name)) continue;
+            const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
+            if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, declaration_end + 1)) continue;
+            const released = rangeReleasesAliasedField(file, alias, field_name, declaration_end + 1, equal_index);
             if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
             try run.report(.{
                 .file_index = file_index,
@@ -2074,137 +2223,82 @@ fn findOwnedElementOverwrites(
                 .span = file.tokens[field_index].loc,
                 .message = if (released)
                     try run.allocator.print(
-                        "fallible replacement of proven owned field '{s}.{s}' occurs after its previous allocation is released",
-                        .{ element_type, field_name },
+                        "fallible replacement through alias '{s}' occurs after proven owned field '{s}.{s}' is released",
+                        .{ alias, element_type, field_name },
                     )
                 else
                     try run.allocator.print(
-                        "assignment replaces proven owned field '{s}.{s}' without releasing its previous allocation",
-                        .{ element_type, field_name },
+                        "assignment through alias '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
+                        .{ alias, element_type, field_name },
                     ),
             });
         }
     }
 }
 
-fn findAliasedOwnedElementOverwrites(
-    run: ProjectRun,
-    summary_index: summaries.Index,
-    evidence: []const OwnedFieldEvidence,
-) !void {
-    const level = run.configuration.level(.overwritten_owning_value);
-    if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, declaration_index| {
-            if (token.tag != .keyword_const or declaration_index + 4 >= file.tokens.len or
-                file.tokens[declaration_index + 1].tag != .identifier or file.tokens[declaration_index + 2].tag != .equal or
-                file.tokens[declaration_index + 3].tag != .ampersand) continue;
-            const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
-            const items_index = findItemsBefore(file, declaration_end, declaration_index + 3) orelse continue;
-            if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
-                file.tokens[items_index - 2].tag != .identifier) continue;
-            const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
-            const alias = tokenText(file.source, file.tokens[declaration_index + 1]);
-            const scope_end = enclosingScopeEnd(file.tokens, declaration_index) orelse continue;
-            var equal_index = declaration_end + 1;
-            while (equal_index + 2 < scope_end) : (equal_index += 1) {
-                if (file.tokens[equal_index].tag != .equal or file.tokens[equal_index - 1].tag != .identifier or
-                    file.tokens[equal_index - 2].tag != .period or !tokenIs(file.source, file.tokens[equal_index - 3], alias)) continue;
-                const field_index = equal_index - 1;
-                const field_name = tokenText(file.source, file.tokens[field_index]);
-                if (!ownedFieldIsProven(evidence, file_index, element_type, field_name)) continue;
-                const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
-                if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, declaration_end + 1)) continue;
-                const released = rangeReleasesAliasedField(file, alias, field_name, declaration_end + 1, equal_index);
-                if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
-                try run.report(.{
-                    .file_index = file_index,
-                    .rule = .overwritten_owning_value,
-                    .span = file.tokens[field_index].loc,
-                    .message = if (released)
-                        try run.allocator.print(
-                            "fallible replacement through alias '{s}' occurs after proven owned field '{s}.{s}' is released",
-                            .{ alias, element_type, field_name },
-                        )
-                    else
-                        try run.allocator.print(
-                            "assignment through alias '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
-                            .{ alias, element_type, field_name },
-                        ),
-                });
-            }
-        }
-    }
-}
-
 fn findCapturedOwnedElementOverwrites(
     run: ProjectRun,
+    file: File,
+    file_index: usize,
     summary_index: summaries.Index,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
 ) !void {
     const level = run.configuration.level(.overwritten_owning_value);
     if (level == .off) return;
-    for (run.files, 0..) |file, file_index| {
-        var element_types = ElementTypeCache{};
-        defer element_types.entries.deinit(run.allocator);
-        for (file.tokens, 0..) |token, for_index| {
-            if (token.tag != .keyword_for or for_index + 1 >= file.tokens.len or
-                file.tokens[for_index + 1].tag != .l_paren) continue;
-            const sequence_end = matchingToken(file.tokens, for_index + 1, .l_paren, .r_paren) orelse continue;
-            const items_index = findItemsBefore(file, sequence_end, for_index + 2) orelse continue;
-            if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
-                file.tokens[items_index - 2].tag != .identifier) continue;
-            const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
-            const element_type = try element_types.lookup(run.allocator, file, sequence_field) orelse continue;
-            if (sequence_end + 4 >= file.tokens.len or file.tokens[sequence_end + 1].tag != .pipe or
-                file.tokens[sequence_end + 2].tag != .asterisk or file.tokens[sequence_end + 3].tag != .identifier or
-                file.tokens[sequence_end + 4].tag != .pipe) continue;
-            const alias = tokenText(file.source, file.tokens[sequence_end + 3]);
-            const body_open = sequence_end + 5;
-            if (body_open >= file.tokens.len) continue;
-            const body_start = if (file.tokens[body_open].tag == .l_brace) body_open + 1 else body_open;
-            const body_end = if (file.tokens[body_open].tag == .l_brace)
-                matchingToken(file.tokens, body_open, .l_brace, .r_brace) orelse continue
-            else
-                statementEnd(file.tokens, for_index) orelse firstNestedBodyEnd(file, body_open) orelse continue;
-            var equal_index = body_start;
-            while (equal_index + 2 < body_end) : (equal_index += 1) {
-                if (file.tokens[equal_index].tag != .equal or file.tokens[equal_index - 1].tag != .identifier or
-                    file.tokens[equal_index - 2].tag != .period or !tokenIs(file.source, file.tokens[equal_index - 3], alias)) continue;
-                const field_index = equal_index - 1;
-                const field_name = tokenText(file.source, file.tokens[field_index]);
-                if (!ownedFieldIsProven(evidence, file_index, element_type, field_name)) continue;
-                const statement_end = statementEnd(file.tokens, equal_index) orelse continue;
-                if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, body_start)) continue;
-                const released = rangeReleasesAliasedField(file, alias, field_name, body_start, equal_index);
-                if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
-                try run.report(.{
-                    .file_index = file_index,
-                    .rule = .overwritten_owning_value,
-                    .span = file.tokens[field_index].loc,
-                    .message = if (released)
-                        try run.allocator.print(
-                            "fallible replacement through pointer capture '{s}' occurs after proven owned field '{s}.{s}' is released",
-                            .{ alias, element_type, field_name },
-                        )
-                    else
-                        try run.allocator.print(
-                            "assignment through pointer capture '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
-                            .{ alias, element_type, field_name },
-                        ),
-                });
-            }
+    for (file.tokens, 0..) |token, for_index| {
+        if (token.tag != .keyword_for or for_index + 1 >= file.tokens.len or
+            file.tokens[for_index + 1].tag != .l_paren) continue;
+        const sequence_end = file.scopes.matchingToken(for_index + 1) orelse continue;
+        const items_index = findItemsBefore(file, sequence_end, for_index + 2) orelse continue;
+        if (items_index < 2 or file.tokens[items_index - 1].tag != .period or
+            file.tokens[items_index - 2].tag != .identifier) continue;
+        const sequence_field = tokenText(file.source, file.tokens[items_index - 2]);
+        const element_type = try file.facts.elementType(file, sequence_field) orelse continue;
+        if (sequence_end + 4 >= file.tokens.len or file.tokens[sequence_end + 1].tag != .pipe or
+            file.tokens[sequence_end + 2].tag != .asterisk or file.tokens[sequence_end + 3].tag != .identifier or
+            file.tokens[sequence_end + 4].tag != .pipe) continue;
+        const alias = tokenText(file.source, file.tokens[sequence_end + 3]);
+        const body_open = sequence_end + 5;
+        if (body_open >= file.tokens.len) continue;
+        const body_start = if (file.tokens[body_open].tag == .l_brace) body_open + 1 else body_open;
+        const body_end = if (file.tokens[body_open].tag == .l_brace)
+            file.scopes.matchingToken(body_open) orelse continue
+        else
+            file.scopes.statementEnd(for_index) orelse firstNestedBodyEnd(file, body_open) orelse continue;
+        var equal_index = body_start;
+        while (equal_index + 2 < body_end) : (equal_index += 1) {
+            if (file.tokens[equal_index].tag != .equal or file.tokens[equal_index - 1].tag != .identifier or
+                file.tokens[equal_index - 2].tag != .period or !tokenIs(file.source, file.tokens[equal_index - 3], alias)) continue;
+            const field_index = equal_index - 1;
+            const field_name = tokenText(file.source, file.tokens[field_index]);
+            if (!evidence.proven(element_type, field_name)) continue;
+            const statement_end = file.scopes.statementEnd(equal_index) orelse continue;
+            if (!assignmentAcquiresOwned(file, summary_index, equal_index + 1, statement_end, body_start)) continue;
+            const released = rangeReleasesAliasedField(file, alias, field_name, body_start, equal_index);
+            if (released and !rangeContainsTry(file.tokens, equal_index + 1, statement_end)) continue;
+            try run.report(.{
+                .file_index = file_index,
+                .rule = .overwritten_owning_value,
+                .span = file.tokens[field_index].loc,
+                .message = if (released)
+                    try run.allocator.print(
+                        "fallible replacement through pointer capture '{s}' occurs after proven owned field '{s}.{s}' is released",
+                        .{ alias, element_type, field_name },
+                    )
+                else
+                    try run.allocator.print(
+                        "assignment through pointer capture '{s}' replaces proven owned field '{s}.{s}' without releasing its previous allocation",
+                        .{ alias, element_type, field_name },
+                    ),
+            });
         }
     }
 }
 
 fn firstNestedBodyEnd(file: File, start: usize) ?usize {
-    const scope_end = enclosingScopeEnd(file.tokens, start) orelse return null;
+    const scope_end = file.scopes.enclosingScopeEnd(start) orelse return null;
     for (file.tokens[start..scope_end], start..) |token, opening| {
-        if (token.tag == .l_brace) return matchingToken(file.tokens, opening, .l_brace, .r_brace);
+        if (token.tag == .l_brace) return file.scopes.matchingToken(opening);
     }
     return null;
 }
@@ -2228,13 +2322,13 @@ fn assignmentAcquiresOwned(
     }
     if (start + 1 != end or file.tokens[start].tag != .identifier) return false;
     const binding = tokenText(file.source, file.tokens[start]);
-    const assignment_scope = enclosingOpeningBrace(file.tokens, start) orelse return false;
+    const assignment_scope = file.scopes.enclosingOpeningBrace(start) orelse return false;
     for (file.tokens[declaration_start..start], declaration_start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 1 >= start or
             !tokenIs(file.source, file.tokens[declaration_index + 1], binding)) continue;
-        const declaration_scope = enclosingOpeningBrace(file.tokens, declaration_index) orelse continue;
+        const declaration_scope = file.scopes.enclosingOpeningBrace(declaration_index) orelse continue;
         if (declaration_scope != assignment_scope) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= start) continue;
         const call = firstCall(file.tokens, declaration_index + 2, declaration_end) orelse continue;
         const name = tokenText(file.source, file.tokens[call.name_index]);
@@ -2255,7 +2349,7 @@ fn rangeReleasesAliasedField(
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy")) or
             method_index + 1 >= end or file.tokens[method_index + 1].tag != .l_paren) continue;
-        const call_end = matchingToken(file.tokens, method_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(method_index + 1) orelse continue;
         var index = method_index + 2;
         while (index + 2 < @min(call_end, end)) : (index += 1) {
             if (tokenIs(file.source, file.tokens[index], alias) and file.tokens[index + 1].tag == .period and
@@ -2275,17 +2369,6 @@ fn findItemsBefore(file: File, end: usize, start: usize) ?usize {
     return null;
 }
 
-fn ownedFieldIsProven(
-    evidence: []const OwnedFieldEvidence,
-    file_index: usize,
-    type_name: []const u8,
-    field_name: []const u8,
-) bool {
-    for (evidence) |field| if (field.file_index == file_index and
-        std.mem.eql(u8, field.type_name, type_name) and std.mem.eql(u8, field.field_name, field_name)) return true;
-    return false;
-}
-
 fn rangeReleasesElementField(
     file: File,
     sequence_field: []const u8,
@@ -2296,7 +2379,7 @@ fn rangeReleasesElementField(
     for (file.tokens[start..end], start..) |token, method_index| {
         if (token.tag != .identifier or
             (!tokenIs(file.source, token, "free") and !tokenIs(file.source, token, "destroy"))) continue;
-        const statement_end = statementEnd(file.tokens, method_index) orelse continue;
+        const statement_end = file.scopes.statementEnd(method_index) orelse continue;
         var saw_sequence = false;
         var saw_field = false;
         for (file.tokens[method_index + 1 .. @min(statement_end, end)], method_index + 1..) |argument, index| {
@@ -2322,7 +2405,7 @@ fn fieldAliasTargetsElement(
     for (file.tokens[start..end], start..) |token, declaration_index| {
         if ((token.tag != .keyword_const and token.tag != .keyword_var) or declaration_index + 2 >= end or
             !tokenIs(file.source, file.tokens[declaration_index + 1], alias)) continue;
-        const declaration_end = statementEnd(file.tokens, declaration_index) orelse continue;
+        const declaration_end = file.scopes.statementEnd(declaration_index) orelse continue;
         if (declaration_end >= end) continue;
         var saw_sequence = false;
         var saw_field = false;
@@ -2351,10 +2434,10 @@ const CleanupMethod = struct {
 };
 
 fn cleanupMethod(file: File, start: usize, end: usize) ?CleanupMethod {
-    for (file.tokens[start..end], start..) |token, fn_index| {
-        if (token.tag != .keyword_fn or fn_index + 3 >= end or file.tokens[fn_index + 1].tag != .identifier or
-            !tokenIs(file.source, file.tokens[fn_index + 1], "deinit") or file.tokens[fn_index + 2].tag != .l_paren) continue;
-        const parameters_end = matchingToken(file.tokens, fn_index + 2, .l_paren, .r_paren) orelse continue;
+    for (Facts.namedIn(&file.facts.functions, "deinit", start, end)) |function_position| {
+        const fn_index: usize = function_position;
+        if (fn_index + 3 >= end or file.tokens[fn_index + 1].tag != .identifier) continue;
+        const parameters_end = file.scopes.matchingToken(fn_index + 2) orelse continue;
         var receiver: ?[]const u8 = null;
         for (file.tokens[fn_index + 3 .. parameters_end], fn_index + 3..) |parameter, index| {
             if (parameter.tag == .identifier and index + 1 < parameters_end and file.tokens[index + 1].tag == .colon) {
@@ -2363,7 +2446,7 @@ fn cleanupMethod(file: File, start: usize, end: usize) ?CleanupMethod {
             }
         }
         const body_start = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const body_end = matchingToken(file.tokens, body_start, .l_brace, .r_brace) orelse continue;
+        const body_end = file.scopes.matchingToken(body_start) orelse continue;
         return .{ .receiver = receiver orelse continue, .body_start = body_start, .body_end = body_end };
     }
     return null;
@@ -2372,12 +2455,11 @@ fn cleanupMethod(file: File, start: usize, end: usize) ?CleanupMethod {
 fn fieldReleased(
     file: File,
     cleanup: CleanupMethod,
-    file_index: usize,
     container_start: usize,
     container_end: usize,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
     field: []const u8,
-) bool {
+) !bool {
     var index = cleanup.body_start + 1;
     while (index + 2 < cleanup.body_end) : (index += 1) {
         if (!tokenIs(file.source, file.tokens[index], cleanup.receiver) or file.tokens[index + 1].tag != .period or
@@ -2393,9 +2475,8 @@ fn fieldReleased(
             if (file.tokens[cursor].tag == .semicolon or file.tokens[cursor].tag == .l_brace) break;
         }
     }
-    return aggregateFieldReleasedByHelper(
+    return try aggregateFieldReleasedByHelper(
         file,
-        file_index,
         evidence,
         cleanup.receiver,
         field,
@@ -2408,22 +2489,21 @@ fn fieldReleased(
 
 fn aggregateFieldReleasedByHelper(
     file: File,
-    file_index: usize,
-    evidence: []const OwnedFieldEvidence,
+    evidence: *const FieldEvidence,
     receiver: []const u8,
     field: []const u8,
     start: usize,
     end: usize,
     container_start: usize,
     container_end: usize,
-) bool {
-    const field_type = declaredFieldTypeName(file, container_start, container_end, field) orelse return false;
+) !bool {
+    const field_type = try declaredFieldTypeName(file, container_start, container_end, field) orelse return false;
     var call_index = start;
     while (call_index + 1 < end) : (call_index += 1) {
         if (file.tokens[call_index].tag != .identifier or file.tokens[call_index + 1].tag != .l_paren or
             call_index < 2 or file.tokens[call_index - 1].tag != .period or
             !tokenIs(file.source, file.tokens[call_index - 2], receiver)) continue;
-        const call_end = matchingToken(file.tokens, call_index + 1, .l_paren, .r_paren) orelse continue;
+        const call_end = file.scopes.matchingToken(call_index + 1) orelse continue;
         if (call_end >= end) continue;
         const argument_index = fieldPathArgumentIndex(
             file,
@@ -2434,10 +2514,9 @@ fn aggregateFieldReleasedByHelper(
         ) orelse continue;
         const function_name = tokenText(file.source, file.tokens[call_index]);
         var selected_function: ?usize = null;
-        for (file.tokens[container_start..container_end], container_start..) |candidate, function_index| {
-            if (candidate.tag != .keyword_fn or function_index + 2 >= container_end or
-                !tokenIs(file.source, file.tokens[function_index + 1], function_name) or
-                file.tokens[function_index + 2].tag != .l_paren) continue;
+        for (Facts.namedIn(&file.facts.functions, function_name, container_start, container_end)) |function_position| {
+            const function_index: usize = function_position;
+            if (function_index + 2 >= container_end) continue;
             if (selected_function != null) {
                 selected_function = null;
                 break;
@@ -2445,17 +2524,16 @@ fn aggregateFieldReleasedByHelper(
             selected_function = function_index;
         }
         const function_index = selected_function orelse continue;
-        const parameters_end = matchingToken(file.tokens, function_index + 2, .l_paren, .r_paren) orelse continue;
+        const parameters_end = file.scopes.matchingToken(function_index + 2) orelse continue;
         const parameter = parameterNameAt(file, function_index + 3, parameters_end, argument_index + 1) orelse continue;
         const parameter_type = parameterTypeNameAt(file, function_index + 3, parameters_end, argument_index + 1) orelse continue;
         if (!std.mem.eql(u8, field_type, parameter_type)) continue;
         const helper_body = syntax_scope.functionBodyAfterParameters(file.tokens, parameters_end) orelse continue;
-        const helper_end = matchingToken(file.tokens, helper_body, .l_brace, .r_brace) orelse continue;
+        const helper_end = file.scopes.matchingToken(helper_body) orelse continue;
         var owned_field_count: usize = 0;
         var released_field_count: usize = 0;
-        for (evidence) |owned_field| {
-            if (owned_field.file_index != file_index or
-                !std.mem.eql(u8, owned_field.type_name, field_type)) continue;
+        for (evidence.ofType(field_type)) |position| {
+            const owned_field = evidence.items.items[position];
             owned_field_count += 1;
             if (elementFieldReleased(
                 file,
@@ -2475,19 +2553,9 @@ fn declaredFieldTypeName(
     start: usize,
     end: usize,
     field: []const u8,
-) ?[]const u8 {
-    var depth: usize = 0;
-    for (file.tokens[start..end], start..) |token, field_index| {
-        switch (token.tag) {
-            .l_brace => depth += 1,
-            .r_brace => depth -|= 1,
-            else => {},
-        }
-        if (depth != 0 or token.tag != .identifier or !tokenIs(file.source, token, field) or
-            field_index + 2 >= end or file.tokens[field_index + 1].tag != .colon) continue;
-        return functionReturnType(file, field_index + 2, @min(fieldTypeEnd(file.tokens, field_index + 2), end));
-    }
-    return null;
+) !?[]const u8 {
+    const field_index = try file.facts.containerField(file, start, end, field) orelse return null;
+    return functionReturnType(file, field_index + 2, @min(fieldTypeEnd(file.tokens, field_index + 2), end));
 }
 
 fn fieldPathArgumentIndex(
@@ -2560,9 +2628,9 @@ fn optionalFieldCaptureReleased(file: File, cleanup: CleanupMethod, field_index:
     const capture = tokenText(file.source, file.tokens[capture_index]);
     const branch_start = capture_index + 2;
     const branch_end = if (branch_start < cleanup.body_end and file.tokens[branch_start].tag == .l_brace)
-        matchingToken(file.tokens, branch_start, .l_brace, .r_brace) orelse cleanup.body_end
+        file.scopes.matchingToken(branch_start) orelse cleanup.body_end
     else
-        @min(statementEnd(file.tokens, branch_start) orelse cleanup.body_end, cleanup.body_end);
+        @min(file.scopes.statementEnd(branch_start) orelse cleanup.body_end, cleanup.body_end);
     for (file.tokens[branch_start..branch_end], branch_start..) |token, index| {
         if (!tokenIs(file.source, token, capture)) continue;
         if (index + 2 < branch_end and file.tokens[index + 1].tag == .period and file.tokens[index + 2].tag == .identifier and
@@ -2596,6 +2664,21 @@ test "cleanup methods release every proven owned field" {
         cleanup_count += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "an aggregate that owns its arena releases every field with it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const files = [_]project.SourceFile{.{
+        .path = "src/config.zig",
+        .source = "const Derived = struct { arena: std.heap.ArenaAllocator, title: []u8, words: []u8, keys: []u8," ++
+            "fn init(gpa: std.mem.Allocator) !Derived { var arena = std.heap.ArenaAllocator.init(gpa); errdefer arena.deinit();" ++
+            "const alloc = arena.allocator(); const title = try alloc.dupe(u8, \"t\"); const words = try alloc.dupe(u8, \"w\");" ++
+            "const keys = try alloc.dupe(u8, \"k\"); return .{ .title = title, .words = words, .keys = keys, .arena = arena }; }" ++
+            "fn deinit(self: *Derived) void { self.arena.deinit(); } };",
+    }};
+    const found = try project.findings(arena.allocator(), &files, types.Configuration.defaults());
+    for (found) |finding| try std.testing.expect(finding.finding.rule != .incomplete_owned_field_cleanup);
 }
 
 test "nested struct cleanup drops report once per owned field" {

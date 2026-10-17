@@ -39,6 +39,8 @@ pub const Absent = enum {
     size,
     /// Judges the file path, not the source text.
     file_name,
+    /// Resolves names through the installed Zig standard library.
+    standard_library,
 };
 
 pub const Example = union(enum) {
@@ -52,6 +54,7 @@ pub const Setting = enum {
     max_columns,
     allow_unsplittable,
     markers,
+    function_case,
 
     /// The key inside the rule's options object.
     pub fn key(comptime setting: Setting) []const u8 {
@@ -68,6 +71,7 @@ pub const Setting = enum {
             .max_columns => "the longest allowed line in columns, a positive integer",
             .allow_unsplittable => "whether a line that cannot be split, such as one long string literal, is exempt, a boolean",
             .markers => "the comments that count as pending work, a non-empty array of non-empty strings",
+            .function_case => "the spelling of functions that do not return a type, `\"camelCase\"` or `\"snake_case\"`",
         };
     }
 
@@ -89,6 +93,7 @@ pub const Setting = enum {
                 try text.append(allocator, ']');
                 break :markers text.toOwnedSlice(allocator);
             },
+            .function_case => allocator.print("\"{s}\"", .{defaults.function_case.text()}),
         };
     }
 };
@@ -99,6 +104,7 @@ pub const Settings = enum {
     function_length,
     line_length,
     todo_comment,
+    non_idiomatic_name,
 
     pub fn options(settings: Settings) []const Setting {
         return switch (settings) {
@@ -106,6 +112,7 @@ pub const Settings = enum {
             .function_length => &.{.max_lines},
             .line_length => &.{ .max_columns, .allow_unsplittable },
             .todo_comment => &.{.markers},
+            .non_idiomatic_name => &.{.function_case},
         };
     }
 };
@@ -374,6 +381,7 @@ const entries = [_]Entry{
         .rule = .non_idiomatic_name,
         .tier = .style,
         .profile = .official,
+        .settings = .non_idiomatic_name,
         .summary = "Reports declarations that do not follow Zig's function, type, or variable naming conventions.",
         .reference = "https://ziglang.org/documentation/master/#Names",
         .example = .{ .source =
@@ -397,7 +405,7 @@ const entries = [_]Entry{
         .tier = .style,
         .profile = .idiomatic,
         .fixes = .fix_all,
-        .summary = "Reports nested identical casts or a cast whose operand is proven to already have the target type.",
+        .summary = "Reports nested identical casts, a cast whose operand is proven to already have the target type, or a cast to the type its declaration or return already declares.",
         .example = .{ .source =
         \\fn f(x: u32) u32 {
         \\    return @as(u32, x);
@@ -409,14 +417,16 @@ const entries = [_]Entry{
         .tier = .style,
         .profile = .idiomatic,
         .fixes = .quick_fix,
-        .summary = "Reports `else` after a branch that always returns, breaks, continues, or evaluates to `noreturn`.",
+        .summary = "Reports a falling-through `else` after a branch that always returns, breaks, continues, or reaches `unreachable`.",
         .example = .{ .source =
         \\fn f(x: u32) u32 {
+        \\    var y = x;
         \\    if (x > 3) {
         \\        return 1;
         \\    } else {
-        \\        return 2;
+        \\        y += 1;
         \\    }
+        \\    return y;
         \\}
         },
     },
@@ -565,7 +575,7 @@ const entries = [_]Entry{
         .rule = .missing_resource_cleanup,
         .tier = .correctness,
         .fixes = .quick_fix,
-        .summary = "Reports a recognized resource or mutex with no visible cleanup, unlock, or ownership transfer.",
+        .summary = "Reports a recognized resource or mutex with no visible cleanup, unlock, or ownership transfer on some path, and a mutex unlocked twice.",
         .example = .{ .source =
         \\fn save(directory: anytype) !void {
         \\    const file = try directory.openFile("state", .{});
@@ -664,7 +674,7 @@ const entries = [_]Entry{
         .rule = .public_declaration_docs,
         .tier = .style,
         .profile = .strict,
-        .summary = "Reports a public declaration without a doc comment.",
+        .summary = "Reports a public declaration on its file's public surface without a doc comment.",
         .reference = "https://ziglang.org/documentation/master/#Doc-Comment-Guidance",
         .example = .{ .source =
         \\pub fn run() void {}
@@ -866,6 +876,7 @@ const entries = [_]Entry{
         .rule = .unsafe_orelse_unreachable,
         .tier = .style,
         .profile = .strict,
+        .fixes = .quick_fix,
         .summary = "Reports `orelse unreachable` used to unwrap an optional.",
         .example = .{ .source =
         \\fn first(items: []const u32) u32 {
@@ -1151,11 +1162,11 @@ const entries = [_]Entry{
         .example = .{ .source =
         \\const std = @import("std");
         \\
-        \\fn dupeZ(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+        \\fn dupeZ(allocator: std.mem.Allocator, src: []const u8) ![:0]u8 {
         \\    const buf = try allocator.alloc(u8, src.len + 1);
         \\    @memcpy(buf[0..src.len], src);
         \\    buf[src.len] = 0;
-        \\    return buf;
+        \\    return buf[0..src.len :0];
         \\}
         },
     },
@@ -1278,7 +1289,7 @@ const entries = [_]Entry{
     .{
         .rule = .unbraced_multiline_if,
         .tier = .style,
-        .profile = .idiomatic,
+        .profile = .strict,
         .fixes = .fix_all,
         .summary = "Reports an unbraced `if` whose single body statement begins on a later line.",
         .example = .{ .source =
@@ -1383,6 +1394,12 @@ const entries = [_]Entry{
         \\    oldName();
         \\}
         },
+    },
+    .{
+        .rule = .removed_std_api,
+        .tier = .correctness,
+        .summary = "Reports a standard-library path, however it is aliased, that the installed Zig standard library provably no longer declares, naming the replacement when one is known.",
+        .example = .{ .none = .standard_library },
     },
     .{
         .rule = .mutated_container_copy,
@@ -1988,7 +2005,7 @@ const entries = [_]Entry{
         .rule = .allocation_after_init,
         .tier = .style,
         .profile = .disciplined,
-        .summary = "Reports direct allocation in a function outside recognized `init*` and `create*` paths.",
+        .summary = "Reports direct allocation in a function outside recognized `init*`, `create*`, and `main` paths.",
         .example = .{ .source =
         \\const std = @import("std");
         \\
@@ -2891,6 +2908,87 @@ const entries = [_]Entry{
         \\fn collect(allocator: std.mem.Allocator) !void {
         \\    var list: std.ArrayList(u32) = .empty;
         \\    try list.append(allocator, 1);
+        \\}
+        },
+    },
+    .{
+        .rule = .prefer_typed_io_parameter,
+        .tier = .style,
+        .profile = .idiomatic,
+        .summary = "Reports an `anytype` writer or reader parameter that is only the receiver of `std.Io.Writer` or `std.Io.Reader` method calls.",
+        .example = .{ .source =
+        \\const Point = struct {
+        \\    x: i32,
+        \\    y: i32,
+        \\
+        \\    pub fn format(point: Point, writer: anytype) !void {
+        \\        try writer.print("({d}, {d})", .{ point.x, point.y });
+        \\    }
+        \\};
+        },
+    },
+    .{
+        .rule = .prefer_doctest,
+        .tier = .style,
+        .profile = .idiomatic,
+        .fixes = .quick_fix,
+        .summary = "Reports a test whose string name is exactly the name of a declaration at the root of the file, which can be a doctest.",
+        .reference = "https://ziglang.org/documentation/master/#Doctests",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn double(value: u32) u32 {
+        \\    return value * 2;
+        \\}
+        \\
+        \\test "double" {
+        \\    try std.testing.expectEqual(@as(u32, 4), double(2));
+        \\}
+        },
+    },
+    .{
+        .rule = .unflushed_writer,
+        .tier = .correctness,
+        .summary = "Reports a buffered `std.Io` file or stream writer that is written but never flushed, ended, returned, stored, or passed to a callee that flushes it.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    var buffer: [256]u8 = undefined;
+        \\    var stdout_writer = std.Io.File.stdout().writer(init.io, &buffer);
+        \\    const stdout = &stdout_writer.interface;
+        \\    try stdout.print("hello\n", .{});
+        \\}
+        },
+    },
+    .{
+        .rule = .unawaited_async,
+        .tier = .correctness,
+        .summary = "Reports an `std.Io` future, group, or select whose tasks are never awaited or cancelled, or that an early exit no `defer` covers can leave pending.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn work() void {}
+        \\
+        \\fn start(io: std.Io) void {
+        \\    var pending = io.async(work, .{});
+        \\    _ = &pending;
+        \\}
+        },
+    },
+    .{
+        .rule = .unconsumed_delimiter,
+        .tier = .correctness,
+        .summary = "Reports a loop that reads with `takeDelimiterExclusive` but never consumes the delimiter, so every later iteration reads an empty slice.",
+        .example = .{ .source =
+        \\const std = @import("std");
+        \\
+        \\fn countLines(reader: *std.Io.Reader) usize {
+        \\    var count: usize = 0;
+        \\    while (reader.takeDelimiterExclusive('\n')) |_| {
+        \\        count += 1;
+        \\    } else |_| {}
+        \\    return count;
         \\}
         },
     },

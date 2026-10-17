@@ -3,6 +3,7 @@ const RuleRun = @import("../context.zig").RuleRun;
 const types = @import("../types.zig");
 const support = @import("../test_support.zig");
 const container_types = @import("../container_types.zig");
+const resources = @import("../resources.zig");
 const tokenText = @import("../../syntax/tokens.zig").tokenText;
 const tokenIs = @import("../../syntax/tokens.zig").tokenIs;
 
@@ -48,6 +49,11 @@ pub fn run(context: RuleRun) !void {
 
         if (!has_mutating_call) continue;
         if (isArenaAllocator(allocator_name) or allocatorAliasesArena(context, allocator_name, declaration_index)) continue;
+        // A leak in a test is reported by `std.testing.allocator` itself.
+        if (context.scopes.insideTestBlock(declaration_index)) continue;
+        if (allocator_name orelse initializerAllocator(context, declaration_index, declaration_end)) |backing| {
+            if (resources.buildGraphAllocator(context.source, context.tokens, context.scopes, backing, declaration_index)) continue;
+        }
 
         // Check if container is deinitialized or transferred
         if (hasDeinitOrTransfer(context, container_name, declaration_end + 1, scope_end)) continue;
@@ -153,6 +159,15 @@ fn isArenaAllocator(allocator_name: ?[]const u8) bool {
     const name = allocator_name orelse return false;
     // The build graph's allocator is an arena owned by `std.Build`.
     return std.ascii.findIgnoreCase(name, "arena") != null or std.mem.eql(u8, name, "b.allocator");
+}
+
+/// The allocator a `try .initCapacity(allocator, n)` initializer hands the container.
+fn initializerAllocator(context: RuleRun, declaration_index: usize, declaration_end: usize) ?[]const u8 {
+    for (context.tokens[declaration_index..declaration_end], declaration_index..) |token, index| {
+        if (token.tag == .identifier and context.tokenIs(index, "initCapacity") and
+            context.tokens[index + 1].tag == .l_paren) return firstArgumentText(context.source, context.tokens, index + 1);
+    }
+    return null;
 }
 
 /// `const temporary = arena_state.allocator();` before the container.
@@ -510,4 +525,30 @@ test "fixed buffers and arena aliases need no deinit" {
         config,
     );
     try std.testing.expectEqual(@as(usize, 0), alias.len);
+}
+
+test "build graph allocators and tests need no container deinit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source: [:0]const u8 =
+        "const Lib = struct { builder: *std.Build, fn libs(self: Lib) ![]const u8 {\n" ++
+        "    var reserved: std.ArrayList(u8) = try .initCapacity(self.builder.allocator, 2);\n" ++
+        "    reserved.appendAssumeCapacity(1);\n" ++
+        "    return reserved.items;\n" ++
+        "} };\n" ++
+        "fn add(b: *std.Build) !void {\n" ++
+        "    const alloc = b.allocator;\n" ++
+        "    var aliased: std.ArrayList(u8) = .empty;\n" ++
+        "    try aliased.append(alloc, 1);\n" ++
+        "}\n" ++
+        "test \"collects\" {\n" ++
+        "    var collected: std.ArrayList(u8) = .empty;\n" ++
+        "    try collected.append(std.testing.allocator, 1);\n" ++
+        "}\n" ++
+        "fn leak(gpa: std.mem.Allocator) !void {\n" ++
+        "    var leaked: std.ArrayList(u8) = .empty;\n" ++
+        "    try leaked.append(gpa, 1);\n" ++
+        "}\n";
+    const found = try support.findings(arena.allocator(), run, source, testConfiguration());
+    try support.expectSpans(source, found, &.{"leaked"});
 }
